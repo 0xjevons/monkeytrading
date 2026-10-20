@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use engine_core::types::{MarketId, Millis};
+use futures_util::SinkExt;
 use tokio::time::{Instant, sleep, timeout};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::clock::now_ms;
 use crate::config::Venue;
@@ -154,7 +156,7 @@ async fn a_connection_with_no_fresh_quote_is_replaced_even_while_down() {
 async fn a_venue_time_far_ahead_of_the_host_clock_is_sequenced_and_alerted() {
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
-    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(WAIT));
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &[(1, "BTC/USD")], fast(Duration::from_millis(300)));
     let (mut ws, _) = accept(&listener).await;
 
     // The engine skips it until the host clock reaches it, so it prices nothing meanwhile, where
@@ -164,6 +166,28 @@ async fn a_venue_time_far_ahead_of_the_host_clock_is_sequenced_and_alerted() {
     assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", ts)]));
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["venue"].as_str()), ("venue_clock_ahead", "kraken"));
+
+    // Correctly dated quotes follow, but the engine holds the newer bad one and ignores them, so
+    // they do not count as the venue quoting.
+    stream(ws, || vec![kraken_ticker("BTC/USD", "100", "101", now_ms())]);
+    let alert = next_alert(&mut alerts).await;
+    assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "BTC/USD"));
+}
+
+#[tokio::test]
+async fn a_binary_message_is_refused_with_an_alert() {
+    let (_guard, mut alerts) = capture_alerts();
+    let (listener, url) = listen().await;
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(WAIT));
+    let (mut ws, _) = accept(&listener).await;
+    ws.send(Message::binary(vec![1, 2, 3])).await.expect("send");
+    let ts = now_ms();
+    send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", ts)]).await;
+
+    let alert = next_alert(&mut alerts).await;
+    assert_eq!((alert["alert"].as_str(), alert["reason"].as_str()), ("venue_message_refused", "binary message"));
+    // The connection carries on.
+    assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", ts)]));
 }
 
 #[tokio::test]

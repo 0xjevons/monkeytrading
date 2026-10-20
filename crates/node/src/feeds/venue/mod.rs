@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
+use std::mem::take;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,8 @@ use crate::clock::now_ms;
 use crate::config::{Venue, VenueConnection, VenuesSection};
 use crate::feeds::{bitstamp, coinbase, kraken};
 use crate::sequencer::Request;
+mod validation;
+pub(super) use validation::{check_size, check_time, to_quote};
 
 /// After a refused-message or clock alert, the same alert from the same venue waits this long, so
 /// a venue that changes its format raises one alert a minute, not one per message.
@@ -34,7 +37,10 @@ const REALERT_AFTER: Duration = Duration::from_secs(60);
 const EXCERPT_CHARS: usize = 200;
 /// A quote dated this far ahead of the host clock raises `venue_clock_ahead`: the venue's clock or
 /// the host's is wrong. The quote is still sequenced, so the engine, which skips a quote dated
-/// after the sequenced time, prices nothing from it rather than keep using older quotes.
+/// after the sequenced time, prices nothing from it rather than keep using older quotes. The
+/// engine also keeps only a venue's newest quote by time, so the venue's later, correctly dated
+/// quotes are ignored until the host clock reaches the bad time; they then count as no fresh
+/// quote here, and the symbol is alerted as silent.
 ///
 /// TODO: the sequencer stamps with the untrusted host clock; once a trusted time bound exists, a
 /// host clock this far behind the venues should fail closed there.
@@ -106,9 +112,30 @@ struct VenueFeed {
     last_quote: BTreeMap<MarketId, Instant>,
     /// Markets alerted as silent that have not quoted since.
     silent: BTreeSet<MarketId>,
-    last_refusal_alert: Option<Instant>,
-    refusals_since_alert: u64,
-    last_clock_alert: Option<Instant>,
+    /// The newest quote time sequenced per market. The engine ignores an older quote, so one is
+    /// never counted as the venue quoting.
+    newest_sequenced: BTreeMap<MarketId, Millis>,
+    refusals: Throttle,
+    clock_alerts: Throttle,
+}
+
+/// Holds an alert to one per `REALERT_AFTER`, counting the ones it held back.
+#[derive(Default)]
+struct Throttle {
+    last: Option<Instant>,
+    held: u64,
+}
+
+impl Throttle {
+    /// Whether to alert at `now`, and if so, how many alerts it held back since the last one.
+    fn ready(&mut self, now: Instant) -> Option<u64> {
+        if self.last.is_some_and(|at| now.duration_since(at) < REALERT_AFTER) {
+            self.held += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(take(&mut self.held))
+    }
 }
 
 impl Timing {
@@ -180,9 +207,9 @@ impl VenueFeed {
             quoted: false,
             last_quote,
             silent: BTreeSet::new(),
-            last_refusal_alert: None,
-            refusals_since_alert: 0,
-            last_clock_alert: None,
+            newest_sequenced: BTreeMap::new(),
+            refusals: Throttle::default(),
+            clock_alerts: Throttle::default(),
         }
     }
 
@@ -247,9 +274,12 @@ impl VenueFeed {
                 }
                 _ = flush.tick() => {
                     let now = now_ms();
-                    for (market, quote) in std::mem::take(&mut pending) {
-                        // As the engine judges it: not after the host clock, and no older than the bound.
-                        let fresh = quote.ts <= now && now - quote.ts <= stale_after;
+                    for (market, quote) in take(&mut pending) {
+                        // As the engine judges it: not before the newest it holds, not after the
+                        // host clock, and no older than the bound.
+                        let newest = self.newest_sequenced.entry(market).or_insert(quote.ts);
+                        let fresh = quote.ts >= *newest && quote.ts <= now && now - quote.ts <= stale_after;
+                        *newest = (*newest).max(quote.ts);
                         if quote.ts > now.saturating_add(MAX_CLOCK_LEAD_MS) {
                             self.clock_ahead(market, quote.ts - now);
                         }
@@ -358,28 +388,24 @@ impl VenueFeed {
     /// Alerts, at most once per `REALERT_AFTER`, that a quote for `market` is dated `lead_ms` ahead
     /// of the host clock.
     fn clock_ahead(&mut self, market: MarketId, lead_ms: Millis) {
-        let now = Instant::now();
-        if self.last_clock_alert.is_some_and(|at| now.duration_since(at) < REALERT_AFTER) {
-            return;
+        if let Some(suppressed) = self.clock_alerts.ready(Instant::now()) {
+            let venue = self.conn.venue.name();
+            warn!(
+                alert = "venue_clock_ahead",
+                venue, market, lead_ms, suppressed, "venue time ahead of the host clock"
+            );
         }
-        let venue = self.conn.venue.name();
-        warn!(alert = "venue_clock_ahead", venue, market, lead_ms, "venue time ahead of the host clock");
-        self.last_clock_alert = Some(now);
     }
 
     /// Logs a refused message, alerting at most once per `REALERT_AFTER`.
     fn refuse(&mut self, reason: &str, text: &str) {
         let venue = self.conn.venue.name();
-        let now = Instant::now();
-        if self.last_refusal_alert.is_some_and(|at| now.duration_since(at) < REALERT_AFTER) {
-            self.refusals_since_alert += 1;
+        let Some(suppressed) = self.refusals.ready(Instant::now()) else {
             debug!(venue, reason, "venue message refused");
             return;
-        }
+        };
         let excerpt: String = text.chars().take(EXCERPT_CHARS).collect();
-        let suppressed = std::mem::take(&mut self.refusals_since_alert);
         warn!(alert = "venue_message_refused", venue, reason, suppressed, excerpt, "venue message refused");
-        self.last_refusal_alert = Some(now);
     }
 
     /// Logs a lost connection. A connection that sequenced fresh quotes is a routine drop; one that
@@ -399,6 +425,10 @@ impl VenueFeed {
 
 /// The TLS client config every venue connection shares: ring as the crypto provider, and
 /// Mozilla's roots compiled into the binary, so the host's certificate store is never trusted.
+///
+/// TODO: certificate validity is judged by the untrusted host clock and revocation is not
+/// checked, so a host holding an expired or revoked venue key could set the clock back and pose
+/// as the venue; a trusted time bound closes the first.
 /// Error cases:
 /// - the provider supports none of the safe default protocol versions
 pub fn tls_config() -> anyhow::Result<Arc<ClientConfig>> {
@@ -421,50 +451,6 @@ pub async fn run(
     tx: mpsc::Sender<Request>,
 ) -> anyhow::Result<()> {
     VenueFeed::new(conn, timing, tls, tx).run().await
-}
-
-/// The venue's mid for one book and the market it prices, refusing a book no working venue
-/// could show.
-/// Error cases:
-/// - the symbol is not one this connection subscribed to
-/// - the bid or ask is outside the valid input range, or the book is crossed or locked
-/// - the timestamp is before the epoch
-pub(super) fn to_quote(
-    venue: Venue,
-    markets: &BTreeMap<String, MarketId>,
-    book: Book,
-) -> Result<(MarketId, SourceQuote), String> {
-    let Book { symbol, bid, ask, ts } = book;
-    let market = *markets.get(&symbol).ok_or_else(|| format!("unsubscribed symbol {symbol}"))?;
-    if !bid.is_valid_input() || !ask.is_valid_input() {
-        return Err(format!("{symbol} bid {bid} or ask {ask} out of range"));
-    }
-    if bid >= ask {
-        return Err(format!("{symbol} book crossed: bid {bid}, ask {ask}"));
-    }
-    check_time(&symbol, ts)?;
-    Ok((market, SourceQuote { source: venue.name().to_owned(), mid: (bid + ask).div_int(2), ts }))
-}
-
-/// Refuses a top-of-book size no working venue could show.
-/// Error cases:
-/// - `size` is not positive, or is above `Fixed::MAX_INPUT`
-pub(super) fn check_size(symbol: &str, side: &str, size: Fixed) -> Result<(), String> {
-    if !size.is_valid_input() {
-        return Err(format!("{symbol} {side} size {size} out of range"));
-    }
-    Ok(())
-}
-
-/// Refuses a venue time no working venue could send. A time ahead of the host clock is not
-/// refused: refusing it would leave the engine on older quotes when the host clock is behind.
-/// Error cases:
-/// - `ts` is before the epoch
-pub(super) fn check_time(symbol: &str, ts: Millis) -> Result<(), String> {
-    if ts < 0 {
-        return Err(format!("{symbol} timestamp {ts} before the epoch"));
-    }
-    Ok(())
 }
 
 /// The wait before the next connection attempt, and the backoff after that. A connection that

@@ -45,6 +45,7 @@ pub(super) fn subscriptions(symbols: &[&str]) -> Vec<String> {
 /// - an unknown event or channel, a missing field, an empty book side, a price, size, or time
 ///   that does not parse, or a top-of-book size out of range (see `check_size`)
 /// - bids not in descending or asks not in ascending price order, which could hide a crossing
+/// - a price at any level outside the valid input range
 /// - a `bts:error` message from the venue
 pub(super) fn parse(text: &str) -> Result<Frame, String> {
     let message: Message = serde_json::from_str(text).map_err(|e| format!("unparseable message: {e}"))?;
@@ -57,6 +58,9 @@ pub(super) fn parse(text: &str) -> Result<Frame, String> {
             let ascending = book.asks.windows(2).all(|pair| pair[0].0 <= pair[1].0);
             if !descending || !ascending {
                 return Err(format!("{symbol} book levels out of price order"));
+            }
+            if let Some((price, _)) = book.bids.iter().chain(&book.asks).find(|(price, _)| !price.is_valid_input()) {
+                return Err(format!("{symbol} book has a price {price} out of range"));
             }
             let (Some((bid, bid_size)), Some((ask, ask_size))) = (book.bids.first(), book.asks.first()) else {
                 return Err(format!("{symbol} book has an empty side"));
@@ -132,6 +136,8 @@ mod tests {
             // Out of order, the first bid hides a better one that crosses the ask.
             BOOK.replace(r#"["2379.32","0.019034"]"#, r#"["2379.40","0.019034"]"#),
             BOOK.replace(r#"["2379.50","1.948232"]"#, r#"["2379.30","1.948232"]"#),
+            // A malformed price below a valid top.
+            BOOK.replace(r#"["2379.32","0.019034"]"#, r#"["-1","0.019034"]"#),
             BOOK.replace(r#"["2379.39","0.004202"]"#, r#"["2379.39","-0.004202"]"#),
             r#"{"event":"data","channel":"order_book_ethusd"}"#.to_owned(),
         ];

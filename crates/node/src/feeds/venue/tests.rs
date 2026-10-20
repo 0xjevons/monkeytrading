@@ -2,6 +2,17 @@ use super::*;
 use crate::config::VenueSymbol;
 use crate::feeds::tests::fake::{WAIT, capture_alerts, fast, next_alert};
 
+#[test]
+fn a_throttle_lets_one_alert_through_a_window_and_counts_the_rest() {
+    let mut throttle = Throttle::default();
+    let start = Instant::now();
+    assert_eq!(throttle.ready(start), Some(0));
+    assert_eq!(throttle.ready(start + Duration::from_secs(1)), None);
+    assert_eq!(throttle.ready(start + REALERT_AFTER - Duration::from_millis(1)), None);
+    assert_eq!(throttle.ready(start + REALERT_AFTER), Some(2));
+    assert_eq!(throttle.ready(start + REALERT_AFTER), None);
+}
+
 #[tokio::test(start_paused = true)]
 async fn refusals_alert_again_after_the_window_with_the_count_between() {
     let (_guard, mut alerts) = capture_alerts();

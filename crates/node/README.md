@@ -53,7 +53,8 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/custody.rs` — the custody adapter (mock only so far)
 - `src/feeds/mod.rs` — the feed index and the mock feed
 - `src/feeds/venue/mod.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect
-- `src/feeds/venue/tests.rs` — venue task unit tests on paused time
+- `src/feeds/venue/validation.rs` — the checks every venue's books pass before they are sequenced
+- `src/feeds/venue/tests.rs` — venue task unit tests: alert throttling, on paused time and fixed instants
 - `src/feeds/coinbase.rs`, `src/feeds/kraken.rs`, `src/feeds/bitstamp.rs` — venue adapters
 - `src/feeds/tests/` — venue tasks against loopback venues, and the dev scenario through the
   sequencer
