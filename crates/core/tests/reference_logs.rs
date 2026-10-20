@@ -74,13 +74,17 @@ fn reference_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference")
 }
 
-/// Every `.jsonl` file in the reference directory, in name order.
+/// Every file in the reference directory but hidden ones (such as `.DS_Store`), in name order;
+/// panics on one that is not a `.jsonl` log, so a misnamed log cannot go unreplayed.
 fn reference_logs() -> Vec<PathBuf> {
     let mut logs: Vec<PathBuf> = fs::read_dir(reference_dir())
         .expect("reference directory is readable")
         .map(|entry| entry.expect("directory entry is readable").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter(|path| !name(path).starts_with('.'))
         .collect();
+    if let Some(stray) = logs.iter().find(|path| !path.is_file() || path.extension().is_none_or(|ext| ext != "jsonl")) {
+        panic!("{} is not a .jsonl reference log", stray.display());
+    }
     logs.sort();
     logs
 }

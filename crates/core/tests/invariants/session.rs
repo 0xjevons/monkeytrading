@@ -8,9 +8,11 @@ use engine_core::price::SourceQuote;
 use engine_core::session::Schedule;
 use engine_core::types::{AccountId, AssetClass, MarketId, Millis, Side};
 use engine_core::{Engine, Fixed};
+use proptest::arbitrary::any;
 use proptest::collection::vec;
-use proptest::prelude::*;
+use proptest::prop_oneof;
 use proptest::sample::select;
+use proptest::strategy::{Just, Strategy};
 
 use crate::common::{AAPL, BTC, ETH, acct, market, params, us_equities};
 

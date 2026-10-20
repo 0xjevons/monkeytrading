@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{BTC, Harness, acct, f, fills, rejection};
+use common::{BTC, Harness, acct, f, fills, params, rejection};
 use engine_core::Fixed;
 use engine_core::command::{AdminCommand, Command, OrderKind};
 use engine_core::event::{Event, Reject};
@@ -146,6 +146,22 @@ fn toxic_flow_pays_a_wider_spread() {
 
     let ev = h.market_order(a, BTC, Side::Sell, "0.1", "100500");
     assert_eq!(fills(&ev)[0].spread_bps, 3);
+}
+
+#[test]
+fn a_markout_horizon_past_the_end_of_time_never_comes_due() {
+    let mut h = Harness::new();
+    let a = acct(1);
+    let mut endless = params();
+    endless.toxicity.horizon_ms = i64::MAX;
+    h.admin(AdminCommand::SetParams(endless));
+    h.deposit(a, "100000");
+    h.price(BTC, "100000");
+    // The fill's markout falls due after the last representable time instead of overflowing.
+    assert_eq!(fills(&h.market_order(a, BTC, Side::Buy, "0.1", "100000")).len(), 1);
+    h.advance(1_000);
+    h.price(BTC, "100500");
+    assert_eq!(h.engine.accounts()[&a].toxicity_bps, 0);
 }
 
 #[test]

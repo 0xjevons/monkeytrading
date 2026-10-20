@@ -13,8 +13,8 @@ use common::{HOUSE_CAPITAL, Harness, acct};
 use engine_core::event::{Event, Reject};
 use engine_core::types::MarketId;
 use engine_core::{Engine, Fixed};
-use proptest::prelude::*;
-use proptest::strategy::ValueTree;
+use proptest::proptest;
+use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngSeed, TestCaseError, TestRunner};
 use session::{Session, command, session};
 
@@ -43,7 +43,7 @@ proptest! {
 }
 
 #[test]
-fn generated_sessions_reach_every_path_that_moves_cash() {
+fn generated_sessions_reach_every_checked_path() {
     let mut runner = TestRunner::new(config());
     let mut reached = BTreeSet::new();
     for _ in 0..config().cases {
