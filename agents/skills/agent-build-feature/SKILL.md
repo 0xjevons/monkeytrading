@@ -54,8 +54,10 @@ a bug fix or a refactor that is not a feature goes straight through
 ## Before review
 
 - Run the local checks per git-workflow.
-- Self-review with [agent-code-review](../agent-code-review/SKILL.md), multi-agent at `medium` for a
-  large feature, and fix what it finds before asking for human review.
+- Self-review with [agent-code-review](../agent-code-review/SKILL.md), multi-agent at `medium` or
+  higher: fix every accepted Critical, High, and Medium finding and run it again until a run accepts
+  none, as [agent-create-pr](../agent-create-pr/SKILL.md#before-a-pr-is-ready-for-review) requires
+  before the PR is marked ready.
 - Show the user the dev scenario — steps, expected result, and the config it needs — and on their
   yes write it into the issue's dev scenario section, replacing the planned text.
 - The scenario's scripted check passes in CI.

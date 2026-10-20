@@ -2,8 +2,9 @@
 name: agent-create-pr
 description: >
   Use when opening a pull request — "create a PR", "open a PR for this branch", "raise a PR for
-  this work". Covers the preconditions for a draft and for a ready PR, the issue blocker check,
-  the `[scopes] Title` and the body in squashed-commit format ending with `Closes #12` or
+  this work". Covers opening every PR as a draft, the preconditions for marking it ready
+  (including a multi-agent agent-code-review at medium or higher), the issue blocker check, the
+  `[scopes] Title` and the body in squashed-commit format ending with `Closes #12` or
   `Part of #12`, and watching the checks after it opens. Does not review, approve, or merge.
 ---
 
@@ -42,6 +43,10 @@ marked ready, may not.
 - **Self-reviewed.** The change was built to
   [development-checklist](../../rules/development-checklist.md); walk every applicable section
   against the final diff once more and fix what it finds.
+- **Multi-agent reviewed.** [agent-code-review](../agent-code-review/SKILL.md) ran in multi-agent
+  mode at level `medium` or higher on the final diff, so Claude and Codex reviewers cross-validated
+  each other. Fix every accepted Critical, High, and Medium finding and run it again until a run
+  accepts none; Low and Nit findings may remain.
 - **Local checks** for the affected crates passed, per git-workflow; the full CI runs
   on the PR.
 
@@ -73,8 +78,9 @@ checklist, no restatement of the diff.
 ## Opening it
 
 - Use `gh`, authenticated as the user, and target `main`.
-- Open as **Draft** for work in progress or for a reference PR that needs no review — say which in
-  the overview; the title stays clean.
+- Open every PR as a **Draft**, and mark it ready (`gh pr ready`) only once
+  [Before a PR is ready for review](#before-a-pr-is-ready-for-review) holds. A reference PR that
+  needs no review stays a draft and says so in its overview; the title stays clean.
 - Watch the checks afterwards. A red PR is not ready yet: read the first real failure (the rest are
   usually fail-fast cancellations), fix, push, re-check, then ask for review.
 
