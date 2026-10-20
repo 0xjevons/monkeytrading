@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::clock::now_ms;
 use crate::config::Venue;
 use crate::feeds::tests::fake::{
-    WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_ticker, listen, next_alert, next_prices,
+    WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_book, listen, next_alert, next_prices,
     quote, send, spawn_feed, stream,
 };
 use crate::feeds::venue::{Book, Timing, next_attempt, next_backoff, to_quote};
@@ -34,7 +34,7 @@ async fn quotes_are_sequenced_per_market_with_the_venue_timestamp() {
 
     send(
         &mut ws,
-        &[kraken_ticker("BTC/USD", "81250.5", "81251.5", 1_000), kraken_ticker("ETH/USD", "2377", "2377.1", 2_000)],
+        &[kraken_book("BTC/USD", "81250.5", "81251.5", 1_000), kraken_book("ETH/USD", "2377", "2377.1", 2_000)],
     )
     .await;
     let mut sequenced = BTreeMap::from([next_prices(&mut rx).await, next_prices(&mut rx).await]);
@@ -50,7 +50,7 @@ async fn only_the_newest_quote_per_market_is_sequenced_each_interval() {
     let (mut ws, _) = accept(&listener).await;
 
     // All three arrive within one interval, the newest by venue time second, so only it is sequenced.
-    let tickers = [1_000, 1_200, 1_100].map(|ts| kraken_ticker("BTC/USD", "100", "101", ts));
+    let tickers = [1_000, 1_200, 1_100].map(|ts| kraken_book("BTC/USD", "100", "101", ts));
     send(&mut ws, &tickers).await;
     assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", 1_200)]));
 }
@@ -60,26 +60,26 @@ async fn malformed_messages_and_books_are_refused_with_an_alert() {
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
     // Every message lands within one interval, so a refused book accepted after the valid one
-    // would replace it as the quote sequenced.
+    // would replace it as the quote sequenced. Bitstamp keeps no book, so the connection carries on.
     let timing = Timing { interval: Duration::from_secs(1), ..fast(WAIT) };
-    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, timing);
+    let (mut rx, _feed) = spawn_feed(Venue::Bitstamp, &url, &[(1, "btcusd"), (2, "ethusd")], timing);
     let (mut ws, _) = accept(&listener).await;
 
     let messages = [
-        kraken_ticker("BTC/USD", "100", "101", 1_000),
+        bitstamp_book("btcusd", "100", "101", 1_000),
         "not json".to_owned(),
-        kraken_ticker("BTC/USD", "101", "100", 2_000),
-        kraken_ticker("BTC/USD", "0", "100", 2_000),
-        kraken_ticker("BTC/USD", "100", "1000000001", 2_000),
-        kraken_ticker("SOL/USD", "100", "101", 2_000),
+        bitstamp_book("btcusd", "101", "100", 2_000),
+        bitstamp_book("btcusd", "0", "100", 2_000),
+        bitstamp_book("btcusd", "100", "1000000001", 2_000),
+        bitstamp_book("solusd", "100", "101", 2_000),
     ];
     send(&mut ws, &messages).await;
 
     // Nothing refused reaches the sequencer, and the first refusal alerts.
-    assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", 1_000)]));
+    assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Bitstamp, "100.5", 1_000)]));
     let alert = next_alert(&mut alerts).await;
     assert_eq!(alert["alert"], "venue_message_refused");
-    assert_eq!(alert["venue"], "kraken");
+    assert_eq!(alert["venue"], "bitstamp");
     // The other refusals within the re-alert window are counted, not alerted.
     assert!(alerts.try_recv().is_err());
 }
@@ -92,14 +92,14 @@ async fn a_dropped_connection_reconnects_and_quotes_resume_without_an_alert() {
 
     let (mut first, _) = accept(&listener).await;
     let ts = now_ms();
-    send(&mut first, &[kraken_ticker("BTC/USD", "100", "101", ts)]).await;
+    send(&mut first, &[kraken_book("BTC/USD", "100", "101", ts)]).await;
     assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", ts)]));
     drop(first);
 
     let (mut second, subscription) = accept(&listener).await;
     assert_eq!(subscription, kraken::subscriptions(&["BTC/USD", "ETH/USD"])[0]);
     let ts = now_ms();
-    send(&mut second, &[kraken_ticker("BTC/USD", "100", "102", ts)]).await;
+    send(&mut second, &[kraken_book("BTC/USD", "100", "102", ts)]).await;
     assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "101", ts)]));
     // A connection that had sequenced fresh quotes is a routine drop, not an outage.
     assert!(alerts.try_recv().is_err());
@@ -162,14 +162,14 @@ async fn a_venue_time_far_ahead_of_the_host_clock_is_sequenced_and_alerted() {
     // The engine skips it until the host clock reaches it, so it prices nothing meanwhile, where
     // refusing it would leave the engine on older quotes when the host clock is the one behind.
     let ts = now_ms() + 60_000;
-    send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", ts)]).await;
+    send(&mut ws, &[kraken_book("BTC/USD", "100", "101", ts)]).await;
     assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", ts)]));
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["venue"].as_str()), ("venue_clock_ahead", "kraken"));
 
     // Correctly dated quotes follow, but the engine holds the newer bad one and ignores them, so
     // they do not count as the venue quoting.
-    stream(ws, || vec![kraken_ticker("BTC/USD", "100", "101", now_ms())]);
+    stream(ws, || vec![kraken_book("BTC/USD", "100", "101", now_ms())]);
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "BTC/USD"));
 }
@@ -182,7 +182,7 @@ async fn a_binary_message_is_refused_with_an_alert() {
     let (mut ws, _) = accept(&listener).await;
     ws.send(Message::binary(vec![1, 2, 3])).await.expect("send");
     let ts = now_ms();
-    send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", ts)]).await;
+    send(&mut ws, &[kraken_book("BTC/USD", "100", "101", ts)]).await;
 
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["reason"].as_str()), ("venue_message_refused", "binary message"));
@@ -198,7 +198,7 @@ async fn a_symbol_the_venue_never_quotes_is_alerted_and_resubscribed() {
     let (ws, _) = accept(&listener).await;
 
     // BTC keeps quoting fresh while ETH never quotes.
-    stream(ws, || vec![kraken_ticker("BTC/USD", "100", "101", now_ms())]);
+    stream(ws, || vec![kraken_book("BTC/USD", "100", "101", now_ms())]);
     next_prices(&mut rx).await;
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "ETH/USD"));
@@ -232,7 +232,7 @@ async fn each_outage_alerts_once() {
     // A fresh quote ends the outage; the connection then drops and the venue stays down.
     let (mut ws, _) = accept(&listener).await;
     let ts = now_ms();
-    send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", ts)]).await;
+    send(&mut ws, &[kraken_book("BTC/USD", "100", "101", ts)]).await;
     assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", ts)]));
     drop(ws);
     refuse_handshake().await;
@@ -250,7 +250,7 @@ async fn an_outage_alert_stands_for_every_symbol_until_a_fresh_quote() {
 
     // Back, but quoting only books a minute old: still down, so no symbol alerts on top of it.
     let (ws, _) = accept(&listener).await;
-    stream(ws, || vec![kraken_ticker("BTC/USD", "100", "101", now_ms() - 60_000)]);
+    stream(ws, || vec![kraken_book("BTC/USD", "100", "101", now_ms() - 60_000)]);
     next_prices(&mut rx).await;
     assert!(timeout(silence * 3, alerts.recv()).await.is_err(), "alerted again during the outage");
 }
@@ -269,8 +269,8 @@ async fn a_symbol_that_goes_quiet_again_alerts_again() {
             let eth = Arc::clone(&eth);
             let messages = move || {
                 let ts = now_ms();
-                let eth = eth.load(Ordering::Relaxed).then(|| kraken_ticker("ETH/USD", "10", "11", ts));
-                [Some(kraken_ticker("BTC/USD", "100", "101", ts)), eth].into_iter().flatten().collect()
+                let eth = eth.load(Ordering::Relaxed).then(|| kraken_book("ETH/USD", "10", "11", ts));
+                [Some(kraken_book("BTC/USD", "100", "101", ts)), eth].into_iter().flatten().collect()
             };
             let _ = stream(ws, messages).await;
         }
@@ -299,7 +299,7 @@ async fn a_recovered_venue_gets_a_full_silence_window_per_symbol() {
     }
     assert_eq!(next_alert(&mut alerts).await["alert"], "venue_feed_down");
     let (ws, _) = accept(&listener).await;
-    stream(ws, || vec![kraken_ticker("BTC/USD", "100", "101", now_ms())]);
+    stream(ws, || vec![kraken_book("BTC/USD", "100", "101", now_ms())]);
     next_prices(&mut rx).await;
     let recovered = Instant::now();
     let alert = next_alert(&mut alerts).await;
@@ -320,7 +320,7 @@ async fn silence_is_counted_across_reconnects() {
         loop {
             let (mut ws, _) = accept(&listener).await;
             for _ in 0..5 {
-                send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", now_ms())]).await;
+                send(&mut ws, &[kraken_book("BTC/USD", "100", "101", now_ms())]).await;
                 sleep(Duration::from_millis(20)).await;
             }
         }
@@ -369,6 +369,26 @@ async fn a_refused_book_from_a_kept_book_resyncs() {
 }
 
 #[tokio::test]
+async fn a_kraken_book_that_fails_its_checksum_resubscribes_without_a_quote() {
+    let (_guard, mut alerts) = capture_alerts();
+    let (listener, url) = listen().await;
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &[(1, "BTC/USD")], fast(WAIT));
+
+    let (mut first, _) = accept(&listener).await;
+    let corrupted = kraken_book("BTC/USD", "100", "101", 1_000).replace(r#""qty":1.50000000"#, r#""qty":1.50000001"#);
+    send(&mut first, &[corrupted]).await;
+    let alert = next_alert(&mut alerts).await;
+    assert_eq!((alert["alert"].as_str(), alert["venue"].as_str()), ("venue_message_refused", "kraken"));
+    assert!(alert["reason"].contains("checksum mismatch"), "{alert:?}");
+
+    // A fresh subscription brings a fresh snapshot, and only its top is sequenced.
+    let (mut second, subscription) = accept(&listener).await;
+    assert_eq!(subscription, kraken::subscriptions(&["BTC/USD"])[0]);
+    send(&mut second, &[kraken_book("BTC/USD", "100", "102", 2_000)]).await;
+    assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "101", 2_000)]));
+}
+
+#[tokio::test]
 async fn a_reconnect_request_ends_the_connection() {
     let (listener, url) = listen().await;
     let (mut rx, _feed) = spawn_feed(Venue::Bitstamp, &url, &[(1, "btcusd")], fast(WAIT));
@@ -387,7 +407,7 @@ async fn the_feed_stops_when_the_sequencer_goes_away() {
     let (rx, feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(WAIT));
     drop(rx);
     let (mut ws, _) = accept(&listener).await;
-    send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", 1_000)]).await;
+    send(&mut ws, &[kraken_book("BTC/USD", "100", "101", 1_000)]).await;
 
     let stopped = timeout(WAIT, feed).await.expect("feed kept running").expect("feed panicked");
     let err = format!("{:#}", stopped.unwrap_err());
@@ -451,7 +471,7 @@ async fn assert_quotes_do_not_count(stamp: impl Fn() -> Millis + Send + 'static)
     let (listener, url) = listen().await;
     let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &[(1, "BTC/USD")], fast(Duration::from_millis(300)));
     let (ws, _) = accept(&listener).await;
-    stream(ws, move || vec![kraken_ticker("BTC/USD", "100", "101", stamp())]);
+    stream(ws, move || vec![kraken_book("BTC/USD", "100", "101", stamp())]);
     let (market, quotes) = next_prices(&mut rx).await;
     assert_eq!((market, quotes[0].source.as_str()), (1, "kraken"));
     let alert = next_alert(&mut alerts).await;

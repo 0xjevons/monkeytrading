@@ -45,6 +45,20 @@ async fn clock_alerts_are_held_to_one_a_window() {
     assert!(alerts.try_recv().is_err());
 }
 
+#[test]
+fn the_newest_quote_the_engine_can_use_is_sequenced() {
+    const NOW: Millis = 1_792_489_875_714;
+    let at = |ts: Millis| SourceQuote { source: "kraken".into(), mid: Fixed::from_int(100), ts };
+    let received = |times: &[Millis]| times.iter().map(|ts| at(*ts)).collect::<VecDeque<_>>();
+    // A host clock a little behind the venue: the newest already reached is used, not the newest.
+    assert_eq!(select(&received(&[NOW - 300, NOW - 100, NOW + 40, NOW - 200]), NOW), Some(at(NOW - 100)));
+    assert_eq!(select(&received(&[NOW - 100, NOW]), NOW), Some(at(NOW)));
+    // Every quote ahead, as after the host clock is set back: the newest goes, and the engine
+    // skips it rather than keep pricing from older quotes.
+    assert_eq!(select(&received(&[NOW + 50, NOW + 80, NOW + 60]), NOW), Some(at(NOW + 80)));
+    assert_eq!(select(&VecDeque::new(), NOW), None);
+}
+
 // ── Helpers ──
 
 /// A Kraken feed for BTC/USD that is never run, for calling its alert paths directly.

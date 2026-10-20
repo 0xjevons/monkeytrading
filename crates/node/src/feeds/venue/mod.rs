@@ -3,7 +3,7 @@
 //! sequencer has gone away: a failed connection is retried inside the task with backoff, and while
 //! it is down the venue's last quotes age out in the engine, which prices from the other venues.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::mem::take;
 use std::sync::Arc;
@@ -35,6 +35,8 @@ pub(super) use validation::{check_size, check_time, to_quote};
 const REALERT_AFTER: Duration = Duration::from_secs(60);
 /// How much of a refused message its log line keeps.
 const EXCERPT_CHARS: usize = 200;
+/// The most quotes kept per market between two sequencing ticks; the oldest go first.
+const MAX_PENDING: usize = 256;
 /// A quote dated this far ahead of the host clock raises `venue_clock_ahead`: the venue's clock or
 /// the host's is wrong. The quote is still sequenced, so the engine, which skips a quote dated
 /// after the sequenced time, prices nothing from it rather than keep using older quotes. The
@@ -51,7 +53,7 @@ const MAX_CLOCK_LEAD_MS: Millis = 1_000;
 enum Adapter {
     Bitstamp,
     Coinbase(coinbase::Books),
-    Kraken,
+    Kraken(kraken::Books),
 }
 
 /// Why an adapter refused a message.
@@ -157,7 +159,7 @@ impl Adapter {
         match venue {
             Venue::Bitstamp => Adapter::Bitstamp,
             Venue::Coinbase => Adapter::Coinbase(coinbase::Books::default()),
-            Venue::Kraken => Adapter::Kraken,
+            Venue::Kraken => Adapter::Kraken(kraken::Books::default()),
         }
     }
 
@@ -166,14 +168,14 @@ impl Adapter {
         match self {
             Adapter::Bitstamp => bitstamp::subscriptions(symbols),
             Adapter::Coinbase(_) => coinbase::subscriptions(symbols),
-            Adapter::Kraken => kraken::subscriptions(symbols),
+            Adapter::Kraken(_) => kraken::subscriptions(symbols),
         }
     }
 
     /// Whether the adapter keeps state built from earlier messages, so a refused book means that
     /// state can no longer be trusted.
     fn keeps_state(&self) -> bool {
-        matches!(self, Adapter::Coinbase(_))
+        matches!(self, Adapter::Coinbase(_) | Adapter::Kraken(_))
     }
 
     /// Reads one venue message.
@@ -185,7 +187,7 @@ impl Adapter {
         match self {
             Adapter::Bitstamp => bitstamp::parse(text).map_err(Refusal::Message),
             Adapter::Coinbase(books) => books.read(text),
-            Adapter::Kraken => kraken::parse(text).map_err(Refusal::Message),
+            Adapter::Kraken(books) => books.read(text),
         }
     }
 }
@@ -232,8 +234,8 @@ impl VenueFeed {
         }
     }
 
-    /// One connection: connect, subscribe, then read messages and sequence the newest quote per
-    /// market every `timing.interval`. A quote no older than `timing.stale_after` when sequenced
+    /// One connection: connect, subscribe, then read messages and sequence one quote per market
+    /// every `timing.interval` (see `select`). A quote no older than `timing.stale_after` when sequenced
     /// counts as the venue quoting that market.
     /// Error cases:
     /// - connecting or subscribing fails or takes longer than `timing.timeout`
@@ -258,7 +260,7 @@ impl VenueFeed {
         info!(venue = self.conn.venue.name(), "venue subscribed");
         let subscribed = Instant::now();
 
-        let mut pending: BTreeMap<MarketId, SourceQuote> = BTreeMap::new();
+        let mut pending: BTreeMap<MarketId, VecDeque<SourceQuote>> = BTreeMap::new();
         let mut flush = interval_at(subscribed + self.timing.interval, self.timing.interval);
         flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let stale_after = Millis::try_from(self.timing.stale_after.as_millis()).unwrap_or(Millis::MAX);
@@ -274,15 +276,16 @@ impl VenueFeed {
                 }
                 _ = flush.tick() => {
                     let now = now_ms();
-                    for (market, quote) in take(&mut pending) {
+                    for (market, quotes) in take(&mut pending) {
+                        if let Some(lead) = quotes.iter().map(|q| q.ts - now).max().filter(|lead| *lead > MAX_CLOCK_LEAD_MS) {
+                            self.clock_ahead(market, lead);
+                        }
+                        let Some(quote) = select(&quotes, now) else { continue };
                         // As the engine judges it: not before the newest it holds, not after the
                         // host clock, and no older than the bound.
                         let newest = self.newest_sequenced.entry(market).or_insert(quote.ts);
                         let fresh = quote.ts >= *newest && quote.ts <= now && now - quote.ts <= stale_after;
                         *newest = (*newest).max(quote.ts);
-                        if quote.ts > now.saturating_add(MAX_CLOCK_LEAD_MS) {
-                            self.clock_ahead(market, quote.ts - now);
-                        }
                         let cmd = Command::Prices { market, quotes: vec![quote] };
                         self.tx.send(Request::Submit { cmd, reply: None }).await.map_err(|_| anyhow!("sequencer gone"))?;
                         if fresh {
@@ -310,7 +313,7 @@ impl VenueFeed {
         &mut self,
         adapter: &mut Adapter,
         text: &str,
-        pending: &mut BTreeMap<MarketId, SourceQuote>,
+        pending: &mut BTreeMap<MarketId, VecDeque<SourceQuote>>,
     ) -> anyhow::Result<()> {
         let books = match adapter.read(text) {
             Ok(Frame::Books(books)) => books,
@@ -328,10 +331,11 @@ impl VenueFeed {
         for book in books {
             match to_quote(self.conn.venue, &self.markets, book) {
                 Ok((market, quote)) => {
-                    // Keep the newest by venue time, as the engine does, whatever order they arrive in.
-                    if pending.get(&market).is_none_or(|held| quote.ts >= held.ts) {
-                        pending.insert(market, quote);
+                    let quotes = pending.entry(market).or_default();
+                    if quotes.len() == MAX_PENDING {
+                        quotes.pop_front();
                     }
+                    quotes.push_back(quote);
                 }
                 Err(reason) if adapter.keeps_state() => {
                     self.refuse(&reason, text);
@@ -451,6 +455,15 @@ pub async fn run(
     tx: mpsc::Sender<Request>,
 ) -> anyhow::Result<()> {
     VenueFeed::new(conn, timing, tls, tx).run().await
+}
+
+/// The quote to sequence for a market from those received since the last tick: the newest the
+/// engine can use at host time `now`, or, when every one is dated after it, the newest of all,
+/// which the engine skips until the host clock reaches it. A host clock a little behind the venue
+/// then still prices from the venue, and one set further back still prices nothing.
+pub(super) fn select(quotes: &VecDeque<SourceQuote>, now: Millis) -> Option<SourceQuote> {
+    let usable = quotes.iter().filter(|quote| quote.ts <= now).max_by_key(|quote| quote.ts);
+    usable.or_else(|| quotes.iter().max_by_key(|quote| quote.ts)).cloned()
 }
 
 /// The wait before the next connection attempt, and the backoff after that. A connection that

@@ -55,7 +55,9 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/feeds/venue/mod.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect
 - `src/feeds/venue/validation.rs` — the checks every venue's books pass before they are sequenced
 - `src/feeds/venue/tests.rs` — venue task unit tests: alert throttling, on paused time and fixed instants
-- `src/feeds/coinbase.rs`, `src/feeds/kraken.rs`, `src/feeds/bitstamp.rs` — venue adapters
+- `src/feeds/coinbase.rs`, `src/feeds/bitstamp.rs` — venue adapters
+- `src/feeds/kraken/mod.rs` — the Kraken adapter: a kept order book verified against Kraken's
+  checksum; `src/feeds/kraken/tests.rs` replays recorded book messages against it
 - `src/feeds/tests/` — venue tasks against loopback venues, and the dev scenario through the
   sequencer
 - `src/clock.rs` — the wall clock used to stamp commands

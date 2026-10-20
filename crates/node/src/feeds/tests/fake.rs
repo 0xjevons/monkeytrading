@@ -23,6 +23,7 @@ use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 use crate::config::{Venue, VenueConnection, VenueSymbol};
+use crate::feeds::kraken;
 use crate::feeds::venue::{self, Timing};
 use crate::sequencer::Request;
 
@@ -172,11 +173,13 @@ fn rfc3339(ts: Millis) -> String {
     DateTime::from_timestamp_millis(ts).expect("time in range").to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-/// A Kraken best-bid-and-offer ticker; prices are JSON numbers, as Kraken sends them.
-pub fn kraken_ticker(symbol: &str, bid: &str, ask: &str, ts: Millis) -> String {
-    let at = rfc3339(ts);
+/// A Kraken book snapshot with one level a side and its checksum; prices and sizes are JSON
+/// numbers, as Kraken sends them.
+pub fn kraken_book(symbol: &str, bid: &str, ask: &str, ts: Millis) -> String {
+    let (at, bid_qty, ask_qty) = (rfc3339(ts), "1.50000000", "2.50000000");
+    let checksum = kraken::checksum([(ask, ask_qty), (bid, bid_qty)].into_iter());
     format!(
-        r#"{{"channel":"ticker","type":"update","data":[{{"symbol":"{symbol}","bid":{bid},"bid_qty":1.5,"ask":{ask},"ask_qty":2.5,"last":{bid},"timestamp":"{at}"}}]}}"#
+        r#"{{"channel":"book","type":"snapshot","data":[{{"symbol":"{symbol}","bids":[{{"price":{bid},"qty":{bid_qty}}}],"asks":[{{"price":{ask},"qty":{ask_qty}}}],"checksum":{checksum},"timestamp":"{at}"}}]}}"#
     )
 }
 

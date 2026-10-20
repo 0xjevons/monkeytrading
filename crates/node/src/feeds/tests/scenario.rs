@@ -20,7 +20,7 @@ use tokio::time::{interval, sleep, timeout};
 use crate::clock::now_ms;
 use crate::config::{NodeConfig, Venue};
 use crate::feeds::tests::fake::{
-    WAIT, accept, bitstamp_book, coinbase_levels, fast, kraken_ticker, listen, send, spawn_feed_into,
+    WAIT, accept, bitstamp_book, coinbase_levels, fast, kraken_book, listen, send, spawn_feed_into,
 };
 use crate::sequencer::{Request, Sequencer, SequencerConfig, StreamMsg};
 use crate::tee::EnclaveKey;
@@ -186,7 +186,7 @@ fn serve_kraken(listener: TcpListener) -> JoinHandle<()> {
         loop {
             every.tick().await;
             let ts = now_ms();
-            let tickers = [kraken_ticker("BTC/USD", BTC.0, BTC.1, ts), kraken_ticker("ETH/USD", ETH.0, ETH.1, ts)];
+            let tickers = [kraken_book("BTC/USD", BTC.0, BTC.1, ts), kraken_book("ETH/USD", ETH.0, ETH.1, ts)];
             send(&mut ws, &tickers).await;
         }
     })
