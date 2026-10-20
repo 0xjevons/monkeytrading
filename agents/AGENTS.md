@@ -41,6 +41,9 @@ an index: load only the rule whose hint matches the current action.
 - **rustfmt.toml** — `max_width = 120`.
 - **README.md** — the public introduction: what the engine does and how, its status, how to verify
   and run it, and how to contribute. Keep its status and quick start in step with the code.
+- **SECURITY.md** — the security policy: the private reporting address, response times,
+  coordinated disclosure, safe harbour, scope, and supported versions; the README's Security
+  section points to it. Keep its scope in step with the components the repository ships.
 - **LICENSE** — Apache License 2.0.
 
 ## Commands
