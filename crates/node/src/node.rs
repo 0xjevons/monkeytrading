@@ -1,8 +1,7 @@
-//! Node wiring: attest the enclave key, recover the engine from its log, then run the sequencer,
-//! ticker, price feeds, custody, trusted time check, and API as supervised tasks. Any task
-//! stopping stops the node.
-//! On SIGTERM or ctrl-c, every task but the sequencer is stopped; the sequencer then drains what
-//! is queued and writes a final checkpoint.
+//! Node wiring: attest the enclave key and the API's TLS key, recover the engine from its log, then
+//! run the sequencer, ticker, price feeds, custody, trusted time check, API, and rate-limit upkeep
+//! as supervised tasks. Any task stopping stops the node. On SIGTERM or ctrl-c, every task but the
+//! sequencer is stopped; the sequencer then drains what is queued and writes a final checkpoint.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,9 +22,11 @@ use crate::api::{ApiState, MAX_BACKFILLS, router};
 use crate::clock::{Clock, SystemClock, now_ms};
 use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProvider};
 use crate::feeds::venue::{self, Timing};
+use crate::limits::{ApiLimits, run_retain};
 use crate::log::Manifest;
 use crate::sequencer::{Request, Sequencer, SequencerConfig};
 use crate::tee::{Attestor, ConfigfsTsm, EnclaveKey, MockAttestor, attest_key};
+use crate::tls::{TlsIdentity, serve};
 use crate::{custody, feeds, trusted_time};
 
 /// How long the sequencer gets to drain and checkpoint after a shutdown signal.
@@ -47,8 +48,8 @@ pub fn init_logging(level: &str) -> anyhow::Result<()> {
 /// Error cases:
 /// - operator rotation is enabled, or the custody provider is not implemented
 /// - `feeds.provider = "venues"` without `[feeds.venues]`, or the TLS config cannot be built
-/// - attesting the enclave key, recovering the log (including a log that records another client
-///   auth), or binding the listener fails
+/// - generating the TLS key, attesting the keys, recovering the log (including a log that records
+///   another client auth), or binding the listener fails
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
 pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.operator.rotation_enabled {
@@ -67,8 +68,16 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         TeeProvider::ConfigfsTsm => Box::new(ConfigfsTsm::default()),
     };
     let key = Arc::new(EnclaveKey::generate());
-    let attestation = Arc::new(attest_key(attestor.as_ref(), &key).context("attesting enclave key")?);
-    info!(enclave = %key.address_hex(), provider = %attestation.provider, "enclave key attested");
+    let tls = TlsIdentity::generate()?;
+    let attestation = Arc::new(
+        attest_key(attestor.as_ref(), &key, &tls.public_key_sha256).context("attesting the enclave and TLS keys")?,
+    );
+    info!(
+        enclave = %key.address_hex(),
+        tls_public_key_sha256 = %attestation.tls_public_key_sha256,
+        provider = %attestation.provider,
+        "enclave and TLS keys attested"
+    );
 
     let vault: AccountId = cfg.custody.vault.parse().context("custody.vault")?;
     let client_auth = cfg.client_auth()?;
@@ -137,6 +146,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     tasks.spawn(async move { ("custody", custody::run(&custody_cfg, withdrawals_rx).await) });
 
     let listener = TcpListener::bind(cfg.node.listen).await.with_context(|| format!("binding {}", cfg.node.listen))?;
+    let limits = Arc::new(ApiLimits::new(&cfg.api));
     let app = router(ApiState {
         tx,
         stream: stream_tx,
@@ -147,9 +157,12 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         log_dir: cfg.node.log_dir.clone(),
         manifest: manifest_rx,
         backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
+        limits: limits.clone(),
     });
-    info!(listen = %cfg.node.listen, "api up");
-    tasks.spawn(async move { ("api", axum::serve(listener, app).await.context("api server")) });
+    info!(listen = %cfg.node.listen, "api up over TLS");
+    let (api, retained) = (cfg.api, limits.clone());
+    tasks.spawn(async move { ("api", serve(listener, tls.config, app, limits, api).await) });
+    tasks.spawn(async move { ("rate limits", run_retain(retained).await) });
 
     let outcome = tokio::select! {
         joined = tasks.join_next() => Err(stopped_task(joined)),

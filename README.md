@@ -72,20 +72,23 @@ clock, so the node checks that clock against signed time from several independen
 has arrived, and stops sequencing while the clock is further from the time the servers agree on
 than a set bound, or once a minute has passed without signed time.
 
-The enclave also attests to the key it signs with. The local node uses a mock attestation, labelled
-as such; attestation on AMD SEV-SNP hardware, and a verifier for it, are being built in
+The enclave also attests to the key it signs with, and to the key its API serves TLS with: both are
+generated inside the enclave, so client connections end where the host cannot read them. The local
+node uses a mock attestation, labelled as such; attestation on AMD SEV-SNP hardware, and a verifier
+for it, are being built in
 [#26](https://github.com/0xjevons/monkeytrading/issues/26) and
 [#27](https://github.com/0xjevons/monkeytrading/issues/27).
 
 ## Running it locally
 
-You need the latest stable Rust on Linux or macOS, and `jq` for the second example. Start a local
-node with a mock enclave, mock custody, and simulated prices; its API listens on `127.0.0.1:8080`,
-which you can change with `node.listen` in `config/dev.toml`. Set `feeds.provider = "venues"` in a
-copy of it to price BTC-USD and ETH-USD from Coinbase, Kraken, and Bitstamp instead; the other
-markets then have no price, so their orders get `no_price`. The node checks its clock against
-public Roughtime servers over UDP: it starts sequencing once they answer, and stops a minute after
-it loses them.
+You need the latest stable Rust on Linux or macOS, and `jq` and `xxd` for the API examples. Start
+a local node with a mock enclave, mock custody, and simulated prices; its API is served over TLS on
+`127.0.0.1:8080`, which you can change with `node.listen` in `config/dev.toml`. The certificate is
+self-signed, so the examples below pass `curl -k`. Set `feeds.provider = "venues"` in a copy of the
+config to price BTC-USD and ETH-USD from Coinbase, Kraken, and Bitstamp instead; the other markets
+then have no price, so their orders get `no_price`. The node checks its clock against public
+Roughtime servers over UDP: it starts sequencing once they answer, and stops a minute after it
+loses them.
 
 ```bash
 cargo test --workspace
@@ -95,14 +98,24 @@ cargo run -p engine-node -- run --config config/dev.toml
 In another terminal, credit a test account and buy 0.25 BTC at the live price:
 
 ```bash
-API=localhost:8080
+API=https://localhost:8080
 ACCOUNT=0x00000000000000000000000000000000000000aa
-curl -s -X POST $API/v1/dev/deposit -H 'content-type: application/json' \
+curl -sk -X POST $API/v1/dev/deposit -H 'content-type: application/json' \
   -d "{\"account\":\"$ACCOUNT\",\"amount\":\"50000\"}"
-PRICE=$(curl -s $API/v1/markets | jq -r '.[] | select(.symbol == "BTC-USD") | .mark')
-curl -s -X POST $API/v1/orders -H 'content-type: application/json' \
+PRICE=$(curl -sk $API/v1/markets | jq -r '.[] | select(.symbol == "BTC-USD") | .mark')
+curl -sk -X POST $API/v1/orders -H 'content-type: application/json' \
   -d "{\"account\":\"$ACCOUNT\",\"client_id\":1,\"market\":1,\"side\":\"buy\",\"qty\":\"0.25\",\"kind\":{\"kind\":\"market\",\"quoted\":\"$PRICE\"}}"
-curl -s $API/v1/accounts/$ACCOUNT
+curl -sk $API/v1/accounts/$ACCOUNT
+```
+
+`-k` only skips the CA check that a self-signed certificate cannot pass. What makes a connection
+trustworthy is pinning the attested key: bytes 32..64 of the attestation's `report_data` are the
+SHA-256 of the certificate's public key (its DER SubjectPublicKeyInfo), which is the form
+`curl --pinnedpubkey` checks. Against a real enclave, verify the quote before trusting the bytes:
+
+```bash
+PIN=$(curl -sk $API/v1/attestation | jq -r '.report_data[66:]' | xxd -r -p | base64)
+curl -s --insecure --pinnedpubkey "sha256//$PIN" $API/v1/health
 ```
 
 Stopping the node with ctrl-c lets it finish what is queued and write a final checkpoint. You can

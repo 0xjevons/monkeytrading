@@ -14,7 +14,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use crate::log::{MANIFEST, Manifest, Offset, SegmentedLog, segment_seq};
 use crate::sequencer::replay;
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
-use crate::test_support::{SEGMENT_COMMANDS, TestSequencer, deposit, log_messages, scratch_dir, withdraw};
+use crate::test_support::{SEGMENT_COMMANDS, TestSequencer, deposit, dev_config, log_messages, scratch_dir, withdraw};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -125,6 +125,15 @@ async fn the_stream_refuses_after_and_from_together_or_a_malformed_offset() {
     }
 }
 
+#[test]
+fn retry_after_is_the_wait_in_whole_seconds_rounded_up() {
+    for (wait, header) in [(1500, "2"), (3000, "3"), (1, "1"), (0, "1")] {
+        let response = ApiError::RateLimited(Duration::from_millis(wait)).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[RETRY_AFTER], header, "a wait of {wait}ms");
+    }
+}
+
 // ── Helpers ──
 
 /// Serves the API for `node`, with `dir` as its log directory, on a free local port.
@@ -134,7 +143,7 @@ async fn serve(node: &TestSequencer, dir: &Path) -> SocketAddr {
 
 /// Serves the API for `node`, with `dir` as its log directory and `manifest` as the writer's.
 async fn serve_with(node: &TestSequencer, dir: &Path, manifest: watch::Receiver<Manifest>) -> SocketAddr {
-    let attestation = Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate()).unwrap());
+    let attestation = Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate(), &[0; 32]).unwrap());
     let app = router(ApiState {
         tx: node.tx.clone(),
         stream: node.stream.clone(),
@@ -145,10 +154,11 @@ async fn serve_with(node: &TestSequencer, dir: &Path, manifest: watch::Receiver<
         log_dir: dir.to_owned(),
         manifest,
         backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
+        limits: Arc::new(ApiLimits::new(&dev_config().api)),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await });
+    tokio::spawn(async move { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await });
     addr
 }
 

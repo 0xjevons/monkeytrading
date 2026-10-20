@@ -1,6 +1,6 @@
 //! Client API: REST for actions and reads, a WebSocket that streams the public log (every
 //! sequenced command with its events, every signed checkpoint, every signed withdrawal), and the
-//! log archive.
+//! log archive. Every request passes the limits in `limits`.
 
 mod archive;
 mod stream;
@@ -9,10 +9,12 @@ pub(crate) use stream::MAX_BACKFILLS;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::StatusCode;
-use axum::middleware::{Next, from_fn};
+use axum::http::header::RETRY_AFTER;
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -31,12 +33,14 @@ use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, debug, info_span};
 
 use crate::clock::now_ms;
+use crate::limits::{ApiLimits, limit_client, read_body};
 use crate::log::Manifest;
 use crate::sequencer::{self, StreamMsg};
 use crate::tee::Attestation;
 
 type ApiResult<T> = Result<Json<T>, ApiError>;
 
+#[derive(Debug)]
 pub enum ApiError {
     Unavailable,
     NotFound,
@@ -49,6 +53,12 @@ pub enum ApiError {
     InvalidNonce {
         expected: u64,
     },
+    /// Over a rate limit; the client may retry after the wait.
+    RateLimited(Duration),
+    TooManySubscribers,
+    BodyTooLarge,
+    /// The client did not send the request body within the read timeout.
+    BodyTimeout,
 }
 
 #[derive(Clone)]
@@ -67,6 +77,7 @@ pub struct ApiState {
     pub manifest: watch::Receiver<Manifest>,
     /// Permits for stream subscribers reading from disk.
     pub backfills: Arc<Semaphore>,
+    pub limits: Arc<ApiLimits>,
 }
 
 #[derive(Serialize)]
@@ -110,12 +121,17 @@ struct AmountBody {
 
 impl IntoResponse for ApiError {
     /// A JSON `{ "error": … }` body with the matching status; an invalid nonce also carries the
-    /// nonce expected.
+    /// nonce expected, and a rate-limited one `Retry-After` in whole seconds, rounded up.
     fn into_response(self) -> Response {
         let (status, msg) = match self {
             ApiError::InvalidNonce { expected } => {
                 let body = json!({ "error": "invalid nonce", "expected": expected });
                 return (StatusCode::CONFLICT, Json(body)).into_response();
+            }
+            ApiError::RateLimited(wait) => {
+                let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+                let body = Json(json!({ "error": "rate limited" }));
+                return (StatusCode::TOO_MANY_REQUESTS, [(RETRY_AFTER, secs.max(1).to_string())], body).into_response();
             }
             ApiError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "engine unavailable".to_owned()),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_owned()),
@@ -123,14 +139,18 @@ impl IntoResponse for ApiError {
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_owned()),
             ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m.to_owned()),
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m.to_owned()),
+            ApiError::TooManySubscribers => (StatusCode::SERVICE_UNAVAILABLE, "too many stream subscribers".to_owned()),
+            ApiError::BodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request body too large".to_owned()),
+            ApiError::BodyTimeout => (StatusCode::REQUEST_TIMEOUT, "request body not received in time".to_owned()),
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
 }
 
 impl ApiState {
-    /// Checks the request may act for `account`, records it as the request's id, and returns the
-    /// auth to sequence with it: the client's, or none where the node trusts the `account` field.
+    /// Checks the request may act for `account`, records it as the request's id, counts it against
+    /// the account's rate, and returns the auth to sequence with it: the client's, or none where
+    /// the node trusts the `account` field.
     /// `hash` gives the digest the request signs under a domain with its nonce and expiry. A signed
     /// request stays out of the log unless its account has been credited, its nonce is the
     /// account's next, and it has not expired: otherwise it could do nothing now, a nonce ahead of
@@ -142,6 +162,7 @@ impl ApiState {
     /// - the request is signed and the engine has never credited `account`
     /// - the request is signed with a nonce other than the account's next
     /// - the request is signed with an expiry already past by the clock or the last sequenced time
+    /// - the account is over its rate
     /// - the sequencer has stopped
     async fn authorise(
         &self,
@@ -151,6 +172,8 @@ impl ApiState {
     ) -> Result<Option<RequestAuth>, ApiError> {
         Span::current().record("id", display(account));
         if self.auth == ClientAuth::Unsigned {
+            // An unsigned request may act for any account it names, so the named one is counted.
+            self.limits.check_account(account)?;
             return Ok(None);
         }
         if let Err(reason) = self.auth.check(account, auth.as_ref(), hash) {
@@ -183,6 +206,10 @@ impl ApiState {
             debug!(expires_at, "request refused: expired");
             return Err(ApiError::BadRequest(format!("request expired at {expires_at}")));
         }
+        // Counted last, so only a request the node would sequence spends the account's rate. Every
+        // signed request is in the public log, so anyone can replay one; a replay fails the nonce
+        // or expiry check first and spends nothing.
+        self.limits.check_account(account)?;
         Ok(auth)
     }
 
@@ -212,8 +239,9 @@ impl ApiState {
     }
 }
 
-/// Every route, with the request span outermost.
+/// Every route, with the request span outermost, then the per-client rate, then the body read.
 pub fn router(state: ApiState) -> Router {
+    let limits = state.limits.clone();
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/attestation", get(attestation))
@@ -228,6 +256,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/stream", get(stream::stream))
         .route("/v1/archive/{file}", get(archive::archive))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(limits.max_body_bytes))
+        .layer(from_fn_with_state(limits.clone(), read_body))
+        .layer(from_fn_with_state(limits, limit_client))
         .layer(from_fn(trace_request))
 }
 
