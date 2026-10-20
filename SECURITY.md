@@ -96,8 +96,9 @@ finding that breaks one of these guarantees, or gets past one of those checks, i
 it starts from an operator's key. Some of the checks behind them are still being built: `engine
 replay` does not yet verify checkpoint signatures; the node does not yet check the log it recovers
 from against anything its host cannot rewrite, so it accepts a truncated or rewritten one; the
-sequencer does not yet bound how far its host's clock may drift; the enclave's signing key does not
-yet survive a restart; and the node refuses unsigned requests unless both the enclave and custody
+sequencer, which bounds its host's clock with signed time, trusts the guest's monotonic clock
+without yet checking that the host cannot scale it; the enclave's signing key does not yet survive
+a restart; and the node refuses unsigned requests unless both the enclave and custody
 are mocks, but does not yet refuse mock custody or simulated prices when it runs with hardware
 attestation, whose report vouches for the signing key but not for the configuration. A gap that this
 policy, an open issue, or a `TODO` in the code already records is known, so a report of it is not a

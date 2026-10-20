@@ -66,6 +66,12 @@ the archive the node serves: its completed log segments, with a manifest of thei
 SHA-256 hashes. A stream subscriber can start or resume at any message offset, and gets the log
 from disk and then live, each message once.
 
+Every command carries the time the sequencer stamped it with. The enclave's host supplies its
+clock, so the node checks that clock against signed time from several independent
+[Roughtime](https://www.rfc-editor.org/rfc/rfc10049) servers. It stamps nothing until signed time
+has arrived, and stops sequencing while the clock is further from the time the servers agree on
+than a set bound, or once a minute has passed without signed time.
+
 The enclave also attests to the key it signs with. The local node uses a mock attestation, labelled
 as such; attestation on AMD SEV-SNP hardware, and a verifier for it, are being built in
 [#26](https://github.com/0xjevons/monkeytrading/issues/26) and
@@ -77,7 +83,9 @@ You need the latest stable Rust on Linux or macOS, and `jq` for the second examp
 node with a mock enclave, mock custody, and simulated prices; its API listens on `127.0.0.1:8080`,
 which you can change with `node.listen` in `config/dev.toml`. Set `feeds.provider = "venues"` in a
 copy of it to price BTC-USD and ETH-USD from Coinbase, Kraken, and Bitstamp instead; the other
-markets then have no price, so their orders get `no_price`.
+markets then have no price, so their orders get `no_price`. The node checks its clock against
+public Roughtime servers over UDP: it starts sequencing once they answer, and stops a minute after
+it loses them.
 
 ```bash
 cargo test --workspace

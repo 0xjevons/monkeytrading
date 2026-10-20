@@ -12,6 +12,10 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - Single-task sequencer: commands are logged and flushed before any client sees their effect
 - Signed checkpoints and withdrawals, bound to the chain id and vault, from an attested key
 - Attestation through Linux configfs-tsm, covering TDX and SEV-SNP, or a clearly marked mock
+- Trusted time: every stamp is checked against signed Roughtime readings that independent servers
+  agree on, and nothing, genesis included, is stamped before the first; sequencing halts with a
+  Critical alert when the host clock is beyond the drift bound, or 60 seconds after the last
+  sample, and resumes once a sample is within the bound
 - REST API for orders, cancels, withdrawals, and reads, plus a WebSocket stream of the log
 - Orders, cancels, and withdrawals signed by the account (EIP-712), checked before they are
   sequenced; `auth = "none"` trusts the account field and runs only with the mock TEE and custody
@@ -33,8 +37,8 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/main.rs` — the `engine` binary: `run` and `replay`
 - `src/lib.rs` — module index
 - `src/node.rs` — startup, task supervision, and shutdown
-- `src/sequencer/mod.rs` — the sequencer, protocol activation, genesis, stream messages,
-  checkpoints, alerts, and log replay
+- `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, alerts, and log replay
+- `src/sequencer/required.rs` — protocol activation and genesis, which wait for trusted time
 - `src/sequencer/tests.rs` — sequencer, activation, genesis restart, and replay tests
 - `src/log/mod.rs` — the JSON-lines log format, stream offsets, and the single-file reader
 - `src/log/segments.rs` — segment files, rotation, the manifest, and recovery checks
@@ -49,6 +53,17 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/api/tests.rs` — API tests, including the resumable stream and archive dev scenario
 - `src/test_support.rs` — the shared test harness
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
+- `src/trusted_time/mod.rs` — the trusted time task: queries the Roughtime servers, backs off
+  failing ones, and turns agreeing replies into a sample
+- `src/trusted_time/gate.rs` — the sequencer's check of each stamp against the latest sample
+- `src/trusted_time/tests/` — agreement, round, back-off, and gate tests, and the offline dev
+  scenario
+- `src/roughtime/mod.rs` — the Roughtime client: builds requests and verifies signed replies, for
+  version 1 (RFC 10049) and the final drafts' 0x8000000c
+- `src/roughtime/message.rs` — the Roughtime wire format
+- `src/roughtime/testing.rs` — a Roughtime server for tests that signs with its own keys
+- `src/roughtime/tests.rs` — client tests over recorded and locally signed replies
+- `src/roughtime/fixtures/replies.json` — replies recorded from the servers in `config/dev.toml`
 - `src/config/mod.rs` — the node config schema and validation
 - `src/config/tests.rs` — config loading and validation tests
 - `src/custody.rs` — the custody adapter (mock only so far)
@@ -73,7 +88,7 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/feeds/tests/late.rs` — venue tasks against a sequencer that answers late: when a quote
   counts as the venue quoting, and how a connection's last quotes are settled after it ends
 - `src/feeds/tests/scenario.rs` — the dev scenario through the sequencer and engine
-- `src/clock.rs` — the wall clock used to stamp commands
+- `src/clock.rs` — the wall and monotonic clocks the sequencer stamps and checks with
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
 - `tests/reference_logs.rs` — replays every committed node reference log, events included
 - `tests/reference/` — one node-format reference log per protocol version, never regenerated
@@ -151,6 +166,9 @@ changing any of them needs a fresh log.
 
 ```bash
 cargo test -p engine-node
+
+# The trusted time dev scenario, offline against loopback Roughtime servers
+cargo test -p engine-node trusted_time::tests::scenario
 ```
 
 ## Authors

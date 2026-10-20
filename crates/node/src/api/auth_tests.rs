@@ -14,10 +14,11 @@ use k256::ecdsa::SigningKey;
 use serde_json::Value;
 use tower::ServiceExt;
 
+use crate::clock::test_clock::TestClock;
 use crate::log::{LogEntry, SegmentedLog};
 use crate::sequencer::{Sequencer, SequencerConfig, SignedWithdrawal, replay};
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
-use crate::test_support::{dev_config, scratch_dir, sequencer_config};
+use crate::test_support::{dev_config, sample_around, scratch_dir, sequencer_config};
 
 const VECTORS: &str = include_str!("../../../core/tests/fixtures/eip712.json");
 /// The time the test sequencer stamps every command with, and the API checks expiries against
@@ -252,16 +253,19 @@ impl Node {
         let (stream, _) = broadcast::channel(1024);
         let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
         let (manifest_tx, manifest) = watch::channel(Manifest::default());
+        let stamps = Arc::new(TestClock::at(NOW));
         let cfg = SequencerConfig {
             chain_id: CHAIN_ID,
             vault: VAULT,
-            clock: || NOW,
+            clock: stamps.clone(),
             client_auth: auth.clone(),
             ..sequencer_config(&dir, manifest_tx)
         };
         let mut seq = Sequencer::recover(cfg, key.clone(), stream.clone(), withdrawals_tx).unwrap();
         seq.activate_protocol().unwrap();
         seq.genesis(&dev_config().genesis).unwrap();
+        // Trusted time agrees with the fixed clock, so the queued activation and genesis go in now.
+        seq.trust(sample_around(stamps.as_ref())).unwrap();
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(seq.run(rx));
         let attestation = Arc::new(attest_key(&MockAttestor, &key).unwrap());

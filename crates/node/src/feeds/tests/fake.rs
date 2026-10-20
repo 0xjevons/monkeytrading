@@ -188,6 +188,7 @@ pub fn spawn_feed(
                             return;
                         }
                     }
+                    Some(Request::TimeSample(_)) => unreachable!("a feed sends no time samples"),
                     None => return,
                 },
             }

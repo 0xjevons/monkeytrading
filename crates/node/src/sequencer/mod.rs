@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use engine_core::auth::ClientAuth;
@@ -18,9 +19,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{error, info, info_span, warn};
 
+use crate::clock::Clock;
 use crate::config::Genesis;
 use crate::log::{self, Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
 use crate::tee::EnclaveKey;
+use crate::trusted_time::{Sample, TimeGate};
 
 const MAX_BATCH: usize = 1024;
 /// The custody reference genesis credits house capital under, as its last command.
@@ -31,8 +34,13 @@ pub type Query = Box<dyn FnOnce(&Engine) + Send>;
 // Unboxed on purpose: boxing every command would add an allocation to the hot path.
 #[allow(clippy::large_enum_variant)]
 pub enum Request {
-    Submit { cmd: Command, reply: Option<oneshot::Sender<Vec<Event>>> },
+    Submit {
+        cmd: Command,
+        reply: Option<oneshot::Sender<Vec<Event>>>,
+    },
     Query(Query),
+    /// A trusted time sample from the trusted time task.
+    TimeSample(Sample),
 }
 
 /// What `/v1/stream` publishes: each log entry at its offset, in offset order.
@@ -77,7 +85,11 @@ pub struct Sequencer {
     stream: broadcast::Sender<Arc<StreamMsg>>,
     withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     outbox: Vec<Arc<StreamMsg>>,
-    clock: fn() -> Millis,
+    clock: Arc<dyn Clock>,
+    time: TimeGate,
+    /// Commands the engine must accept, waiting for a stamp trusted time admits, each group with
+    /// what it is for.
+    required: Vec<(&'static str, Vec<Command>)>,
     client_auth: ClientAuth,
 }
 
@@ -89,8 +101,10 @@ pub struct SequencerConfig<'a> {
     pub checkpoint_every: u64,
     pub chain_id: u64,
     pub vault: AccountId,
-    /// The clock commands are stamped with.
-    pub clock: fn() -> Millis,
+    /// The clocks commands are stamped and checked with.
+    pub clock: Arc<dyn Clock>,
+    /// The most a stamp may differ from trusted time.
+    pub max_drift: Duration,
     /// The client auth the config gives, which a log that records one must match.
     pub client_auth: ClientAuth,
 }
@@ -159,7 +173,9 @@ impl Sequencer {
             stream,
             withdrawals,
             outbox: Vec::new(),
+            time: TimeGate::new(cfg.max_drift, cfg.clock.instant()),
             clock: cfg.clock,
+            required: Vec::new(),
             client_auth: cfg.client_auth,
         };
         for (account, amount, nonce) in unsigned {
@@ -171,45 +187,12 @@ impl Sequencer {
         Ok(sequencer)
     }
 
-    /// Whether genesis has yet to finish: its last command, the house capital credit, is not in
-    /// the log. Genesis commands are safe to repeat, so a genesis cut short runs again in full.
-    pub fn needs_genesis(&self) -> bool {
-        !self.engine.is_credited(GENESIS_REF)
-    }
-
-    /// Records the config's client auth and activates the latest protocol version, whichever the
-    /// log lacks, then checkpoints. Both run at the log's next seq, so earlier commands keep the
-    /// rules they ran under. `recover` has already refused a log that records other client auth.
-    /// Error cases:
-    /// - the engine rejects either command
-    /// - the log cannot be written
-    pub fn activate_protocol(&mut self) -> anyhow::Result<()> {
-        let mut cmds = Vec::new();
-        if self.engine.client_auth().is_none() {
-            cmds.push(Command::Admin(AdminCommand::SetClientAuth(self.client_auth.clone())));
-        }
-        if self.engine.protocol_version() < ProtocolVersion::LATEST {
-            cmds.push(Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }));
-        }
-        if cmds.is_empty() {
-            return Ok(());
-        }
-        info!(version = ?ProtocolVersion::LATEST, seq = self.next_seq, "activating protocol");
-        self.sequence_required(cmds).context("protocol activation")
-    }
-
-    /// Sequences the genesis config as ordinary admin commands, then checkpoints.
-    /// Error cases:
-    /// - the engine rejects any genesis command
-    /// - the log cannot be written
-    pub fn genesis(&mut self, genesis: &Genesis) -> anyhow::Result<()> {
-        self.sequence_required(genesis_commands(genesis)).context("genesis")
-    }
-
     /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch is
-    /// flushed before its replies, stream messages, and queries go out.
+    /// flushed before its replies, stream messages, and queries go out. A command trusted time
+    /// refuses is dropped with its reply, which the API answers as unavailable.
     /// Error cases:
     /// - the log cannot be written; the node must stop rather than acknowledge undurable commands
+    /// - the engine rejects a queued required command
     pub async fn run(mut self, mut rx: mpsc::Receiver<Request>) -> anyhow::Result<()> {
         let mut replies = Vec::new();
         let mut queries: Vec<Query> = Vec::new();
@@ -218,12 +201,14 @@ impl Sequencer {
             while let Some(req) = next.take() {
                 match req {
                     Request::Submit { cmd, reply } => {
-                        let events = self.sequence(cmd)?;
-                        if let Some(reply) = reply {
+                        if let Some(events) = self.sequence(cmd)?
+                            && let Some(reply) = reply
+                        {
                             replies.push((reply, events));
                         }
                     }
                     Request::Query(q) => queries.push(q),
+                    Request::TimeSample(sample) => self.take_sample(sample)?,
                 }
                 if replies.len() + queries.len() < MAX_BATCH {
                     next = rx.try_recv().ok();
@@ -243,15 +228,55 @@ impl Sequencer {
         Ok(())
     }
 
-    /// Stamps and applies one command, logs it with its events, signs any approved withdrawal, and
+    /// Stamps and sequences one command, after any queued required commands. Returns `None`, with
+    /// nothing logged, when trusted time refuses the stamp.
+    /// Error cases:
+    /// - the log cannot be written
+    /// - the engine rejects a queued required command
+    /// - the engine refuses the sequence, which means this sequencer is broken
+    fn sequence(&mut self, cmd: Command) -> anyhow::Result<Option<Vec<Event>>> {
+        let Some(ts) = self.admitted_ts() else {
+            return Ok(None);
+        };
+        self.sequence_queued(ts)?;
+        self.stamp(ts, cmd).map(Some)
+    }
+
+    /// Takes `sample` as the latest trusted time, and sequences any queued required commands it
+    /// admits.
+    /// Error cases:
+    /// - the engine rejects a queued required command
+    /// - the log cannot be written
+    fn take_sample(&mut self, sample: Sample) -> anyhow::Result<()> {
+        self.time.update(sample);
+        self.sequence_queued_if_admitted()
+    }
+
+    /// `take_sample` outside `run`, flushing what it sequences: how a test gives a sequencer trusted
+    /// time before it runs.
+    /// Error cases:
+    /// - as `take_sample`, or the log cannot be flushed
+    #[cfg(test)]
+    pub fn trust(&mut self, sample: Sample) -> anyhow::Result<()> {
+        self.take_sample(sample)?;
+        self.flush()
+    }
+
+    /// The stamp for a command now, if trusted time admits it. The host clock is untrusted inside
+    /// a TEE: it can't move sequenced time backwards, and nothing is logged unless the clock and the
+    /// stamp are within the drift bound of trusted time.
+    fn admitted_ts(&mut self) -> Option<Millis> {
+        let host_ms = self.clock.now_ms();
+        let ts = host_ms.max(self.last_ts);
+        self.time.admit(host_ms, ts, self.clock.instant()).then_some(ts)
+    }
+
+    /// Applies one command at `ts`, logs it with its events, signs any approved withdrawal, and
     /// checkpoints on schedule. The command's span carries its seq as `id`.
     /// Error cases:
     /// - the log cannot be written
     /// - the engine refuses the sequence, which means this sequencer is broken
-    fn sequence(&mut self, cmd: Command) -> anyhow::Result<Vec<Event>> {
-        // The host clock is untrusted inside a TEE, but it can't move sequenced time backwards.
-        // TODO: bound drift against a trusted time source.
-        let ts = (self.clock)().max(self.last_ts);
+    fn stamp(&mut self, ts: Millis, cmd: Command) -> anyhow::Result<Vec<Event>> {
         let sequenced = Sequenced { seq: self.next_seq, ts, cmd };
         let _span = info_span!("command", id = sequenced.seq).entered();
         let events = self.engine.apply(&sequenced).context("sequencer produced an invalid sequence")?;
@@ -280,23 +305,6 @@ impl Sequencer {
         self.last_offset = Some(offset);
         self.outbox.push(Arc::new(StreamMsg::new(offset, entry)));
         Ok(())
-    }
-
-    /// Sequences commands the engine must accept, then checkpoints.
-    /// Error cases:
-    /// - the engine rejects any of them
-    /// - the log cannot be written
-    fn sequence_required(&mut self, cmds: Vec<Command>) -> anyhow::Result<()> {
-        for cmd in cmds {
-            let events = self.sequence(cmd)?;
-            if let Some(Event::AdminRejected { reason }) =
-                events.iter().find(|e| matches!(e, Event::AdminRejected { .. }))
-            {
-                bail!("rejected: {reason}");
-            }
-        }
-        self.checkpoint()?;
-        self.flush()
     }
 
     /// Signs an approved withdrawal and logs it; custody and the stream get it once it is flushed.
@@ -468,6 +476,8 @@ fn alert_on(event: &Event) {
         _ => {}
     }
 }
+
+mod required;
 
 #[cfg(test)]
 mod tests;
