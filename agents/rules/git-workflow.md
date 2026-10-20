@@ -56,8 +56,8 @@ CI on the PR.
   `./scripts/check-file-loc.sh`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test -p <crate>` for each affected crate, `./scripts/check-reference-logs.sh` when
   `crates/core/tests/reference/` changes, and `cargo deny check` when dependencies change.
-- A push to a draft PR may carry failing or skipped checks when the PR says which; every check
-  passes before the PR is marked ready.
+- A push to a draft PR may carry failing or skipped checks when the PR says which; every CI
+  check passes before the PR is marked ready.
 - When the change touches a shared or public surface, add its direct consumers, since a check
   scoped to one crate never builds them: a change to `engine-core`'s public API also checks
   `engine-node`.
