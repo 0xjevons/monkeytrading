@@ -11,8 +11,8 @@ use crate::Fixed;
 use crate::market::PriceRules;
 use crate::types::Millis;
 
-/// How far after the sequenced time a venue may stamp a quote: the disagreement between a venue's
-/// clock and the sequencer's that the engine tolerates. A quote stamped further ahead is refused.
+/// How far after the sequenced time a venue may stamp a quote. A quote stamped up to this far ahead
+/// is kept and counts once the sequenced time reaches its stamp; one stamped further ahead is refused.
 pub const MAX_QUOTE_LEAD_MS: Millis = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]

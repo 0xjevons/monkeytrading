@@ -7,7 +7,7 @@ use common::{BTC, Harness, acct, f, fills, rejection};
 use engine_core::Fixed;
 use engine_core::command::{AdminCommand, Command, OrderKind};
 use engine_core::event::{Event, Reject};
-use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
+use engine_core::price::{MAX_QUOTE_LEAD_MS, PriceError, SourceQuote};
 use engine_core::types::{Millis, Side};
 
 #[test]
@@ -145,7 +145,7 @@ fn a_quote_stamped_an_hour_ahead_is_refused_and_the_venue_counts_again_on_its_ne
     );
 
     // Correctly stamped quotes follow. Two venues are needed, so the mark at their mean shows venue0
-    // counts, and orders fill again.
+    // counts, and an order fills at it.
     h.advance(100);
     h.quotes(BTC, &["100000", "100100"]);
     assert_eq!(h.engine.markets()[&BTC].mark, Some(f("100050")));
@@ -186,18 +186,22 @@ fn a_kept_quote_stamped_ahead_does_not_hold_back_the_venues_next_quote() {
 }
 
 #[test]
-fn a_refused_quote_also_drops_the_venues_older_quote() {
+fn a_refused_quote_leaves_the_venues_stored_quote_in_place() {
     let mut h = Harness::new();
     let a = acct(1);
     h.deposit(a, "100000");
-    h.price(BTC, "100000");
+    // venue0 is 101bps from the other two, beyond the 50bps limit, so the market has no price.
+    h.quotes(BTC, &["100000", "99000", "99000"]);
+    let quoted_at = h.ts;
 
-    // venue0's quote from 100ms ago is still fresh, but after venue0 sends one stamped past the lead
-    // limit it no longer counts, which leaves one venue of the two needed.
+    // A refused venue0 quote changes nothing: venue0's stored quote still counts, and the market
+    // still has no price.
     h.advance(100);
-    h.cmd(Command::Prices { market: BTC, quotes: vec![quote("venue0", "100000", h.ts + MAX_QUOTE_LEAD_MS + 1)] });
-    let ev = h.market_order(a, BTC, Side::Buy, "0.1", "100000");
-    assert!(matches!(rejection(&ev), Reject::NoPrice(_)));
+    h.cmd(Command::Prices { market: BTC, quotes: vec![quote("venue0", "99000", h.ts + MAX_QUOTE_LEAD_MS + 1)] });
+    let stored = h.engine.markets()[&BTC].quotes.get("venue0").map(|q| (q.mid, q.ts));
+    assert_eq!(stored, Some((f("100000"), quoted_at)));
+    let ev = h.market_order(a, BTC, Side::Buy, "0.1", "99000");
+    assert!(matches!(rejection(&ev), Reject::NoPrice(PriceError::Divergent { .. })), "{ev:?}");
 }
 
 #[test]

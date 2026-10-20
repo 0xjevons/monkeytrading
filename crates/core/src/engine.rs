@@ -253,9 +253,6 @@ impl Engine {
             }
             let lead_ms = quote.ts.saturating_sub(now);
             if lead_ms > MAX_QUOTE_LEAD_MS {
-                // The venue's clock disagrees with the sequencer's, so its stored quote's age is
-                // unknown too: the venue has no price until it sends a quote within the limit.
-                market.quotes.remove(&quote.source);
                 let reason = format!("quote from {} stamped {lead_ms}ms ahead of the sequenced time", quote.source);
                 events.push(Event::PricesRejected { market: market_id, reason });
                 continue;
