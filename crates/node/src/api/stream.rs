@@ -27,8 +27,8 @@ use crate::sequencer::StreamMsg;
 
 /// Most messages read from disk per blocking call.
 const BACKFILL_BATCH: usize = 256;
-/// Subscribers reading a batch from disk at once. Each holds up to one completed segment in memory
-/// while it reads, so this bounds backfill memory at this many segments.
+/// Subscribers reading a batch from disk at once, each holding one checked chunk of a segment while
+/// it reads. A subscriber keeps up to `BACKFILL_BATCH` decoded messages after it reads them.
 pub const MAX_BACKFILLS: usize = 16;
 /// How long one message may wait for a subscriber to take it before the subscriber is closed.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -100,7 +100,7 @@ impl Feed {
                 continue;
             }
             match self.live.recv().await {
-                // Already yielded from disk.
+                // Before the next offset to yield: already yielded, or before the start.
                 Ok(msg) if self.next.is_some_and(|next| msg.offset < next) => {}
                 Ok(msg) => {
                     if let Some(next) = self.next {

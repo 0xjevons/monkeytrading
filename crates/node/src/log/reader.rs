@@ -55,8 +55,8 @@ impl LogReader {
         Ok(reader)
     }
 
-    /// Closes the reader's segment file. The next read opens it again where this one stopped,
-    /// checking each chunk it reads.
+    /// Closes the reader's segment file. The next read opens it again where this one stopped, and
+    /// checks each chunk it reads once the manifest lists the segment.
     pub fn release(&mut self) {
         if let Some((_, segment)) = &mut self.segment {
             segment.lines = None;

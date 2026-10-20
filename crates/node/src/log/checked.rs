@@ -27,6 +27,21 @@ pub(super) struct CheckedChunks {
     pos: usize,
 }
 
+impl Read for CheckedChunks {
+    /// Bytes from the current chunk, loading and checking the next one when it runs out.
+    /// Error cases:
+    /// - the next chunk cannot be read, or differs from its hash
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pos == self.buf.len() {
+            self.load()?;
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 impl CheckedChunks {
     /// The segment at `path`, whose chunks hash to `chunks`, from byte `position` on.
     /// Error cases:
@@ -61,19 +76,6 @@ impl CheckedChunks {
         }
         self.next_chunk += 1;
         Ok(())
-    }
-}
-
-impl Read for CheckedChunks {
-    /// Bytes from the current chunk, loading and checking the next one when it runs out.
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.pos == self.buf.len() {
-            self.load()?;
-        }
-        let n = out.len().min(self.buf.len() - self.pos);
-        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
     }
 }
 

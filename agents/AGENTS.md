@@ -21,8 +21,9 @@ an index: load only the rule whose hint matches the current action.
 - **crates/node/** — `engine-node`, binary `engine` (`main.rs` over `lib.rs`). Contains the
   sequencer, the public log with signed checkpoints (segmented, with a public archive), `engine
   replay`, the REST API and the resumable WebSocket stream, TEE attestation (configfs-tsm for TDX
-  and SEV-SNP), and the custody and price-feed adapters (mock only so far). Its `README.md` lists
-  every file.
+  and SEV-SNP), and the custody and price-feed adapters (mock only so far). `tests/reference/`
+  holds the node-format reference log per protocol version, with events, written once by
+  `examples/reference_log.rs`. Its `README.md` lists every file.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine.
   Its `[genesis]` section is protocol: it is sequenced into the log as admin commands on first
   boot. Every section rejects unknown keys.
@@ -53,12 +54,15 @@ Run from the repo root:
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Format check: `cargo fmt --all -- --check`
 - File line cap: `./scripts/check-file-loc.sh`
-- Reference logs: `cargo test -p engine-core --test reference_logs` replays them;
+- Reference logs: `cargo test -p engine-core --test reference_logs` replays them, and
+  `cargo test -p engine-node --test reference_logs` replays the node's, events included;
   `./scripts/check-reference-logs.sh [base]` checks none changed since `base` (default
   `origin/main`)
 - Property tests: `cargo test -p engine-core --test invariants`
 - New protocol version's reference log:
-  `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`
+  `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`, then
+  the node's from it: `cargo run -p engine-node --example reference_log --
+  crates/core/tests/reference/v<N>.jsonl crates/node/tests/reference/v<N>.jsonl`
 - Supply chain: `cargo deny check` (CI runs it; install `cargo-deny` to run it locally)
 - Run a local node: `cargo run -p engine-node -- run --config config/dev.toml` (or set
   `CONFIG_PATH`); the API listens on `127.0.0.1:8080`, the log goes to segment files and a

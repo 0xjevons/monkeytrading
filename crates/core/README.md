@@ -94,7 +94,14 @@ version:
    the new rules.
 2. Write the version's log, which the generator refuses to do over an existing file:
    `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`
-3. Commit the file. The replay test and CI pick it up with no other change.
+3. Write the node's log from it, with the events each command emits:
+   `cargo run -p engine-node --example reference_log -- crates/core/tests/reference/v<N>.jsonl
+   crates/node/tests/reference/v<N>.jsonl`
+4. Commit both files. The replay tests and CI pick them up with no other change.
+
+The node's logs carry each command's events, and its replay refuses events that differ from what
+the engine emits. A change to the events a command emits, or to how they serialize, is therefore a
+protocol change too, even when state roots stay the same.
 
 ## Authors
 

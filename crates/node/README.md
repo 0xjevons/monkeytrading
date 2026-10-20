@@ -43,6 +43,9 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/custody.rs` — the custody adapter (mock only so far)
 - `src/feeds.rs` — price feed adapters (mock only so far)
 - `src/clock.rs` — the wall clock used to stamp commands
+- `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
+- `tests/reference_logs.rs` — replays every committed node reference log, events included
+- `tests/reference/` — one node-format reference log per protocol version, never regenerated
 
 ## Usage
 
@@ -72,17 +75,17 @@ without its `events` key.
 
 The log is a directory (`node.log_dir`) of segment files named for their first seq, plus
 `manifest.jsonl`, which gets one line per completed segment with its seq range, size, and SHA-256.
-The node loads the manifest at recovery, after checking it against the segment files, and then
-holds it in memory, adding each segment it completes. The archive serves that copy, not the file
-on disk. Backfill reads up to 256 messages at a time. It checks a completed segment against the
-manifest in one pass the first time it reads from it, then checks each chunk it reads, and refuses
-any other segment the manifest does not list. The segment still being written is read from disk
-unchecked, and replay against the signed checkpoints is the check for it. While it reads a batch,
-a subscriber holds one of 16 permits and up to one completed segment in memory. If a new segment
-cannot be created, the current one keeps growing and the node warns (`log_rotation_failed`) until
-it can. A log written as one file before segments existed continues as the first segment: move it
-to `<log_dir>/00000000000000000000.jsonl`. Every segment is kept, since recovery replays the log
-from genesis.
+The node loads the manifest at recovery, after checking it against the segment files, and then holds
+it in memory, adding each segment it completes. The archive serves that copy, not the file on disk.
+Backfill reads up to 256 messages at a time and keeps them until the subscriber takes them. It
+checks a completed segment against the manifest in one pass the first time it reads from it, then
+checks each chunk it reads, and refuses any other segment the manifest does not list. The segment
+still being written is read from disk unchecked, and replay against the signed checkpoints is the
+check for it. While it reads a batch, a subscriber holds one of 16 permits and one 1 MiB chunk of a
+segment. If a new segment cannot be created, the current one keeps growing and the node warns
+(`log_rotation_failed`) until it can. A log written as one file before segments existed continues as
+the first segment: move it to `<log_dir>/00000000000000000000.jsonl`. Every segment is kept, since
+recovery replays the log from genesis.
 
 ## Configuration
 
