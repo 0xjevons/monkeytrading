@@ -15,5 +15,5 @@ pub struct ReferenceEntry {
 
 /// A state root as `0x`-prefixed lower-case hex.
 pub fn root_hex(root: [u8; 32]) -> String {
-    root.iter().fold(String::from("0x"), |hex, byte| hex + &format!("{byte:02x}"))
+    format!("0x{}", hex::encode(root))
 }

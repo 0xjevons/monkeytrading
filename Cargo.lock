@@ -377,6 +377,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "chrono-tz",
+ "hex",
  "proptest",
  "serde",
  "serde_json",

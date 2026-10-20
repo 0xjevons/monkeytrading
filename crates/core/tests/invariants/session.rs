@@ -9,7 +9,9 @@ use engine_core::session::Schedule;
 use engine_core::types::{AccountId, AssetClass, MarketId, Millis, Side};
 use engine_core::{Engine, Fixed};
 use proptest::arbitrary::any;
+use proptest::array::uniform3;
 use proptest::collection::vec;
+use proptest::option;
 use proptest::prop_oneof;
 use proptest::sample::select;
 use proptest::strategy::{Just, Strategy};
@@ -185,7 +187,7 @@ fn resolve(price: Price, base: Fixed) -> Fixed {
 
 /// Funding for the three traders and up to 200 steps.
 pub(crate) fn session() -> impl Strategy<Value = Session> {
-    (proptest::array::uniform3(cash()), vec(step(), 1..=200)).prop_map(|(funding, steps)| Session { funding, steps })
+    (uniform3(cash()), vec(step(), 1..=200)).prop_map(|(funding, steps)| Session { funding, steps })
 }
 
 /// A step: mostly a short clock move so quotes stay fresh, sometimes up to two days so sessions
@@ -264,8 +266,7 @@ fn admin() -> impl Strategy<Value = AdminCommand> {
             benchmark: benchmark.into(),
             annual_bps
         }),
-        (proptest::option::of(market_id()), level)
-            .prop_map(|(market, level)| AdminCommand::SetStressFloor { market, level }),
+        (option::of(market_id()), level).prop_map(|(market, level)| AdminCommand::SetStressFloor { market, level }),
         (market_id(), any::<bool>())
             .prop_map(|(market, reduce_only)| AdminCommand::SetReduceOnly { market, reduce_only }),
         params_change().prop_map(AdminCommand::SetParams),

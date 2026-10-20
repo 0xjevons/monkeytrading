@@ -2,7 +2,8 @@
 //! custody, and operator commands, with values inside and outside the engine's input bounds, and
 //! checks after every command that it did not panic, that cash is conserved, and that each market's
 //! aggregates match its accounts' positions. The same sessions must reach every path that moves cash
-//! and every kind of out-of-bounds input, so the checks cannot pass vacuously.
+//! and the refusal of out-of-range amounts, order numbers, and quotes, so the checks cannot pass
+//! vacuously.
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -48,15 +49,18 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
     let expected = [
         "deposit",
         "deposit rejected",
+        "deposit out of range",
         "withdrawal",
         "withdrawal rejected",
+        "withdrawal out of range",
         "house capital",
+        "house capital out of range",
         "fill",
         "fill with profit fee",
         "liquidation",
         "bad debt",
         "financing",
-        "order out of bounds",
+        "order out of range",
         "malformed quote",
         "admin applied",
         "admin rejected",
@@ -130,8 +134,10 @@ fn cash_moved(events: &[Event]) -> Fixed {
 fn path(event: &Event) -> &'static str {
     match event {
         Event::Deposited { .. } => "deposit",
+        Event::DepositRejected { reason: Reject::InvalidAmount, .. } => "deposit out of range",
         Event::DepositRejected { .. } => "deposit rejected",
         Event::WithdrawalApproved { .. } => "withdrawal",
+        Event::WithdrawalRejected { reason: Reject::InvalidAmount, .. } => "withdrawal out of range",
         Event::WithdrawalRejected { .. } => "withdrawal rejected",
         Event::HouseCapitalMoved { .. } => "house capital",
         Event::Fill(fill) if fill.liquidation => "liquidation",
@@ -140,10 +146,11 @@ fn path(event: &Event) -> &'static str {
         Event::BadDebt { .. } => "bad debt",
         Event::Financing { .. } => "financing",
         Event::OrderRejected { reason: Reject::InvalidOrder { reason }, .. } if reason.ends_with("out of range") => {
-            "order out of bounds"
+            "order out of range"
         }
         Event::PricesRejected { reason, .. } if reason.starts_with("malformed") => "malformed quote",
         Event::AdminApplied => "admin applied",
+        Event::AdminRejected { reason } if reason.ends_with("amount out of range") => "house capital out of range",
         Event::AdminRejected { .. } => "admin rejected",
         _ => "other",
     }
