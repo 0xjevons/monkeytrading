@@ -87,10 +87,9 @@ diff. Walk every applicable section of the development checklist in order, desig
 each finding with the severity guide. In current-agent mode, re-check each accepted finding against
 its source before writing the final report.
 
-When the branch under review — in PR scope, the PR's head branch — has fix notes
-([Fixing an accepted finding](#fixing-an-accepted-finding)) in the checkout that has it checked
-out, whichever checkout this review runs from, the current agent also checks that each invariant
-they record holds across the diff; a site where one fails is a finding.
+The current agent also checks that each invariant in the fix notes of the branch under review — in
+PR scope, the PR's head branch — holds across the diff
+([Fixing an accepted finding](#fixing-an-accepted-finding)); a site where one fails is a finding.
 
 ## Final report
 
@@ -173,10 +172,10 @@ fixes its class, not only the cited instance:
 5. **Record the invariant and the sites fixed** in the branch's fix notes, under a heading for the
    round, so every later round checks the class instead of rediscovering it. A later fix that
    changes a recorded invariant rewrites its entry. The notes are the gitignored
-   `agents/.processes/fixes/<branch>.md`, with the PR's head branch name kept whole
-   (`fixes/<user>/size-spread-tiers-gh12.md`), in the checkout that has that branch checked out, as
-   `git worktree list --porcelain` shows. A subagent fixing on its own local branch writes to the
-   PR branch's notes there.
+   `agents/.processes/fixes/<branch>.md` in the main checkout, which every worktree finds with
+   `dirname "$(git rev-parse --path-format=absolute --git-common-dir)"`, with the PR's head branch
+   name kept whole (`fixes/<user>/size-spread-tiers-gh12.md`). Only the agent that owns the PR
+   branch writes them; a subagent returns its invariant and sites to that agent.
 
 Every round still reviews the full diff; the recorded invariants add to what it checks and never
 narrow it.
