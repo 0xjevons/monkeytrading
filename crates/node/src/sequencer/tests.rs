@@ -207,6 +207,22 @@ async fn replay_refuses_a_command_without_logged_events_after_ones_with_them() {
     assert!(format!("{err:#}").contains("has no logged events, though earlier commands do"), "{err:#}");
 }
 
+#[tokio::test]
+async fn replay_refuses_a_checkpoint_after_an_approval_whose_signed_entry_is_missing() {
+    let dir = scratch_dir("seq-missing-withdrawal-checkpoint");
+    let node = TestSequencer::start(&dir, 16);
+    node.submit(deposit(100, "dep-1")).await;
+    node.tick_to_checkpoint().await;
+    node.submit(withdraw(40)).await;
+    node.stop().await;
+    let mut entries = SegmentedLog::open(&dir).unwrap().entries;
+    assert!(matches!(entries.last(), Some(LogEntry::Checkpoint(_))));
+    let at = entries.iter().position(|e| matches!(e, LogEntry::Withdrawal(_))).unwrap();
+    entries.remove(at);
+    let err = replay(&entries).err().unwrap();
+    assert!(format!("{err:#}").contains("has no signed entry"), "{err:#}");
+}
+
 // ── Helpers ──
 
 /// The segment file the log appends to.

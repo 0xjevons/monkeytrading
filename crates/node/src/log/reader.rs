@@ -33,6 +33,8 @@ struct OpenSegment {
     /// A later segment was listed before this one was last read to its end, so it gets no more
     /// appends.
     complete: bool,
+    /// An entry has been read, so the segment's first entry has been checked.
+    started: bool,
 }
 
 impl LogReader {
@@ -66,6 +68,14 @@ impl LogReader {
                 continue;
             };
             if let Some(entry) = segment.read_entry()? {
+                if !segment.started {
+                    ensure!(
+                        matches!(entry, LogEntry::Command(_)),
+                        "{} does not start with a command",
+                        segment.path.display()
+                    );
+                    segment.started = true;
+                }
                 // A missing segment, or lines removed from one, shows up as a gap in the seqs.
                 if let (LogEntry::Command(c), Some(prev)) = (&entry, self.last) {
                     let seq = c.sequenced.seq;
@@ -95,6 +105,8 @@ impl LogReader {
                 continue;
             }
             ensure!(segment.line.is_empty(), "{} ends mid-line", segment.path.display());
+            // Release this segment before the next is read into memory.
+            self.segment = None;
             self.segment = Some((i + 1, self.open_segment(i + 1)?));
         }
     }
@@ -141,7 +153,7 @@ impl LogReader {
             }
         };
         let complete = i + 1 < self.segments.len();
-        Ok(OpenSegment { path: path.clone(), lines, line: Vec::new(), complete })
+        Ok(OpenSegment { path: path.clone(), lines, line: Vec::new(), complete, started: false })
     }
 }
 

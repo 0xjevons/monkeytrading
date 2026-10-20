@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::Response;
@@ -17,7 +17,7 @@ use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use tokio::task::spawn_blocking;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout_at};
 use tracing::{Instrument, Span, error, info};
 
 use crate::api::{ApiError, ApiState};
@@ -29,7 +29,8 @@ const BACKFILL_BATCH: usize = 256;
 /// Subscribers reading from disk at once. Each holds up to one completed segment in memory, so
 /// this bounds backfill memory at this many segments.
 pub const MAX_BACKFILLS: usize = 16;
-/// How long one message may wait for a subscriber to take it before the subscriber is closed.
+/// How long one message, or one batch read from disk, may wait for a subscriber to take it before
+/// the subscriber is closed. The batch bound also bounds how long a subscriber holds a permit.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
@@ -49,6 +50,8 @@ struct Feed {
     /// Shared by every subscriber; held while reading from disk.
     backfills: Arc<Semaphore>,
     permit: Option<OwnedSemaphorePermit>,
+    /// When the batch last read under the permit must have been taken.
+    batch_deadline: Option<Instant>,
     /// The lowest offset not yet yielded; `None` until a live-only feed yields its first message.
     next: Option<Offset>,
     /// Reading from disk until it reaches what has been written.
@@ -69,13 +72,22 @@ impl Feed {
         backfills: Arc<Semaphore>,
         start: Option<Offset>,
     ) -> Self {
-        let (catching_up, reader, permit, backlog) = (start.is_some(), None, None, VecDeque::new());
-        Self { live, log_dir, manifest, backfills, permit, next: start, catching_up, reader, backlog }
+        let (catching_up, reader, permit, batch_deadline, backlog) =
+            (start.is_some(), None, None, None, VecDeque::new());
+        Self { live, log_dir, manifest, backfills, permit, batch_deadline, next: start, catching_up, reader, backlog }
+    }
+
+    /// When the subscriber must have taken the next message.
+    fn send_deadline(&self) -> Instant {
+        let per_message = Instant::now() + SEND_TIMEOUT;
+        self.batch_deadline.map_or(per_message, |batch| batch.min(per_message))
     }
 
     /// The next message, or `None` once the sequencer has stopped.
     /// Error cases:
     /// - the log on disk cannot be read (see `LogReader`)
+    /// - the next live message does not follow the last one yielded, so history is missing from
+    ///   the log on disk
     async fn next(&mut self) -> anyhow::Result<Option<Arc<StreamMsg>>> {
         loop {
             if let Some(msg) = self.backlog.pop_front() {
@@ -97,6 +109,7 @@ impl Feed {
                 if !self.catching_up {
                     self.permit = None;
                 }
+                self.batch_deadline = self.permit.as_ref().map(|_| Instant::now() + SEND_TIMEOUT);
                 self.reader = reader;
                 self.backlog.extend(batch);
                 continue;
@@ -105,6 +118,13 @@ impl Feed {
                 // Already yielded from disk.
                 Ok(msg) if self.next.is_some_and(|next| msg.offset < next) => {}
                 Ok(msg) => {
+                    if let Some(next) = self.next {
+                        ensure!(
+                            msg.offset == next || msg.offset == Offset::start_of(next.seq + 1),
+                            "messages from {next} up to {} are missing from the log on disk",
+                            msg.offset
+                        );
+                    }
                     self.next = Some(msg.offset.next());
                     return Ok(Some(msg));
                 }
@@ -137,8 +157,8 @@ pub async fn stream(
     Ok(ws.on_upgrade(move |socket| forward(socket, feed).instrument(span)))
 }
 
-/// Sends the feed to one subscriber until it disconnects, stops reading for `SEND_TIMEOUT`, or the
-/// sequencer stops.
+/// Sends the feed to one subscriber until it disconnects, misses a send deadline, or the sequencer
+/// stops.
 async fn forward<S: Sink<Message> + Unpin>(mut socket: S, mut feed: Feed) {
     loop {
         let msg = match feed.next().await {
@@ -157,7 +177,7 @@ async fn forward<S: Sink<Message> + Unpin>(mut socket: S, mut feed: Feed) {
                 return;
             }
         };
-        match timeout(SEND_TIMEOUT, socket.send(Message::Text(json.into()))).await {
+        match timeout_at(feed.send_deadline(), socket.send(Message::Text(json.into()))).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return,
             Err(_) => {
@@ -195,13 +215,15 @@ fn read_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::pin::Pin;
     use std::task::{Context as TaskContext, Poll};
 
     use engine_core::command::{Command, Sequenced};
     use futures_util::FutureExt;
+    use tokio::time::timeout;
 
-    use crate::log::{CommandEntry, LogEntry};
+    use crate::log::{CommandEntry, LogEntry, segment_seq};
 
     use crate::test_support::{TestSequencer, deposit, log_messages, scratch_dir, withdraw};
 
@@ -330,7 +352,72 @@ mod tests {
         drop(live);
     }
 
+    #[tokio::test]
+    async fn a_feed_refuses_to_go_live_past_history_missing_from_disk() {
+        let dir = scratch_dir("feed-tail-gap");
+        let node = TestSequencer::start(&dir, 1024);
+        // Stop right after a rotation, so the tick below lands in the open segment.
+        let mut n = 0;
+        while node.manifest.borrow().segments.len() < 2 || newest_segment(&dir) + 1 != node.next_seq().await {
+            node.submit(deposit(1, &format!("dep-{n}"))).await;
+            n += 1;
+        }
+        // The host unlinks the newest completed segment and the open one; the writer keeps its handle.
+        let newest_listed = node.manifest.borrow().segments.last().unwrap().first_seq;
+        let survivor = node.manifest.borrow().segments.iter().rev().nth(1).unwrap().last_seq;
+        for name in fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()) {
+            if segment_seq(&name).is_some_and(|seq| seq >= newest_listed) {
+                fs::remove_file(dir.join(name)).unwrap();
+            }
+        }
+        let mut feed = Feed::new(
+            node.stream.subscribe(),
+            dir.clone(),
+            node.manifest.clone(),
+            permits(),
+            Some(Offset::start_of(0)),
+        );
+        node.submit(Command::Tick).await;
+        loop {
+            match timeout(Duration::from_secs(10), feed.next()).await.expect("an answer in time") {
+                Ok(Some(msg)) => assert!(msg.offset.seq <= survivor, "{} yielded past the gap", msg.offset),
+                Ok(None) => panic!("the stream closed"),
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backfill_batch_must_be_taken_within_one_send_timeout() {
+        let dir = scratch_dir("feed-batch-deadline");
+        let node = TestSequencer::start(&dir, 1024);
+        for n in 0..BACKFILL_BATCH {
+            node.submit(deposit(1, &format!("dep-{n}"))).await;
+        }
+        let mut feed = Feed::new(
+            node.stream.subscribe(),
+            dir.clone(),
+            node.manifest.clone(),
+            permits(),
+            Some(Offset::start_of(0)),
+        );
+        next_msg(&mut feed).await;
+        tokio::time::pause();
+        let paused_at = Instant::now();
+        tokio::time::advance(SEND_TIMEOUT).await;
+        // The rest of the batch is overdue, so the first send that waits closes the subscriber.
+        assert!(timeout(SEND_TIMEOUT, forward(Stalled, feed)).await.is_ok());
+        // No second timeout was waited out; timers round up to the next millisecond.
+        assert!(Instant::now() - paused_at < SEND_TIMEOUT + Duration::from_secs(1));
+    }
+
     // ── Helpers ──
+
+    /// The first seq of the newest segment file in `dir`.
+    fn newest_segment(dir: &Path) -> u64 {
+        let names = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap());
+        names.filter_map(|name| segment_seq(&name)).max().unwrap()
+    }
 
     /// A subscriber that never takes a message.
     struct Stalled;
