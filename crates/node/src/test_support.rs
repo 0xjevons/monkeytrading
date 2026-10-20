@@ -3,15 +3,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use engine_core::Fixed;
 use engine_core::command::Command;
 use engine_core::event::Event;
 use engine_core::types::AccountId;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use engine_core::{Engine, Fixed};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::NodeConfig;
-use crate::log::{LogReader, Offset};
+use crate::log::{LogReader, Manifest, Offset};
 use crate::sequencer::{Request, Sequencer, SequencerConfig, SignedWithdrawal, StreamMsg};
 use crate::tee::EnclaveKey;
 
@@ -25,8 +25,9 @@ pub const TRADER: AccountId = AccountId([7; 20]);
 pub struct TestSequencer {
     pub tx: mpsc::Sender<Request>,
     pub stream: broadcast::Sender<Arc<StreamMsg>>,
-    /// Kept open so custody hand-offs succeed.
-    _withdrawals: mpsc::UnboundedReceiver<SignedWithdrawal>,
+    pub manifest: watch::Receiver<Manifest>,
+    /// What custody receives.
+    pub withdrawals: mpsc::UnboundedReceiver<SignedWithdrawal>,
     task: JoinHandle<anyhow::Result<()>>,
 }
 
@@ -35,16 +36,17 @@ impl TestSequencer {
     /// The stream channel holds `stream_capacity` messages.
     pub fn start(dir: &Path, stream_capacity: usize) -> Self {
         let (stream, _) = broadcast::channel(stream_capacity);
-        let (withdrawals_tx, _withdrawals) = mpsc::unbounded_channel();
-        let mut seq =
-            Sequencer::recover(sequencer_config(dir), Arc::new(EnclaveKey::generate()), stream.clone(), withdrawals_tx)
-                .expect("sequencer recovers");
+        let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
+        let (manifest_tx, manifest) = watch::channel(Manifest::default());
+        let key = Arc::new(EnclaveKey::generate());
+        let mut seq = Sequencer::recover(sequencer_config(dir, manifest_tx), key, stream.clone(), withdrawals_tx)
+            .expect("sequencer recovers");
         if seq.is_fresh() {
             seq.genesis(&dev_config().genesis).expect("dev genesis");
         }
         let (tx, rx) = mpsc::channel(64);
         let task = tokio::spawn(seq.run(rx));
-        Self { tx, stream, _withdrawals, task }
+        Self { tx, stream, manifest, withdrawals, task }
     }
 
     /// Stops the sequencer as a shutdown does: it drains and writes a final checkpoint.
@@ -63,7 +65,7 @@ impl TestSequencer {
     /// The seq the next command will get.
     pub async fn next_seq(&self) -> u64 {
         let (reply, rx) = oneshot::channel();
-        let query = Box::new(move |e: &engine_core::Engine| {
+        let query = Box::new(move |e: &Engine| {
             let _ = reply.send(e.last_seq().map_or(0, |s| s + 1));
         });
         self.tx.send(Request::Query(query)).await.expect("sequencer running");
@@ -95,11 +97,12 @@ pub fn dev_config() -> NodeConfig {
     NodeConfig::load(Path::new(DEV_CONFIG)).expect("dev config loads")
 }
 
-/// The sequencer settings the harness runs with.
-pub fn sequencer_config(dir: &Path) -> SequencerConfig<'_> {
+/// The sequencer settings the harness runs with, publishing the manifest on `manifest`.
+pub fn sequencer_config(dir: &Path, manifest: watch::Sender<Manifest>) -> SequencerConfig<'_> {
     SequencerConfig {
         log_dir: dir,
         segment_commands: SEGMENT_COMMANDS,
+        manifest,
         checkpoint_every: CHECKPOINT_EVERY,
         chain_id: 31337,
         vault: AccountId([0; 20]),
@@ -118,7 +121,8 @@ pub fn withdraw(amount: i64) -> Command {
 
 /// Every message on disk at or after `from`, as the stream encodes them.
 pub fn log_messages(dir: &Path, from: Offset) -> Vec<String> {
-    let mut reader = LogReader::open(dir, from).expect("log opens");
+    let manifest = watch::channel(Manifest::load(dir).expect("manifest loads")).1;
+    let mut reader = LogReader::open(dir, from, manifest).expect("log opens");
     std::iter::from_fn(|| reader.next_entry().expect("log reads"))
         .map(|(offset, entry)| serde_json::to_string(&StreamMsg::new(offset, entry)).expect("message encodes"))
         .collect()

@@ -12,13 +12,13 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::Response;
 use serde::Deserialize;
-use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, watch};
 use tokio::task::spawn_blocking;
 use tracing::{Instrument, Span, error};
 
 use crate::api::{ApiError, ApiState};
-use crate::log::{LogReader, Offset};
+use crate::log::{LogReader, Manifest, Offset};
 use crate::sequencer::StreamMsg;
 
 /// Most messages read from disk per blocking call.
@@ -37,6 +37,7 @@ pub struct StreamParams {
 struct Feed {
     live: broadcast::Receiver<Arc<StreamMsg>>,
     log_dir: PathBuf,
+    manifest: watch::Receiver<Manifest>,
     /// The lowest offset not yet yielded; `None` until a live-only feed yields its first message.
     next: Option<Offset>,
     /// Reading from disk until it reaches what has been written.
@@ -50,8 +51,14 @@ impl Feed {
     /// A feed that starts at `start`, or with the next live message if `None`. `live` must be
     /// subscribed before the feed first reads the disk, so that every message is either on disk by
     /// then or still to come live.
-    fn new(live: broadcast::Receiver<Arc<StreamMsg>>, log_dir: PathBuf, start: Option<Offset>) -> Self {
-        Self { live, log_dir, next: start, catching_up: start.is_some(), reader: None, backlog: VecDeque::new() }
+    fn new(
+        live: broadcast::Receiver<Arc<StreamMsg>>,
+        log_dir: PathBuf,
+        manifest: watch::Receiver<Manifest>,
+        start: Option<Offset>,
+    ) -> Self {
+        let backlog = VecDeque::new();
+        Self { live, log_dir, manifest, next: start, catching_up: start.is_some(), reader: None, backlog }
     }
 
     /// The next message, or `None` once the sequencer has stopped.
@@ -65,9 +72,10 @@ impl Feed {
             }
             if self.catching_up {
                 let from = self.next.context("catching up with no offset to start from")?;
-                let (dir, reader) = (self.log_dir.clone(), self.reader.take());
-                let (reader, batch) =
-                    spawn_blocking(move || read_batch(&dir, from, reader)).await.context("log reader task")??;
+                let (dir, manifest, reader) = (self.log_dir.clone(), self.manifest.clone(), self.reader.take());
+                let (reader, batch) = spawn_blocking(move || read_batch(&dir, manifest, from, reader))
+                    .await
+                    .context("log reader task")??;
                 self.catching_up = reader.is_some();
                 self.reader = reader;
                 self.backlog.extend(batch);
@@ -104,7 +112,7 @@ pub async fn stream(
         (None, Some(seq)) => Some(Offset::start_of(seq)),
         (None, None) => None,
     };
-    let feed = Feed::new(s.stream.subscribe(), s.log_dir.clone(), start);
+    let feed = Feed::new(s.stream.subscribe(), s.log_dir.clone(), s.manifest.clone(), start);
     let span = Span::current();
     Ok(ws.on_upgrade(move |socket| forward(socket, feed).instrument(span)))
 }
@@ -140,12 +148,13 @@ async fn forward(mut socket: WebSocket, mut feed: Feed) {
 /// - the log cannot be read (see `LogReader`)
 fn read_batch(
     dir: &Path,
+    manifest: watch::Receiver<Manifest>,
     from: Offset,
     reader: Option<LogReader>,
 ) -> anyhow::Result<(Option<LogReader>, Vec<Arc<StreamMsg>>)> {
     let mut reader = match reader {
         Some(reader) => reader,
-        None => LogReader::open(dir, from)?,
+        None => LogReader::open(dir, from, manifest)?,
     };
     let mut batch = Vec::new();
     while batch.len() < BACKFILL_BATCH {
@@ -172,7 +181,8 @@ mod tests {
         let dir = scratch_dir("feed-from");
         let node = TestSequencer::start(&dir, 1024);
         node.submit(deposit(100, "dep-1")).await;
-        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), Some(Offset::start_of(0)));
+        let mut feed =
+            Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), Some(Offset::start_of(0)));
         // These reach both the disk and the live channel before the feed reads either.
         node.submit(withdraw(40)).await;
         for n in 0..5 {
@@ -191,7 +201,7 @@ mod tests {
         let seq = node.tick_to_checkpoint().await;
         node.submit(withdraw(40)).await;
         let after = Offset::start_of(seq);
-        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), Some(after.next()));
+        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), Some(after.next()));
 
         let expected = log_messages(&dir, after.next());
         let got = take(&mut feed, expected.len()).await;
@@ -204,7 +214,7 @@ mod tests {
     async fn a_feed_that_falls_behind_the_live_channel_catches_up_from_disk() {
         let dir = scratch_dir("feed-lag");
         let node = TestSequencer::start(&dir, 2);
-        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), None);
+        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), None);
         node.submit(deposit(100, "dep-1")).await;
         let first = next_msg(&mut feed).await;
         for n in 0..20 {
@@ -220,10 +230,10 @@ mod tests {
     async fn a_live_feed_starts_at_the_next_message_and_one_that_lags_before_it_starts_later() {
         let dir = scratch_dir("feed-live");
         let node = TestSequencer::start(&dir, 2);
-        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), None);
+        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), None);
         assert_next_is_the_next_command(&node, &mut feed).await;
 
-        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), None);
+        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), None);
         for n in 0..10 {
             node.submit(deposit(1, &format!("dep-{n}"))).await;
         }

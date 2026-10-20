@@ -76,12 +76,13 @@ Run from the repo root:
 - **`engine-core` is deterministic.** No clocks, randomness, floats, `HashMap` iteration, or IO.
   Time comes only from the sequencer's stamp, and money is `Fixed`.
 - **Replay is the audit.** The sequenced log is public, and anyone can replay it against this code
-  to check the signed state roots. A change to `engine-core` state, its serialization, or its
-  semantics changes the roots that existing logs carry, so it needs a stated plan for replaying
-  logs written by the older code. Each protocol version has a reference log in
-  `crates/core/tests/reference/`, committed once and never regenerated; CI replays every one on
-  each platform, so a rule change ships as a new protocol version with its own log
-  (`crates/core/README.md`, "Adding a protocol version").
+  to check the signed state roots and the events logged with each command. A change to
+  `engine-core` state, its serialization, its semantics, or the events a command emits changes the
+  roots or events that existing logs carry, so it needs a stated plan for replaying logs written by
+  the older code. Each protocol version has a reference log in `crates/core/tests/reference/`,
+  committed once and never regenerated; CI replays every one on each platform, so a rule change
+  ships as a new protocol version with its own log (`crates/core/README.md`, "Adding a protocol
+  version").
 - **The host is untrusted.** Inside the enclave, the host controls the clock, disk, and network.
   Code that trusts any of them names the check that bounds it, or a `TODO` that says what is
   missing.

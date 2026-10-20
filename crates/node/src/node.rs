@@ -12,7 +12,7 @@ use engine_core::types::AccountId;
 use tokio::net::TcpListener;
 use tokio::signal::ctrl_c;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{interval, timeout};
 use tracing::{error, info, warn};
@@ -20,6 +20,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::api::{ApiState, router};
 use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProvider};
+use crate::log::Manifest;
 use crate::sequencer::{Request, Sequencer, SequencerConfig};
 use crate::tee::{Attestor, ConfigfsTsm, EnclaveKey, MockAttestor, attest_key};
 use crate::{custody, feeds};
@@ -68,9 +69,11 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     let vault: AccountId = cfg.custody.vault.parse().context("custody.vault")?;
     let (stream_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
     let (withdrawals_tx, withdrawals_rx) = mpsc::unbounded_channel();
+    let (manifest_tx, manifest_rx) = watch::channel(Manifest::default());
     let seq_cfg = SequencerConfig {
         log_dir: &cfg.node.log_dir,
         segment_commands: cfg.node.segment_commands,
+        manifest: manifest_tx,
         checkpoint_every: cfg.node.checkpoint_every,
         chain_id: cfg.custody.chain_id,
         vault,
@@ -112,6 +115,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         auth: cfg.node.auth,
         dev_deposits,
         log_dir: cfg.node.log_dir.clone(),
+        manifest: manifest_rx,
     });
     info!(listen = %cfg.node.listen, "api up");
     tasks.spawn(async move { ("api", axum::serve(listener, app).await.context("api server")) });

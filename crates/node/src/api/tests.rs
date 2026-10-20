@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
-use crate::log::{MANIFEST, Manifest, Offset, SegmentedLog};
+use crate::log::{MANIFEST, Manifest, Offset, SegmentedLog, segment_seq};
 use crate::sequencer::replay;
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
 use crate::test_support::{SEGMENT_COMMANDS, TestSequencer, deposit, log_messages, scratch_dir, withdraw};
@@ -54,11 +54,11 @@ async fn dev_scenario_resume_between_messages_of_one_seq_and_replay_the_archive(
 
     let (status, body) = get(addr, &format!("/v1/archive/{MANIFEST}")).await;
     assert_eq!(status, 200);
-    let manifest: Manifest = serde_json::from_slice(&body).unwrap();
-    assert!(manifest.segments.len() >= 3, "{manifest:?}");
     let archive = scratch_dir("dev-scenario-archive");
     fs::create_dir_all(&archive).unwrap();
     fs::write(archive.join(MANIFEST), &body).unwrap();
+    let manifest = Manifest::load(&archive).unwrap();
+    assert!(manifest.segments.len() >= 3, "{manifest:?}");
     for listed in &manifest.segments {
         let (status, segment) = get(addr, &format!("/v1/archive/{}", listed.file)).await;
         assert_eq!(status, 200);
@@ -70,32 +70,47 @@ async fn dev_scenario_resume_between_messages_of_one_seq_and_replay_the_archive(
 }
 
 #[tokio::test]
-async fn the_archive_serves_the_manifest_and_completed_segments_only() {
+async fn the_archive_serves_the_enclave_manifest_and_completed_segments_only() {
     let dir = scratch_dir("archive-routes");
     let node = TestSequencer::start(&dir, 16);
     let addr = serve(&node, &dir).await;
-    for n in 0..SEGMENT_COMMANDS {
+    for n in 0..2 * SEGMENT_COMMANDS {
         node.submit(deposit(1, &format!("dep-{n}"))).await;
     }
-    let manifest = Manifest::load(&dir).unwrap();
+    let manifest = node.manifest.borrow().clone();
     let completed = &manifest.segments[0];
     let (status, body) = get(addr, &format!("/v1/archive/{}", completed.file)).await;
     assert_eq!((status, body), (200, fs::read(dir.join(&completed.file)).unwrap()));
 
-    let mut files: Vec<_> =
-        fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
-    files.sort();
-    let open_segment = files.iter().rev().find(|f| f.ends_with(".jsonl")).unwrap();
-    assert!(!manifest.segments.iter().any(|s| s.file == *open_segment));
-    for path in [format!("/v1/archive/{open_segment}"), "/v1/archive/nothing.jsonl".into(), "/v1/archive/..%2Fx".into()]
+    // The host's copy of the manifest is not what gets served or trusted.
+    let listed = fs::read(dir.join(MANIFEST)).unwrap();
+    let forged = br#"{"file":"/etc/hosts","first_seq":999,"last_seq":999,"bytes":1,"sha256":"00"}"#;
+    fs::write(dir.join(MANIFEST), [listed.as_slice(), forged, b"\n"].concat()).unwrap();
+    assert_eq!(get(addr, &format!("/v1/archive/{MANIFEST}")).await, (200, listed));
+
+    let open_segment = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .find(|name| segment_seq(name).is_some_and(|seq| manifest.get(seq).is_none()))
+        .unwrap();
+    for path in
+        [format!("/v1/archive/{open_segment}"), "/v1/archive/nothing.jsonl".into(), "/v1/archive/%2Fetc%2Fhosts".into()]
     {
         assert_eq!(get(addr, &path).await.0, 404, "{path}");
     }
 
-    let empty = scratch_dir("archive-empty");
-    let addr = serve(&node, &empty).await;
-    let (status, body) = get(addr, &format!("/v1/archive/{MANIFEST}")).await;
-    assert_eq!((status, serde_json::from_slice::<Manifest>(&body).unwrap()), (200, Manifest::default()));
+    fs::remove_file(dir.join(&manifest.segments[1].file)).unwrap();
+    assert_eq!(get(addr, &format!("/v1/archive/{}", manifest.segments[1].file)).await.0, 500);
+}
+
+#[tokio::test]
+async fn the_archive_serves_only_what_the_enclave_manifest_lists() {
+    let dir = scratch_dir("archive-empty");
+    let node = TestSequencer::start(&dir, 16);
+    // Segment 0 is complete on disk, but this manifest lists nothing.
+    let addr = serve_with(&node, &dir, watch::channel(Manifest::default()).1).await;
+    assert_eq!(get(addr, &format!("/v1/archive/{MANIFEST}")).await, (200, Vec::new()));
+    assert_eq!(get(addr, "/v1/archive/00000000000000000000.jsonl").await.0, 404);
 }
 
 #[tokio::test]
@@ -114,6 +129,11 @@ async fn the_stream_refuses_after_and_from_together_or_a_malformed_offset() {
 
 /// Serves the API for `node`, with `dir` as its log directory, on a free local port.
 async fn serve(node: &TestSequencer, dir: &Path) -> SocketAddr {
+    serve_with(node, dir, node.manifest.clone()).await
+}
+
+/// Serves the API for `node`, with `dir` as its log directory and `manifest` as the writer's.
+async fn serve_with(node: &TestSequencer, dir: &Path, manifest: watch::Receiver<Manifest>) -> SocketAddr {
     let attestation = Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate()).unwrap());
     let app = router(ApiState {
         tx: node.tx.clone(),
@@ -122,6 +142,7 @@ async fn serve(node: &TestSequencer, dir: &Path) -> SocketAddr {
         auth: AuthMode::None,
         dev_deposits: true,
         log_dir: dir.to_owned(),
+        manifest,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

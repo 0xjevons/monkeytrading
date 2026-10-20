@@ -65,7 +65,7 @@ pub struct NodeConfig {
 #[serde(deny_unknown_fields)]
 pub struct NodeSection {
     pub listen: SocketAddr,
-    /// The log's segment files and `manifest.json`. Completed segments and the manifest are the
+    /// The log's segment files and `manifest.jsonl`. Completed segments and the manifest are the
     /// public archive, served at `/v1/archive/`; every segment is kept, since recovery replays the
     /// log from genesis.
     pub log_dir: PathBuf,
@@ -187,7 +187,7 @@ impl NodeConfig {
 mod tests {
     use super::*;
 
-    const DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/dev.toml");
+    use crate::test_support::DEV_CONFIG as DEV;
 
     #[test]
     fn the_committed_dev_config_loads() {

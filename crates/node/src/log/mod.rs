@@ -7,6 +7,7 @@
 mod reader;
 pub use reader::LogReader;
 mod segments;
+pub(crate) use segments::segment_seq;
 pub use segments::{LogWriter, MANIFEST, Manifest, SegmentInfo, SegmentedLog};
 
 use std::fmt;
@@ -117,6 +118,13 @@ pub fn offset_of(prev: Option<Offset>, entry: &LogEntry) -> anyhow::Result<Offse
         (_, Some(prev)) => Ok(prev.next()),
         (_, None) => bail!("log entry before the first command of its segment"),
     }
+}
+
+/// The offset of the last of `entries`, a whole log in order.
+/// Error cases:
+/// - a withdrawal or checkpoint comes before any command
+pub fn last_offset(entries: &[LogEntry]) -> anyhow::Result<Option<Offset>> {
+    entries.iter().try_fold(None, |prev, entry| offset_of(prev, entry).map(Some))
 }
 
 /// Reads every entry of a single log file; a missing file is an empty log.

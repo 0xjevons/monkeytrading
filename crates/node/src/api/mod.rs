@@ -23,12 +23,13 @@ use engine_core::types::{AccountId, MarketId, OrderId};
 use engine_core::{Engine, Fixed};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, info_span};
 
 use crate::clock::now_ms;
 use crate::config::AuthMode;
+use crate::log::Manifest;
 use crate::sequencer::{self, StreamMsg};
 use crate::tee::Attestation;
 
@@ -51,6 +52,8 @@ pub struct ApiState {
     pub auth: AuthMode,
     pub dev_deposits: bool,
     pub log_dir: PathBuf,
+    /// The log writer's manifest, held in enclave memory.
+    pub manifest: watch::Receiver<Manifest>,
 }
 
 #[derive(Serialize)]

@@ -1,7 +1,11 @@
 use super::*;
+use std::fs;
+use std::path::PathBuf;
 
-use crate::log::Manifest;
-use crate::test_support::{SEGMENT_COMMANDS, TestSequencer, log_messages, scratch_dir, sequencer_config};
+use crate::log::{Manifest, segment_seq};
+use crate::test_support::{
+    SEGMENT_COMMANDS, TRADER, TestSequencer, deposit, log_messages, scratch_dir, sequencer_config, withdraw,
+};
 
 fn tick(seq: u64) -> LogEntry {
     LogEntry::Command(CommandEntry { sequenced: Sequenced { seq, ts: 0, cmd: Command::Tick }, events: None })
@@ -84,7 +88,8 @@ fn custody_gets_a_withdrawal_only_once_its_log_entry_is_flushed() {
     let (stream, _) = broadcast::channel(16);
     let (withdrawals_tx, mut withdrawals) = mpsc::unbounded_channel();
     let key = Arc::new(EnclaveKey::generate());
-    let mut seq = Sequencer::recover(sequencer_config(&dir), key, stream, withdrawals_tx).unwrap();
+    let manifest = watch::channel(Manifest::default()).0;
+    let mut seq = Sequencer::recover(sequencer_config(&dir, manifest), key, stream, withdrawals_tx).unwrap();
     seq.sequence(deposit(100, "dep-1")).unwrap();
     seq.sequence(withdraw(40)).unwrap();
     assert!(withdrawals.try_recv().is_err());
@@ -149,12 +154,53 @@ async fn a_restarted_sequencer_continues_the_log_offsets_and_segments() {
     assert!(Manifest::load(&dir).unwrap().segments.len() >= 2);
 }
 
-// ── Helpers ──
-
-fn deposit(amount: i64, chain_ref: &str) -> Command {
-    crate::test_support::deposit(amount, chain_ref)
+#[tokio::test]
+async fn replay_refuses_an_approved_withdrawal_whose_signed_entry_is_missing() {
+    let dir = scratch_dir("seq-missing-withdrawal");
+    let node = TestSequencer::start(&dir, 16);
+    node.submit(deposit(100, "dep-1")).await;
+    node.submit(withdraw(40)).await;
+    node.submit(Command::Tick).await;
+    node.stop().await;
+    let mut entries = SegmentedLog::open(&dir).unwrap().entries;
+    let at = entries.iter().position(|e| matches!(e, LogEntry::Withdrawal(_))).unwrap();
+    entries.remove(at);
+    let err = replay(&entries).err().unwrap();
+    assert!(format!("{err:#}").contains("has no signed entry"), "{err:#}");
 }
 
-fn withdraw(amount: i64) -> Command {
-    crate::test_support::withdraw(amount)
+#[tokio::test]
+async fn a_restart_signs_a_withdrawal_the_log_ends_before_and_hands_it_to_custody() {
+    let dir = scratch_dir("seq-resign");
+    let mut node = TestSequencer::start(&dir, 16);
+    node.submit(deposit(100, "dep-1")).await;
+    node.submit(withdraw(40)).await;
+    assert_eq!(node.withdrawals.try_recv().unwrap().nonce, 1);
+    node.stop().await;
+    // As if the process died after the withdraw command's line reached disk and before the rest.
+    let segment = last_segment(&dir);
+    let text = fs::read_to_string(&segment).unwrap();
+    let command = text.find(r#""cmd":{"type":"withdraw""#).unwrap();
+    fs::write(&segment, &text[..command + text[command..].find('\n').unwrap() + 1]).unwrap();
+    let approved = (TRADER, Fixed::from_int(40), 1);
+    assert_eq!(replay(&SegmentedLog::open(&dir).unwrap().entries).unwrap().unsigned, [approved]);
+
+    let mut node = TestSequencer::start(&dir, 16);
+    let signed = node.withdrawals.try_recv().unwrap();
+    assert_eq!((signed.account, signed.amount, signed.nonce), approved);
+    node.stop().await;
+    assert!(replay(&SegmentedLog::open(&dir).unwrap().entries).unwrap().unsigned.is_empty());
+}
+
+// ── Helpers ──
+
+/// The segment file the log appends to.
+fn last_segment(dir: &Path) -> PathBuf {
+    let mut names: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| segment_seq(name).is_some())
+        .collect();
+    names.sort();
+    dir.join(names.last().unwrap())
 }

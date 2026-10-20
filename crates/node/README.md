@@ -53,15 +53,15 @@ cargo run -p engine-node -- run --config config/dev.toml
 cargo run -p engine-node -- replay --log data/dev/log
 
 # Download the archive: the manifest, then each segment it lists
-curl -o archive/manifest.json http://127.0.0.1:8080/v1/archive/manifest.json
-jq -r '.segments[].file' archive/manifest.json |
+curl -o archive/manifest.jsonl http://127.0.0.1:8080/v1/archive/manifest.jsonl
+jq -r '.file' archive/manifest.jsonl |
   xargs -I{} curl -o archive/{} http://127.0.0.1:8080/v1/archive/{}
 ```
 
 Endpoints: `GET /v1/health`, `GET /v1/attestation`, `GET /v1/markets`, `GET /v1/house`,
 `GET /v1/accounts/{address}`, `POST /v1/orders`, `POST /v1/orders/cancel`, `POST /v1/withdrawals`,
 `POST /v1/dev/deposit` (mock custody only), `GET /v1/stream` (WebSocket), and
-`GET /v1/archive/{file}` (`manifest.json` or a segment it lists).
+`GET /v1/archive/{file}` (`manifest.jsonl` or a segment it lists).
 
 `/v1/stream` is live from now by default. `?from=<seq>` starts at the first message of `seq`
 (`from=0` is the whole log), and `?after=<seq>:<index>` resumes after the `offset` of the last
@@ -69,9 +69,12 @@ message received. Each message carries its `offset`: the command of a seq is ind
 withdrawals, then any checkpoint.
 
 The log is a directory (`node.log_dir`) of segment files named for their first seq, plus
-`manifest.json`. A log written as one file before segments existed continues as the first segment:
-move it to `<log_dir>/00000000000000000000.jsonl`. Every segment is kept, since recovery replays
-the log from genesis.
+`manifest.jsonl`, which gets one line per completed segment with its seq range, size, and SHA-256.
+The archive serves the manifest the node holds in memory, not the copy on disk, and backfill checks
+each completed segment against it before streaming from it. A log written as one file before
+segments existed continues as the first segment: move it to
+`<log_dir>/00000000000000000000.jsonl`. Every segment is kept, since recovery replays the log from
+genesis.
 
 ## Configuration
 

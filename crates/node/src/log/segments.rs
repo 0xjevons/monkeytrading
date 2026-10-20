@@ -1,9 +1,9 @@
 //! The log on disk: a directory of segment files, each named for the seq of its first command
-//! (`00000000000000000000.jsonl`), and `manifest.json`. The writer appends to the last segment and
-//! starts a new one at a command once the current one holds `segment_commands` commands, so a
+//! (`00000000000000000000.jsonl`), and `manifest.jsonl`. The writer appends to the last segment
+//! and starts a new one at a command once the current one holds `segment_commands` commands, so a
 //! seq's entries never straddle two segments. A completed segment is never written again; the
-//! manifest records its seq range, size, and SHA-256. Completed segments and the manifest are the
-//! public archive.
+//! manifest gets one line for it with its seq range, size, and SHA-256. Completed segments and the
+//! manifest are the public archive.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -12,14 +12,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
+use tracing::info;
 
 use crate::log::{LogEntry, parse_lines};
 
-pub const MANIFEST: &str = "manifest.json";
+pub const MANIFEST: &str = "manifest.jsonl";
 
 /// The completed segments, oldest first.
-#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Manifest {
     pub segments: Vec<SegmentInfo>,
 }
@@ -41,6 +42,8 @@ pub struct SegmentedLog {
     /// Every entry, oldest first.
     pub entries: Vec<LogEntry>,
     manifest: Manifest,
+    /// Bytes of the manifest file up to the end of its last whole line.
+    manifest_len: u64,
     /// The last segment, when the manifest does not list it yet.
     open: Option<Segment>,
 }
@@ -49,7 +52,8 @@ pub struct SegmentedLog {
 pub struct LogWriter {
     dir: PathBuf,
     segment_commands: u64,
-    manifest: Manifest,
+    /// Published for the archive and for stream readers, which trust it over the host's copy.
+    manifest: watch::Sender<Manifest>,
     open: Option<(Segment, BufWriter<File>)>,
 }
 
@@ -65,27 +69,47 @@ struct Segment {
 impl Manifest {
     /// Reads the manifest in `dir`; a missing one lists nothing.
     /// Error cases:
-    /// - the file exists but cannot be read, or is not a valid manifest
+    /// - the file exists but cannot be read, or a whole line is not a valid listing
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
-        let path = dir.join(MANIFEST);
-        match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
+        Self::read(dir).map(|(manifest, _)| manifest)
     }
 
-    /// Replaces the manifest in `dir` atomically and durably.
+    /// The listing of the completed segment whose first command is `first_seq`.
+    pub fn get(&self, first_seq: u64) -> Option<&SegmentInfo> {
+        let i = self.segments.binary_search_by_key(&first_seq, |s| s.first_seq).ok()?;
+        Some(&self.segments[i])
+    }
+
+    /// The manifest as it is stored: one JSON line per completed segment.
     /// Error cases:
-    /// - the temporary file cannot be written or synced, or renamed over the manifest
-    fn store(&self, dir: &Path) -> anyhow::Result<()> {
-        let tmp = dir.join(format!("{MANIFEST}.tmp"));
-        let mut file = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        serde_json::to_writer_pretty(&mut file, self).context("writing manifest")?;
-        file.write_all(b"\n").context("writing manifest")?;
-        file.sync_all().context("syncing manifest")?;
-        fs::rename(&tmp, dir.join(MANIFEST)).context("replacing manifest")?;
-        File::open(dir).and_then(|d| d.sync_all()).with_context(|| format!("syncing {}", dir.display()))
+    /// - a listing cannot be encoded
+    pub fn to_jsonl(&self) -> anyhow::Result<Vec<u8>> {
+        self.segments.iter().try_fold(Vec::new(), |mut out, listed| {
+            out.extend(listing_line(listed)?);
+            Ok(out)
+        })
+    }
+
+    /// The manifest in `dir`, and the length of its whole lines. A last line with no line break,
+    /// which a crash while listing leaves, is left out: the segment it lists is then still the last
+    /// one, and is listed again when the next segment starts.
+    /// Error cases:
+    /// - the file exists but cannot be read, or a whole line is not a valid listing
+    fn read(dir: &Path) -> anyhow::Result<(Self, u64)> {
+        let path = dir.join(MANIFEST);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Self::default(), 0)),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        let segments = bytes[..whole]
+            .split(|b| *b == b'\n')
+            .enumerate()
+            .filter(|(_, line)| !line.trim_ascii().is_empty())
+            .map(|(n, line)| serde_json::from_slice(line).with_context(|| format!("{} line {}", path.display(), n + 1)))
+            .collect::<anyhow::Result<_>>()?;
+        Ok((Self { segments }, whole as u64))
     }
 }
 
@@ -100,7 +124,7 @@ impl SegmentedLog {
     /// - a segment other than the last is missing from the manifest, or an empty last segment is
     ///   not named for the next seq
     pub fn open(dir: &Path) -> anyhow::Result<Self> {
-        let manifest = Manifest::load(dir)?;
+        let (manifest, manifest_len) = Manifest::read(dir)?;
         let files = list_segments(dir)?;
         ensure!(
             manifest.segments.len() <= files.len(),
@@ -131,15 +155,25 @@ impl SegmentedLog {
             let next_seq = entries.iter().rev().find_map(command_seq).map_or(0, |s| s + 1);
             ensure!(segment.first_seq == next_seq, "empty last segment is not named for the next seq {next_seq}");
         }
-        Ok(Self { dir: dir.to_owned(), entries, manifest, open })
+        Ok(Self { dir: dir.to_owned(), entries, manifest, manifest_len, open })
     }
 
     /// A writer that appends to the last segment, or starts a new one at the next command if the
-    /// manifest lists the last one.
+    /// manifest lists the last one. It publishes the manifest on `manifest`, starting now.
     /// Error cases:
-    /// - the directory cannot be created, or the last segment cannot be opened for appending
-    pub fn into_writer(self, segment_commands: u64) -> anyhow::Result<LogWriter> {
+    /// - the directory cannot be created, or the manifest cannot be trimmed to its whole lines
+    /// - the last segment cannot be opened for appending
+    pub fn into_writer(self, segment_commands: u64, manifest: watch::Sender<Manifest>) -> anyhow::Result<LogWriter> {
         fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
+        // Drop a listing a crash cut short, so the next one starts on its own line.
+        let manifest_path = self.dir.join(MANIFEST);
+        if fs::metadata(&manifest_path).is_ok_and(|m| m.len() > self.manifest_len) {
+            OpenOptions::new()
+                .write(true)
+                .open(&manifest_path)
+                .and_then(|f| f.set_len(self.manifest_len))
+                .with_context(|| format!("trimming {}", manifest_path.display()))?;
+        }
         let open = match self.open {
             Some(segment) => {
                 let path = self.dir.join(segment_name(segment.first_seq));
@@ -151,7 +185,8 @@ impl SegmentedLog {
             }
             None => None,
         };
-        Ok(LogWriter { dir: self.dir, segment_commands, manifest: self.manifest, open })
+        manifest.send_replace(self.manifest);
+        Ok(LogWriter { dir: self.dir, segment_commands, manifest, open })
     }
 }
 
@@ -190,14 +225,23 @@ impl LogWriter {
     /// Syncs and lists the current segment, if any, then creates the segment for `first_seq`.
     /// The new file exists only once the old one is complete, which is what `LogReader` relies on.
     /// Error cases:
-    /// - the current segment cannot be flushed or synced, or the manifest cannot be stored
+    /// - the current segment cannot be flushed or synced, or its listing cannot be stored
     /// - the new segment cannot be created, or already exists
     fn start_segment(&mut self, first_seq: u64) -> anyhow::Result<()> {
         if let Some((segment, out)) = self.open.take() {
             let file = out.into_inner().map_err(|e| e.into_error()).context("flushing log segment")?;
             file.sync_all().context("syncing log segment")?;
-            self.manifest.segments.push(segment.info());
-            self.manifest.store(&self.dir)?;
+            let listed = segment.info();
+            append_listing(&self.dir, &listed)?;
+            info!(
+                file = %listed.file,
+                first_seq = listed.first_seq,
+                last_seq = listed.last_seq,
+                bytes = listed.bytes,
+                sha256 = %listed.sha256,
+                "log segment completed"
+            );
+            self.manifest.send_modify(|m| m.segments.push(listed));
         }
         let path = self.dir.join(segment_name(first_seq));
         let file = OpenOptions::new()
@@ -275,13 +319,41 @@ pub(super) fn list_segments(dir: &Path) -> anyhow::Result<Vec<(u64, PathBuf)>> {
     Ok(segments)
 }
 
+/// Appends one listing to the manifest in `dir`, durably.
+/// Error cases:
+/// - the manifest cannot be opened, written, or synced
+fn append_listing(dir: &Path, listed: &SegmentInfo) -> anyhow::Result<()> {
+    let path = dir.join(MANIFEST);
+    let created = !path.exists();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.write_all(&listing_line(listed)?).context("writing manifest")?;
+    file.sync_all().context("syncing manifest")?;
+    if created {
+        File::open(dir).and_then(|d| d.sync_all()).with_context(|| format!("syncing {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// One manifest line.
+/// Error cases:
+/// - the listing cannot be encoded
+fn listing_line(listed: &SegmentInfo) -> anyhow::Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(listed).context("encoding segment listing")?;
+    line.push(b'\n');
+    Ok(line)
+}
+
 /// The file name of the segment whose first command is `first_seq`.
 fn segment_name(first_seq: u64) -> String {
     format!("{first_seq:020}.jsonl")
 }
 
 /// The first seq a segment file name stands for, if it is one.
-fn segment_seq(name: &str) -> Option<u64> {
+pub(crate) fn segment_seq(name: &str) -> Option<u64> {
     let seq = name.strip_suffix(".jsonl")?.parse().ok()?;
     (segment_name(seq) == name).then_some(seq)
 }

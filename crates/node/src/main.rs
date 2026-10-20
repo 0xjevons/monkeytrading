@@ -49,6 +49,12 @@ async fn main() -> anyhow::Result<()> {
                 replayed.checkpoints,
                 hex::encode(replayed.engine.state_root())
             );
+            if !replayed.unsigned.is_empty() {
+                println!(
+                    "note: the log ends before signing {} approved withdrawal(s); the node signs them when it restarts",
+                    replayed.unsigned.len()
+                );
+            }
             Ok(())
         }
     }
