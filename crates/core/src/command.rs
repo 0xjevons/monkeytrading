@@ -6,9 +6,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::Fixed;
+use crate::auth::{ClientAuth, RequestAuth};
 use crate::market::MarketSpec;
 use crate::params::ProtocolParams;
 use crate::price::SourceQuote;
+use crate::protocol::ProtocolVersion;
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,6 +36,8 @@ pub enum Command {
     Withdraw {
         account: AccountId,
         amount: Fixed,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RequestAuth>,
     },
     /// House capital in or out, applied at most once per `chain_ref`. Equity issuance against it
     /// is not designed yet; for now this only moves house NAV.
@@ -45,12 +49,14 @@ pub enum Command {
     CancelOrder {
         account: AccountId,
         order_id: OrderId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RequestAuth>,
     },
     Admin(AdminCommand),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OrderKind {
     /// Fill now at the live price. `quoted` is the price the client saw.
     /// Quotes are indicative, not firm: the fill happens at the live price,
@@ -91,6 +97,12 @@ pub enum AdminCommand {
         market: MarketId,
         reduce_only: bool,
     },
+    /// Records how client requests are authorised from `V3`. A log records it once.
+    SetClientAuth(ClientAuth),
+    /// Applies `version`'s rules from this seq on. Versions only move forward.
+    ActivateProtocol {
+        version: ProtocolVersion,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -101,6 +113,7 @@ pub struct Sequenced {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderRequest {
     pub account: AccountId,
     /// Client-chosen id, echoed back so clients can match responses.
@@ -112,4 +125,29 @@ pub struct OrderRequest {
     /// Only reduce an existing position, never open or flip it.
     #[serde(default)]
     pub reduce_only: bool,
+    /// The account's signature, nonce, and expiry, where the log's rules require them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<RequestAuth>,
+}
+
+/// A client's request to cancel a resting order, as it signs and posts it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelRequest {
+    pub account: AccountId,
+    pub order_id: OrderId,
+    /// The account's signature, nonce, and expiry, where the log's rules require them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<RequestAuth>,
+}
+
+/// A client's request to withdraw, as it signs and posts it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WithdrawalRequest {
+    pub account: AccountId,
+    pub amount: Fixed,
+    /// The account's signature, nonce, and expiry, where the log's rules require them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<RequestAuth>,
 }

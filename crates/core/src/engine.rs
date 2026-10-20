@@ -2,7 +2,8 @@
 //!
 //! Single-threaded and deterministic. Time comes only from the sequencer's stamp. This file holds
 //! the state, dispatch, time, and prices; funds and financing live in `funds.rs`, admin and stress
-//! in `admin.rs`, orders and pricing in `execution.rs`, and close-outs in `closeout.rs`.
+//! in `admin.rs`, client request auth in `auth.rs`, orders and pricing in `execution.rs`, and
+//! close-outs in `closeout.rs`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -11,11 +12,13 @@ use sha3::{Digest, Keccak256};
 
 use crate::Fixed;
 use crate::account::Account;
+use crate::auth::ClientAuth;
 use crate::command::{Command, Sequenced};
 use crate::event::Event;
 use crate::market::MarketSpec;
 use crate::params::ProtocolParams;
 use crate::price::{MAX_QUOTE_LEAD_MS, SourceQuote, compute_index};
+use crate::protocol::ProtocolVersion;
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
 
 /// Clamp on a single markout, so one wild print cannot dominate an account's toxicity score.
@@ -46,6 +49,17 @@ pub struct Engine {
     pub(crate) markouts: VecDeque<Markout>,
     pub(crate) last_seq: Option<u64>,
     pub(crate) now: Millis,
+    // The fields below are left out of the encoding while they hold their defaults, so a log that
+    // never activates a protocol version keeps the roots it was written with.
+    /// The rules in force.
+    #[serde(default, skip_serializing_if = "ProtocolVersion::is_v2")]
+    pub(crate) protocol_version: ProtocolVersion,
+    /// How client requests are authorised from `V3`; recorded once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) client_auth: Option<ClientAuth>,
+    /// Each account's next request nonce; an account missing here is at 0.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) request_nonces: BTreeMap<AccountId, u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,10 +144,12 @@ impl Engine {
             Command::Prices { market, quotes } => self.on_prices(*market, quotes, &mut events),
             Command::Tick => self.refresh_all_sessions(&mut events),
             Command::Deposit { account, amount, chain_ref } => self.deposit(*account, *amount, chain_ref, &mut events),
-            Command::Withdraw { account, amount } => self.withdraw(*account, *amount, &mut events),
+            Command::Withdraw { account, amount, auth } => self.withdraw(*account, *amount, auth.as_ref(), &mut events),
             Command::HouseCapital { amount, chain_ref } => self.house_capital(*amount, chain_ref, &mut events),
             Command::PlaceOrder(req) => self.place_order(req, &mut events),
-            Command::CancelOrder { account, order_id } => self.cancel_order(*account, *order_id, &mut events),
+            Command::CancelOrder { account, order_id, auth } => {
+                self.cancel_order(*account, *order_id, auth.as_ref(), &mut events)
+            }
             Command::Admin(cmd) => match self.admin(cmd, &mut events) {
                 Ok(()) => events.push(Event::AdminApplied),
                 Err(reason) => events.push(Event::AdminRejected { reason }),
@@ -167,6 +183,21 @@ impl Engine {
         self.params.as_ref()
     }
 
+    /// The protocol version in force.
+    pub fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
+    /// How client requests are authorised from `V3`, once recorded.
+    pub fn client_auth(&self) -> Option<&ClientAuth> {
+        self.client_auth.as_ref()
+    }
+
+    /// The nonce `account`'s next signed request must carry.
+    pub fn next_request_nonce(&self, account: AccountId) -> u64 {
+        self.request_nonces.get(&account).copied().unwrap_or(0)
+    }
+
     /// Every listed market, by id.
     pub fn markets(&self) -> &BTreeMap<MarketId, MarketState> {
         &self.markets
@@ -175,6 +206,11 @@ impl Engine {
     /// Every account that has ever been credited, by id.
     pub fn accounts(&self) -> &BTreeMap<AccountId, Account> {
         &self.accounts
+    }
+
+    /// Whether the custody reference `chain_ref` has been credited.
+    pub fn is_credited(&self, chain_ref: &str) -> bool {
+        self.credited_refs.contains(chain_ref)
     }
 
     /// House cash, before clients' unrealised PnL.

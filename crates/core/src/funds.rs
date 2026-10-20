@@ -5,6 +5,8 @@
 
 use crate::Fixed;
 use crate::account::Position;
+use crate::auth::RequestAuth;
+use crate::eip712::withdrawal_hash;
 use crate::engine::Engine;
 use crate::event::{Event, Reject};
 use crate::types::{AccountId, MarketId};
@@ -28,15 +30,26 @@ impl Engine {
         events.push(Event::Deposited { account, amount });
     }
 
-    /// Approves a withdrawal of free cash: no more than the balance, and no more than equity above
-    /// the margin requirement. Approval bumps the account's withdrawal nonce, which the enclave
-    /// signs with the payout.
-    pub(crate) fn withdraw(&mut self, account: AccountId, amount: Fixed, events: &mut Vec<Event>) {
+    /// Authorises the request, then approves a withdrawal of free cash: no more than the balance,
+    /// and no more than equity above the margin requirement. Approval bumps the account's
+    /// withdrawal nonce, which the enclave signs with the payout.
+    pub(crate) fn withdraw(
+        &mut self,
+        account: AccountId,
+        amount: Fixed,
+        auth: Option<&RequestAuth>,
+        events: &mut Vec<Event>,
+    ) {
+        let authorised = self.authorise(account, auth, |domain, auth| {
+            withdrawal_hash(domain, account, amount, auth.nonce, auth.expires_at)
+        });
         let available = self.accounts.get(&account).map_or(Fixed::ZERO, |acct| {
             let (equity, margin) = self.equity_and_margin(acct, None);
             acct.balance.min(equity - margin).max(Fixed::ZERO)
         });
-        let reason = if !amount.is_valid_input() {
+        let reason = if let Err(reason) = authorised {
+            Some(reason)
+        } else if !amount.is_valid_input() {
             Some(Reject::InvalidAmount)
         } else if amount > available {
             Some(Reject::InsufficientFunds { available })

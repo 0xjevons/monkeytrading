@@ -11,6 +11,9 @@ repository = "https://github.com/0xjevons/monkeytrading"
 [workspace.dependencies]
 engine-core = { path = "crates/core", version = "0.1.0" }
 
+alloy-dyn-abi = { version = "1.7.3", default-features = false, features = ["std", "eip712"] }
+alloy-primitives = { version = "1.7.3", default-features = false, features = ["std", "serde"] }
+alloy-sol-types = { version = "1.7.3", default-features = false, features = ["std"] }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
@@ -19,7 +22,7 @@ clap = { version = "4", features = ["derive", "env"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hex = "0.4"
 humantime-serde = "1"
-k256 = { version = "0.13", features = ["ecdsa"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 proptest = { version = "1.12", default-features = false, features = ["std"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +34,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.8"
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

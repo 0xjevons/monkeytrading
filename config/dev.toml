@@ -13,6 +13,8 @@ log_dir = "data/dev/log"
 segment_commands = 1000
 checkpoint_every = 1000
 tick = "250ms"
+# Recorded in the log on first start, with the custody chain id and vault under
+# "eip712"; changing it needs a fresh log.
 auth = "none"
 
 [logging]

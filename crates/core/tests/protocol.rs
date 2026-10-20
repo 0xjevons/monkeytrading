@@ -90,6 +90,7 @@ fn orders_before_genesis_or_for_unknown_markets_are_rejected() {
             qty: f("1"),
             kind: OrderKind::Market { quoted: f("1"), max_slippage_bps: None },
             reduce_only: false,
+            auth: None,
         })
     };
     let ev = engine.apply(&Sequenced { seq: 0, ts: 0, cmd: order(BTC) }).unwrap();

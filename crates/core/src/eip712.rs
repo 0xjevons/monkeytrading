@@ -1,0 +1,200 @@
+//! EIP-712 typed-data signatures: the domain, the request types clients sign, and signer recovery.
+//!
+//! A client signs each order, cancel, and withdrawal with its account key, as a wallet does with
+//! `eth_signTypedData_v4`. The domain names the custody chain and vault, and each request carries
+//! the account's next nonce and an expiry, so one signature authorises one request on one
+//! deployment, accepted within a few minutes at most; an order it places then rests as usual. The
+//! expiry is checked against sequenced time, which follows the host clock (see
+//! `MAX_EXPIRY_AHEAD_MS`). Amounts and prices are `int128` in `Fixed`'s raw units (9 decimals);
+//! `expiresAt` is milliseconds since the Unix epoch, the unit of sequenced time; sides and order
+//! kinds are their JSON names. `crates/core/tests/fixtures/eip712.json` holds the
+//! typed data and signatures of each request type, and `examples/sign_request.rs` signs a request
+//! body for the API.
+
+pub use alloy_primitives::B256;
+use alloy_primitives::{Address, FixedBytes, U256};
+pub use alloy_sol_types::Eip712Domain;
+use alloy_sol_types::SolStruct;
+use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey, VerifyingKey};
+use sha3::{Digest, Keccak256};
+
+use crate::Fixed;
+use crate::command::{OrderKind, OrderRequest};
+use crate::types::{AccountId, Millis, OrderId, Side};
+
+/// The domain name every request is signed under.
+pub const DOMAIN_NAME: &str = "monkeytrading";
+/// The version of the request types below, which `V3` signs under. A protocol version that
+/// changes a request type adds new types under a new domain version and keeps these.
+pub const DOMAIN_VERSION: &str = "1";
+
+/// A 65-byte `r || s || v` secp256k1 signature with `v` in {27, 28}, as wallets return it.
+pub type Signature = FixedBytes<65>;
+
+/// The structs clients sign, named apart from the engine's own types.
+mod typed {
+    use alloy_sol_types::sol;
+
+    sol! {
+        /// `Command::PlaceOrder`. `price` is a market order's quoted price, or a limit or stop
+        /// order's trigger price. `hasMaxSlippage` is false when the order takes the market's bound.
+        struct OrderRequest {
+            address account;
+            uint64 nonce;
+            int64 expiresAt;
+            uint64 clientId;
+            uint32 market;
+            string side;
+            int128 qty;
+            string kind;
+            int128 price;
+            bool hasMaxSlippage;
+            int64 maxSlippageBps;
+            bool reduceOnly;
+        }
+
+        /// `Command::CancelOrder`.
+        struct CancelRequest {
+            address account;
+            uint64 nonce;
+            int64 expiresAt;
+            uint64 orderId;
+        }
+
+        /// `Command::Withdraw`.
+        struct WithdrawalRequest {
+            address account;
+            uint64 nonce;
+            int64 expiresAt;
+            int128 amount;
+        }
+    }
+}
+
+/// The domain of the vault `vault` on chain `chain_id`.
+pub fn domain(chain_id: u64, vault: AccountId) -> Eip712Domain {
+    Eip712Domain::new(
+        Some(DOMAIN_NAME.into()),
+        Some(DOMAIN_VERSION.into()),
+        Some(U256::from(chain_id)),
+        Some(Address::from(vault.0)),
+        None,
+    )
+}
+
+/// The digest a client signs to place `req` with `nonce`, until `expires_at`.
+pub fn order_hash(domain: &Eip712Domain, req: &OrderRequest, nonce: u64, expires_at: Millis) -> B256 {
+    // Every field is named, so a field added to `OrderRequest` fails to compile until it is signed.
+    let OrderRequest { account, client_id, market, side, qty, kind, reduce_only, auth: _ } = req;
+    let (kind, price, max_slippage_bps) = match *kind {
+        OrderKind::Market { quoted, max_slippage_bps } => ("market", quoted, max_slippage_bps),
+        OrderKind::Limit { price } => ("limit", price, None),
+        OrderKind::Stop { price } => ("stop", price, None),
+    };
+    let side = match side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    };
+    typed::OrderRequest {
+        account: Address::from(account.0),
+        nonce,
+        expiresAt: expires_at,
+        clientId: *client_id,
+        market: *market,
+        side: side.into(),
+        qty: qty.raw(),
+        kind: kind.into(),
+        price: price.raw(),
+        hasMaxSlippage: max_slippage_bps.is_some(),
+        maxSlippageBps: max_slippage_bps.unwrap_or(0),
+        reduceOnly: *reduce_only,
+    }
+    .eip712_signing_hash(domain)
+}
+
+/// The digest a client signs to cancel `order_id` with `nonce`, until `expires_at`.
+pub fn cancel_hash(
+    domain: &Eip712Domain,
+    account: AccountId,
+    order_id: OrderId,
+    nonce: u64,
+    expires_at: Millis,
+) -> B256 {
+    typed::CancelRequest { account: Address::from(account.0), nonce, expiresAt: expires_at, orderId: order_id }
+        .eip712_signing_hash(domain)
+}
+
+/// The digest a client signs to withdraw `amount` with `nonce`, until `expires_at`.
+pub fn withdrawal_hash(
+    domain: &Eip712Domain,
+    account: AccountId,
+    amount: Fixed,
+    nonce: u64,
+    expires_at: Millis,
+) -> B256 {
+    typed::WithdrawalRequest { account: Address::from(account.0), nonce, expiresAt: expires_at, amount: amount.raw() }
+        .eip712_signing_hash(domain)
+}
+
+/// The account whose key signed `hash`, or `None` when `signature` is malformed or recovers no key.
+pub fn recover(hash: &B256, signature: &Signature) -> Option<AccountId> {
+    let recovery_id = match signature[64] {
+        v @ (27 | 28) => RecoveryId::from_byte(v - 27)?,
+        _ => return None,
+    };
+    let ecdsa = EcdsaSignature::from_slice(&signature[..64]).ok()?;
+    let key = VerifyingKey::recover_from_prehash(hash.as_slice(), &ecdsa, recovery_id).ok()?;
+    Some(address(&key))
+}
+
+/// The EVM address of `key`: the last 20 bytes of keccak-256 over the uncompressed point.
+pub fn address(key: &VerifyingKey) -> AccountId {
+    let point = key.to_encoded_point(false);
+    let hash = Keccak256::digest(&point.as_bytes()[1..]);
+    AccountId(hash[12..].try_into().expect("keccak-256 has 32 bytes"))
+}
+
+/// Signs `hash` with `key` in the form `recover` reads. For clients, tests, and the node's enclave
+/// key; the engine only verifies.
+pub fn sign(key: &SigningKey, hash: &B256) -> Signature {
+    // Signing a 32-byte prehash with a valid key cannot fail.
+    let (ecdsa, recovery_id) = key.sign_prehash_recoverable(hash.as_slice()).expect("signing a 32-byte digest");
+    let mut out = [0u8; 65];
+    out[..64].copy_from_slice(&ecdsa.to_bytes());
+    out[64] = 27 + recovery_id.to_byte();
+    Signature::from(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(byte: u8) -> SigningKey {
+        SigningKey::from_slice(&[byte; 32]).unwrap()
+    }
+
+    #[test]
+    fn a_signature_recovers_to_its_signer_only_for_the_hash_it_signed() {
+        let (key, hash) = (key(7), B256::repeat_byte(1));
+        let signature = sign(&key, &hash);
+        assert_eq!(recover(&hash, &signature), Some(address(key.verifying_key())));
+        assert_ne!(recover(&B256::repeat_byte(2), &signature), Some(address(key.verifying_key())));
+    }
+
+    #[test]
+    fn a_malformed_signature_recovers_nobody() {
+        let hash = B256::repeat_byte(1);
+        let mut signature = sign(&key(7), &hash);
+        signature[64] = 1;
+        assert_eq!(recover(&hash, &signature), None);
+        assert_eq!(recover(&hash, &Signature::ZERO), None);
+    }
+
+    #[test]
+    fn the_domain_binds_the_chain_and_vault() {
+        let vault = AccountId([9; 20]);
+        let base = domain(1, vault).separator();
+        assert_ne!(base, domain(2, vault).separator());
+        assert_ne!(base, domain(1, AccountId([8; 20])).separator());
+    }
+}

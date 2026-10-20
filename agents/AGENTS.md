@@ -11,11 +11,12 @@ an index: load only the rule whose hint matches the current action.
 
 - **crates/core/** — `engine-core`: the protocol state machine. Covers pricing against the index,
   size and stress spreads, margin and close-out, the profit fee, overnight financing, trading
-  sessions, house exposure caps, and toxicity scoring. It does no IO and uses no clocks,
-  randomness, or floats. `impl Engine` is split by area (`engine.rs`, `execution.rs`,
-  `closeout.rs`, `funds.rs`, `admin.rs`). Unit tests sit inline; protocol tests are in `tests/`
-  by area, with the shared harness in `tests/common/`. `tests/reference/` holds one reference log
-  per protocol version, written once by `examples/reference_log.rs` and replayed to its roots by
+  sessions, house exposure caps, toxicity scoring, signed client requests (EIP-712, per-account
+  nonces, and expiries), and protocol versions. It does no IO and uses no clocks, randomness, or
+  floats. `impl Engine` is split by area (`engine.rs`, `execution.rs`, `closeout.rs`, `funds.rs`,
+  `admin.rs`, `auth.rs`). Unit tests sit inline; protocol tests are in `tests/` by area, with the
+  shared harness in `tests/common/`. `tests/reference/` holds one reference log per protocol
+  version, written once by `examples/reference_log.rs` and replayed to its roots by
   `tests/reference_logs.rs`; `tests/invariants/` holds the property tests. Its `README.md` lists
   every file.
 - **crates/node/** — `engine-node`, binary `engine` (`main.rs` over `lib.rs`). Contains the
@@ -25,8 +26,10 @@ an index: load only the rule whose hint matches the current action.
   holds the node-format reference log per protocol version, with events, written once by
   `examples/reference_log.rs`. Its `README.md` lists every file.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine.
-  Its `[genesis]` section is protocol: it is sequenced into the log as admin commands on first
-  boot. Every section rejects unknown keys.
+  Its `[genesis]` section is protocol: it is sequenced into the log as admin commands on first boot.
+  `node.auth`, with `custody.chain_id` and `custody.vault` under `eip712`, is recorded in the log
+  when it first activates protocol versions, so changing it needs a fresh log. Every section rejects
+  unknown keys.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate, and
   `check-reference-logs.sh`, which fails a branch that changes a committed reference log.
 - **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, the reference-log
@@ -85,11 +88,11 @@ Run from the repo root:
 - **Replay is the audit.** The sequenced log is public, and anyone can replay it against this code
   to check the signed state roots and the events logged with each command. A change to
   `engine-core` state, its serialization, its semantics, or the events a command emits changes the
-  roots or events that existing logs carry, so it needs a stated plan for replaying logs written by
-  the older code. Each protocol version has a reference log in `crates/core/tests/reference/`,
-  committed once and never regenerated; CI replays every one on each platform, so a rule change
-  ships as a new protocol version with its own log (`crates/core/README.md`, "Adding a protocol
-  version").
+  roots or events that existing logs carry, so it ships as a new protocol version
+  (`crates/core/src/protocol.rs` lists the code steps). Each protocol version has a reference log in
+  `crates/core/tests/reference/`, committed once and never regenerated; CI replays every one on
+  each platform, so a rule change ships as a new protocol version with its own log
+  (`crates/core/README.md`, "Adding a protocol version").
 - **The host is untrusted.** Inside the enclave, the host controls the clock, disk, and network.
   Code that trusts any of them names the check that bounds it, or a `TODO` that says what is
   missing.

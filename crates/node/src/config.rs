@@ -1,6 +1,8 @@
-//! Node configuration: one TOML file, loaded and validated once at startup. The `[genesis]`
-//! section is protocol and is sequenced into the log on first boot; everything else configures
-//! this node only.
+//! Node configuration: one TOML file, loaded and validated once at startup. Two parts are protocol
+//! and go into the log: the client auth (`node.auth`, with `custody.chain_id` and `custody.vault`
+//! under `eip712`), recorded when the log first activates protocol versions and fixed for the life
+//! of the log; and the `[genesis]` section, sequenced after protocol activation. Everything else
+//! configures this node only.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -8,15 +10,18 @@ use std::time::Duration;
 
 use anyhow::Context;
 use engine_core::Fixed;
+use engine_core::auth::ClientAuth;
 use engine_core::market::MarketSpec;
-use engine_core::params::ProtocolParams;
+use engine_core::params::{MAX_BENCHMARK_BPS, ProtocolParams};
+use engine_core::types::AccountId;
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
-    /// Trusts the `account` field on requests. Local development only.
+    /// Trusts the `account` field on requests. Local development only: it needs the mock TEE and
+    /// mock custody.
     None,
     /// Requests must carry an EIP-712 signature from the account's key.
     Eip712,
@@ -56,8 +61,9 @@ pub struct NodeConfig {
     pub operator: OperatorSection,
     pub custody: CustodySection,
     pub feeds: FeedsSection,
-    /// Sequenced as admin commands when the log is empty, so the rules every fill ran under are
-    /// part of the public record.
+    /// Sequenced as admin commands after protocol activation, and again on each boot until its
+    /// house capital credit is in the log, so the rules every fill ran under are part of the public
+    /// record.
     pub genesis: Genesis,
 }
 
@@ -151,7 +157,9 @@ impl NodeConfig {
     /// - the file cannot be read, or is not valid TOML for this schema (unknown keys included)
     /// - `logging.level` is not a valid filter directive
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, or `feeds.interval` is zero
+    /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
     /// - genesis parameters or a market spec fail validation
+    /// - genesis house capital or a benchmark rate is one the engine would refuse
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg: NodeConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
@@ -159,11 +167,27 @@ impl NodeConfig {
         Ok(cfg)
     }
 
+    /// The client auth this config asks the log to record: unsigned, or signed under the domain of
+    /// `custody.vault` on `custody.chain_id`.
+    /// Error cases:
+    /// - `custody.vault` is not an address
+    pub fn client_auth(&self) -> anyhow::Result<ClientAuth> {
+        Ok(match self.node.auth {
+            AuthMode::None => ClientAuth::Unsigned,
+            AuthMode::Eip712 => {
+                let vault: AccountId = self.custody.vault.parse().context("custody.vault")?;
+                ClientAuth::Eip712 { chain_id: self.custody.chain_id, vault }
+            }
+        })
+    }
+
     /// Checks values that parse but would fail silently or at the wrong moment.
     /// Error cases:
     /// - `logging.level` is not a valid filter directive
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, or `feeds.interval` is zero
+    /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
     /// - genesis parameters or a market spec fail validation
+    /// - genesis house capital or a benchmark rate is one the engine would refuse
     fn validate(&self) -> anyhow::Result<()> {
         EnvFilter::try_new(&self.logging.level).context("logging.level")?;
         if self.node.tick.is_zero()
@@ -175,7 +199,24 @@ impl NodeConfig {
                 "node.tick, node.checkpoint_every, node.segment_commands, and feeds.interval must be non-zero"
             );
         }
+        // Unsigned requests let anyone act for any account, so they never run beside a real
+        // enclave or real funds.
+        if self.node.auth == AuthMode::None
+            && (self.tee.provider != TeeProvider::Mock || self.custody.provider != CustodyProvider::Mock)
+        {
+            anyhow::bail!("node.auth = \"none\" needs tee.provider and custody.provider both \"mock\"");
+        }
         self.genesis.params.validate().map_err(anyhow::Error::msg).context("genesis.params")?;
+        // Genesis reruns on every boot until it completes, so a command the engine would refuse
+        // fails here, before anything reaches the log.
+        if !self.genesis.house_capital.is_valid_input() {
+            anyhow::bail!("genesis.house_capital must be above zero and at most {}", Fixed::MAX_INPUT);
+        }
+        if let Some(b) =
+            self.genesis.benchmarks.iter().find(|b| !(-MAX_BENCHMARK_BPS..=MAX_BENCHMARK_BPS).contains(&b.annual_bps))
+        {
+            anyhow::bail!("genesis benchmark {} is outside ±{MAX_BENCHMARK_BPS} bps", b.name);
+        }
         for m in &self.genesis.markets {
             m.validate().map_err(anyhow::Error::msg).with_context(|| format!("market {}", m.symbol))?;
         }
@@ -210,6 +251,51 @@ mod tests {
         let text = std::fs::read_to_string(DEV).unwrap().replace("segment_commands = 1000", "segment_commands = 0");
         let cfg: NodeConfig = toml::from_str(&text).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn unsigned_requests_need_the_mock_tee_and_mock_custody() {
+        let dev = std::fs::read_to_string(DEV).unwrap();
+        let tee = dev.replace("provider = \"mock\" # \"configfs_tsm\"", "provider = \"configfs_tsm\" #");
+        let custody = dev.replace("[custody]\nprovider = \"mock\"", "[custody]\nprovider = \"evm\"");
+        for text in [&tee, &custody] {
+            assert_ne!(text, &dev, "the replacement must change the config");
+            let cfg: NodeConfig = toml::from_str(text).unwrap();
+            let err = cfg.validate().unwrap_err();
+            assert!(err.to_string().contains("node.auth = \"none\""), "{err:#}");
+            let signed: NodeConfig = toml::from_str(&text.replace("auth = \"none\"", "auth = \"eip712\"")).unwrap();
+            signed.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn signed_requests_take_their_domain_from_the_custody_chain_and_vault() {
+        let dev = std::fs::read_to_string(DEV).unwrap();
+        assert_eq!(toml::from_str::<NodeConfig>(&dev).unwrap().client_auth().unwrap(), ClientAuth::Unsigned);
+        let vault = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+        let signed = dev
+            .replace("auth = \"none\"", "auth = \"eip712\"")
+            .replace("chain_id = 31337", "chain_id = 42161")
+            .replace("vault = \"0x0000000000000000000000000000000000000000\"", &format!("vault = \"{vault}\""));
+        let cfg: NodeConfig = toml::from_str(&signed).unwrap();
+        assert_eq!(cfg.client_auth().unwrap(), ClientAuth::Eip712 { chain_id: 42_161, vault: vault.parse().unwrap() });
+    }
+
+    #[test]
+    fn genesis_values_the_engine_would_refuse_fail_the_boot() {
+        let dev = std::fs::read_to_string(DEV).unwrap();
+        let zero_capital = dev.replace("house_capital = \"10000000\"", "house_capital = \"0\"");
+        let wild_rate = dev.replace("{ name = \"SOFR\", annual_bps = 400 }", "{ name = \"SOFR\", annual_bps = 10001 }");
+        let min_rate = dev.replace(
+            "{ name = \"SOFR\", annual_bps = 400 }",
+            &format!("{{ name = \"SOFR\", annual_bps = {} }}", i64::MIN),
+        );
+        for text in [&zero_capital, &wild_rate, &min_rate] {
+            assert_ne!(text, &dev, "the replacement must change the config");
+            assert!(toml::from_str::<NodeConfig>(text).unwrap().validate().is_err());
+        }
+        let at_limit = dev.replace("{ name = \"SOFR\", annual_bps = 400 }", "{ name = \"SOFR\", annual_bps = -10000 }");
+        toml::from_str::<NodeConfig>(&at_limit).unwrap().validate().unwrap();
     }
 
     #[test]

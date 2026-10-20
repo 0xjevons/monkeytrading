@@ -123,7 +123,7 @@ pub(crate) fn command(action: &Action, engine: &Engine, now: Millis) -> Command 
         Action::Deposit { account, amount, chain_ref } => {
             Command::Deposit { account: *account, amount: *amount, chain_ref: format!("0xref:{chain_ref}") }
         }
-        Action::Withdraw { account, amount } => Command::Withdraw { account: *account, amount: *amount },
+        Action::Withdraw { account, amount } => Command::Withdraw { account: *account, amount: *amount, auth: None },
         Action::HouseCapital { amount, chain_ref } => {
             Command::HouseCapital { amount: *amount, chain_ref: format!("0xref:{chain_ref}") }
         }
@@ -152,9 +152,12 @@ pub(crate) fn command(action: &Action, engine: &Engine, now: Millis) -> Command 
                 qty,
                 kind,
                 reduce_only: order.reduce_only,
+                auth: None,
             })
         }
-        Action::Cancel { account, order_id } => Command::CancelOrder { account: *account, order_id: *order_id },
+        Action::Cancel { account, order_id } => {
+            Command::CancelOrder { account: *account, order_id: *order_id, auth: None }
+        }
         Action::Admin(cmd) => Command::Admin(cmd.clone()),
     }
 }

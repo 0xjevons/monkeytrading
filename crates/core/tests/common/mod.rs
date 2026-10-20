@@ -6,15 +6,21 @@
 
 pub mod reference;
 
+use std::collections::BTreeMap;
+
 use chrono::TimeZone;
+use engine_core::auth::{ClientAuth, RequestAuth};
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
+use engine_core::eip712::{self, B256, Eip712Domain, cancel_hash, order_hash, withdrawal_hash};
 use engine_core::event::{Event, Fill, Reject};
 use engine_core::market::{FinancingSpec, MarketSpec, PriceRules, Tier};
 use engine_core::params::{ProtocolParams, Rollover, StressLevel, StressTrigger, ToxicityParams, ToxicityTier};
 use engine_core::price::SourceQuote;
+use engine_core::protocol::ProtocolVersion;
 use engine_core::session::Schedule;
-use engine_core::types::{AccountId, AssetClass, MarketId, Millis, Side};
+use engine_core::types::{AccountId, AssetClass, MarketId, Millis, OrderId, Side};
 use engine_core::{Engine, Fixed};
+use k256::ecdsa::SigningKey;
 
 pub const BTC: MarketId = 1;
 pub const ETH: MarketId = 2;
@@ -22,6 +28,9 @@ pub const AAPL: MarketId = 3;
 /// A market id nothing lists.
 pub const UNLISTED: MarketId = 99;
 pub const HOUSE_CAPITAL: i64 = 100_000_000;
+/// The custody chain and vault the signed harness records.
+pub const CHAIN_ID: u64 = 31_337;
+pub const VAULT: AccountId = AccountId([0xaa; 20]);
 
 /// A sequenced engine with three markets and 100m of house capital, plus a record of the log and
 /// of the cash it credited.
@@ -30,27 +39,89 @@ pub struct Harness {
     pub log: Vec<Sequenced>,
     pub ts: Millis,
     pub deposits: Fixed,
+    /// Keys `cmd` signs unsigned client requests with, by account.
+    pub signers: BTreeMap<AccountId, SigningKey>,
 }
 
 impl Harness {
     /// Genesis: parameters, BTC and ETH (24/7, 10% margin), AAPL (US hours, 20% margin), and house
     /// capital, at Tue 20 Oct 2026 10:00 New York.
     pub fn new() -> Self {
-        let mut h = Harness { engine: Engine::new(), log: vec![], ts: start(), deposits: Fixed::ZERO };
-        h.admin(AdminCommand::SetParams(params()));
-        h.admin(AdminCommand::UpsertMarket(market(BTC, "BTC-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000)));
-        h.admin(AdminCommand::UpsertMarket(market(ETH, "ETH-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000)));
-        h.admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, us_equities(), 2_000)));
-        h.cmd(Command::HouseCapital { amount: Fixed::from_int(HOUSE_CAPITAL), chain_ref: "genesis".into() });
+        let mut h = Harness::empty();
+        h.genesis();
         h
     }
 
-    /// Sequences and applies one command at the current time, recording it in the log.
+    /// `new`'s genesis under `V3`, after recording `auth`.
+    pub fn v3(auth: ClientAuth) -> Self {
+        let mut h = Harness::empty();
+        h.admin(AdminCommand::SetClientAuth(auth));
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V3 });
+        h.genesis();
+        h
+    }
+
+    /// No commands yet, at the harness start time.
+    fn empty() -> Self {
+        Harness { engine: Engine::new(), log: vec![], ts: start(), deposits: Fixed::ZERO, signers: BTreeMap::new() }
+    }
+
+    /// `V3` with signed requests under `CHAIN_ID` and `VAULT`.
+    pub fn signed() -> Self {
+        Harness::v3(ClientAuth::Eip712 { chain_id: CHAIN_ID, vault: VAULT })
+    }
+
+    /// The account of the key from `seed`, whose unsigned requests `cmd` signs from now on.
+    pub fn signer(&mut self, seed: u8) -> AccountId {
+        let client = Client::new(seed);
+        self.signers.insert(client.account, client.key);
+        client.account
+    }
+
+    /// Parameters, three markets, and house capital.
+    fn genesis(&mut self) {
+        self.admin(AdminCommand::SetParams(params()));
+        self.admin(AdminCommand::UpsertMarket(market(BTC, "BTC-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000)));
+        self.admin(AdminCommand::UpsertMarket(market(ETH, "ETH-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000)));
+        self.admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, us_equities(), 2_000)));
+        self.cmd(Command::HouseCapital { amount: Fixed::from_int(HOUSE_CAPITAL), chain_ref: "genesis".into() });
+    }
+
+    /// Sequences and applies one command at the current time, recording it in the log. An unsigned
+    /// client request from a `signer` account is signed first, with its next nonce and an expiry a
+    /// minute ahead.
     pub fn cmd(&mut self, cmd: Command) -> Vec<Event> {
+        let cmd = self.sign(cmd);
         let sequenced = Sequenced { seq: self.log.len() as u64, ts: self.ts, cmd };
         let events = self.engine.apply(&sequenced).expect("in sequence");
         self.log.push(sequenced);
         events
+    }
+
+    /// `cmd` signed by its account's key, if it is an unsigned client request from a `signer`.
+    fn sign(&self, cmd: Command) -> Command {
+        let domain = eip712::domain(CHAIN_ID, VAULT);
+        let expires_at = self.ts + 60_000;
+        let auth = |account: AccountId, hash: &dyn Fn(u64) -> B256| {
+            let key = self.signers.get(&account)?;
+            let nonce = self.engine.next_request_nonce(account);
+            Some(RequestAuth { nonce, expires_at, signature: eip712::sign(key, &hash(nonce)) })
+        };
+        match cmd {
+            Command::PlaceOrder(mut req) if req.auth.is_none() => {
+                req.auth = auth(req.account, &|nonce| order_hash(&domain, &req, nonce, expires_at));
+                Command::PlaceOrder(req)
+            }
+            Command::CancelOrder { account, order_id, auth: None } => {
+                let auth = auth(account, &|nonce| cancel_hash(&domain, account, order_id, nonce, expires_at));
+                Command::CancelOrder { account, order_id, auth }
+            }
+            Command::Withdraw { account, amount, auth: None } => {
+                let auth = auth(account, &|nonce| withdrawal_hash(&domain, account, amount, nonce, expires_at));
+                Command::Withdraw { account, amount, auth }
+            }
+            cmd => cmd,
+        }
     }
 
     /// Applies an admin command that must succeed.
@@ -110,6 +181,7 @@ impl Harness {
             qty: f(qty),
             kind,
             reduce_only: false,
+            auth: None,
         }))
     }
 
@@ -136,6 +208,49 @@ impl Harness {
         let balances: Fixed = self.engine.accounts().values().map(|a| a.balance).sum();
         let expected = self.deposits + Fixed::from_int(HOUSE_CAPITAL) - withdrawn;
         assert_eq!(balances + self.engine.house_cash(), expected);
+    }
+}
+
+/// A client key, the account it controls, and the domain it signs under.
+pub struct Client {
+    pub key: SigningKey,
+    pub account: AccountId,
+    pub domain: Eip712Domain,
+    /// The expiry every request this client signs carries.
+    pub expires_at: Millis,
+}
+
+impl Client {
+    /// A distinct key per `seed`, signing under the signed harness's domain, with requests that
+    /// expire a minute after the harness starts.
+    pub fn new(seed: u8) -> Self {
+        let key = SigningKey::from_slice(&[seed; 32]).expect("a valid scalar");
+        let account = eip712::address(key.verifying_key());
+        Client { key, account, domain: eip712::domain(CHAIN_ID, VAULT), expires_at: start() + 60_000 }
+    }
+
+    /// `req` with this key's signature over it and `nonce`, whatever account it names.
+    pub fn order(&self, nonce: u64, mut req: OrderRequest) -> Command {
+        let hash = order_hash(&self.domain, &req, nonce, self.expires_at);
+        req.auth = Some(self.auth(nonce, hash));
+        Command::PlaceOrder(req)
+    }
+
+    /// A signed cancel of `order_id` for this account.
+    pub fn cancel(&self, nonce: u64, order_id: OrderId) -> Command {
+        let hash = cancel_hash(&self.domain, self.account, order_id, nonce, self.expires_at);
+        Command::CancelOrder { account: self.account, order_id, auth: Some(self.auth(nonce, hash)) }
+    }
+
+    /// A signed withdrawal of `amount` for this account.
+    pub fn withdraw(&self, nonce: u64, amount: &str) -> Command {
+        let hash = withdrawal_hash(&self.domain, self.account, f(amount), nonce, self.expires_at);
+        Command::Withdraw { account: self.account, amount: f(amount), auth: Some(self.auth(nonce, hash)) }
+    }
+
+    /// This key's signature over `hash`, with `nonce` and this client's expiry.
+    fn auth(&self, nonce: u64, hash: B256) -> RequestAuth {
+        RequestAuth { nonce, expires_at: self.expires_at, signature: eip712::sign(&self.key, &hash) }
     }
 }
 

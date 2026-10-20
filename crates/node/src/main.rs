@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use engine_core::auth::ClientAuth;
 use engine_node::{NodeConfig, init_logging, log, replay, run};
 
 #[derive(Subcommand)]
@@ -43,11 +44,19 @@ async fn main() -> anyhow::Result<()> {
             init_logging("info")?;
             let entries = if path.is_dir() { log::SegmentedLog::open(&path)?.entries } else { log::read_all(&path)? };
             let replayed = replay(&entries)?;
+            let activations: Vec<String> =
+                replayed.activations.iter().map(|(version, seq)| format!("{version:?} from seq {seq}")).collect();
             println!(
-                "verified: {} commands, {} checkpoints, final root 0x{}",
+                "verified: {} commands, {} checkpoints, final root 0x{}, protocol V2{}, client auth {}",
                 replayed.commands,
                 replayed.checkpoints,
-                hex::encode(replayed.engine.state_root())
+                hex::encode(replayed.engine.state_root()),
+                activations.iter().map(|a| format!(", {a}")).collect::<String>(),
+                match replayed.engine.client_auth() {
+                    None => "none recorded".to_owned(),
+                    Some(ClientAuth::Unsigned) => "unsigned".to_owned(),
+                    Some(ClientAuth::Eip712 { chain_id, vault }) => format!("eip712 (chain {chain_id}, vault {vault})"),
+                }
             );
             if !replayed.unsigned.is_empty() {
                 println!(

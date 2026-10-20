@@ -10,14 +10,18 @@ repository.workspace = true
 # HashMap iteration. Anyone replaying the public event log against this code
 # must reproduce the same state roots bit for bit.
 [dependencies]
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+k256.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha3.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+alloy-dyn-abi.workspace = true
 anyhow.workspace = true
 hex.workspace = true
 proptest.workspace = true

@@ -1,0 +1,127 @@
+//! Who may act for an account. From protocol `V3`, every order, cancel, and withdrawal is
+//! authorised as the log's `ClientAuth` records: under `Eip712`, by the account's signature over
+//! the request, the account's next nonce, and an expiry the request has not passed, so a replay of
+//! the log proves each request was the account's and ran in time. `V2` logs, and dev logs that
+//! record `Unsigned`, accept unsigned requests.
+
+use serde::{Deserialize, Serialize};
+
+use crate::eip712::{self, B256, Eip712Domain, Signature};
+use crate::engine::Engine;
+use crate::event::Reject;
+use crate::protocol::ProtocolVersion;
+use crate::types::{AccountId, Millis};
+
+/// How far past the sequenced time a signed request's expiry may lie: five minutes. The engine
+/// refuses a request with a later expiry and uses its nonce, so clients must sign short-lived
+/// requests; the expiry a client signs is what caps how long the host, which controls the network,
+/// can hold a captured request before delivering it. Five minutes leaves time to confirm in a
+/// wallet and room for a clock a few minutes off. The cap holds only as far as sequenced time
+/// tracks real time: it follows the host clock, which nothing yet bounds (the sequencer's
+/// trusted-time TODO).
+pub const MAX_EXPIRY_AHEAD_MS: Millis = 5 * 60 * 1000;
+
+/// How a log authorises client requests from `V3`. Recorded once, so a replay needs only the log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClientAuth {
+    /// Anyone may act for any account. Development logs only.
+    Unsigned,
+    /// Each request carries the account's EIP-712 signature under the domain of `vault` on
+    /// `chain_id`, the account's next nonce, and an expiry.
+    Eip712 { chain_id: u64, vault: AccountId },
+}
+
+/// A client's signature over a request, the account nonce the request uses, and the latest
+/// sequenced time the request itself is accepted at. A limit or stop order it places rests until it
+/// fills or is cancelled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestAuth {
+    pub nonce: u64,
+    pub expires_at: Millis,
+    pub signature: Signature,
+}
+
+impl ClientAuth {
+    /// The domain requests are signed under, or `None` when they are unsigned.
+    pub fn domain(&self) -> Option<Eip712Domain> {
+        match self {
+            ClientAuth::Unsigned => None,
+            ClientAuth::Eip712 { chain_id, vault } => Some(eip712::domain(*chain_id, *vault)),
+        }
+    }
+
+    /// Checks a request may act for `account` under these rules, leaving its nonce and expiry to
+    /// the caller: unsigned under `Unsigned`, and signed by `account` under `Eip712`. `hash` gives
+    /// the digest the request signs under a domain with its nonce and expiry.
+    /// Error cases:
+    /// - `MissingSignature`: unsigned under `Eip712`
+    /// - `InvalidSignature`: signed under `Unsigned`, or not by `account`
+    pub fn check(
+        &self,
+        account: AccountId,
+        auth: Option<&RequestAuth>,
+        hash: impl FnOnce(&Eip712Domain, &RequestAuth) -> B256,
+    ) -> Result<(), Reject> {
+        match (self.domain(), auth) {
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(Reject::MissingSignature),
+            (Some(domain), Some(auth)) if eip712::recover(&hash(&domain, auth), &auth.signature) == Some(account) => {
+                Ok(())
+            }
+            (_, Some(_)) => Err(Reject::InvalidSignature),
+        }
+    }
+}
+
+impl RequestAuth {
+    /// Checks the request may execute at sequenced time `now`.
+    /// Error cases:
+    /// - `Expired`: `now` is past `expires_at`
+    /// - `ExpiryTooFar`: `expires_at` is more than `MAX_EXPIRY_AHEAD_MS` past `now`
+    pub fn check_expiry(&self, now: Millis) -> Result<(), Reject> {
+        let latest = now.saturating_add(MAX_EXPIRY_AHEAD_MS);
+        if now > self.expires_at {
+            Err(Reject::Expired { expires_at: self.expires_at })
+        } else if self.expires_at > latest {
+            Err(Reject::ExpiryTooFar { latest })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Engine {
+    /// Checks a client request may act for `account` under the rules in force, and uses its nonce
+    /// when it is signed. Nothing changes when the signature or nonce fails. A request that passes
+    /// both uses its nonce even if it is then refused, for its expiry or by the engine, so it
+    /// cannot be replayed from the log once it would succeed.
+    /// Error cases:
+    /// - `MissingSignature` or `InvalidSignature`: see `ClientAuth::check`
+    /// - `InvalidNonce`: a nonce other than the account's next
+    /// - `Expired` or `ExpiryTooFar`: see `RequestAuth::check_expiry`
+    pub(crate) fn authorise(
+        &mut self,
+        account: AccountId,
+        auth: Option<&RequestAuth>,
+        hash: impl FnOnce(&Eip712Domain, &RequestAuth) -> B256,
+    ) -> Result<(), Reject> {
+        const ORIGINAL: ClientAuth = ClientAuth::Unsigned;
+        let rules = if self.protocol_version >= ProtocolVersion::V3 {
+            // `ActivateProtocol` refuses `V3` until client auth is recorded.
+            self.client_auth.as_ref().expect("client auth is recorded before V3")
+        } else {
+            &ORIGINAL
+        };
+        rules.check(account, auth, hash)?;
+        let Some(auth) = auth else { return Ok(()) };
+        let expected = self.next_request_nonce(account);
+        if auth.nonce != expected {
+            return Err(Reject::InvalidNonce { expected });
+        }
+        // One nonce per request: 2^64 requests from one account cannot happen.
+        self.request_nonces.insert(account, expected + 1);
+        auth.check_expiry(self.now)
+    }
+}

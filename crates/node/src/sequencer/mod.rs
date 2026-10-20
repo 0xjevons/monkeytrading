@@ -8,20 +8,23 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
+use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::event::Event;
+use engine_core::protocol::ProtocolVersion;
 use engine_core::types::{AccountId, Millis};
 use engine_core::{Engine, Fixed};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{error, info, info_span, warn};
 
-use crate::clock::now_ms;
 use crate::config::Genesis;
 use crate::log::{self, Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
 use crate::tee::EnclaveKey;
 
 const MAX_BATCH: usize = 1024;
+/// The custody reference genesis credits house capital under, as its last command.
+const GENESIS_REF: &str = "genesis";
 
 pub type Query = Box<dyn FnOnce(&Engine) + Send>;
 
@@ -72,6 +75,8 @@ pub struct Sequencer {
     stream: broadcast::Sender<Arc<StreamMsg>>,
     withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     outbox: Vec<Arc<StreamMsg>>,
+    clock: fn() -> Millis,
+    client_auth: ClientAuth,
 }
 
 pub struct SequencerConfig<'a> {
@@ -82,6 +87,10 @@ pub struct SequencerConfig<'a> {
     pub checkpoint_every: u64,
     pub chain_id: u64,
     pub vault: AccountId,
+    /// The clock commands are stamped with.
+    pub clock: fn() -> Millis,
+    /// The client auth the config gives, which a log that records one must match.
+    pub client_auth: ClientAuth,
 }
 
 /// The result of replaying a log.
@@ -92,6 +101,8 @@ pub struct Replayed {
     /// Withdrawals the last command approved that the log ends before signing, as a crash between
     /// a command's entry and its withdrawal entry leaves: `(account, amount, nonce)`.
     pub unsigned: Vec<(AccountId, Fixed, u64)>,
+    /// Each protocol version the log activated, with the seq it took effect at.
+    pub activations: Vec<(ProtocolVersion, u64)>,
 }
 
 impl StreamMsg {
@@ -115,6 +126,7 @@ impl Sequencer {
     /// Error cases:
     /// - the log cannot be read, or fails its manifest check (see `SegmentedLog::open`) or replay
     ///   (see `replay`)
+    /// - the log records a client auth other than the config's
     /// - the log cannot be opened for appending, or written
     pub fn recover(
         cfg: SequencerConfig<'_>,
@@ -123,7 +135,12 @@ impl Sequencer {
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
         let log = SegmentedLog::open(cfg.log_dir)?;
-        let Replayed { engine, commands, checkpoints, unsigned } = replay(&log.entries)?;
+        let Replayed { engine, commands, checkpoints, unsigned, .. } = replay(&log.entries)?;
+        // A config naming another client auth, and so another chain or vault, is the wrong one for
+        // this log: refuse before anything is written or signed under it.
+        if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
+            bail!("the log records client auth {recorded:?}, but the config gives {:?}", cfg.client_auth);
+        }
         let last_offset = log::last_offset(&log.entries)?;
         info!(commands, checkpoints, "recovered from log");
         let mut sequencer = Self {
@@ -140,6 +157,8 @@ impl Sequencer {
             stream,
             withdrawals,
             outbox: Vec::new(),
+            clock: cfg.clock,
+            client_auth: cfg.client_auth,
         };
         for (account, amount, nonce) in unsigned {
             let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
@@ -150,9 +169,31 @@ impl Sequencer {
         Ok(sequencer)
     }
 
-    /// Whether the log was empty, so genesis has not been sequenced.
-    pub fn is_fresh(&self) -> bool {
-        self.next_seq == 0
+    /// Whether genesis has yet to finish: its last command, the house capital credit, is not in
+    /// the log. Genesis commands are safe to repeat, so a genesis cut short runs again in full.
+    pub fn needs_genesis(&self) -> bool {
+        !self.engine.is_credited(GENESIS_REF)
+    }
+
+    /// Records the config's client auth and activates the latest protocol version, whichever the
+    /// log lacks, then checkpoints. Both run at the log's next seq, so earlier commands keep the
+    /// rules they ran under. `recover` has already refused a log that records other client auth.
+    /// Error cases:
+    /// - the engine rejects either command
+    /// - the log cannot be written
+    pub fn activate_protocol(&mut self) -> anyhow::Result<()> {
+        let mut cmds = Vec::new();
+        if self.engine.client_auth().is_none() {
+            cmds.push(Command::Admin(AdminCommand::SetClientAuth(self.client_auth.clone())));
+        }
+        if self.engine.protocol_version() < ProtocolVersion::LATEST {
+            cmds.push(Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }));
+        }
+        if cmds.is_empty() {
+            return Ok(());
+        }
+        info!(version = ?ProtocolVersion::LATEST, seq = self.next_seq, "activating protocol");
+        self.sequence_required(cmds).context("protocol activation")
     }
 
     /// Sequences the genesis config as ordinary admin commands, then checkpoints.
@@ -165,17 +206,8 @@ impl Sequencer {
             Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: b.name.clone(), annual_bps: b.annual_bps })
         }));
         cmds.extend(genesis.markets.iter().map(|m| Command::Admin(AdminCommand::UpsertMarket(m.clone()))));
-        cmds.push(Command::HouseCapital { amount: genesis.house_capital, chain_ref: "genesis".into() });
-        for cmd in cmds {
-            let events = self.sequence(cmd)?;
-            if let Some(Event::AdminRejected { reason }) =
-                events.iter().find(|e| matches!(e, Event::AdminRejected { .. }))
-            {
-                bail!("genesis rejected: {reason}");
-            }
-        }
-        self.checkpoint()?;
-        self.flush()
+        cmds.push(Command::HouseCapital { amount: genesis.house_capital, chain_ref: GENESIS_REF.into() });
+        self.sequence_required(cmds).context("genesis")
     }
 
     /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch is
@@ -223,7 +255,7 @@ impl Sequencer {
     fn sequence(&mut self, cmd: Command) -> anyhow::Result<Vec<Event>> {
         // The host clock is untrusted inside a TEE, but it can't move sequenced time backwards.
         // TODO: bound drift against a trusted time source.
-        let ts = now_ms().max(self.last_ts);
+        let ts = (self.clock)().max(self.last_ts);
         let sequenced = Sequenced { seq: self.next_seq, ts, cmd };
         let _span = info_span!("command", id = sequenced.seq).entered();
         let events = self.engine.apply(&sequenced).context("sequencer produced an invalid sequence")?;
@@ -252,6 +284,23 @@ impl Sequencer {
         self.last_offset = Some(offset);
         self.outbox.push(Arc::new(StreamMsg::new(offset, entry)));
         Ok(())
+    }
+
+    /// Sequences commands the engine must accept, then checkpoints.
+    /// Error cases:
+    /// - the engine rejects any of them
+    /// - the log cannot be written
+    fn sequence_required(&mut self, cmds: Vec<Command>) -> anyhow::Result<()> {
+        for cmd in cmds {
+            let events = self.sequence(cmd)?;
+            if let Some(Event::AdminRejected { reason }) =
+                events.iter().find(|e| matches!(e, Event::AdminRejected { .. }))
+            {
+                bail!("rejected: {reason}");
+            }
+        }
+        self.checkpoint()?;
+        self.flush()
     }
 
     /// Signs an approved withdrawal and logs it; custody and the stream get it once it is flushed.
@@ -324,7 +373,7 @@ impl Sequencer {
 /// - a checkpoint root that differs from the replayed state
 pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
     let mut engine = Engine::new();
-    let (mut commands, mut checkpoints) = (0, 0);
+    let (mut commands, mut checkpoints, mut activations) = (0, 0, Vec::new());
     // Withdrawals the last command approved that no withdrawal entry has matched yet. Entries
     // written before events were logged have no withdrawal entries. Once a command carries its
     // events, every later one must, and every approval must be signed.
@@ -338,7 +387,11 @@ pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
                 if logs_events && c.events.is_none() {
                     bail!("seq {seq} has no logged events, though earlier commands do");
                 }
+                let version = engine.protocol_version();
                 let events = engine.apply(&c.sequenced).with_context(|| format!("applying seq {seq}"))?;
+                if engine.protocol_version() != version {
+                    activations.push((engine.protocol_version(), seq));
+                }
                 if c.events.as_ref().is_some_and(|logged| *logged != events) {
                     bail!("events logged at seq {seq} differ from the events replay gives");
                 }
@@ -371,7 +424,7 @@ pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
         }
     }
     let unsigned = if logs_events { approved.into() } else { Vec::new() };
-    Ok(Replayed { engine, commands, checkpoints, unsigned })
+    Ok(Replayed { engine, commands, checkpoints, unsigned, activations })
 }
 
 /// Checks the last command's approved withdrawals all have their signed entries.

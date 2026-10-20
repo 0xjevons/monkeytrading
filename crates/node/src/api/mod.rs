@@ -17,19 +17,20 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use engine_core::account::{Position, RestingOrder};
-use engine_core::command::{Command, OrderRequest};
-use engine_core::event::Event;
+use engine_core::auth::{ClientAuth, RequestAuth};
+use engine_core::command::{CancelRequest, Command, OrderRequest, WithdrawalRequest};
+use engine_core::eip712::{B256, Eip712Domain, cancel_hash, order_hash, withdrawal_hash};
+use engine_core::event::{Event, Reject};
 use engine_core::market::MarketSpec;
-use engine_core::types::{AccountId, MarketId, OrderId};
+use engine_core::types::{AccountId, MarketId, Millis, OrderId};
 use engine_core::{Engine, Fixed};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tracing::field::{Empty, display};
-use tracing::{Instrument, Span, info_span};
+use tracing::{Instrument, Span, debug, info_span};
 
 use crate::clock::now_ms;
-use crate::config::AuthMode;
 use crate::log::Manifest;
 use crate::sequencer::{self, StreamMsg};
 use crate::tee::Attestation;
@@ -40,9 +41,14 @@ pub enum ApiError {
     Unavailable,
     NotFound,
     BadRequest(String),
-    NotImplemented(&'static str),
     /// The node failed to serve the request; the cause is logged where it happened.
     Internal,
+    Unauthorized(&'static str),
+    Forbidden(&'static str),
+    /// A signed request whose nonce is not the account's next.
+    InvalidNonce {
+        expected: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -50,8 +56,12 @@ pub struct ApiState {
     pub tx: mpsc::Sender<sequencer::Request>,
     pub stream: broadcast::Sender<Arc<StreamMsg>>,
     pub attestation: Arc<Attestation>,
-    pub auth: AuthMode,
+    /// The client auth the log records; `Unsigned` trusts the `account` field.
+    pub auth: ClientAuth,
     pub dev_deposits: bool,
+    /// The clock a signed request's expiry is checked against; the node gives the sequencer the same
+    /// one to stamp commands with.
+    pub clock: fn() -> Millis,
     pub log_dir: PathBuf,
     /// The log writer's manifest, held in enclave memory.
     pub manifest: watch::Receiver<Manifest>,
@@ -86,11 +96,9 @@ struct AccountView {
     toxicity_bps: i64,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CancelBody {
-    account: AccountId,
-    order_id: OrderId,
+#[derive(Serialize)]
+struct NonceView {
+    next_nonce: u64,
 }
 
 #[derive(Deserialize)]
@@ -101,32 +109,81 @@ struct AmountBody {
 }
 
 impl IntoResponse for ApiError {
-    /// A JSON `{ "error": … }` body with the matching status.
+    /// A JSON `{ "error": … }` body with the matching status; an invalid nonce also carries the
+    /// nonce expected.
     fn into_response(self) -> Response {
         let (status, msg) = match self {
+            ApiError::InvalidNonce { expected } => {
+                let body = json!({ "error": "invalid nonce", "expected": expected });
+                return (StatusCode::CONFLICT, Json(body)).into_response();
+            }
             ApiError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "engine unavailable".to_owned()),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_owned()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m.to_owned()),
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_owned()),
+            ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m.to_owned()),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m.to_owned()),
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
 }
 
 impl ApiState {
-    /// Checks the request may act for `account`, and records it as the request's id.
-    ///
-    /// TODO(auth): verify an EIP-712 signature from `account` over the request, with a per-account
-    /// nonce to stop replays.
+    /// Checks the request may act for `account`, records it as the request's id, and returns the
+    /// auth to sequence with it: the client's, or none where the node trusts the `account` field.
+    /// `hash` gives the digest the request signs under a domain with its nonce and expiry. A signed
+    /// request stays out of the log unless its account has been credited, its nonce is the
+    /// account's next, and it has not expired: otherwise it could do nothing now, a nonce ahead of
+    /// the next would stay replayable from the public log, and free keys or copied requests could
+    /// grow the log and engine state. A request refused this way uses no nonce, so it stays valid
+    /// until its expiry. The engine checks the nonce and expiry again at the sequenced time.
     /// Error cases:
-    /// - EIP-712 auth is configured, which is not implemented yet
-    fn authorise(&self, account: AccountId) -> Result<(), ApiError> {
+    /// - signatures are required and the request has none, or one that is not `account`'s
+    /// - the request is signed and the engine has never credited `account`
+    /// - the request is signed with a nonce other than the account's next
+    /// - the request is signed with an expiry already past by the clock or the last sequenced time
+    /// - the sequencer has stopped
+    async fn authorise(
+        &self,
+        account: AccountId,
+        auth: Option<RequestAuth>,
+        hash: impl FnOnce(&Eip712Domain, &RequestAuth) -> B256,
+    ) -> Result<Option<RequestAuth>, ApiError> {
         Span::current().record("id", display(account));
-        match self.auth {
-            AuthMode::None => Ok(()),
-            AuthMode::Eip712 => Err(ApiError::NotImplemented("EIP-712 request signing is not implemented yet")),
+        if self.auth == ClientAuth::Unsigned {
+            return Ok(None);
         }
+        if let Err(reason) = self.auth.check(account, auth.as_ref(), hash) {
+            debug!(?reason, "request refused");
+            return Err(ApiError::Unauthorized(match reason {
+                Reject::MissingSignature => "missing signature",
+                _ => "invalid signature",
+            }));
+        }
+        // Accounts are never removed and nonces only grow, so neither check can pass a request
+        // that the engine then sees ahead of its account's next nonce.
+        let (credited, next, last_sequenced) =
+            self.query(move |e| (e.accounts().contains_key(&account), e.next_request_nonce(account), e.now())).await?;
+        if !credited {
+            debug!("request refused: account never credited");
+            return Err(ApiError::Forbidden("account has never been credited"));
+        }
+        let nonce = auth.as_ref().map(|auth| auth.nonce);
+        if nonce != Some(next) {
+            debug!(?nonce, expected = next, "request refused: invalid nonce");
+            return Err(ApiError::InvalidNonce { expected: next });
+        }
+        // The sequencer stamps no earlier than its clock reads now or the last sequenced time, so a
+        // request already expired by then can never run, unless the host turns its clock back (the
+        // sequencer's trusted-time TODO). An expiry too far ahead is left to the engine, which uses
+        // the nonce as it refuses it, so the request cannot run later once its expiry comes within
+        // the bound.
+        let now = (self.clock)().max(last_sequenced);
+        if let Some(Err(Reject::Expired { expires_at })) = auth.as_ref().map(|auth| auth.check_expiry(now)) {
+            debug!(expires_at, "request refused: expired");
+            return Err(ApiError::BadRequest(format!("request expired at {expires_at}")));
+        }
+        Ok(auth)
     }
 
     /// Sequences a command and waits for its events.
@@ -163,6 +220,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/markets", get(markets))
         .route("/v1/house", get(house))
         .route("/v1/accounts/{address}", get(account))
+        .route("/v1/accounts/{address}/nonce", get(nonce))
         .route("/v1/orders", post(place_order))
         .route("/v1/orders/cancel", post(cancel_order))
         .route("/v1/withdrawals", post(withdraw))
@@ -245,12 +303,25 @@ async fn account(State(s): State<ApiState>, Path(address): Path<String>) -> ApiR
     view.map(Json).ok_or(ApiError::NotFound)
 }
 
+/// The nonce the account's next signed request must carry.
+/// Error cases:
+/// - the address is malformed
+/// - the sequencer has stopped
+async fn nonce(State(s): State<ApiState>, Path(address): Path<String>) -> ApiResult<NonceView> {
+    let id: AccountId = address.parse().map_err(|e| ApiError::BadRequest(format!("{e}")))?;
+    Span::current().record("id", display(id));
+    let next_nonce = s.query(move |e| e.next_request_nonce(id)).await?;
+    Ok(Json(NonceView { next_nonce }))
+}
+
 /// Places an order and returns the events it produced.
 /// Error cases:
 /// - the request is not authorised for its account
 /// - the sequencer has stopped
-async fn place_order(State(s): State<ApiState>, Json(req): Json<OrderRequest>) -> ApiResult<Vec<Event>> {
-    s.authorise(req.account)?;
+async fn place_order(State(s): State<ApiState>, Json(mut req): Json<OrderRequest>) -> ApiResult<Vec<Event>> {
+    let auth = req.auth.take();
+    req.auth =
+        s.authorise(req.account, auth, |domain, auth| order_hash(domain, &req, auth.nonce, auth.expires_at)).await?;
     Ok(Json(s.submit(Command::PlaceOrder(req)).await?))
 }
 
@@ -258,18 +329,26 @@ async fn place_order(State(s): State<ApiState>, Json(req): Json<OrderRequest>) -
 /// Error cases:
 /// - the request is not authorised for its account
 /// - the sequencer has stopped
-async fn cancel_order(State(s): State<ApiState>, Json(b): Json<CancelBody>) -> ApiResult<Vec<Event>> {
-    s.authorise(b.account)?;
-    Ok(Json(s.submit(Command::CancelOrder { account: b.account, order_id: b.order_id }).await?))
+async fn cancel_order(State(s): State<ApiState>, Json(b): Json<CancelRequest>) -> ApiResult<Vec<Event>> {
+    let auth = s
+        .authorise(b.account, b.auth, |domain, auth| {
+            cancel_hash(domain, b.account, b.order_id, auth.nonce, auth.expires_at)
+        })
+        .await?;
+    Ok(Json(s.submit(Command::CancelOrder { account: b.account, order_id: b.order_id, auth }).await?))
 }
 
 /// Requests a withdrawal; an approval is signed and streamed.
 /// Error cases:
 /// - the request is not authorised for its account
 /// - the sequencer has stopped
-async fn withdraw(State(s): State<ApiState>, Json(b): Json<AmountBody>) -> ApiResult<Vec<Event>> {
-    s.authorise(b.account)?;
-    Ok(Json(s.submit(Command::Withdraw { account: b.account, amount: b.amount }).await?))
+async fn withdraw(State(s): State<ApiState>, Json(b): Json<WithdrawalRequest>) -> ApiResult<Vec<Event>> {
+    let auth = s
+        .authorise(b.account, b.auth, |domain, auth| {
+            withdrawal_hash(domain, b.account, b.amount, auth.nonce, auth.expires_at)
+        })
+        .await?;
+    Ok(Json(s.submit(Command::Withdraw { account: b.account, amount: b.amount, auth }).await?))
 }
 
 /// Mock custody only: credits an account without a chain deposit, under a fresh reference.
@@ -285,5 +364,7 @@ async fn dev_deposit(State(s): State<ApiState>, Json(b): Json<AmountBody>) -> Ap
     Ok(Json(s.submit(Command::Deposit { account: b.account, amount: b.amount, chain_ref }).await?))
 }
 
+#[cfg(test)]
+mod auth_tests;
 #[cfg(test)]
 mod tests;

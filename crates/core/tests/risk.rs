@@ -72,11 +72,11 @@ fn withdrawals_are_limited_to_free_cash() {
     h.price(BTC, "100000");
     h.market_order(a, BTC, Side::Buy, "0.09", "100000");
 
-    let ev = h.cmd(Command::Withdraw { account: a, amount: f("200") });
+    let ev = h.cmd(Command::Withdraw { account: a, amount: f("200"), auth: None });
     assert!(
         matches!(&ev[0], Event::WithdrawalRejected { reason: Reject::InsufficientFunds { available }, .. } if *available == f("100"))
     );
-    let ev = h.cmd(Command::Withdraw { account: a, amount: f("100") });
+    let ev = h.cmd(Command::Withdraw { account: a, amount: f("100"), auth: None });
     assert_eq!(ev[0], Event::WithdrawalApproved { account: a, amount: f("100"), nonce: 1 });
     h.assert_conserved(f("100"));
 }
@@ -87,7 +87,7 @@ fn withdrawals_of_out_of_range_amounts_are_rejected() {
     let a = acct(1);
     h.deposit(a, "1000");
     for amount in ["0", "-5", "1000000000.000000001"] {
-        let ev = h.cmd(Command::Withdraw { account: a, amount: f(amount) });
+        let ev = h.cmd(Command::Withdraw { account: a, amount: f(amount), auth: None });
         assert!(matches!(&ev[0], Event::WithdrawalRejected { reason: Reject::InvalidAmount, .. }), "{amount}");
     }
     assert_eq!(h.balance(a), f("1000"));
@@ -144,6 +144,7 @@ fn reduce_only_orders_and_markets_never_add_risk() {
             qty: f(qty),
             kind: OrderKind::Market { quoted: f("100000"), max_slippage_bps: None },
             reduce_only: true,
+            auth: None,
         })
     };
     assert_eq!(rejection(&h.cmd(reduce(Side::Sell, "0.1"))), &Reject::ReduceOnly);
@@ -181,12 +182,15 @@ fn clients_can_cancel_their_resting_orders_once() {
     let Event::OrderAccepted { order_id, .. } = ev[0] else { panic!("{ev:?}") };
 
     // Another account cannot cancel it.
-    assert_eq!(rejection(&h.cmd(Command::CancelOrder { account: acct(2), order_id })), &Reject::UnknownOrder);
+    assert_eq!(
+        rejection(&h.cmd(Command::CancelOrder { account: acct(2), order_id, auth: None })),
+        &Reject::UnknownOrder
+    );
     assert_eq!(h.engine.markets()[&BTC].resting.len(), 1);
 
-    let ev = h.cmd(Command::CancelOrder { account: a, order_id });
+    let ev = h.cmd(Command::CancelOrder { account: a, order_id, auth: None });
     assert_eq!(ev, vec![Event::OrderCancelled { account: a, order_id, reason: CancelReason::Client }]);
     assert!(h.engine.markets()[&BTC].resting.is_empty());
     // A second cancel finds nothing.
-    assert_eq!(rejection(&h.cmd(Command::CancelOrder { account: a, order_id })), &Reject::UnknownOrder);
+    assert_eq!(rejection(&h.cmd(Command::CancelOrder { account: a, order_id, auth: None })), &Reject::UnknownOrder);
 }

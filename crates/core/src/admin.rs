@@ -8,11 +8,9 @@ use crate::Fixed;
 use crate::command::AdminCommand;
 use crate::engine::{Engine, MarketState};
 use crate::event::Event;
-use crate::params::StressLevel;
+use crate::params::{MAX_BENCHMARK_BPS, StressLevel};
+use crate::protocol::ProtocolVersion;
 use crate::types::MarketId;
-
-/// The largest benchmark rate accepted, either sign: 100% a year.
-const MAX_BENCHMARK_BPS: i64 = 10_000;
 
 impl Engine {
     /// Applies an operator command.
@@ -23,6 +21,9 @@ impl Engine {
     /// - `SetStressFloor` before parameters are set, at a level that does not exist, or for an
     ///   unknown market
     /// - `SetReduceOnly` for an unknown market
+    /// - `SetClientAuth` once client auth is recorded
+    /// - `ActivateProtocol` for a version no newer than the one in force, or for `V3` or later
+    ///   before client auth is recorded
     pub(crate) fn admin(&mut self, cmd: &AdminCommand, events: &mut Vec<Event>) -> Result<(), String> {
         match cmd {
             AdminCommand::SetParams(params) => {
@@ -60,6 +61,21 @@ impl Engine {
             }
             AdminCommand::SetReduceOnly { market, reduce_only } => {
                 self.markets.get_mut(market).ok_or("unknown market")?.reduce_only = *reduce_only;
+            }
+            AdminCommand::SetClientAuth(auth) => {
+                if self.client_auth.is_some() {
+                    return Err("client auth is already recorded".into());
+                }
+                self.client_auth = Some(auth.clone());
+            }
+            AdminCommand::ActivateProtocol { version } => {
+                if *version <= self.protocol_version {
+                    return Err(format!("protocol {version:?} is not newer than {:?}", self.protocol_version));
+                }
+                if *version >= ProtocolVersion::V3 && self.client_auth.is_none() {
+                    return Err(format!("protocol {version:?} needs client auth recorded first"));
+                }
+                self.protocol_version = *version;
             }
         }
         Ok(())

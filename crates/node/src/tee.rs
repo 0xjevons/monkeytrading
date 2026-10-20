@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use engine_core::Fixed;
+use engine_core::eip712::{self, B256};
 use engine_core::types::AccountId;
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
@@ -97,9 +98,7 @@ impl EnclaveKey {
 
     /// The key's EVM address: the last 20 bytes of keccak-256 over the uncompressed public key.
     pub fn address(&self) -> [u8; 20] {
-        let point = self.key.verifying_key().to_encoded_point(false);
-        let hash = Keccak256::digest(&point.as_bytes()[1..]);
-        hash[12..].try_into().expect("keccak-256 has 32 bytes")
+        eip712::address(self.key.verifying_key()).0
     }
 
     /// The address as `0x` hex.
@@ -135,11 +134,7 @@ impl EnclaveKey {
 
     /// 65-byte `r || s || v` with `v` in {27, 28}, as `ecrecover` expects.
     fn sign_digest(&self, digest: [u8; 32]) -> String {
-        // Signing a 32-byte prehash with a valid key cannot fail.
-        let (sig, recid) = self.key.sign_prehash_recoverable(&digest).expect("signing a 32-byte digest");
-        let mut out = sig.to_bytes().to_vec();
-        out.push(27 + recid.to_byte());
-        format!("0x{}", hex::encode(out))
+        format!("0x{}", hex::encode(eip712::sign(&self.key, &B256::from(digest))))
     }
 }
 

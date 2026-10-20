@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use engine_core::auth::ClientAuth;
 use engine_core::command::Command;
 use engine_core::event::{CancelReason, Event, Fill, Reject};
 use engine_core::price::PriceError;
@@ -11,6 +12,7 @@ use engine_core::{Engine, Fixed};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::clock::now_ms;
 use crate::config::NodeConfig;
 use crate::log::{LogReader, Manifest, Offset};
 use crate::sequencer::{Request, Sequencer, SequencerConfig, SignedWithdrawal, StreamMsg};
@@ -42,7 +44,7 @@ impl TestSequencer {
         let key = Arc::new(EnclaveKey::generate());
         let mut seq = Sequencer::recover(sequencer_config(dir, manifest_tx), key, stream.clone(), withdrawals_tx)
             .expect("sequencer recovers");
-        if seq.is_fresh() {
+        if seq.needs_genesis() {
             seq.genesis(&dev_config().genesis).expect("dev genesis");
         }
         let (tx, rx) = mpsc::channel(64);
@@ -107,6 +109,8 @@ pub fn sequencer_config(dir: &Path, manifest: watch::Sender<Manifest>) -> Sequen
         checkpoint_every: CHECKPOINT_EVERY,
         chain_id: 31337,
         vault: AccountId([0; 20]),
+        clock: now_ms,
+        client_auth: ClientAuth::Unsigned,
     }
 }
 
@@ -117,7 +121,7 @@ pub fn deposit(amount: i64, chain_ref: &str) -> Command {
 
 /// A withdrawal by `TRADER` of `amount` whole units.
 pub fn withdraw(amount: i64) -> Command {
-    Command::Withdraw { account: TRADER, amount: Fixed::from_int(amount) }
+    Command::Withdraw { account: TRADER, amount: Fixed::from_int(amount), auth: None }
 }
 
 /// Every message on disk at or after `from`, as the stream encodes them.
@@ -147,6 +151,11 @@ pub fn every_event() -> Vec<Event> {
         Reject::HouseCapacity,
         Reject::InvalidAmount,
         Reject::DuplicateReference,
+        Reject::MissingSignature,
+        Reject::InvalidSignature,
+        Reject::InvalidNonce { expected: 3 },
+        Reject::Expired { expires_at: 1_000 },
+        Reject::ExpiryTooFar { latest: 2_000 },
     ];
     for reason in &reasons {
         match reason {
@@ -161,7 +170,12 @@ pub fn every_event() -> Vec<Event> {
             | Reject::InsufficientFunds { .. }
             | Reject::HouseCapacity
             | Reject::InvalidAmount
-            | Reject::DuplicateReference => {}
+            | Reject::DuplicateReference
+            | Reject::MissingSignature
+            | Reject::InvalidSignature
+            | Reject::InvalidNonce { .. }
+            | Reject::Expired { .. }
+            | Reject::ExpiryTooFar { .. } => {}
         }
     }
     let fill = Fill {
