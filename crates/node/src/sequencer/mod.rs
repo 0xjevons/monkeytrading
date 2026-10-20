@@ -1,7 +1,7 @@
 //! The sequencer owns the engine. Commands arrive over one channel, get a seq and a timestamp, and
 //! are applied in order; each then goes into the log with the events it produced. Nothing is
-//! acknowledged or published until its log entry is flushed. One task, no locks, and no queue beyond the channel: a fill costs about one
-//! engine step plus a buffered write.
+//! acknowledged or published until its log entry is flushed. One task, no locks, and no queue
+//! beyond the channel: a fill costs about one engine step plus a buffered write.
 
 use std::collections::VecDeque;
 use std::path::Path;

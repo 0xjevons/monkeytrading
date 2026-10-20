@@ -18,6 +18,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
+use tracing::field::display;
 use tracing::{Instrument, Span, error, info};
 
 use crate::api::{ApiError, ApiState};
@@ -137,6 +138,7 @@ pub async fn stream(
         (None, Some(seq)) => Some(Offset::start_of(seq)),
         (None, None) => None,
     };
+    Span::current().record("id", display(start.map_or_else(|| "live".to_owned(), |from| from.to_string())));
     let feed = Feed::new(s.stream.subscribe(), s.log_dir.clone(), s.manifest.clone(), s.backfills.clone(), start);
     let span = Span::current();
     Ok(ws.on_upgrade(move |socket| forward(socket, feed).instrument(span)))
@@ -207,6 +209,7 @@ mod tests {
     use std::task::{Context as TaskContext, Poll};
 
     use engine_core::command::{Command, Sequenced};
+    use futures_util::FutureExt;
     use tokio::time::timeout;
 
     use crate::log::{CommandEntry, LogEntry, segment_seq};
@@ -306,13 +309,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_backfill_holds_a_permit_only_while_it_reads_a_batch() {
+    async fn a_backfill_reads_a_batch_only_with_a_permit_and_returns_it_after() {
         let dir = scratch_dir("feed-permits");
         let node = TestSequencer::start(&dir, 1024);
         for n in 0..BACKFILL_BATCH {
             node.submit(deposit(1, &format!("dep-{n}"))).await;
         }
-        let backfills = Arc::new(Semaphore::new(0));
+        let backfills = Arc::new(Semaphore::new(1));
         let mut feed = Feed::new(
             node.stream.subscribe(),
             dir.clone(),
@@ -320,14 +323,21 @@ mod tests {
             backfills.clone(),
             Some(Offset::start_of(0)),
         );
-        let waited = timeout(Duration::from_millis(200), feed.next()).await;
-        assert!(waited.is_err(), "no disk read without a permit");
-
-        backfills.add_permits(1);
         let first = next_msg(&mut feed).await;
         assert_eq!(backfills.available_permits(), 1, "the permit is back once the batch is read");
+        let mut got = take(&mut feed, BACKFILL_BATCH - 1).await;
+        assert!(feed.backlog.is_empty() && feed.reader.is_some(), "the next message needs another batch");
+
+        let held = backfills.clone().try_acquire_owned().unwrap();
+        let mut waiting = Box::pin(feed.next());
+        assert!((&mut waiting).now_or_never().is_none());
+        drop(waiting);
+        assert!(feed.reader.is_some(), "no batch starts without a permit");
+        drop(held);
+
         let expected = log_messages(&dir, first.offset.next());
-        assert_eq!(take(&mut feed, expected.len()).await, expected);
+        got.extend(take(&mut feed, expected.len() - got.len()).await);
+        assert_eq!(got, expected);
     }
 
     #[tokio::test]

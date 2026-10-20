@@ -1,14 +1,14 @@
 //! Reads the log from any offset, across segments, while the sequencer appends to it. Only whole
 //! lines are read: a line still being written is left for a later call.
 
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
-use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
+use crate::log::checked::{self, CheckedChunks, ChunkHashes};
 use crate::log::segments::list_segments;
 use crate::log::{LogEntry, MANIFEST, Manifest, Offset, offset_of};
 
@@ -30,6 +30,8 @@ struct OpenSegment {
     path: PathBuf,
     /// The segment's contents from `consumed` on; `None` until read, and after `release`.
     lines: Option<Box<dyn BufRead + Send>>,
+    /// Chunk hashes, once a listed segment has matched its listing.
+    checked: Option<ChunkHashes>,
     /// Bytes of whole lines read so far.
     consumed: u64,
     /// Bytes of a line not yet fully written.
@@ -53,8 +55,8 @@ impl LogReader {
         Ok(reader)
     }
 
-    /// Drops what the reader holds of its segment, which a completed one keeps whole in memory. The
-    /// next read opens it again where this one stopped, and checks it again.
+    /// Closes the reader's segment file. The next read opens it again where this one stopped,
+    /// checking each chunk it reads.
     pub fn release(&mut self) {
         if let Some((_, segment)) = &mut self.segment {
             segment.lines = None;
@@ -142,8 +144,8 @@ impl LogReader {
     fn open_segment(&self, i: usize) -> OpenSegment {
         let (first_seq, path) = &self.segments[i];
         let complete = i + 1 < self.segments.len();
-        let (lines, consumed, line, started) = (None, 0, Vec::new(), false);
-        OpenSegment { first_seq: *first_seq, path: path.clone(), lines, consumed, line, complete, started }
+        let (lines, checked, consumed, line, started) = (None, None, 0, Vec::new(), false);
+        OpenSegment { first_seq: *first_seq, path: path.clone(), lines, checked, consumed, line, complete, started }
     }
 }
 
@@ -171,34 +173,42 @@ impl OpenSegment {
 }
 
 /// The contents of `segment` from where its last read stopped. A segment the manifest lists is
-/// read whole and checked against its listing before any of it is yielded, since the host can
-/// rewrite files on disk.
+/// checked against its listing in one pass the first time it is read, and each chunk after that
+/// as it is read, since the host can rewrite files on disk.
 /// Error cases:
 /// - the file cannot be opened, read, or positioned
-/// - a listed segment's size or SHA-256 differs from its listing
+/// - a listed segment differs from its listing
+/// - an unlisted segment does not start right after the last listed one
 fn segment_lines(
     manifest: &watch::Receiver<Manifest>,
-    segment: &OpenSegment,
+    segment: &mut OpenSegment,
 ) -> anyhow::Result<Box<dyn BufRead + Send>> {
     let path = &segment.path;
-    let listed = manifest.borrow().get(segment.first_seq).cloned();
-    let Some(listed) = listed else {
-        // TODO: the segment still being written is read from host disk unchecked, to the end of
-        // the batch even if it completes meanwhile. Check it against the writer's running hash, or
-        // serve it from enclave memory, before relying on backfill for integrity; until then,
-        // replay against the signed checkpoints is the check.
-        let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        file.seek(SeekFrom::Start(segment.consumed)).with_context(|| format!("seeking in {}", path.display()))?;
-        return Ok(Box::new(BufReader::new(file)));
-    };
-    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let sha256 = hex::encode(Sha256::digest(&bytes));
-    ensure!(
-        bytes.len() as u64 == listed.bytes && sha256 == listed.sha256,
-        "{} does not match its listing in {MANIFEST}",
-        path.display()
-    );
-    let mut cursor = Cursor::new(bytes);
-    cursor.set_position(segment.consumed);
-    Ok(Box::new(cursor))
+    if segment.checked.is_none() {
+        let (listed, unlisted_from) = {
+            let manifest = manifest.borrow();
+            let unlisted_from = manifest.segments.last().map_or(0, |last| last.last_seq + 1);
+            (manifest.get(segment.first_seq).cloned(), unlisted_from)
+        };
+        match listed {
+            Some(listed) => segment.checked = Some(checked::check(path, &listed)?),
+            None => {
+                ensure!(
+                    segment.first_seq == unlisted_from,
+                    "{} is not in {MANIFEST}, and does not start right after the last segment it lists",
+                    path.display()
+                );
+                // TODO: the segment still being written is read from host disk unchecked, to the
+                // end of the batch even if it completes meanwhile. Check it against the writer's
+                // running hash, or serve it from enclave memory, before relying on backfill for
+                // integrity; until then, replay against the signed checkpoints is the check.
+                let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+                let at = SeekFrom::Start(segment.consumed);
+                file.seek(at).with_context(|| format!("seeking in {}", path.display()))?;
+                return Ok(Box::new(BufReader::new(file)));
+            }
+        }
+    }
+    let chunks = segment.checked.clone().expect("a listed segment's chunks are checked above");
+    Ok(Box::new(BufReader::new(CheckedChunks::open(path, chunks, segment.consumed)?)))
 }

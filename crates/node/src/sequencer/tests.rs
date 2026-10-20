@@ -54,6 +54,8 @@ fn replay_accepts_a_log_written_before_events_and_withdrawals_were_logged() {
     entries.push(checkpoint(1, format!("0x{}", hex::encode(engine.state_root()))));
     let replayed = replay(&entries).unwrap();
     assert_eq!((replayed.commands, replayed.checkpoints), (2, 1));
+    // The old node signed that withdrawal itself; recovery must not sign it again.
+    assert!(replayed.unsigned.is_empty());
 }
 
 #[tokio::test]

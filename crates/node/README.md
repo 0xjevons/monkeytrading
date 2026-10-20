@@ -31,6 +31,7 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/log/mod.rs` — the JSON-lines log format, stream offsets, and the single-file reader
 - `src/log/segments.rs` — segment files, rotation, the manifest, and recovery checks
 - `src/log/reader.rs` — reads the log from any offset while it is being written
+- `src/log/checked.rs` — reads a completed segment in chunks checked against its listing
 - `src/log/tests.rs` — log format, segment, and reader tests
 - `src/api/mod.rs` — REST routes and the request span
 - `src/api/stream.rs` — the WebSocket stream: backfill from disk, then live
@@ -73,8 +74,9 @@ The log is a directory (`node.log_dir`) of segment files named for their first s
 `manifest.jsonl`, which gets one line per completed segment with its seq range, size, and SHA-256.
 The node loads the manifest at recovery, after checking it against the segment files, and then
 holds it in memory, adding each segment it completes. The archive serves that copy, not the file
-on disk. Backfill reads up to 256 messages at a time, and checks a completed segment against the
-manifest each time it reads a batch from it. The segment still being written is read from disk
+on disk. Backfill reads up to 256 messages at a time. It checks a completed segment against the
+manifest in one pass the first time it reads from it, then checks each chunk it reads, and refuses
+any other segment the manifest does not list. The segment still being written is read from disk
 unchecked, and replay against the signed checkpoints is the check for it. While it reads a batch,
 a subscriber holds one of 16 permits and up to one completed segment in memory. If a new segment
 cannot be created, the current one keeps growing and the node warns (`log_rotation_failed`) until

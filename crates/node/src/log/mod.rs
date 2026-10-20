@@ -4,6 +4,7 @@
 //! signed by the enclave key. The same entries stream live over `/v1/stream`, each at an
 //! [`Offset`].
 
+mod checked;
 mod reader;
 pub use reader::LogReader;
 mod segments;

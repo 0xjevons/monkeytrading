@@ -255,11 +255,7 @@ impl LogWriter {
             Ok(file) => file,
             Err(e) if self.open.is_some() => {
                 if !self.rotation_failing {
-                    warn!(
-                        alert = "log_rotation_failed",
-                        seq = first_seq,
-                        "cannot start a log segment, so the current one grows: {e}"
-                    );
+                    warn!(alert = "log_rotation_failed", "cannot start a log segment, so the current one grows: {e}");
                     self.rotation_failing = true;
                 }
                 return Ok(());
@@ -285,7 +281,7 @@ impl LogWriter {
         fs::rename(&staged, &path).with_context(|| format!("renaming {} into place", staged.display()))?;
         self.open = Some((Segment::empty(first_seq), BufWriter::new(file)));
         if std::mem::take(&mut self.rotation_failing) {
-            info!(seq = first_seq, "log segments rotate again");
+            info!("log segments rotate again");
         }
         Ok(())
     }

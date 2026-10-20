@@ -385,6 +385,18 @@ fn a_segment_that_cannot_be_started_leaves_the_current_one_growing_until_it_can(
     assert_eq!(ranges, [(0, 2)]);
 }
 
+#[test]
+fn the_reader_refuses_an_unlisted_segment_inside_listed_history() {
+    let dir = scratch_dir("reader-planted");
+    write(&dir, 4, &[cmd(0), cmd(1), cmd(2), cmd(3), cmd(4)]);
+    // The host plants its own copy of seqs 2 and 3 among the completed segments.
+    let line = |entry: &LogEntry| [serde_json::to_vec(entry).unwrap(), b"\n".to_vec()].concat();
+    fs::write(dir.join(SEG_2), [line(&cmd(2)), line(&cmd(3))].concat()).unwrap();
+    let mut reader = LogReader::open(&dir, Offset::start_of(2), manifest_of(&dir)).unwrap();
+    let err = reader.next_entry().err().unwrap();
+    assert!(format!("{err:#}").contains("does not start right after the last segment it lists"), "{err:#}");
+}
+
 // ── Helpers ──
 
 fn cmd(seq: u64) -> LogEntry {
