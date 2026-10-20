@@ -170,12 +170,14 @@ fixes its class, not only the cited instance:
 4. **Re-read the fix diff** before the next review round, against the finding's scenario and its
    neighbours, to check that the fix creates no mirror-image defect.
 5. **Record the invariant and the sites fixed** in the branch's fix notes, under a heading for the
-   round, so every later round checks the class instead of rediscovering it. A later fix that
-   changes a recorded invariant rewrites its entry. The notes are the gitignored
+   round, so every later round checks the class instead of rediscovering it. An entry stays only
+   while its fix is on the branch: a later fix that changes the invariant rewrites the entry, and a
+   fix that is reverted or rejected removes it. The notes are the gitignored
    `agents/.processes/fixes/<branch>.md` in the main checkout, which every worktree finds with
    `dirname "$(git rev-parse --path-format=absolute --git-common-dir)"`, with the PR's head branch
    name kept whole (`fixes/<user>/size-spread-tiers-gh12.md`). Only the agent that owns the PR
-   branch writes them; a subagent returns its invariant and sites to that agent.
+   branch writes them; a subagent returns its invariant and sites to that agent. A new branch
+   starts with none ([git-workflow](../../rules/git-workflow.md#branches)).
 
 Every round still reviews the full diff; the recorded invariants add to what it checks and never
 narrow it.

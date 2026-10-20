@@ -63,6 +63,7 @@ else
   DEFAULT="$(git -C "$REPO_ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD \
     || echo "origin/$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)")"
   git -C "$REPO_ROOT" worktree add -b "$BRANCH" "$WT_PATH" "${BASE:-$DEFAULT}"   # new branch
+  rm -f "$REPO_ROOT/agents/.processes/fixes/$BRANCH.md"                          # no stale fix notes (git-workflow)
 fi
 ```
 

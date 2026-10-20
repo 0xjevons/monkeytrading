@@ -20,6 +20,10 @@ Load on request before creating a branch, committing, pushing, or opening or upd
     one when the request does not say; omit it when the user confirms there is none. Several
     issues are appended in order.
 - An existing branch, including a PR's head branch, keeps its original name.
+- A new branch starts with no fix notes: whoever creates it removes any
+  `agents/.processes/fixes/<branch>.md` left in the main checkout
+  ([agent-code-review](../skills/agent-code-review/SKILL.md#fixing-an-accepted-finding)), so a
+  reused name inherits no stale invariants.
 
 ```
 {gh user}/size-spread-tiers

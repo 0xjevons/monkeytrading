@@ -125,7 +125,7 @@ self-review, opening the PR, and reviewing — not only at the end.
 - [rules/code-comments.md](rules/code-comments.md) — terse, self-documenting comments; load before writing comments / docs.
 - [rules/keep-agents-index-in-sync.md](rules/keep-agents-index-in-sync.md) — keep the nearest `AGENTS.md` in sync (structure, commands, conventions) with any change in a dir it documents; load before changing such a dir.
 - [rules/no-deploy.md](rules/no-deploy.md) — never deploy, sequence admin commands into a live engine, or mutate any environment, contract, or key without explicit per-action approval; load before any deploy / admin command / contract call / secret write.
-- [rules/git-workflow.md](rules/git-workflow.md) — branch naming (`{gh user}/<slug>[-gh<issue>]`), commit approval and `[scopes] Subject` format, no AI signatures, local checks scoped to the affected crates (full CI runs on the PR, never publishing steps), force-push with lease; load before creating a branch, committing, pushing, or opening a PR.
+- [rules/git-workflow.md](rules/git-workflow.md) — branch naming (`{gh user}/<slug>[-gh<issue>]`), a new branch starting with no fix notes, commit approval and `[scopes] Subject` format, no AI signatures, local checks scoped to the affected crates (full CI runs on the PR, never publishing steps), force-push with lease; load before creating a branch, committing, pushing, or opening a PR.
 
 ### Skills
 

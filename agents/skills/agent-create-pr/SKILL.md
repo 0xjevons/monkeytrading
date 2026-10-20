@@ -128,8 +128,9 @@ After the merge, still in the main checkout, the session cleans up the PR's head
 - **Locally**, only while the branch points at `$SHA`: `git worktree remove` on the linked worktree
   that has it checked out, or `git switch main` when the main checkout has it, then
   `git branch -D "$BRANCH"` and `rm -f "agents/.processes/fixes/$BRANCH.md"`, its fix notes
-  ([agent-code-review](../agent-code-review/SKILL.md#fixing-an-accepted-finding)). A branch with commits after `$SHA` keeps its worktree, and the session
-  reports those commits (`git log --oneline "$SHA..$BRANCH"`).
+  ([agent-code-review](../agent-code-review/SKILL.md#fixing-an-accepted-finding)). A branch with
+  commits after `$SHA` keeps its worktree, and the session reports those commits
+  (`git log --oneline "$SHA..$BRANCH"`).
 
 If GitHub or git refuses any step, the session reports why and stops.
 
