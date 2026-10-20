@@ -43,14 +43,14 @@ you so.
 
 We will not take or support legal action against anyone who researches and reports a vulnerability
 in good faith under this policy, and if a third party does, we will make it known that the research
-was authorised. Good faith means demonstrating a vulnerability on a node you run yourself rather
-than on a live deployment; never accessing anyone else's data beyond what the engine publishes
-through its log and public API, and never changing or destroying it; not degrading the service for
-other users; and keeping the details private as this policy asks. If you come across a
-vulnerability while using a live deployment, trade only from your own accounts, stop as soon as you
-have seen the problem, report it, and make no withdrawal from the affected account until we have
-agreed with you how to return what the problem gained you. If you are unsure whether something you
-plan to do is covered, ask us before you do it.
+was authorised. Good faith means demonstrating a vulnerability on a node, chain fork, or enclave you
+run yourself rather than on a live deployment; never accessing anyone else's data beyond what the
+engine publishes through its log and public API, and never changing or destroying it; not degrading
+the service for other users; and keeping the details private as this policy asks. If you come
+across a vulnerability while using a live deployment, trade only from your own accounts, stop as
+soon as you have seen the problem, report it, and keep at least what the problem gained you in the
+affected account until we have agreed with you how to return it. If you are unsure whether
+something you plan to do is covered, ask us before you do it.
 
 ## Scope
 
@@ -77,10 +77,10 @@ attestation on SEV-SNP hardware and a verifier for it are still being built, as 
 
 Out of scope are volumetric denial of service, meaning attacks that work only by flooding the API or
 the network with traffic; social engineering of anyone involved with the project; and
-vulnerabilities in third-party venues and services, such as the exchanges that supply prices, the
-Arbitrum network, the USDC contract, and the enclave hardware, which should be reported to their
-owners. How the engine handles what those services send it, including a venue that quotes a false
-price, is in scope.
+vulnerabilities in third-party services, such as the venues that supply prices, the Arbitrum
+network, the USDC contract, and the enclave hardware, which should be reported to their owners. How
+the engine handles what those services send it, including a venue that quotes a false price, is in
+scope.
 
 Findings that need an operator's key or credentials to be compromised first are also out of scope,
 unless they defeat a guarantee the engine makes. The engine is designed so that whoever runs it, and
@@ -90,9 +90,11 @@ pay out funds the engine did not approve. A finding that breaks one of these gua
 even when it starts from an operator's key. Some of the checks behind them are still being built:
 `engine replay` does not yet verify checkpoint signatures; the node does not yet check the log it
 recovers from against anything its host cannot rewrite, so it accepts a truncated or rewritten one;
-and the enclave's signing key does not yet survive a restart. A gap that an open issue or a `TODO`
-in the code already records is known, so a report of it is not a new finding, though its details
-stay private under the disclosure timeline above; a way around a check that exists is a new finding.
+the enclave's signing key does not yet survive a restart; and the node does not yet refuse its
+development settings when it runs with hardware attestation, whose report vouches for the signing
+key but not for the configuration. A gap that this list, an open issue, or a `TODO` in the code
+already records is known, so a report of it is not a new finding, though its details stay private
+under the disclosure timeline above; a way around a check that exists is a new finding.
 
 ## Supported versions
 
