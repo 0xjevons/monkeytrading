@@ -13,7 +13,11 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - Signed checkpoints and withdrawals, bound to the chain id and vault, from an attested key
 - Attestation through Linux configfs-tsm, covering TDX and SEV-SNP, or a clearly marked mock
 - REST API for orders, cancels, withdrawals, and reads, plus a WebSocket stream of the log
-- `engine replay` to verify a published log against the open-source engine
+- Stream offsets of `<seq>:<index>`: a subscriber starts or resumes at any offset, reads the log
+  from disk, then goes live, getting each message once; one that falls behind resumes from disk
+- Segmented log: completed segments and a manifest of their seq ranges and SHA-256 hashes are a
+  public archive served over HTTP
+- `engine replay` to verify a published log, or a downloaded archive, against the open-source engine
 - Supervised tasks: any task stopping stops the node, and SIGTERM drains to a final checkpoint
 - Mock custody and price feeds for local development
 
@@ -22,14 +26,26 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/main.rs` — the `engine` binary: `run` and `replay`
 - `src/lib.rs` — module index
 - `src/node.rs` — startup, task supervision, and shutdown
-- `src/sequencer.rs` — the sequencer, checkpoints, alerts, and log replay
-- `src/log.rs` — the JSON-lines log format, writer, and reader
-- `src/api.rs` — REST routes, the request span, and the WebSocket stream
+- `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, alerts, and log replay
+- `src/sequencer/tests.rs` — sequencer and replay tests
+- `src/log/mod.rs` — the JSON-lines log format, stream offsets, and the single-file reader
+- `src/log/segments.rs` — segment files, rotation, the manifest, and recovery checks
+- `src/log/reader.rs` — reads the log from any offset while it is being written
+- `src/log/checked.rs` — reads a completed segment in chunks checked against its listing
+- `src/log/tests.rs` — log format, segment, and reader tests
+- `src/api/mod.rs` — REST routes and the request span
+- `src/api/stream.rs` — the WebSocket stream: backfill from disk, then live
+- `src/api/archive.rs` — the archive routes: the manifest and completed segments
+- `src/api/tests.rs` — API tests, including the resumable stream and archive dev scenario
+- `src/test_support.rs` — the shared test harness
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
 - `src/config.rs` — the node config schema and validation
 - `src/custody.rs` — the custody adapter (mock only so far)
 - `src/feeds.rs` — price feed adapters (mock only so far)
 - `src/clock.rs` — the wall clock used to stamp commands
+- `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
+- `tests/reference_logs.rs` — replays every committed node reference log, events included
+- `tests/reference/` — one node-format reference log per protocol version, never regenerated
 
 ## Usage
 
@@ -37,13 +53,39 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 # Run a local node with mock TEE, custody, and feeds (API on 127.0.0.1:8080)
 cargo run -p engine-node -- run --config config/dev.toml
 
-# Verify a published log
-cargo run -p engine-node -- replay --log data/dev/log.jsonl
+# Verify a node's log directory, a downloaded archive, or a single log file
+cargo run -p engine-node -- replay --log data/dev/log
+
+# Download the archive: the manifest, then each segment it lists
+curl --create-dirs -o archive/manifest.jsonl http://127.0.0.1:8080/v1/archive/manifest.jsonl
+jq -r '.file' archive/manifest.jsonl |
+  xargs -I{} curl -o archive/{} http://127.0.0.1:8080/v1/archive/{}
 ```
 
 Endpoints: `GET /v1/health`, `GET /v1/attestation`, `GET /v1/markets`, `GET /v1/house`,
 `GET /v1/accounts/{address}`, `POST /v1/orders`, `POST /v1/orders/cancel`, `POST /v1/withdrawals`,
-`POST /v1/dev/deposit` (mock custody only), and `GET /v1/stream` (WebSocket).
+`POST /v1/dev/deposit` (mock custody only), `GET /v1/stream` (WebSocket), and
+`GET /v1/archive/{file}` (`manifest.jsonl` or a segment it lists).
+
+`/v1/stream` is live from now by default. `?from=<seq>` starts at the first message of `seq`
+(`from=0` is the whole log), and `?after=<seq>:<index>` resumes after the `offset` of the last
+message received. Each message carries its `offset`: the command of a seq is index 0, then its
+withdrawals, then any checkpoint. A command logged before events were recorded in the log streams
+without its `events` key.
+
+The log is a directory (`node.log_dir`) of segment files named for their first seq, plus
+`manifest.jsonl`, which gets one line per completed segment with its seq range, size, and SHA-256.
+The node loads the manifest at recovery, after checking it against the segment files, and then holds
+it in memory, adding each segment it completes. The archive serves that copy, not the file on disk.
+Backfill reads up to 256 messages at a time and keeps them until the subscriber takes them. It
+checks a completed segment against the manifest in one pass the first time it reads from it, then
+checks each chunk it reads, and refuses any other segment the manifest does not list. The segment
+still being written is read from disk unchecked, and replay against the signed checkpoints is the
+check for it. While it reads a batch, a subscriber holds one of 16 permits and one 1 MiB chunk of a
+segment. If a new segment cannot be created, the current one keeps growing and the node warns
+(`log_rotation_failed`) until it can. A log written as one file before segments existed continues as
+the first segment: move it to `<log_dir>/00000000000000000000.jsonl`. Every segment is kept, since
+recovery replays the log from genesis.
 
 ## Configuration
 

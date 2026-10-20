@@ -19,9 +19,11 @@ an index: load only the rule whose hint matches the current action.
   `tests/reference_logs.rs`; `tests/invariants/` holds the property tests. Its `README.md` lists
   every file.
 - **crates/node/** — `engine-node`, binary `engine` (`main.rs` over `lib.rs`). Contains the
-  sequencer, the public log with signed checkpoints, `engine replay`, the REST and WebSocket API,
-  TEE attestation (configfs-tsm for TDX and SEV-SNP), and the custody and price-feed adapters
-  (mock only so far). Its `README.md` lists every file.
+  sequencer, the public log with signed checkpoints (segmented, with a public archive), `engine
+  replay`, the REST API and the resumable WebSocket stream, TEE attestation (configfs-tsm for TDX
+  and SEV-SNP), and the custody and price-feed adapters (mock only so far). `tests/reference/`
+  holds the node-format reference log per protocol version, with events, written once by
+  `examples/reference_log.rs`. Its `README.md` lists every file.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine.
   Its `[genesis]` section is protocol: it is sequenced into the log as admin commands on first
   boot. Every section rejects unknown keys.
@@ -55,17 +57,21 @@ Run from the repo root:
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Format check: `cargo fmt --all -- --check`
 - File line cap: `./scripts/check-file-loc.sh`
-- Reference logs: `cargo test -p engine-core --test reference_logs` replays them;
+- Reference logs: `cargo test -p engine-core --test reference_logs` replays them, and
+  `cargo test -p engine-node --test reference_logs` replays the node's, events included;
   `./scripts/check-reference-logs.sh [base]` checks none changed since `base` (default
   `origin/main`)
 - Property tests: `cargo test -p engine-core --test invariants`
 - New protocol version's reference log:
-  `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`
+  `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`, then
+  the node's from it: `cargo run -p engine-node --example reference_log --
+  crates/core/tests/reference/v<N>.jsonl crates/node/tests/reference/v<N>.jsonl`
 - Supply chain: `cargo deny check` (CI runs it; install `cargo-deny` to run it locally)
 - Run a local node: `cargo run -p engine-node -- run --config config/dev.toml` (or set
-  `CONFIG_PATH`); the API listens on `127.0.0.1:8080`, the log goes to `data/dev/log.jsonl`
-  (gitignored), and the log level comes from `[logging].level`
-- Verify a published log: `cargo run -p engine-node -- replay --log <path>`
+  `CONFIG_PATH`); the API listens on `127.0.0.1:8080`, the log goes to segment files and a
+  manifest in `data/dev/log/` (gitignored), and the log level comes from `[logging].level`
+- Verify a published log: `cargo run -p engine-node -- replay --log <path>`, where `<path>` is a
+  log directory, a downloaded archive, or a single log file
 
 ## Repo facts
 
@@ -77,12 +83,13 @@ Run from the repo root:
 - **`engine-core` is deterministic.** No clocks, randomness, floats, `HashMap` iteration, or IO.
   Time comes only from the sequencer's stamp, and money is `Fixed`.
 - **Replay is the audit.** The sequenced log is public, and anyone can replay it against this code
-  to check the signed state roots. A change to `engine-core` state, its serialization, or its
-  semantics changes the roots that existing logs carry, so it needs a stated plan for replaying
-  logs written by the older code. Each protocol version has a reference log in
-  `crates/core/tests/reference/`, committed once and never regenerated; CI replays every one on
-  each platform, so a rule change ships as a new protocol version with its own log
-  (`crates/core/README.md`, "Adding a protocol version").
+  to check the signed state roots and the events logged with each command. A change to
+  `engine-core` state, its serialization, its semantics, or the events a command emits changes the
+  roots or events that existing logs carry, so it needs a stated plan for replaying logs written by
+  the older code. Each protocol version has a reference log in `crates/core/tests/reference/`,
+  committed once and never regenerated; CI replays every one on each platform, so a rule change
+  ships as a new protocol version with its own log (`crates/core/README.md`, "Adding a protocol
+  version").
 - **The host is untrusted.** Inside the enclave, the host controls the clock, disk, and network.
   Code that trusts any of them names the check that bounds it, or a `TODO` that says what is
   missing.

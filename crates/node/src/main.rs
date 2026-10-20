@@ -12,7 +12,8 @@ enum Cmd {
         #[arg(short, long, env = "CONFIG_PATH", default_value = "config/dev.toml")]
         config: PathBuf,
     },
-    /// Replay a published log and verify every checkpoint root.
+    /// Replay a published log and verify every checkpoint root. `--log` is a single log file, or a
+    /// directory of segments with their manifest: a node's log directory or a downloaded archive.
     Replay {
         #[arg(short, long)]
         log: PathBuf,
@@ -29,7 +30,7 @@ struct Cli {
 /// Dispatches the subcommand.
 /// Error cases:
 /// - the config cannot be loaded, or the node stops with an error
-/// - the log cannot be read, or fails verification
+/// - the log cannot be read, or fails its manifest check or verification
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
@@ -40,13 +41,20 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Replay { log: path } => {
             init_logging("info")?;
-            let replayed = replay(&log::read_all(&path)?)?;
+            let entries = if path.is_dir() { log::SegmentedLog::open(&path)?.entries } else { log::read_all(&path)? };
+            let replayed = replay(&entries)?;
             println!(
                 "verified: {} commands, {} checkpoints, final root 0x{}",
                 replayed.commands,
                 replayed.checkpoints,
                 hex::encode(replayed.engine.state_root())
             );
+            if !replayed.unsigned.is_empty() {
+                println!(
+                    "note: the log ends before signing {} approved withdrawal(s); the node signs them when it restarts",
+                    replayed.unsigned.len()
+                );
+            }
             Ok(())
         }
     }

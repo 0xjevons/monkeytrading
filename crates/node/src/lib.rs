@@ -13,3 +13,5 @@ pub use node::{init_logging, run};
 pub mod sequencer;
 pub use sequencer::replay;
 mod tee;
+#[cfg(test)]
+mod test_support;

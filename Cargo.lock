@@ -393,14 +393,18 @@ dependencies = [
  "axum",
  "clap",
  "engine-core",
+ "futures-util",
  "hex",
  "humantime-serde",
  "k256",
  "rand 0.8.8",
  "serde",
  "serde_json",
+ "sha2",
  "sha3",
  "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -1288,6 +1292,19 @@ dependencies = [
  "log",
  "tokio",
  "tungstenite",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

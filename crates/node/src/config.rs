@@ -65,7 +65,12 @@ pub struct NodeConfig {
 #[serde(deny_unknown_fields)]
 pub struct NodeSection {
     pub listen: SocketAddr,
-    pub log_path: PathBuf,
+    /// The log's segment files and `manifest.jsonl`. Completed segments and the manifest are the
+    /// public archive, served at `/v1/archive/`; every segment is kept, since recovery replays the
+    /// log from genesis.
+    pub log_dir: PathBuf,
+    /// Start a new log segment once the current one holds this many commands.
+    pub segment_commands: u64,
     /// Write a signed state root every N commands.
     pub checkpoint_every: u64,
     /// Interval of `Tick` commands that drive sessions and rollovers.
@@ -145,7 +150,7 @@ impl NodeConfig {
     /// Error cases:
     /// - the file cannot be read, or is not valid TOML for this schema (unknown keys included)
     /// - `logging.level` is not a valid filter directive
-    /// - `node.tick`, `node.checkpoint_every`, or `feeds.interval` is zero
+    /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, or `feeds.interval` is zero
     /// - genesis parameters or a market spec fail validation
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -157,12 +162,18 @@ impl NodeConfig {
     /// Checks values that parse but would fail silently or at the wrong moment.
     /// Error cases:
     /// - `logging.level` is not a valid filter directive
-    /// - `node.tick`, `node.checkpoint_every`, or `feeds.interval` is zero
+    /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, or `feeds.interval` is zero
     /// - genesis parameters or a market spec fail validation
     fn validate(&self) -> anyhow::Result<()> {
         EnvFilter::try_new(&self.logging.level).context("logging.level")?;
-        if self.node.tick.is_zero() || self.node.checkpoint_every == 0 || self.feeds.interval.is_zero() {
-            anyhow::bail!("node.tick, node.checkpoint_every, and feeds.interval must be non-zero");
+        if self.node.tick.is_zero()
+            || self.node.checkpoint_every == 0
+            || self.node.segment_commands == 0
+            || self.feeds.interval.is_zero()
+        {
+            anyhow::bail!(
+                "node.tick, node.checkpoint_every, node.segment_commands, and feeds.interval must be non-zero"
+            );
         }
         self.genesis.params.validate().map_err(anyhow::Error::msg).context("genesis.params")?;
         for m in &self.genesis.markets {
@@ -176,7 +187,7 @@ impl NodeConfig {
 mod tests {
     use super::*;
 
-    const DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/dev.toml");
+    use crate::test_support::DEV_CONFIG as DEV;
 
     #[test]
     fn the_committed_dev_config_loads() {
@@ -192,6 +203,13 @@ mod tests {
         assert!(toml::from_str::<NodeConfig>(&text).is_err());
         let text = std::fs::read_to_string(DEV).unwrap().replace("house_cap_bps", "house_capp_bps");
         assert!(toml::from_str::<NodeConfig>(&text).is_err());
+    }
+
+    #[test]
+    fn a_zero_segment_size_is_refused() {
+        let text = std::fs::read_to_string(DEV).unwrap().replace("segment_commands = 1000", "segment_commands = 0");
+        let cfg: NodeConfig = toml::from_str(&text).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

@@ -1,10 +1,15 @@
-//! Client API: REST for actions and reads, plus a WebSocket that streams the public log live (every
-//! sequenced command with its events, every signed checkpoint, every signed withdrawal).
+//! Client API: REST for actions and reads, a WebSocket that streams the public log (every
+//! sequenced command with its events, every signed checkpoint, every signed withdrawal), and the
+//! log archive.
+
+mod archive;
+mod stream;
+pub(crate) use stream::MAX_BACKFILLS;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn};
@@ -19,12 +24,13 @@ use engine_core::types::{AccountId, MarketId, OrderId};
 use engine_core::{Engine, Fixed};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, info_span};
 
 use crate::clock::now_ms;
 use crate::config::AuthMode;
+use crate::log::Manifest;
 use crate::sequencer::{self, StreamMsg};
 use crate::tee::Attestation;
 
@@ -35,6 +41,8 @@ pub enum ApiError {
     NotFound,
     BadRequest(String),
     NotImplemented(&'static str),
+    /// The node failed to serve the request; the cause is logged where it happened.
+    Internal,
 }
 
 #[derive(Clone)]
@@ -44,6 +52,11 @@ pub struct ApiState {
     pub attestation: Arc<Attestation>,
     pub auth: AuthMode,
     pub dev_deposits: bool,
+    pub log_dir: PathBuf,
+    /// The log writer's manifest, held in enclave memory.
+    pub manifest: watch::Receiver<Manifest>,
+    /// Permits for stream subscribers reading from disk.
+    pub backfills: Arc<Semaphore>,
 }
 
 #[derive(Serialize)]
@@ -95,6 +108,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_owned()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m.to_owned()),
+            ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_owned()),
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
@@ -153,7 +167,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/orders/cancel", post(cancel_order))
         .route("/v1/withdrawals", post(withdraw))
         .route("/v1/dev/deposit", post(dev_deposit))
-        .route("/v1/stream", get(stream))
+        .route("/v1/stream", get(stream::stream))
+        .route("/v1/archive/{file}", get(archive::archive))
         .with_state(state)
         .layer(from_fn(trace_request))
 }
@@ -270,30 +285,5 @@ async fn dev_deposit(State(s): State<ApiState>, Json(b): Json<AmountBody>) -> Ap
     Ok(Json(s.submit(Command::Deposit { account: b.account, amount: b.amount, chain_ref }).await?))
 }
 
-/// Upgrades to a WebSocket that streams the public log from now on.
-async fn stream(State(s): State<ApiState>, ws: WebSocketUpgrade) -> Response {
-    let rx = s.stream.subscribe();
-    ws.on_upgrade(move |socket| forward(socket, rx))
-}
-
-/// Forwards stream messages to one subscriber until it disconnects or falls behind.
-///
-/// TODO: let clients resume from a seq (backfill from the log file) so a lagging subscriber can
-/// catch up instead of being dropped.
-async fn forward(mut socket: WebSocket, mut rx: broadcast::Receiver<Arc<StreamMsg>>) {
-    loop {
-        let msg = match rx.recv().await {
-            Ok(msg) => msg,
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                let note = json!({ "type": "lagged", "missed": n }).to_string();
-                let _ = socket.send(Message::Text(note.into())).await;
-                return;
-            }
-            Err(broadcast::error::RecvError::Closed) => return,
-        };
-        let Ok(json) = serde_json::to_string(&*msg) else { continue };
-        if socket.send(Message::Text(json.into())).await.is_err() {
-            return;
-        }
-    }
-}
+#[cfg(test)]
+mod tests;

@@ -8,10 +8,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 base=${1:-origin/main}
-dir=crates/core/tests/reference
+dirs=(crates/core/tests/reference crates/node/tests/reference)
 
 # Lower-case `a` excludes additions: every other status is a change to a committed log.
-changed=$(git diff --name-status --diff-filter=a "$base"...HEAD -- "$dir")
+changed=$(git diff --name-status --diff-filter=a "$base"...HEAD -- "${dirs[@]}")
 if [[ -n "$changed" ]]; then
   echo "Committed reference logs must never change; a rule change ships as a new protocol version with its own log:"
   echo "$changed"

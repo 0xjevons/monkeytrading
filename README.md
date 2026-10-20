@@ -60,9 +60,10 @@ machine, to the last unit. The node streams each command it sequences, with the 
 and the enclave periodically signs a hash of the whole state. `engine replay` re-applies a log from
 the beginning and checks the hash at every checkpoint against the state the published code
 computes; checking the signatures themselves arrives with
-[#24](https://github.com/0xjevons/monkeytrading/issues/24). Replay reads the node's log file today,
-and a downloadable archive and a resumable stream are being built in
-[#20](https://github.com/0xjevons/monkeytrading/issues/20).
+[#24](https://github.com/0xjevons/monkeytrading/issues/24). Replay reads a node's log directory or
+the archive the node serves: its completed log segments, with a manifest of their seq ranges and
+SHA-256 hashes. A stream subscriber can start or resume at any message offset, and gets the log
+from disk and then live, each message once.
 
 The enclave also attests to the key it signs with. The local node uses a mock attestation, labelled
 as such; attestation on AMD SEV-SNP hardware, and a verifier for it, are being built in
@@ -97,7 +98,7 @@ Stopping the node with ctrl-c lets it finish what is queued and write a final ch
 then verify the log it wrote:
 
 ```bash
-cargo run -p engine-node -- replay --log data/dev/log.jsonl
+cargo run -p engine-node -- replay --log data/dev/log
 ```
 
 The local configuration accepts unsigned requests; signed requests are being built in
