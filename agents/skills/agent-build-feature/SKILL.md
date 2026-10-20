@@ -56,14 +56,18 @@ a bug fix or a refactor that is not a feature goes straight through
 
 - Run the local checks per git-workflow.
 - Self-review with [agent-code-review](../agent-code-review/SKILL.md), multi-agent at `medium` or
-  higher: fix every accepted Critical, High, and Medium finding and run it again until a run accepts
-  none, as [agent-create-pr](../agent-create-pr/SKILL.md#before-a-pr-is-ready-for-review) requires
-  before the PR is marked ready.
+  higher: fix every accepted Critical, High, and Medium finding by class
+  ([Fixing an accepted finding](../agent-code-review/SKILL.md#fixing-an-accepted-finding)) and run
+  it again until [the review loop](../agent-code-review/SKILL.md#the-review-loop) ends, as
+  [agent-create-pr](../agent-create-pr/SKILL.md#before-a-pr-is-ready-for-review) requires before
+  the PR is marked ready.
 - Show the user the dev scenario — steps, expected result, and the config it needs — and on their
   yes write it into the issue's dev scenario section, replacing the planned text.
 - Rebase the branch onto `main` and run the dev scenario in dev on that build: a local node built
   from the branch, or a hosted dev environment once one exists, deployed only on the user's
-  explicit approval ([no-deploy](../../rules/no-deploy.md)). Show the user the result.
+  explicit approval ([no-deploy](../../rules/no-deploy.md)). Show the user the result. A
+  mechanical rebase needs no new review round; one that changes behaviour does
+  ([the review loop](../agent-code-review/SKILL.md#the-review-loop)).
 - The scenario's scripted check passes in CI.
 - Put what promotion needs in the PR body: config, secrets, genesis or parameter changes, contract
   deployments, deploy ordering, rollback.

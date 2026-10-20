@@ -146,6 +146,11 @@ tags, headings, lists, code blocks, restating the comment, or AI signature.
 
 ## Fixing and verifying
 
+- Fix each `Fix` item by class, as
+  [Fixing an accepted finding](../agent-code-review/SKILL.md#fixing-an-accepted-finding) says: its
+  invariant and the sites fixed go in the branch's fix notes and the item's `Changes`, and its reply
+  states the invariant. A review round over the fixes follows
+  [the review loop](../agent-code-review/SKILL.md#the-review-loop).
 - Check every fix against the applicable sections of
   [development-checklist](../../rules/development-checklist.md): a fix must not open a new
   concurrency, crash-recovery, or test gap, and it must remove the failure, not just the flagged
@@ -164,15 +169,15 @@ Number every item and keep the numbers in later discussion:
 - **Comment** — a short plain-language restatement.
 - **Severity** — the comment's own `Severity` when it has one, otherwise your assessment with the
   [severity guide](../agent-code-review/references/severity.md), and why.
-- **Changes** — the completed local change, or `No change` with the outcome and reason. Only
-  `Needs a decision` may defer a change.
+- **Changes** — the completed local change, with the invariant it restores and every site fixed,
+  or `No change` with the outcome and reason. Only `Needs a decision` may defer a change.
 - **Reply** — the exact text to post, or `none` for a top-level comment that asks for nothing.
 
 ```
 1. https://github.com/<org>/<repo>/pull/42#discussion_r3845829157
    Comment: A chain read can hang indefinitely.
    Severity: High — it blocks the update loop.
-   Changes: Added a per-call timeout to every chain read.
+   Changes: Every chain read is bounded — added a timeout to the block, log, and receipt reads.
    Reply: Fixed — every chain read is bounded, so a hung endpoint errors instead of stalling.
 ```
 
@@ -236,7 +241,8 @@ and report the failure.
 3. Triage each item against the code.
 4. **Print the triage — outcome, planned change, and draft reply per item — and wait.** A request
    to fix without review skips this wait.
-5. Make the approved fixes; ask before anything that widens scope.
+5. Make the approved fixes, each by class ([Fixing and verifying](#fixing-and-verifying)); ask
+   before anything that widens scope.
 6. Verify the fixes and run the local checks. On a feature PR, a fix that changes the feature's
    behaviour also runs its dev scenario again
    ([agent-build-feature](../agent-build-feature/SKILL.md#pr-and-merge)).
