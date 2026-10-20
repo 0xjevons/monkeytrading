@@ -4,7 +4,7 @@ monkeytrading is meant to be trusted without trusting the people who run it: its
 code, it is built to run inside a confidential-computing enclave, and anyone can replay the commands
 it publishes to check the state it reports. A vulnerability can undermine any of that, so we ask
 that you report it privately and give us time to fix it before it becomes public. This policy
-explains how to reach us, what we commit to in return, and what it covers.
+explains how to reach us, what you can expect from us in return, and what it covers.
 
 ## Reporting a vulnerability
 
@@ -67,9 +67,10 @@ to, forge or reuse a signature the enclave makes, read or alter what the enclave
 machine it runs on, or halt the engine with a request any client can send.
 
 The node's development settings, which are the mock enclave, mock custody, simulated prices, and
-unsigned requests, exist for local testing and make no security claims, so a weakness in them is in
-scope only if a production configuration can reach it. The same holds for development-only
-endpoints such as `POST /v1/dev/deposit`, which the node serves only with mock custody. A production
+unsigned requests, exist for local testing and make no security claims of their own, and neither
+does `POST /v1/dev/deposit`, which the node serves only with mock custody. A weakness in them is in
+scope when a production configuration can reach it, or when whoever runs an attested enclave can
+switch them on, since the node reads its configuration from the machine it runs on. A production
 configuration uses hardware attestation, on-chain custody, live prices, and signed requests, and
 none of these is finished: the node can request an attestation report through configfs-tsm, but
 attestation on SEV-SNP hardware and a verifier for it are still being built, as are the other three.
@@ -84,13 +85,14 @@ price, is in scope.
 Findings that need an operator's key or credentials to be compromised first are also out of scope,
 unless they defeat a guarantee the engine makes. The engine is designed so that whoever runs it, and
 controls the machine it runs on, cannot alter the published log without detection, have the enclave
-sign a state its rules do not produce, or pay out funds the engine did not approve. A finding that
-breaks one of these guarantees is in scope even when it starts from an operator's key. Some of the
-checks behind them are still being built: `engine replay` does not yet verify checkpoint signatures;
-the node does not yet check the log it recovers from against anything its host cannot rewrite, so it
-accepts a truncated or rewritten one; and the enclave's signing key does not yet survive a restart.
-A gap that an open issue or a `TODO` in the code already records is known; a way around a check that
-exists is a finding.
+sign a state its rules do not produce, credit an account with funds that no deposit brought in, or
+pay out funds the engine did not approve. A finding that breaks one of these guarantees is in scope
+even when it starts from an operator's key. Some of the checks behind them are still being built:
+`engine replay` does not yet verify checkpoint signatures; the node does not yet check the log it
+recovers from against anything its host cannot rewrite, so it accepts a truncated or rewritten one;
+and the enclave's signing key does not yet survive a restart. A gap that an open issue or a `TODO`
+in the code already records is known, so a report of it is not a new finding, though its details
+stay private under the disclosure timeline above; a way around a check that exists is a new finding.
 
 ## Supported versions
 
