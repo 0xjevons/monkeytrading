@@ -9,6 +9,7 @@ use crate::auth::RequestAuth;
 use crate::eip712::withdrawal_hash;
 use crate::engine::Engine;
 use crate::event::{Event, Reject};
+use crate::protocol::ProtocolVersion;
 use crate::types::{AccountId, MarketId};
 
 impl Engine {
@@ -67,9 +68,11 @@ impl Engine {
     }
 
     /// Moves house capital in (positive) or out (negative), at most once per chain reference, and
-    /// never leaving house NAV at or below zero.
+    /// never leaving house NAV at or below zero. From `V4`, a zero amount records its reference and
+    /// moves nothing, so a genesis that starts the house with no capital still records its credit.
     pub(crate) fn house_capital(&mut self, amount: Fixed, chain_ref: &str, events: &mut Vec<Event>) {
-        let reason = if !amount.abs().is_valid_input() {
+        let recorded_zero = amount == Fixed::ZERO && self.protocol_version >= ProtocolVersion::V4;
+        let reason = if !recorded_zero && !amount.abs().is_valid_input() {
             Some("house capital amount out of range")
         } else if self.credited_refs.contains(chain_ref) {
             Some("house capital reference already applied")

@@ -15,7 +15,8 @@ this crate and reproduce the signed state roots exactly.
 - Indicative quotes with bounded slippage: orders are declined only when the bound is exceeded
 - A flat fee on realised profit only, and daily CFD financing at a benchmark rate plus markup
 - Tiered margin, account close-out largest loser first, and negative balance protection
-- Venue trading hours for RWA markets, with resting orders filling at the gapped open
+- Venue trading hours for RWA markets, with holidays, early closes, and special sessions, and
+  resting orders filling at the gapped open
 - Markout-based toxicity scoring that widens spreads for flow that picks off stale prices
 - Deposits credited at most once per chain reference, and all external numbers bounded
 - A keccak-256 state root over the canonical state encoding
@@ -41,7 +42,8 @@ this crate and reproduce the signed state roots exactly.
 - `src/market.rs` — market listings and tier tables
 - `src/params.rs` — protocol parameters, stress levels, toxicity, and the rollover clock
 - `src/price.rs` — venue quotes and the reference index
-- `src/session.rs` — weekly trading windows and holidays
+- `src/session.rs` — weekly trading windows, holidays, dated closures such as early closes, and
+  special sessions
 - `src/account.rs` — accounts, netted positions, and resting orders
 - `src/command.rs` / `src/event.rs` — engine inputs and outputs
 - `src/types.rs` — ids, sides, and asset classes
@@ -111,7 +113,9 @@ stamped more than `MAX_QUOTE_LEAD_MS` after the sequenced time is refused, and a
 stored one stamped after the sequenced time. Both predate activation, so every log starts under
 their combined rules, which `src/protocol.rs` names `V2`; `v1.jsonl` still replays because none of
 its quotes is stamped ahead. `V3` adds signed client requests and activates at a recorded seq; its
-log is `v3.jsonl`. For each later version:
+log is `v3.jsonl`. `V4` lets schedules carry dated closures and special sessions, and lets a zero
+house capital move record its reference; it activates the same way, and its log is `v4.jsonl`. For
+each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log.rs` so it activates the new version and exercises the new rules.

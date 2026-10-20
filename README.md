@@ -36,10 +36,10 @@ Margin is shared across an account's positions. When equity falls below half of 
 requirement, the largest losing position is closed first, and so on until the account recovers.
 Losses beyond an account's balance fall on the house, never on the trader. The check runs on each
 price update today; [#45](https://github.com/0xjevons/monkeytrading/issues/45) extends it to
-financing and margin changes. Markets in real-world assets keep their exchange's hours, and orders
-resting while a market is closed fill at the first price after it opens, gap and all. The house
-limits its own risk by capping its net exposure in each market, and the sum of those exposures
-across markets, as fractions of its net asset value.
+financing and margin changes. Markets in real-world assets keep their exchange's hours, holidays,
+and early closes, and orders resting while a market is closed fill at the first price after it
+opens, gap and all. The house limits its own risk by capping its net exposure in each market, and
+the sum of those exposures across markets, as fractions of its net asset value.
 
 Collateral is USDC, held in a vault contract on Arbitrum One. The chain safeguards funds and never
 executes trades; deposits are being built in

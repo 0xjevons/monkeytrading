@@ -1,0 +1,1731 @@
+# Production genesis: the launch market catalogue with its venue calendars,
+# margins, spreads, and financing.
+#
+# This file is the [genesis] section of a production node config and nothing
+# else. It is protocol: on first boot the node sequences it into the public log
+# as admin commands. A full config is the deployment's [node], [logging],
+# [tee], [operator], [custody] and [feeds] sections followed by this file.
+#
+# Launch values:
+# - Markets: the majors of each asset class (#7, launch markets) and 20 US
+#   large-cap shares.
+# - Margin (#8, launch margin tables): professional-client levels, up to 200:1
+#   (50 bps) on FX majors and major indices and lower on commodities, shares
+#   and crypto, with bands that rise with position notional.
+# - Fees (#9, launch fee schedule): a 10% profit fee, and financing markups
+#   over the benchmark of 2.5% for indices, commodities and shares, 1% for FX,
+#   and 5% for crypto.
+# - Size spreads, stress levels, and the other protocol parameters are
+#   config/dev.toml's (#9). A market dev.toml does not list takes its asset
+#   class's size spreads, slippage bound, price rules, margin tables and house
+#   cap, except SOL-USD's house cap: 10% of house NAV, set here below BTC's 30%
+#   and ETH's 20%. Each market's financing benchmark is the rate of its base or
+#   index currency, as dev.toml's EUR-USD uses ESTR, with that rate's day basis.
+# - Margin and spread bands and house caps are in USD notional. USD-JPY,
+#   Germany 40, UK 100 and Japan 225 are quoted in JPY, EUR, GBP and JPY at
+#   their venues; their profit and loss accrues in the quote currency and
+#   converts to USD at the engine's EUR-USD, GBP-USD and USD-JPY prices once
+#   USD settlement (#70) lands. Until then the engine treats their prices as
+#   USD.
+# - Benchmark rates are not set here. The daily benchmark rates feature (#33)
+#   sequences them; until then a benchmark with no rate counts as zero.
+# - house_capital is 0: the house starts with no capital and builds it from
+#   trader losses. Genesis records a zero house capital credit, which moves no
+#   cash and marks genesis done, so the vault holds only trader deposits. Exposure caps have no dollar floor yet; margin and solvency
+#   checks (#45) add one so trading can start from a zero house (#15 §2).
+#   Until then caps are a fraction of house NAV alone, so this genesis admits no
+#   opening trade, and house utilisation reads as full, so every priced market
+#   sits at the top stress level; the floor must cover the stress trigger too.
+#
+# Calendars. Each schedule uses its venue's time zone. `windows` are the weekly
+# sessions, `closed_dates` whole local days the venue is shut, `closures`
+# dated local [from, to) periods inside the windows (early closes, holiday
+# halts, and closures that run past midnight), and `special_sessions` dated
+# local periods the venue trades outside the windows. Closures and special
+# sessions need protocol version V4, which the node activates before it
+# sequences genesis. After launch, a calendar change is an UpsertMarket admin
+# command carrying the market's new schedule; it applies from the seq it is
+# sequenced at. A running node takes admin commands through the operator
+# command channel (#47).
+#
+# Sourcing, as read on 2026-10-20. A venue's own publication decides, checked
+# against a second, independent source. Where the venue has published nothing,
+# two independent sources must agree; where they disagree, the schedule closes
+# at the earliest time any of them gives. The independent sources are
+# government holiday lists and two open-source calendar libraries,
+# pandas_market_calendars 5.5.0 and exchange_calendars 4.13.2. Each venue below
+# lists what is NOT VERIFIED by two sources.
+#
+# - US shares (ids 40-59): NYSE core session 09:30-16:00 ET, with its 2026 and
+#   2027 holidays and 13:00 early closes:
+#   https://www.nyse.com/markets/hours-calendars
+#   Nasdaq observes the same holidays and publishes the same 2026 dates,
+#   https://www.nasdaqtrader.com/Trader.aspx?id=Calendar ; its 2027 calendar
+#   is not out. Both libraries (NYSE, NASDAQ, XNYS, XNAS) give the same hours,
+#   holidays and early closes for both years. NYSE observes no New Year's Day
+#   holiday on 31 Dec 2027, as 1 Jan 2028 is a Saturday.
+# - FX (ids 10-13): Cboe FX spot, Sunday 17:00 to Friday 17:00 ET, closed on
+#   Christmas Day and New Year's Day:
+#   https://cdn.cboe.com/resources/fx/operation.pdf (section 22) and
+#   https://www.cboe.com/about/hours/fx
+#   pandas_market_calendars' FX calendar gives the same week, and its CME FX
+#   calendar shuts from 17:00 ET the evening before 25 Dec 2026, 1 Jan 2027
+#   and 24 Dec 2027 (Christmas Day on a Saturday). Cboe's trading day starts
+#   at 17:00 ET, and it has not said whether a holiday closure follows it or
+#   how it treats Christmas Day on a Saturday, so the schedule takes the
+#   earlier close: shut from 17:00 ET the evening before each of those days.
+#   NOT VERIFIED: that 17:00 ET start of each closure, and the closure on
+#   24 Dec 2027.
+# - US 500, US Tech 100, Wall St 30 (ids 20-22) and gold, silver, WTI
+#   (ids 30-32): CME Globex, Sunday to Friday 17:00-16:00 CT with a daily
+#   16:00-17:00 break, as CME's E-mini S&P 500, gold and crude oil pages give
+#   it in search-engine excerpts and pandas_market_calendars (CME Globex
+#   Equity, CMEGlobex_GC, _SI, _CL) gives it too:
+#   https://www.cmegroup.com/trading-hours.html
+#   CME finalises each holiday's hours about two weeks before it, so none for
+#   2026-2027 is published. Both libraries (pandas_market_calendars and
+#   exchange_calendars' CMES, COMEX and NYMEX) shut all six markets on
+#   25 Dec 2026, 1 Jan 2027 and 24 Dec 2027, and metals and energy on Good
+#   Friday 2027. They halt equity at 12:00 CT on Thanksgiving and on MLK,
+#   Presidents', Memorial, Independence and Labor Days, and metals and energy
+#   at 12:00 CT on Labor Day.
+#   NOT VERIFIED, the libraries disagree and the schedule takes the earliest:
+#   equity on 27 Nov 2026, 24 Dec 2026 and 26 Nov 2027 (12:00 or 12:15 CT),
+#   Juneteenth 2027 (12:00 CT or no halt) and Good Friday 2027 (shut, or open
+#   until 08:15 CT); metals and energy halts on every other holiday (12:00 CT,
+#   or 12:45-13:45 CT) and on Juneteenth 2027 (13:30 CT, one library only).
+# - Brent (id 33): ICE Futures Europe, 01:00-23:00 London Monday to Friday
+#   with a 23:00 Sunday open, and its 2026 and 2027 holiday hours:
+#   https://www.ice.com/products/219/brent-crude-futures and
+#   https://www.ice.com/publicdocs/Trading_Schedule.pdf
+#   ICE keeps these hours fixed to New York time: in the week UK and US clocks
+#   differ it trades 00:00-22:00 GMT, 20:00-18:00 EDT,
+#   https://www.ice.com/publicdocs/futures/Trading_Schedule_Temporary_Trading_Hours_for_DST.pdf
+#   so the schedule is written in New York time. The early closes are the ET
+#   times ICE prints beside the UK ones. On MLK Day and Presidents' Day 2027
+#   ICE trades Brent at regular hours (status A), and on Thanksgiving 2027 it
+#   closes at 14:30 ET (status C*), an hour later than in 2026. Both
+#   libraries' ICE calendars (pandas_market_calendars ICE, exchange_calendars
+#   IEPA) give the same 20:00-18:00 ET week and the same closures on
+#   25 Dec 2026, 1 Jan 2027 and Good Friday 2027.
+#   NOT VERIFIED, ICE's schedule is used where the libraries differ: their
+#   20:00 ET Sunday open, against ICE's 23:00 London (18:00 ET); their
+#   13:00 ET closes on US holidays, against ICE's 13:30-15:00 ET closes and
+#   regular hours on MLK and Presidents' Days; their closure on 24 Dec 2027,
+#   when ICE trades until 08:00 ET; and the hours for the weeks of 2027 when US
+#   and UK clocks differ (14-27 March and 31 October-6 November), which ICE
+#   has not published.
+# - UK 100 (id 24): ICE Futures Europe FTSE 100 Index Future, 01:00-21:00
+#   London, closed 25 and 28 Dec 2026:
+#   https://www.ice.com/products/38716764/FTSE-100-Index-Future and
+#   https://www.ice.com/publicdocs/futures/Trading_Schedule_Migrated_Liffe_Contracts.pdf
+#   That schedule closes the future on every England and Wales bank holiday
+#   of 2026 and covers 2026 only. The 2027 closures are the 2027 bank holidays,
+#   https://www.gov.uk/bank-holidays.json , which both libraries' London
+#   calendars (LSE, XLON) also close.
+#   NOT VERIFIED: ICE's on-screen hours on 24 and 31 Dec 2026 and 2027. The
+#   schedule closes at 12:30 with the London Stock Exchange, as both libraries
+#   give; ICE's 2026 schedule names 13:00 for block trades only.
+# - Germany 40 (id 23): Eurex DAX Futures, continuous trading to 22:00 Berlin,
+#   from 01:10 CET in winter and 02:10 CEST in summer, and the 2026 closures:
+#   https://www.eurex.com/ex-en/markets/idx/dax/DAX-Futures-139902 and
+#   https://www.eurex.com/ex-en/trade/trading-calendar (2026 PDF)
+#   Eurex fixes the open to UTC and the close to Berlin time, which one weekly
+#   window cannot follow: the windows open at 02:10, and each CET weekday
+#   Eurex trades has a 01:10-02:10 special session. 2027 closures are from the
+#   indicative calendar, confirmed by the end of 2026:
+#   https://www.eurex.com/ex-en/trade/trading-calendar/indicative-trading-calendars
+#   and https://www.eurex.com/ex-en/trade/trading-calendar/holiday-regulations
+#   exchange_calendars' XEUR closes the same days in both years.
+#   NOT VERIFIED: the 01:10 CET / 02:10 CEST open, which only Eurex publishes;
+#   FDAX hours on 30 Dec 2026, which Eurex has not published; and the final
+#   2027 calendar.
+# - Japan 225 (id 25): Osaka Exchange Nikkei 225 Futures, day session
+#   08:45-15:45 and night session 17:00-06:00 Tokyo, as JPX's pages give them
+#   in search-engine excerpts and QUICK gives them:
+#   https://www.jpx.co.jp/english/derivatives/rules/trading-hours/index.html
+#   https://corporate.quick.co.jp/en/japanmarketsview/equity/one-month-to-extension-of-tokyo-stock-exchange-trading-hours-new-market-close-system-to-be-introduced/
+#   Japan's national holidays are the Cabinet Office's,
+#   https://www8.cao.go.jp/chosei/shukujitsu/syukujitsu.csv , and JPX shuts
+#   from 31 Dec to 3 Jan; both libraries' Tokyo calendars (JPX, XTKS) give the
+#   same holidays and year-end. Closed 23 Nov 2026 and 20 Sep 2027 (BCP
+#   tests), 31 Dec 2026 to 3 Jan 2027, and 31 Dec 2027.
+#   NOT VERIFIED, from JPX's pages in search-engine excerpts only:
+#   https://www.jpx.co.jp/english/derivatives/rules/holidaytrading/index.html
+#   that Nikkei 225 futures trade both sessions on every other national
+#   holiday as a holiday-trading day, which the schedule follows; that holiday
+#   trading days from July 2027 hold, as they are scheduled until JPX
+#   finalises them in December 2026; that the night session after a business
+#   day runs before a holiday; and whether the Friday night sessions before the
+#   BCP tests run, which the schedule keeps.
+
+[genesis]
+house_capital = "0"
+
+[genesis.params]
+profit_fee_bps = 1000
+closeout_level_bps = 5000
+house_total_cap_bps = 20000
+stress_move_window_ms = 60000
+stress_cooldown_ms = 300000
+
+[genesis.params.rollover]
+tz = "Europe/London"
+hour = 22
+minute = 0
+
+[genesis.params.toxicity]
+horizon_ms = 2000
+ewma_weight_bps = 1000
+tiers = [
+  { min_score_bps = 5, extra_spread_bps = 1 },
+  { min_score_bps = 15, extra_spread_bps = 3 },
+]
+
+# Level 0 is normal. Higher levels widen spreads, either automatically on
+# any trigger or when the operator raises the floor.
+[[genesis.params.stress_levels]]
+size_spread_multiplier_bps = 10000
+min_spread_bps = 0
+
+[[genesis.params.stress_levels]]
+size_spread_multiplier_bps = 20000
+min_spread_bps = 2
+trigger = { divergence_bps = 15, move_bps = 150, utilisation_bps = 8000 }
+
+[[genesis.params.stress_levels]]
+size_spread_multiplier_bps = 40000
+min_spread_bps = 10
+trigger = { divergence_bps = 20, move_bps = 300, utilisation_bps = 9500 }
+
+# --- Crypto: 24/7 ---------------------------------------------------------
+
+[[genesis.markets]]
+id = 1
+symbol = "BTC-USD"
+asset_class = "crypto"
+max_slippage_bps = 25
+house_cap_bps = 3000
+margin_tiers = [{ up_to = "1000000", bps = 1000 }, { bps = 2000 }]
+spread_tiers = [{ up_to = "2000000", bps = 0 }, { up_to = "10000000", bps = 3 }, { bps = 8 }]
+schedule = { kind = "always_open" }
+price_rules = { max_age_ms = 1000, max_divergence_bps = 25, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 500, day_basis = 365 }
+
+[[genesis.markets]]
+id = 2
+symbol = "ETH-USD"
+asset_class = "crypto"
+max_slippage_bps = 25
+house_cap_bps = 2000
+margin_tiers = [{ up_to = "1000000", bps = 1000 }, { bps = 2000 }]
+spread_tiers = [{ up_to = "1000000", bps = 0 }, { up_to = "5000000", bps = 3 }, { bps = 8 }]
+schedule = { kind = "always_open" }
+price_rules = { max_age_ms = 1000, max_divergence_bps = 25, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 500, day_basis = 365 }
+
+[[genesis.markets]]
+id = 3
+symbol = "SOL-USD"
+asset_class = "crypto"
+max_slippage_bps = 25
+house_cap_bps = 1000
+margin_tiers = [{ up_to = "1000000", bps = 1000 }, { bps = 2000 }]
+spread_tiers = [{ up_to = "1000000", bps = 0 }, { up_to = "5000000", bps = 3 }, { bps = 8 }]
+schedule = { kind = "always_open" }
+price_rules = { max_age_ms = 1000, max_divergence_bps = 25, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 500, day_basis = 365 }
+
+# --- FX majors: Cboe FX ---------------------------------------------------
+
+[[genesis.markets]]
+id = 10
+symbol = "EUR-USD"
+asset_class = "fx"
+max_slippage_bps = 5
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 300 }]
+spread_tiers = [{ up_to = "10000000", bps = 0 }, { up_to = "50000000", bps = 1 }, { bps = 3 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 5, min_sources = 2 }
+financing = { benchmark = "ESTR", markup_bps = 100, day_basis = 360 }
+
+# FX: Cboe FX spot week, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Sun 17:00", close = "Fri 17:00" },
+]
+closures = [
+  { from = "2026-12-24T17:00:00", to = "2026-12-25T17:00:00" },
+  { from = "2026-12-31T17:00:00", to = "2027-01-01T17:00:00" },
+  { from = "2027-12-23T17:00:00", to = "2027-12-24T17:00:00" },
+]
+
+[[genesis.markets]]
+id = 11
+symbol = "GBP-USD"
+asset_class = "fx"
+max_slippage_bps = 5
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 300 }]
+spread_tiers = [{ up_to = "10000000", bps = 0 }, { up_to = "50000000", bps = 1 }, { bps = 3 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 5, min_sources = 2 }
+financing = { benchmark = "SONIA", markup_bps = 100, day_basis = 365 }
+
+# FX: Cboe FX spot week, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Sun 17:00", close = "Fri 17:00" },
+]
+closures = [
+  { from = "2026-12-24T17:00:00", to = "2026-12-25T17:00:00" },
+  { from = "2026-12-31T17:00:00", to = "2027-01-01T17:00:00" },
+  { from = "2027-12-23T17:00:00", to = "2027-12-24T17:00:00" },
+]
+
+[[genesis.markets]]
+id = 12
+symbol = "USD-JPY"
+asset_class = "fx"
+max_slippage_bps = 5
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 300 }]
+spread_tiers = [{ up_to = "10000000", bps = 0 }, { up_to = "50000000", bps = 1 }, { bps = 3 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 5, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 100, day_basis = 360 }
+
+# FX: Cboe FX spot week, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Sun 17:00", close = "Fri 17:00" },
+]
+closures = [
+  { from = "2026-12-24T17:00:00", to = "2026-12-25T17:00:00" },
+  { from = "2026-12-31T17:00:00", to = "2027-01-01T17:00:00" },
+  { from = "2027-12-23T17:00:00", to = "2027-12-24T17:00:00" },
+]
+
+[[genesis.markets]]
+id = 13
+symbol = "AUD-USD"
+asset_class = "fx"
+max_slippage_bps = 5
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 300 }]
+spread_tiers = [{ up_to = "10000000", bps = 0 }, { up_to = "50000000", bps = 1 }, { bps = 3 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 5, min_sources = 2 }
+financing = { benchmark = "AONIA", markup_bps = 100, day_basis = 365 }
+
+# FX: Cboe FX spot week, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Sun 17:00", close = "Fri 17:00" },
+]
+closures = [
+  { from = "2026-12-24T17:00:00", to = "2026-12-25T17:00:00" },
+  { from = "2026-12-31T17:00:00", to = "2027-01-01T17:00:00" },
+  { from = "2027-12-23T17:00:00", to = "2027-12-24T17:00:00" },
+]
+
+# --- Indices: front futures on their venue --------------------------------
+
+[[genesis.markets]]
+id = 20
+symbol = "US500"
+asset_class = "index"
+max_slippage_bps = 10
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "5000000", bps = 0 }, { up_to = "25000000", bps = 1 }, { bps = 4 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# CME Globex equity index futures, Chicago time. Halt times are unverified: see the header.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/Chicago"
+windows = [
+  { open = "Sun 17:00", close = "Mon 16:00" },
+  { open = "Mon 17:00", close = "Tue 16:00" },
+  { open = "Tue 17:00", close = "Wed 16:00" },
+  { open = "Wed 17:00", close = "Thu 16:00" },
+  { open = "Thu 17:00", close = "Fri 16:00" },
+]
+closures = [
+  { from = "2026-11-26T12:00:00", to = "2026-11-26T16:00:00" },
+  { from = "2026-11-27T12:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T12:00:00", to = "2026-12-25T16:00:00" },
+  { from = "2026-12-31T17:00:00", to = "2027-01-01T16:00:00" },
+  { from = "2027-01-18T12:00:00", to = "2027-01-18T16:00:00" },
+  { from = "2027-02-15T12:00:00", to = "2027-02-15T16:00:00" },
+  { from = "2027-03-25T17:00:00", to = "2027-03-26T16:00:00" },
+  { from = "2027-05-31T12:00:00", to = "2027-05-31T16:00:00" },
+  { from = "2027-06-18T12:00:00", to = "2027-06-18T16:00:00" },
+  { from = "2027-07-05T12:00:00", to = "2027-07-05T16:00:00" },
+  { from = "2027-09-06T12:00:00", to = "2027-09-06T16:00:00" },
+  { from = "2027-11-25T12:00:00", to = "2027-11-25T16:00:00" },
+  { from = "2027-11-26T12:00:00", to = "2027-11-26T16:00:00" },
+  { from = "2027-12-23T17:00:00", to = "2027-12-24T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 21
+symbol = "US100"
+asset_class = "index"
+max_slippage_bps = 10
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "5000000", bps = 0 }, { up_to = "25000000", bps = 1 }, { bps = 4 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# CME Globex equity index futures, Chicago time. Halt times are unverified: see the header.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/Chicago"
+windows = [
+  { open = "Sun 17:00", close = "Mon 16:00" },
+  { open = "Mon 17:00", close = "Tue 16:00" },
+  { open = "Tue 17:00", close = "Wed 16:00" },
+  { open = "Wed 17:00", close = "Thu 16:00" },
+  { open = "Thu 17:00", close = "Fri 16:00" },
+]
+closures = [
+  { from = "2026-11-26T12:00:00", to = "2026-11-26T16:00:00" },
+  { from = "2026-11-27T12:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T12:00:00", to = "2026-12-25T16:00:00" },
+  { from = "2026-12-31T17:00:00", to = "2027-01-01T16:00:00" },
+  { from = "2027-01-18T12:00:00", to = "2027-01-18T16:00:00" },
+  { from = "2027-02-15T12:00:00", to = "2027-02-15T16:00:00" },
+  { from = "2027-03-25T17:00:00", to = "2027-03-26T16:00:00" },
+  { from = "2027-05-31T12:00:00", to = "2027-05-31T16:00:00" },
+  { from = "2027-06-18T12:00:00", to = "2027-06-18T16:00:00" },
+  { from = "2027-07-05T12:00:00", to = "2027-07-05T16:00:00" },
+  { from = "2027-09-06T12:00:00", to = "2027-09-06T16:00:00" },
+  { from = "2027-11-25T12:00:00", to = "2027-11-25T16:00:00" },
+  { from = "2027-11-26T12:00:00", to = "2027-11-26T16:00:00" },
+  { from = "2027-12-23T17:00:00", to = "2027-12-24T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 22
+symbol = "US30"
+asset_class = "index"
+max_slippage_bps = 10
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "5000000", bps = 0 }, { up_to = "25000000", bps = 1 }, { bps = 4 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# CME Globex equity index futures, Chicago time. Halt times are unverified: see the header.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/Chicago"
+windows = [
+  { open = "Sun 17:00", close = "Mon 16:00" },
+  { open = "Mon 17:00", close = "Tue 16:00" },
+  { open = "Tue 17:00", close = "Wed 16:00" },
+  { open = "Wed 17:00", close = "Thu 16:00" },
+  { open = "Thu 17:00", close = "Fri 16:00" },
+]
+closures = [
+  { from = "2026-11-26T12:00:00", to = "2026-11-26T16:00:00" },
+  { from = "2026-11-27T12:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T12:00:00", to = "2026-12-25T16:00:00" },
+  { from = "2026-12-31T17:00:00", to = "2027-01-01T16:00:00" },
+  { from = "2027-01-18T12:00:00", to = "2027-01-18T16:00:00" },
+  { from = "2027-02-15T12:00:00", to = "2027-02-15T16:00:00" },
+  { from = "2027-03-25T17:00:00", to = "2027-03-26T16:00:00" },
+  { from = "2027-05-31T12:00:00", to = "2027-05-31T16:00:00" },
+  { from = "2027-06-18T12:00:00", to = "2027-06-18T16:00:00" },
+  { from = "2027-07-05T12:00:00", to = "2027-07-05T16:00:00" },
+  { from = "2027-09-06T12:00:00", to = "2027-09-06T16:00:00" },
+  { from = "2027-11-25T12:00:00", to = "2027-11-25T16:00:00" },
+  { from = "2027-11-26T12:00:00", to = "2027-11-26T16:00:00" },
+  { from = "2027-12-23T17:00:00", to = "2027-12-24T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 23
+symbol = "DE40"
+asset_class = "index"
+max_slippage_bps = 10
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "5000000", bps = 0 }, { up_to = "25000000", bps = 1 }, { bps = 4 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "ESTR", markup_bps = 250, day_basis = 360 }
+
+# Eurex DAX Futures, Berlin time, with the winter 01:10 open as special sessions: see the header.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "Europe/Berlin"
+windows = [
+  { open = "Mon 02:10", close = "Mon 22:00" },
+  { open = "Tue 02:10", close = "Tue 22:00" },
+  { open = "Wed 02:10", close = "Wed 22:00" },
+  { open = "Thu 02:10", close = "Thu 22:00" },
+  { open = "Fri 02:10", close = "Fri 22:00" },
+]
+closed_dates = [
+  "2026-12-24",
+  "2026-12-25",
+  "2026-12-31",
+  "2027-01-01",
+  "2027-03-26",
+  "2027-03-29",
+  "2027-12-24",
+  "2027-12-31",
+]
+special_sessions = [
+  { from = "2026-10-26T01:10:00", to = "2026-10-26T02:10:00" },
+  { from = "2026-10-27T01:10:00", to = "2026-10-27T02:10:00" },
+  { from = "2026-10-28T01:10:00", to = "2026-10-28T02:10:00" },
+  { from = "2026-10-29T01:10:00", to = "2026-10-29T02:10:00" },
+  { from = "2026-10-30T01:10:00", to = "2026-10-30T02:10:00" },
+  { from = "2026-11-02T01:10:00", to = "2026-11-02T02:10:00" },
+  { from = "2026-11-03T01:10:00", to = "2026-11-03T02:10:00" },
+  { from = "2026-11-04T01:10:00", to = "2026-11-04T02:10:00" },
+  { from = "2026-11-05T01:10:00", to = "2026-11-05T02:10:00" },
+  { from = "2026-11-06T01:10:00", to = "2026-11-06T02:10:00" },
+  { from = "2026-11-09T01:10:00", to = "2026-11-09T02:10:00" },
+  { from = "2026-11-10T01:10:00", to = "2026-11-10T02:10:00" },
+  { from = "2026-11-11T01:10:00", to = "2026-11-11T02:10:00" },
+  { from = "2026-11-12T01:10:00", to = "2026-11-12T02:10:00" },
+  { from = "2026-11-13T01:10:00", to = "2026-11-13T02:10:00" },
+  { from = "2026-11-16T01:10:00", to = "2026-11-16T02:10:00" },
+  { from = "2026-11-17T01:10:00", to = "2026-11-17T02:10:00" },
+  { from = "2026-11-18T01:10:00", to = "2026-11-18T02:10:00" },
+  { from = "2026-11-19T01:10:00", to = "2026-11-19T02:10:00" },
+  { from = "2026-11-20T01:10:00", to = "2026-11-20T02:10:00" },
+  { from = "2026-11-23T01:10:00", to = "2026-11-23T02:10:00" },
+  { from = "2026-11-24T01:10:00", to = "2026-11-24T02:10:00" },
+  { from = "2026-11-25T01:10:00", to = "2026-11-25T02:10:00" },
+  { from = "2026-11-26T01:10:00", to = "2026-11-26T02:10:00" },
+  { from = "2026-11-27T01:10:00", to = "2026-11-27T02:10:00" },
+  { from = "2026-11-30T01:10:00", to = "2026-11-30T02:10:00" },
+  { from = "2026-12-01T01:10:00", to = "2026-12-01T02:10:00" },
+  { from = "2026-12-02T01:10:00", to = "2026-12-02T02:10:00" },
+  { from = "2026-12-03T01:10:00", to = "2026-12-03T02:10:00" },
+  { from = "2026-12-04T01:10:00", to = "2026-12-04T02:10:00" },
+  { from = "2026-12-07T01:10:00", to = "2026-12-07T02:10:00" },
+  { from = "2026-12-08T01:10:00", to = "2026-12-08T02:10:00" },
+  { from = "2026-12-09T01:10:00", to = "2026-12-09T02:10:00" },
+  { from = "2026-12-10T01:10:00", to = "2026-12-10T02:10:00" },
+  { from = "2026-12-11T01:10:00", to = "2026-12-11T02:10:00" },
+  { from = "2026-12-14T01:10:00", to = "2026-12-14T02:10:00" },
+  { from = "2026-12-15T01:10:00", to = "2026-12-15T02:10:00" },
+  { from = "2026-12-16T01:10:00", to = "2026-12-16T02:10:00" },
+  { from = "2026-12-17T01:10:00", to = "2026-12-17T02:10:00" },
+  { from = "2026-12-18T01:10:00", to = "2026-12-18T02:10:00" },
+  { from = "2026-12-21T01:10:00", to = "2026-12-21T02:10:00" },
+  { from = "2026-12-22T01:10:00", to = "2026-12-22T02:10:00" },
+  { from = "2026-12-23T01:10:00", to = "2026-12-23T02:10:00" },
+  { from = "2026-12-28T01:10:00", to = "2026-12-28T02:10:00" },
+  { from = "2026-12-29T01:10:00", to = "2026-12-29T02:10:00" },
+  { from = "2026-12-30T01:10:00", to = "2026-12-30T02:10:00" },
+  { from = "2027-01-04T01:10:00", to = "2027-01-04T02:10:00" },
+  { from = "2027-01-05T01:10:00", to = "2027-01-05T02:10:00" },
+  { from = "2027-01-06T01:10:00", to = "2027-01-06T02:10:00" },
+  { from = "2027-01-07T01:10:00", to = "2027-01-07T02:10:00" },
+  { from = "2027-01-08T01:10:00", to = "2027-01-08T02:10:00" },
+  { from = "2027-01-11T01:10:00", to = "2027-01-11T02:10:00" },
+  { from = "2027-01-12T01:10:00", to = "2027-01-12T02:10:00" },
+  { from = "2027-01-13T01:10:00", to = "2027-01-13T02:10:00" },
+  { from = "2027-01-14T01:10:00", to = "2027-01-14T02:10:00" },
+  { from = "2027-01-15T01:10:00", to = "2027-01-15T02:10:00" },
+  { from = "2027-01-18T01:10:00", to = "2027-01-18T02:10:00" },
+  { from = "2027-01-19T01:10:00", to = "2027-01-19T02:10:00" },
+  { from = "2027-01-20T01:10:00", to = "2027-01-20T02:10:00" },
+  { from = "2027-01-21T01:10:00", to = "2027-01-21T02:10:00" },
+  { from = "2027-01-22T01:10:00", to = "2027-01-22T02:10:00" },
+  { from = "2027-01-25T01:10:00", to = "2027-01-25T02:10:00" },
+  { from = "2027-01-26T01:10:00", to = "2027-01-26T02:10:00" },
+  { from = "2027-01-27T01:10:00", to = "2027-01-27T02:10:00" },
+  { from = "2027-01-28T01:10:00", to = "2027-01-28T02:10:00" },
+  { from = "2027-01-29T01:10:00", to = "2027-01-29T02:10:00" },
+  { from = "2027-02-01T01:10:00", to = "2027-02-01T02:10:00" },
+  { from = "2027-02-02T01:10:00", to = "2027-02-02T02:10:00" },
+  { from = "2027-02-03T01:10:00", to = "2027-02-03T02:10:00" },
+  { from = "2027-02-04T01:10:00", to = "2027-02-04T02:10:00" },
+  { from = "2027-02-05T01:10:00", to = "2027-02-05T02:10:00" },
+  { from = "2027-02-08T01:10:00", to = "2027-02-08T02:10:00" },
+  { from = "2027-02-09T01:10:00", to = "2027-02-09T02:10:00" },
+  { from = "2027-02-10T01:10:00", to = "2027-02-10T02:10:00" },
+  { from = "2027-02-11T01:10:00", to = "2027-02-11T02:10:00" },
+  { from = "2027-02-12T01:10:00", to = "2027-02-12T02:10:00" },
+  { from = "2027-02-15T01:10:00", to = "2027-02-15T02:10:00" },
+  { from = "2027-02-16T01:10:00", to = "2027-02-16T02:10:00" },
+  { from = "2027-02-17T01:10:00", to = "2027-02-17T02:10:00" },
+  { from = "2027-02-18T01:10:00", to = "2027-02-18T02:10:00" },
+  { from = "2027-02-19T01:10:00", to = "2027-02-19T02:10:00" },
+  { from = "2027-02-22T01:10:00", to = "2027-02-22T02:10:00" },
+  { from = "2027-02-23T01:10:00", to = "2027-02-23T02:10:00" },
+  { from = "2027-02-24T01:10:00", to = "2027-02-24T02:10:00" },
+  { from = "2027-02-25T01:10:00", to = "2027-02-25T02:10:00" },
+  { from = "2027-02-26T01:10:00", to = "2027-02-26T02:10:00" },
+  { from = "2027-03-01T01:10:00", to = "2027-03-01T02:10:00" },
+  { from = "2027-03-02T01:10:00", to = "2027-03-02T02:10:00" },
+  { from = "2027-03-03T01:10:00", to = "2027-03-03T02:10:00" },
+  { from = "2027-03-04T01:10:00", to = "2027-03-04T02:10:00" },
+  { from = "2027-03-05T01:10:00", to = "2027-03-05T02:10:00" },
+  { from = "2027-03-08T01:10:00", to = "2027-03-08T02:10:00" },
+  { from = "2027-03-09T01:10:00", to = "2027-03-09T02:10:00" },
+  { from = "2027-03-10T01:10:00", to = "2027-03-10T02:10:00" },
+  { from = "2027-03-11T01:10:00", to = "2027-03-11T02:10:00" },
+  { from = "2027-03-12T01:10:00", to = "2027-03-12T02:10:00" },
+  { from = "2027-03-15T01:10:00", to = "2027-03-15T02:10:00" },
+  { from = "2027-03-16T01:10:00", to = "2027-03-16T02:10:00" },
+  { from = "2027-03-17T01:10:00", to = "2027-03-17T02:10:00" },
+  { from = "2027-03-18T01:10:00", to = "2027-03-18T02:10:00" },
+  { from = "2027-03-19T01:10:00", to = "2027-03-19T02:10:00" },
+  { from = "2027-03-22T01:10:00", to = "2027-03-22T02:10:00" },
+  { from = "2027-03-23T01:10:00", to = "2027-03-23T02:10:00" },
+  { from = "2027-03-24T01:10:00", to = "2027-03-24T02:10:00" },
+  { from = "2027-03-25T01:10:00", to = "2027-03-25T02:10:00" },
+  { from = "2027-11-01T01:10:00", to = "2027-11-01T02:10:00" },
+  { from = "2027-11-02T01:10:00", to = "2027-11-02T02:10:00" },
+  { from = "2027-11-03T01:10:00", to = "2027-11-03T02:10:00" },
+  { from = "2027-11-04T01:10:00", to = "2027-11-04T02:10:00" },
+  { from = "2027-11-05T01:10:00", to = "2027-11-05T02:10:00" },
+  { from = "2027-11-08T01:10:00", to = "2027-11-08T02:10:00" },
+  { from = "2027-11-09T01:10:00", to = "2027-11-09T02:10:00" },
+  { from = "2027-11-10T01:10:00", to = "2027-11-10T02:10:00" },
+  { from = "2027-11-11T01:10:00", to = "2027-11-11T02:10:00" },
+  { from = "2027-11-12T01:10:00", to = "2027-11-12T02:10:00" },
+  { from = "2027-11-15T01:10:00", to = "2027-11-15T02:10:00" },
+  { from = "2027-11-16T01:10:00", to = "2027-11-16T02:10:00" },
+  { from = "2027-11-17T01:10:00", to = "2027-11-17T02:10:00" },
+  { from = "2027-11-18T01:10:00", to = "2027-11-18T02:10:00" },
+  { from = "2027-11-19T01:10:00", to = "2027-11-19T02:10:00" },
+  { from = "2027-11-22T01:10:00", to = "2027-11-22T02:10:00" },
+  { from = "2027-11-23T01:10:00", to = "2027-11-23T02:10:00" },
+  { from = "2027-11-24T01:10:00", to = "2027-11-24T02:10:00" },
+  { from = "2027-11-25T01:10:00", to = "2027-11-25T02:10:00" },
+  { from = "2027-11-26T01:10:00", to = "2027-11-26T02:10:00" },
+  { from = "2027-11-29T01:10:00", to = "2027-11-29T02:10:00" },
+  { from = "2027-11-30T01:10:00", to = "2027-11-30T02:10:00" },
+  { from = "2027-12-01T01:10:00", to = "2027-12-01T02:10:00" },
+  { from = "2027-12-02T01:10:00", to = "2027-12-02T02:10:00" },
+  { from = "2027-12-03T01:10:00", to = "2027-12-03T02:10:00" },
+  { from = "2027-12-06T01:10:00", to = "2027-12-06T02:10:00" },
+  { from = "2027-12-07T01:10:00", to = "2027-12-07T02:10:00" },
+  { from = "2027-12-08T01:10:00", to = "2027-12-08T02:10:00" },
+  { from = "2027-12-09T01:10:00", to = "2027-12-09T02:10:00" },
+  { from = "2027-12-10T01:10:00", to = "2027-12-10T02:10:00" },
+  { from = "2027-12-13T01:10:00", to = "2027-12-13T02:10:00" },
+  { from = "2027-12-14T01:10:00", to = "2027-12-14T02:10:00" },
+  { from = "2027-12-15T01:10:00", to = "2027-12-15T02:10:00" },
+  { from = "2027-12-16T01:10:00", to = "2027-12-16T02:10:00" },
+  { from = "2027-12-17T01:10:00", to = "2027-12-17T02:10:00" },
+  { from = "2027-12-20T01:10:00", to = "2027-12-20T02:10:00" },
+  { from = "2027-12-21T01:10:00", to = "2027-12-21T02:10:00" },
+  { from = "2027-12-22T01:10:00", to = "2027-12-22T02:10:00" },
+  { from = "2027-12-23T01:10:00", to = "2027-12-23T02:10:00" },
+  { from = "2027-12-27T01:10:00", to = "2027-12-27T02:10:00" },
+  { from = "2027-12-28T01:10:00", to = "2027-12-28T02:10:00" },
+  { from = "2027-12-29T01:10:00", to = "2027-12-29T02:10:00" },
+  { from = "2027-12-30T01:10:00", to = "2027-12-30T02:10:00" },
+]
+
+[[genesis.markets]]
+id = 24
+symbol = "UK100"
+asset_class = "index"
+max_slippage_bps = 10
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "5000000", bps = 0 }, { up_to = "25000000", bps = 1 }, { bps = 4 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SONIA", markup_bps = 250, day_basis = 365 }
+
+# ICE Futures Europe FTSE 100 Index Future, London time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "Europe/London"
+windows = [
+  { open = "Mon 01:00", close = "Mon 21:00" },
+  { open = "Tue 01:00", close = "Tue 21:00" },
+  { open = "Wed 01:00", close = "Wed 21:00" },
+  { open = "Thu 01:00", close = "Thu 21:00" },
+  { open = "Fri 01:00", close = "Fri 21:00" },
+]
+closed_dates = [
+  "2026-12-25",
+  "2026-12-28",
+  "2027-01-01",
+  "2027-03-26",
+  "2027-03-29",
+  "2027-05-03",
+  "2027-05-31",
+  "2027-08-30",
+  "2027-12-27",
+  "2027-12-28",
+]
+closures = [
+  { from = "2026-12-24T12:30:00", to = "2026-12-24T21:00:00" },
+  { from = "2026-12-31T12:30:00", to = "2026-12-31T21:00:00" },
+  { from = "2027-12-24T12:30:00", to = "2027-12-24T21:00:00" },
+  { from = "2027-12-31T12:30:00", to = "2027-12-31T21:00:00" },
+]
+
+[[genesis.markets]]
+id = 25
+symbol = "JP225"
+asset_class = "index"
+max_slippage_bps = 10
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "5000000", bps = 0 }, { up_to = "25000000", bps = 1 }, { bps = 4 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "TONA", markup_bps = 250, day_basis = 365 }
+
+# Osaka Exchange Nikkei 225 Futures, Tokyo time. UNVERIFIED: see the header.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "Asia/Tokyo"
+windows = [
+  { open = "Mon 08:45", close = "Mon 15:45" },
+  { open = "Tue 08:45", close = "Tue 15:45" },
+  { open = "Wed 08:45", close = "Wed 15:45" },
+  { open = "Thu 08:45", close = "Thu 15:45" },
+  { open = "Fri 08:45", close = "Fri 15:45" },
+  { open = "Mon 17:00", close = "Tue 06:00" },
+  { open = "Tue 17:00", close = "Wed 06:00" },
+  { open = "Wed 17:00", close = "Thu 06:00" },
+  { open = "Thu 17:00", close = "Fri 06:00" },
+  { open = "Fri 17:00", close = "Sat 06:00" },
+]
+closures = [
+  { from = "2026-11-23T08:45:00", to = "2026-11-24T06:00:00" },
+  { from = "2026-12-31T08:45:00", to = "2027-01-02T06:00:00" },
+  { from = "2027-09-20T08:45:00", to = "2027-09-21T06:00:00" },
+  { from = "2027-12-31T08:45:00", to = "2028-01-01T06:00:00" },
+]
+
+# --- Commodities: front futures on their venue ----------------------------
+
+[[genesis.markets]]
+id = 30
+symbol = "XAU-USD"
+asset_class = "commodity"
+max_slippage_bps = 10
+house_cap_bps = 3000
+margin_tiers = [{ up_to = "2000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "2000000", bps = 0 }, { up_to = "10000000", bps = 2 }, { bps = 6 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# CME Globex metals and energy futures, Chicago time. Halt times are unverified: see the header.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/Chicago"
+windows = [
+  { open = "Sun 17:00", close = "Mon 16:00" },
+  { open = "Mon 17:00", close = "Tue 16:00" },
+  { open = "Tue 17:00", close = "Wed 16:00" },
+  { open = "Wed 17:00", close = "Thu 16:00" },
+  { open = "Thu 17:00", close = "Fri 16:00" },
+]
+closures = [
+  { from = "2026-11-26T12:00:00", to = "2026-11-26T16:00:00" },
+  { from = "2026-11-27T12:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T12:00:00", to = "2026-12-25T16:00:00" },
+  { from = "2026-12-31T17:00:00", to = "2027-01-01T16:00:00" },
+  { from = "2027-01-18T12:00:00", to = "2027-01-18T16:00:00" },
+  { from = "2027-02-15T12:00:00", to = "2027-02-15T16:00:00" },
+  { from = "2027-03-25T17:00:00", to = "2027-03-26T16:00:00" },
+  { from = "2027-05-31T12:00:00", to = "2027-05-31T16:00:00" },
+  { from = "2027-06-18T13:30:00", to = "2027-06-18T16:00:00" },
+  { from = "2027-07-05T12:00:00", to = "2027-07-05T16:00:00" },
+  { from = "2027-09-06T12:00:00", to = "2027-09-06T16:00:00" },
+  { from = "2027-11-25T12:00:00", to = "2027-11-25T16:00:00" },
+  { from = "2027-11-26T12:00:00", to = "2027-11-26T16:00:00" },
+  { from = "2027-12-23T17:00:00", to = "2027-12-24T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 31
+symbol = "XAG-USD"
+asset_class = "commodity"
+max_slippage_bps = 10
+house_cap_bps = 3000
+margin_tiers = [{ up_to = "2000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "2000000", bps = 0 }, { up_to = "10000000", bps = 2 }, { bps = 6 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# CME Globex metals and energy futures, Chicago time. Halt times are unverified: see the header.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/Chicago"
+windows = [
+  { open = "Sun 17:00", close = "Mon 16:00" },
+  { open = "Mon 17:00", close = "Tue 16:00" },
+  { open = "Tue 17:00", close = "Wed 16:00" },
+  { open = "Wed 17:00", close = "Thu 16:00" },
+  { open = "Thu 17:00", close = "Fri 16:00" },
+]
+closures = [
+  { from = "2026-11-26T12:00:00", to = "2026-11-26T16:00:00" },
+  { from = "2026-11-27T12:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T12:00:00", to = "2026-12-25T16:00:00" },
+  { from = "2026-12-31T17:00:00", to = "2027-01-01T16:00:00" },
+  { from = "2027-01-18T12:00:00", to = "2027-01-18T16:00:00" },
+  { from = "2027-02-15T12:00:00", to = "2027-02-15T16:00:00" },
+  { from = "2027-03-25T17:00:00", to = "2027-03-26T16:00:00" },
+  { from = "2027-05-31T12:00:00", to = "2027-05-31T16:00:00" },
+  { from = "2027-06-18T13:30:00", to = "2027-06-18T16:00:00" },
+  { from = "2027-07-05T12:00:00", to = "2027-07-05T16:00:00" },
+  { from = "2027-09-06T12:00:00", to = "2027-09-06T16:00:00" },
+  { from = "2027-11-25T12:00:00", to = "2027-11-25T16:00:00" },
+  { from = "2027-11-26T12:00:00", to = "2027-11-26T16:00:00" },
+  { from = "2027-12-23T17:00:00", to = "2027-12-24T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 32
+symbol = "WTI"
+asset_class = "commodity"
+max_slippage_bps = 10
+house_cap_bps = 3000
+margin_tiers = [{ up_to = "2000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "2000000", bps = 0 }, { up_to = "10000000", bps = 2 }, { bps = 6 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# CME Globex metals and energy futures, Chicago time. Halt times are unverified: see the header.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/Chicago"
+windows = [
+  { open = "Sun 17:00", close = "Mon 16:00" },
+  { open = "Mon 17:00", close = "Tue 16:00" },
+  { open = "Tue 17:00", close = "Wed 16:00" },
+  { open = "Wed 17:00", close = "Thu 16:00" },
+  { open = "Thu 17:00", close = "Fri 16:00" },
+]
+closures = [
+  { from = "2026-11-26T12:00:00", to = "2026-11-26T16:00:00" },
+  { from = "2026-11-27T12:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T12:00:00", to = "2026-12-25T16:00:00" },
+  { from = "2026-12-31T17:00:00", to = "2027-01-01T16:00:00" },
+  { from = "2027-01-18T12:00:00", to = "2027-01-18T16:00:00" },
+  { from = "2027-02-15T12:00:00", to = "2027-02-15T16:00:00" },
+  { from = "2027-03-25T17:00:00", to = "2027-03-26T16:00:00" },
+  { from = "2027-05-31T12:00:00", to = "2027-05-31T16:00:00" },
+  { from = "2027-06-18T13:30:00", to = "2027-06-18T16:00:00" },
+  { from = "2027-07-05T12:00:00", to = "2027-07-05T16:00:00" },
+  { from = "2027-09-06T12:00:00", to = "2027-09-06T16:00:00" },
+  { from = "2027-11-25T12:00:00", to = "2027-11-25T16:00:00" },
+  { from = "2027-11-26T12:00:00", to = "2027-11-26T16:00:00" },
+  { from = "2027-12-23T17:00:00", to = "2027-12-24T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 33
+symbol = "BRENT"
+asset_class = "commodity"
+max_slippage_bps = 10
+house_cap_bps = 3000
+margin_tiers = [{ up_to = "2000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "2000000", bps = 0 }, { up_to = "10000000", bps = 2 }, { bps = 6 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# ICE Futures Europe Brent, fixed in New York time: see the header.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Sun 18:00", close = "Mon 18:00" },
+  { open = "Mon 20:00", close = "Tue 18:00" },
+  { open = "Tue 20:00", close = "Wed 18:00" },
+  { open = "Wed 20:00", close = "Thu 18:00" },
+  { open = "Thu 20:00", close = "Fri 18:00" },
+]
+closures = [
+  { from = "2026-11-26T13:30:00", to = "2026-11-26T18:00:00" },
+  { from = "2026-11-27T15:00:00", to = "2026-11-27T18:00:00" },
+  { from = "2026-12-24T14:00:00", to = "2026-12-25T18:00:00" },
+  { from = "2026-12-31T15:00:00", to = "2027-01-01T18:00:00" },
+  { from = "2027-03-25T20:00:00", to = "2027-03-26T18:00:00" },
+  { from = "2027-05-31T13:30:00", to = "2027-05-31T18:00:00" },
+  { from = "2027-06-18T13:30:00", to = "2027-06-18T18:00:00" },
+  { from = "2027-07-05T13:30:00", to = "2027-07-05T18:00:00" },
+  { from = "2027-09-06T13:30:00", to = "2027-09-06T18:00:00" },
+  { from = "2027-11-25T14:30:00", to = "2027-11-25T18:00:00" },
+  { from = "2027-11-26T15:00:00", to = "2027-11-26T18:00:00" },
+  { from = "2027-12-24T08:00:00", to = "2027-12-24T18:00:00" },
+  { from = "2027-12-31T15:00:00", to = "2027-12-31T18:00:00" },
+]
+
+# --- US shares: core session of the listing exchange ----------------------
+
+[[genesis.markets]]
+id = 40
+symbol = "AAPL"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 41
+symbol = "MSFT"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 42
+symbol = "NVDA"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 43
+symbol = "AMZN"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 44
+symbol = "GOOGL"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 45
+symbol = "META"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 46
+symbol = "TSLA"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 47
+symbol = "AVGO"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 48
+symbol = "BRK.B"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 49
+symbol = "JPM"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 50
+symbol = "V"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 51
+symbol = "MA"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 52
+symbol = "LLY"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 53
+symbol = "JNJ"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 54
+symbol = "XOM"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 55
+symbol = "WMT"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 56
+symbol = "COST"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 57
+symbol = "NFLX"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 58
+symbol = "AMD"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]
+
+[[genesis.markets]]
+id = 59
+symbol = "ORCL"
+asset_class = "equity"
+max_slippage_bps = 15
+house_cap_bps = 1000
+min_order_notional = "10"
+margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
+spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 250, day_basis = 360 }
+
+# US shares: NYSE and Nasdaq core session, New York time.
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "America/New_York"
+windows = [
+  { open = "Mon 09:30", close = "Mon 16:00" },
+  { open = "Tue 09:30", close = "Tue 16:00" },
+  { open = "Wed 09:30", close = "Wed 16:00" },
+  { open = "Thu 09:30", close = "Thu 16:00" },
+  { open = "Fri 09:30", close = "Fri 16:00" },
+]
+closed_dates = [
+  "2026-11-26",
+  "2026-12-25",
+  "2027-01-01",
+  "2027-01-18",
+  "2027-02-15",
+  "2027-03-26",
+  "2027-05-31",
+  "2027-06-18",
+  "2027-07-05",
+  "2027-09-06",
+  "2027-11-25",
+  "2027-12-24",
+]
+closures = [
+  { from = "2026-11-27T13:00:00", to = "2026-11-27T16:00:00" },
+  { from = "2026-12-24T13:00:00", to = "2026-12-24T16:00:00" },
+  { from = "2027-11-26T13:00:00", to = "2027-11-26T16:00:00" },
+]

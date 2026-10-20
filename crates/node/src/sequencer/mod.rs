@@ -43,6 +43,8 @@ pub struct StreamMsg {
     pub body: StreamBody,
 }
 
+// Unboxed on purpose, like `Request`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamBody {
@@ -201,13 +203,7 @@ impl Sequencer {
     /// - the engine rejects any genesis command
     /// - the log cannot be written
     pub fn genesis(&mut self, genesis: &Genesis) -> anyhow::Result<()> {
-        let mut cmds = vec![Command::Admin(AdminCommand::SetParams(genesis.params.clone()))];
-        cmds.extend(genesis.benchmarks.iter().map(|b| {
-            Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: b.name.clone(), annual_bps: b.annual_bps })
-        }));
-        cmds.extend(genesis.markets.iter().map(|m| Command::Admin(AdminCommand::UpsertMarket(m.clone()))));
-        cmds.push(Command::HouseCapital { amount: genesis.house_capital, chain_ref: GENESIS_REF.into() });
-        self.sequence_required(cmds).context("genesis")
+        self.sequence_required(genesis_commands(genesis)).context("genesis")
     }
 
     /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch is
@@ -441,6 +437,18 @@ fn ensure_signed(
         }
         _ => Ok(()),
     }
+}
+
+/// The commands that sequence `genesis` into an empty log, in order. The last is the house capital
+/// credit under `GENESIS_REF`, a zero one included, which marks genesis done.
+pub fn genesis_commands(genesis: &Genesis) -> Vec<Command> {
+    let mut cmds = vec![Command::Admin(AdminCommand::SetParams(genesis.params.clone()))];
+    cmds.extend(genesis.benchmarks.iter().map(|b| {
+        Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: b.name.clone(), annual_bps: b.annual_bps })
+    }));
+    cmds.extend(genesis.markets.iter().map(|m| Command::Admin(AdminCommand::UpsertMarket(m.clone()))));
+    cmds.push(Command::HouseCapital { amount: genesis.house_capital, chain_ref: GENESIS_REF.into() });
+    cmds
 }
 
 /// Raises an alert for an engine rejection an operator must look at.

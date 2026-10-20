@@ -23,6 +23,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::sequencer::SignedWithdrawal;
 
+// Unboxed on purpose: boxing every command would add an allocation to the hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "entry", rename_all = "snake_case")]
 pub enum LogEntry {

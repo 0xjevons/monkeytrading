@@ -1,12 +1,12 @@
 //! Trading hours. Crypto trades 24/7; RWA markets follow their venue's weekly windows in local
-//! time (so DST is handled by the tz database), minus holiday closures. While a market is closed
-//! nothing fills. Resting orders wait, and the first fresh price after the open fills them, gap
-//! included.
+//! time (so DST is handled by the tz database), minus holiday closures and dated closures such as
+//! early closes, plus dated special sessions. While a market is closed nothing fills. Resting
+//! orders wait, and the first fresh price after the open fills them, gap included.
 
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -25,7 +25,24 @@ pub enum Schedule {
         /// Whole local days the venue is shut (exchange holidays).
         #[serde(default)]
         closed_dates: Vec<NaiveDate>,
+        /// Dated closures inside the weekly windows: early closes, holiday halts, and closures
+        /// that span midnight. Skipped from the encoding when empty, so the state root of a
+        /// schedule without closures does not depend on this field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        closures: Vec<Period>,
+        /// Dated sessions outside the weekly windows. A special session is open even on a closed
+        /// date or inside a closure. Skipped from the encoding when empty, like `closures`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        special_sessions: Vec<Period>,
     },
+}
+
+/// `[from, to)` in venue-local date and time, written `"2026-11-27T13:00:00"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Period {
+    pub from: NaiveDateTime,
+    pub to: NaiveDateTime,
 }
 
 /// `[open, close)` in venue-local week time. A window whose close is before its open wraps over
@@ -91,40 +108,70 @@ impl<'de> Deserialize<'de> for WeekTime {
     }
 }
 
+impl fmt::Display for Period {
+    /// `"2026-11-27 13:00:00..2026-11-27 16:00:00"` form.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}..{}", self.from, self.to)
+    }
+}
+
 impl Schedule {
     /// Whether the venue is open at `ts`. A timestamp outside chrono's range reads as closed.
     pub fn is_open(&self, ts: Millis) -> bool {
         match self {
             Schedule::AlwaysOpen => true,
-            Schedule::Weekly { tz, windows, closed_dates } => {
+            Schedule::Weekly { tz, windows, closed_dates, closures, special_sessions } => {
                 let Some(utc) = DateTime::<Utc>::from_timestamp_millis(ts) else {
                     return false;
                 };
-                let local = utc.with_timezone(tz);
-                if closed_dates.contains(&local.date_naive()) {
-                    return false;
-                }
-                let t = WeekTime(
-                    local.weekday().num_days_from_monday() * MINUTES_PER_DAY + local.hour() * 60 + local.minute(),
-                );
-                windows.iter().any(|w| w.contains(t))
+                let local = utc.with_timezone(tz).naive_local();
+                special_sessions.iter().any(|p| p.contains(local))
+                    || (regular_open(windows, closed_dates, local) && !closures.iter().any(|p| p.contains(local)))
             }
         }
     }
 
-    /// Checks the schedule can ever open.
+    /// Whether the schedule lists any dated closure or special session.
+    pub fn has_exceptions(&self) -> bool {
+        matches!(self, Schedule::Weekly { closures, special_sessions, .. }
+            if !closures.is_empty() || !special_sessions.is_empty())
+    }
+
+    /// Checks the schedule can ever open, and that every dated exception changes the hours where it
+    /// starts, so a mistyped date or time is refused rather than ignored.
     /// Error cases:
     /// - a weekly schedule with no windows
     /// - a window whose open equals its close
+    /// - a closure or special session that does not end after it starts
+    /// - a closure or special session that starts at a local time the time zone skips (a DST gap)
+    /// - a closure that starts while the weekly windows and closed dates already have the venue shut
+    /// - a special session that starts while the venue is already open
     pub fn validate(&self) -> Result<(), String> {
-        match self {
-            Schedule::AlwaysOpen => Ok(()),
-            Schedule::Weekly { windows, .. } if windows.is_empty() => Err("weekly schedule has no windows".into()),
-            Schedule::Weekly { windows, .. } => match windows.iter().find(|w| w.open == w.close) {
-                Some(w) => Err(format!("empty window {}-{}", w.open, w.close)),
-                None => Ok(()),
-            },
+        let Schedule::Weekly { tz, windows, closed_dates, closures, special_sessions } = self else {
+            return Ok(());
+        };
+        if windows.is_empty() {
+            return Err("weekly schedule has no windows".into());
         }
+        if let Some(w) = windows.iter().find(|w| w.open == w.close) {
+            return Err(format!("empty window {}-{}", w.open, w.close));
+        }
+        if let Some(p) = closures.iter().chain(special_sessions).find(|p| p.from >= p.to) {
+            return Err(format!("empty period {p}"));
+        }
+        if let Some(p) =
+            closures.iter().chain(special_sessions).find(|p| tz.from_local_datetime(&p.from).earliest().is_none())
+        {
+            return Err(format!("period {p} starts at a local time {tz} skips"));
+        }
+        if let Some(p) = closures.iter().find(|p| !regular_open(windows, closed_dates, p.from)) {
+            return Err(format!("closure {p} starts while the venue is already shut"));
+        }
+        let open_at = |t| regular_open(windows, closed_dates, t) && !closures.iter().any(|c| c.contains(t));
+        if let Some(p) = special_sessions.iter().find(|p| open_at(p.from)) {
+            return Err(format!("special session {p} starts while the venue is already open"));
+        }
+        Ok(())
     }
 }
 
@@ -139,10 +186,22 @@ impl Window {
     }
 }
 
+impl Period {
+    /// Whether local time `t` falls inside `[from, to)`.
+    fn contains(&self, t: NaiveDateTime) -> bool {
+        self.from <= t && t < self.to
+    }
+}
+
+/// Whether local time `t` is inside a weekly window on a date that is not a closed date.
+fn regular_open(windows: &[Window], closed_dates: &[NaiveDate], t: NaiveDateTime) -> bool {
+    let week_time = WeekTime(t.weekday().num_days_from_monday() * MINUTES_PER_DAY + t.hour() * 60 + t.minute());
+    !closed_dates.contains(&t.date()) && windows.iter().any(|w| w.contains(week_time))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn w(open: &str, close: &str) -> Window {
         Window { open: open.parse().unwrap(), close: close.parse().unwrap() }
@@ -157,6 +216,8 @@ mod tests {
             tz: chrono_tz::America::New_York,
             windows: DAYS[..5].iter().map(|d| w(&format!("{d} 09:30"), &format!("{d} 16:00"))).collect(),
             closed_dates: vec![NaiveDate::from_ymd_opt(2026, 11, 26).unwrap()],
+            closures: vec![],
+            special_sessions: vec![],
         }
     }
 
@@ -182,6 +243,8 @@ mod tests {
             tz: chrono_tz::America::New_York,
             windows: vec![w("Sun 17:00", "Fri 17:00")],
             closed_dates: vec![],
+            closures: vec![],
+            special_sessions: vec![],
         };
         assert!(s.is_open(ny_ms(2026, 10, 19, 3, 0))); // Mon
         assert!(!s.is_open(ny_ms(2026, 10, 23, 17, 0))); // Fri close
@@ -198,10 +261,21 @@ mod tests {
 
     #[test]
     fn validation_rejects_schedules_that_never_open() {
-        let empty = Schedule::Weekly { tz: chrono_tz::UTC, windows: vec![], closed_dates: vec![] };
+        let empty = Schedule::Weekly {
+            tz: chrono_tz::UTC,
+            windows: vec![],
+            closed_dates: vec![],
+            closures: vec![],
+            special_sessions: vec![],
+        };
         assert!(empty.validate().is_err());
-        let zero =
-            Schedule::Weekly { tz: chrono_tz::UTC, windows: vec![w("Mon 09:00", "Mon 09:00")], closed_dates: vec![] };
+        let zero = Schedule::Weekly {
+            tz: chrono_tz::UTC,
+            windows: vec![w("Mon 09:00", "Mon 09:00")],
+            closed_dates: vec![],
+            closures: vec![],
+            special_sessions: vec![],
+        };
         assert!(zero.validate().is_err());
         assert!(us_equities().validate().is_ok());
     }
@@ -210,6 +284,113 @@ mod tests {
     fn unknown_schedule_fields_are_rejected() {
         let typo = serde_json::json!({ "kind": "weekly", "tz": "UTC", "windows": [], "closed_date": [] });
         assert!(serde_json::from_value::<Schedule>(typo).is_err());
+        let typo = serde_json::json!({ "kind": "weekly", "tz": "UTC", "windows": [], "closure": [] });
+        assert!(serde_json::from_value::<Schedule>(typo).is_err());
+        let typo = serde_json::json!({ "from": "2026-11-27T13:00:00", "until": "2026-11-27T16:00:00" });
+        assert!(serde_json::from_value::<Period>(typo).is_err());
+    }
+
+    #[test]
+    fn an_early_close_shortens_only_its_own_session() {
+        let s = us_equities_with(vec![period("2026-11-27 13:00", "2026-11-27 16:00")], vec![]);
+        assert!(s.is_open(ny_ms(2026, 11, 27, 12, 59)));
+        assert!(!s.is_open(ny_ms(2026, 11, 27, 13, 0)));
+        assert!(!s.is_open(ny_ms(2026, 11, 27, 15, 59)));
+        // The sessions either side keep their hours.
+        assert!(s.is_open(ny_ms(2026, 11, 25, 15, 59)));
+        assert!(s.is_open(ny_ms(2026, 11, 30, 9, 30)));
+        assert!(s.is_open(ny_ms(2026, 11, 30, 15, 59)));
+    }
+
+    #[test]
+    fn a_closure_spans_midnight_and_the_weekend() {
+        // Halts Thu 24 Dec 2026 at 12:15 Chicago and reopens with the regular Sunday session.
+        let s = globex(vec![period("2026-12-24 12:15", "2026-12-27 17:00")], vec![]);
+        assert!(s.is_open(chicago_ms(2026, 12, 24, 12, 14)));
+        assert!(!s.is_open(chicago_ms(2026, 12, 24, 12, 15)));
+        // Thursday evening's session, which the windows alone would open, stays shut.
+        assert!(!s.is_open(chicago_ms(2026, 12, 24, 17, 0)));
+        assert!(!s.is_open(chicago_ms(2026, 12, 25, 10, 0)));
+        assert!(s.is_open(chicago_ms(2026, 12, 27, 17, 0)));
+        // A week earlier the same hours are open.
+        assert!(s.is_open(chicago_ms(2026, 12, 17, 17, 0)));
+    }
+
+    #[test]
+    fn a_special_session_opens_on_a_weekend_a_closed_date_and_inside_a_closure() {
+        let s = us_equities_with(vec![], vec![period("2026-10-24 10:00", "2026-10-24 12:00")]);
+        assert!(!s.is_open(ny_ms(2026, 10, 24, 9, 59)));
+        assert!(s.is_open(ny_ms(2026, 10, 24, 10, 0)));
+        assert!(!s.is_open(ny_ms(2026, 10, 24, 12, 0)));
+        // Thanksgiving is a closed date.
+        let s = us_equities_with(vec![], vec![period("2026-11-26 10:00", "2026-11-26 12:00")]);
+        assert!(s.is_open(ny_ms(2026, 11, 26, 11, 0)));
+        assert!(!s.is_open(ny_ms(2026, 11, 26, 12, 0)));
+        let s = globex(
+            vec![period("2026-12-24 12:15", "2026-12-27 17:00")],
+            vec![period("2026-12-25 08:00", "2026-12-25 10:00")],
+        );
+        assert!(s.is_open(chicago_ms(2026, 12, 25, 9, 0)));
+        assert!(!s.is_open(chicago_ms(2026, 12, 25, 10, 0)));
+    }
+
+    #[test]
+    fn validation_refuses_exceptions_that_change_nothing_where_they_start() {
+        let early_close = period("2026-11-27 13:00", "2026-11-27 16:00");
+        assert_eq!(us_equities_with(vec![early_close], vec![]).validate(), Ok(()));
+        let backwards = period("2026-11-27 16:00", "2026-11-27 13:00");
+        let err = us_equities_with(vec![backwards], vec![]).validate().unwrap_err();
+        assert!(err.contains("empty period"), "{err}");
+        // Saturday, and Thanksgiving, are already shut.
+        for shut in [period("2026-11-28 13:00", "2026-11-28 16:00"), period("2026-11-26 13:00", "2026-11-26 16:00")] {
+            let err = us_equities_with(vec![shut], vec![]).validate().unwrap_err();
+            assert!(err.contains("already shut"), "{err}");
+        }
+        let err =
+            us_equities_with(vec![], vec![period("2026-10-20 10:00", "2026-10-20 11:00")]).validate().unwrap_err();
+        assert!(err.contains("already open"), "{err}");
+        let empty = period("2026-10-24 10:00", "2026-10-24 10:00");
+        assert!(us_equities_with(vec![], vec![empty]).validate().unwrap_err().contains("empty period"));
+        // A session inside the hour New York skips when clocks go forward never opens.
+        let skipped = period("2027-03-14 02:00", "2027-03-14 02:30");
+        let err = us_equities_with(vec![], vec![skipped]).validate().unwrap_err();
+        assert!(err.contains("skips"), "{err}");
+        // A special session inside a closure starts while the venue is shut.
+        let closure = period("2026-12-24 12:15", "2026-12-27 17:00");
+        let inside = period("2026-12-25 08:00", "2026-12-25 10:00");
+        assert_eq!(globex(vec![closure], vec![inside]).validate(), Ok(()));
+    }
+
+    #[test]
+    fn has_exceptions_sees_either_kind() {
+        let early_close = vec![period("2026-11-27 13:00", "2026-11-27 16:00")];
+        let special = vec![period("2026-10-24 10:00", "2026-10-24 12:00")];
+        assert!(!Schedule::AlwaysOpen.has_exceptions());
+        assert!(!us_equities().has_exceptions());
+        assert!(us_equities_with(early_close.clone(), vec![]).has_exceptions());
+        assert!(us_equities_with(vec![], special.clone()).has_exceptions());
+        assert!(us_equities_with(early_close, special).has_exceptions());
+    }
+
+    #[test]
+    fn a_schedule_without_exceptions_encodes_as_before_they_existed() {
+        // Exactly the keys of the encoding the committed reference logs carry.
+        let json = serde_json::to_value(us_equities()).unwrap();
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["closed_dates", "kind", "tz", "windows"]);
+    }
+
+    #[test]
+    fn exceptions_encode_as_local_date_times_and_round_trip() {
+        let s = us_equities_with(
+            vec![period("2026-11-27 13:00", "2026-11-27 16:00")],
+            vec![period("2026-10-24 10:00", "2026-10-24 12:00")],
+        );
+        let json = serde_json::to_value(&s).unwrap();
+        let early_close = serde_json::json!([{ "from": "2026-11-27T13:00:00", "to": "2026-11-27T16:00:00" }]);
+        assert_eq!(json["closures"], early_close);
+        assert_eq!(json["special_sessions"][0]["from"], "2026-10-24T10:00:00");
+        assert_eq!(serde_json::from_value::<Schedule>(json).unwrap(), s);
     }
 
     #[test]
@@ -218,5 +399,40 @@ mod tests {
         assert_eq!(t.to_string(), "Sun 17:05");
         assert!("Xyz 10:00".parse::<WeekTime>().is_err());
         assert!("Mon 24:00".parse::<WeekTime>().is_err());
+    }
+
+    // ── Helpers ──
+
+    /// A local `"YYYY-MM-DD HH:MM"` period.
+    fn period(from: &str, to: &str) -> Period {
+        let at = |s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
+        Period { from: at(from), to: at(to) }
+    }
+
+    /// `us_equities` with dated exceptions.
+    fn us_equities_with(closures: Vec<Period>, special_sessions: Vec<Period>) -> Schedule {
+        let Schedule::Weekly { tz, windows, closed_dates, .. } = us_equities() else {
+            unreachable!("US equities keep weekly hours")
+        };
+        Schedule::Weekly { tz, windows, closed_dates, closures, special_sessions }
+    }
+
+    /// Futures hours in Chicago: Sunday 17:00 to Friday 16:00, with a daily 16:00-17:00 break.
+    fn globex(closures: Vec<Period>, special_sessions: Vec<Period>) -> Schedule {
+        let windows = ["Sun", "Mon", "Tue", "Wed", "Thu"]
+            .iter()
+            .zip(&DAYS[..5])
+            .map(|(open, close)| w(&format!("{open} 17:00"), &format!("{close} 16:00")));
+        Schedule::Weekly {
+            tz: chrono_tz::America::Chicago,
+            windows: windows.collect(),
+            closed_dates: vec![],
+            closures,
+            special_sessions,
+        }
+    }
+
+    fn chicago_ms(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> Millis {
+        chrono_tz::America::Chicago.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().timestamp_millis()
     }
 }

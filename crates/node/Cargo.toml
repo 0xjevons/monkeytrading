@@ -37,5 +37,7 @@ tracing-subscriber.workspace = true
 webpki-roots.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
 tower.workspace = true

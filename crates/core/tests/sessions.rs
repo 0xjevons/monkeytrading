@@ -1,14 +1,17 @@
-//! Time: venue hours with gap-aware fills at the open, and the daily financing rollover, end to
-//! end through `Engine::apply`.
+//! Time: venue hours with gap-aware fills at the open, calendar updates, and the daily financing
+//! rollover, end to end through `Engine::apply`.
 
 mod common;
 
 use chrono::{TimeZone, Utc};
-use common::{AAPL, BTC, Harness, acct, f, fills, ny, rejection};
-use engine_core::Fixed;
-use engine_core::command::{AdminCommand, Command, OrderKind};
+use common::{AAPL, BTC, Harness, acct, f, fills, market, ny, rejection, us_equities};
+use engine_core::auth::ClientAuth;
+use engine_core::command::{AdminCommand, Command, OrderKind, Sequenced};
 use engine_core::event::{Event, Reject};
-use engine_core::types::Side;
+use engine_core::protocol::ProtocolVersion;
+use engine_core::session::Schedule;
+use engine_core::types::{AssetClass, Side};
+use engine_core::{Engine, Fixed};
 
 #[test]
 fn closed_markets_do_not_trade_and_stops_fill_at_the_gapped_open() {
@@ -90,4 +93,131 @@ fn financing_after_downtime_charges_every_missed_day() {
     let charges = h.cmd(Command::Tick).iter().filter(|e| matches!(e, Event::Financing { .. })).count();
     assert_eq!(charges, 3);
     h.assert_conserved(Fixed::ZERO);
+}
+
+#[test]
+fn a_calendar_update_applies_from_its_seq() {
+    let mut h = v4();
+    // Thu 22 Oct 2026 14:00: the listed calendar keeps AAPL open all afternoon.
+    h.advance_to(ny(2026, 10, 22, 14, 0));
+    assert!(h.cmd(Command::Tick).is_empty());
+    assert!(h.engine.markets()[&AAPL].open);
+
+    // An update closing at 13:00 today and tomorrow shuts the market at its own seq.
+    let events = h.cmd(calendar_update(&["2026-10-22", "2026-10-23"]));
+    assert_eq!(events, [Event::MarketClosed { market: AAPL }, Event::AdminApplied]);
+    assert_eq!(h.engine.markets()[&AAPL].spec.schedule, early_closes(&["2026-10-22", "2026-10-23"]));
+    // Friday follows the new calendar: open from 09:30, shut from 13:00.
+    h.advance_to(ny(2026, 10, 23, 9, 30));
+    assert_eq!(h.cmd(Command::Tick), [Event::MarketOpened { market: AAPL }]);
+    h.advance_to(ny(2026, 10, 23, 13, 0));
+    assert_eq!(h.cmd(Command::Tick), [Event::MarketClosed { market: AAPL }]);
+}
+
+#[test]
+fn a_calendar_update_that_changes_nothing_is_refused_and_the_calendar_kept() {
+    let mut h = v4();
+    // A 13:00 close typed for Saturday 24 Oct, when the venue is already shut.
+    let events = h.cmd(calendar_update(&["2026-10-24"]));
+    assert!(matches!(&events[..], [Event::AdminRejected { reason }] if reason.contains("already shut")), "{events:?}");
+    assert_eq!(h.engine.markets()[&AAPL].spec.schedule, us_equities());
+}
+
+#[test]
+fn a_log_with_a_calendar_update_replays_to_the_roots_it_recorded() {
+    let mut h = v4();
+    let mut recorded = roots(&h.log);
+    let mut step = |h: &mut Harness, cmd| {
+        h.cmd(cmd);
+        recorded.push(h.engine.state_root());
+    };
+    h.advance_to(ny(2026, 10, 22, 14, 0));
+    step(&mut h, Command::Tick);
+    step(&mut h, calendar_update(&["2026-10-22", "2026-10-23"]));
+    h.advance_to(ny(2026, 10, 23, 13, 0));
+    step(&mut h, Command::Tick);
+
+    // A verifier replaying the log from genesis reaches every root the live engine signed, before
+    // the update and after it.
+    assert_eq!(roots(&h.log), recorded);
+}
+
+#[test]
+fn dated_exceptions_are_accepted_only_from_v4() {
+    // Under each version, a weekly schedule without exceptions is accepted, and one with an early
+    // close, or with a special session only, is accepted from V4 on.
+    let updates = [("early close", calendar_update(&["2026-10-22"])), ("special session", special_session_update())];
+    for (kind, update) in updates {
+        let cases = [
+            (ProtocolVersion::V2, Harness::new()),
+            (ProtocolVersion::V3, Harness::v3(ClientAuth::Unsigned)),
+            (ProtocolVersion::V4, v4()),
+        ];
+        for (version, mut h) in cases {
+            assert_eq!(h.engine.protocol_version(), version);
+            let plain = Command::Admin(AdminCommand::UpsertMarket(market(
+                AAPL,
+                "AAPL",
+                AssetClass::Equity,
+                us_equities(),
+                2_000,
+            )));
+            assert_eq!(h.cmd(plain), [Event::AdminApplied], "{kind} {version:?}");
+            let events = h.cmd(update.clone());
+            if version >= ProtocolVersion::V4 {
+                assert!(events.contains(&Event::AdminApplied), "{kind} {version:?}: {events:?}");
+                assert!(h.engine.markets()[&AAPL].spec.schedule.has_exceptions(), "{kind}");
+            } else {
+                let refused =
+                    matches!(&events[..], [Event::AdminRejected { reason }] if reason.contains("need protocol V4"));
+                assert!(refused, "{kind} {version:?}: {events:?}");
+                assert_eq!(h.engine.markets()[&AAPL].spec.schedule, us_equities(), "{kind}");
+            }
+        }
+    }
+}
+
+// ── Helpers ──
+
+/// `Harness::v4` with unsigned client requests.
+fn v4() -> Harness {
+    Harness::v4(ClientAuth::Unsigned)
+}
+
+/// An admin command re-listing AAPL with a 13:00 New York close on each date.
+fn calendar_update(dates: &[&str]) -> Command {
+    let spec = market(AAPL, "AAPL", AssetClass::Equity, early_closes(dates), 2_000);
+    Command::Admin(AdminCommand::UpsertMarket(spec))
+}
+
+/// An admin command re-listing AAPL with a Saturday 24 Oct 2026 10:00-12:00 special session only.
+fn special_session_update() -> Command {
+    let mut schedule = serde_json::to_value(us_equities()).unwrap();
+    schedule["special_sessions"] = serde_json::json!([{ "from": "2026-10-24T10:00:00", "to": "2026-10-24T12:00:00" }]);
+    let spec = market(AAPL, "AAPL", AssetClass::Equity, serde_json::from_value(schedule).unwrap(), 2_000);
+    Command::Admin(AdminCommand::UpsertMarket(spec))
+}
+
+/// US equity hours with a 13:00 close on each date.
+fn early_closes(dates: &[&str]) -> Schedule {
+    let mut schedule = serde_json::to_value(us_equities()).unwrap();
+    let closures: Vec<_> = dates
+        .iter()
+        .map(|d| serde_json::json!({ "from": format!("{d}T13:00:00"), "to": format!("{d}T16:00:00") }))
+        .collect();
+    schedule["closures"] = closures.into();
+    serde_json::from_value(schedule).unwrap()
+}
+
+/// The state root after each command of `log`, read back from its JSON encoding as a verifier reads
+/// the published log and replayed on a fresh engine.
+fn roots(log: &[Sequenced]) -> Vec<[u8; 32]> {
+    let mut engine = Engine::new();
+    log.iter()
+        .map(|sequenced| {
+            let published: Sequenced = serde_json::from_str(&serde_json::to_string(sequenced).unwrap()).unwrap();
+            engine.apply(&published).expect("in sequence");
+            engine.state_root()
+        })
+        .collect()
 }
