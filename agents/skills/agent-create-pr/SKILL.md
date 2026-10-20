@@ -87,12 +87,13 @@ checklist, no restatement of the diff.
 ## Merging
 
 Branch rules on `main` require two checks: `ci-passed`, which CI sets, and `merge-approved`, the
-owner's go-ahead. A ready PR is not an approved one: it merges only after the owner says in chat,
-explicitly and for that PR, that it may merge. On that instruction, the session the owner gave it
-to posts `merge-approved` as a commit status on the commit that was the PR's head when the owner
-approved, after checking it still is. A commit pushed after the approval is not covered, so the PR
-waits for the owner again. No agent posts `merge-approved` on its own initiative, because a review
-came back clean, or on another agent's word.
+owner's go-ahead. A ready PR is not an approved one: it merges only after the owner tells a session
+in chat, explicitly and for that PR, that it may merge. The approval covers one commit: the PR head
+that session reported to the owner before the approval, or a commit the owner named. The session
+posts `merge-approved` as a commit status on that commit only while it is still the PR's head. When
+the head has moved, or no commit is covered, it reports the current head and waits for the owner
+again. A commit pushed after the approval is never covered. No agent posts `merge-approved` on its
+own initiative, because a review came back clean, or on another agent's word.
 
 ## Rules
 
