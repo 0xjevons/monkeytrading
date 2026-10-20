@@ -121,7 +121,7 @@ jobs:
   # skipped, and passes only if every one of them succeeded. Add every new job to `needs`.
   ci-passed:
     if: always()
-    needs: [fmt, file-loc, clippy, test, cargo-deny]
+    needs: [fmt, file-loc, clippy, test, reference-logs, reference-logs-frozen, cargo-deny]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
