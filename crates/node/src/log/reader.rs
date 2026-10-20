@@ -2,7 +2,7 @@
 //! lines are read: a line still being written is left for a later call.
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
@@ -26,8 +26,12 @@ pub struct LogReader {
 }
 
 struct OpenSegment {
+    first_seq: u64,
     path: PathBuf,
-    lines: Box<dyn BufRead + Send>,
+    /// The segment's contents from `consumed` on; `None` until read, and after `release`.
+    lines: Option<Box<dyn BufRead + Send>>,
+    /// Bytes of whole lines read so far.
+    consumed: u64,
     /// Bytes of a line not yet fully written.
     line: Vec<u8>,
     /// A later segment was listed before this one was last read to its end, so it gets no more
@@ -41,13 +45,21 @@ impl LogReader {
     /// A reader for the log in `dir` that yields entries at or after `from`, starting in the
     /// segment that holds `from.seq`, and checks completed segments against `manifest`.
     /// Error cases:
-    /// - the directory cannot be listed, or the start segment is missing or cannot be opened (see
-    ///   `open_start`)
+    /// - the directory cannot be listed, or segments exist but none holds `from.seq`
     pub fn open(dir: &Path, from: Offset, manifest: watch::Receiver<Manifest>) -> anyhow::Result<Self> {
         let segments = list_segments(dir)?;
         let mut reader = Self { dir: dir.to_owned(), from, manifest, segments, segment: None, last: None };
         reader.open_start()?;
         Ok(reader)
+    }
+
+    /// Drops what the reader holds of its segment, which a completed one keeps whole in memory. The
+    /// next read opens it again where this one stopped, and checks it again.
+    pub fn release(&mut self) {
+        if let Some((_, segment)) = &mut self.segment {
+            segment.lines = None;
+            segment.line.clear();
+        }
     }
 
     /// The next entry at or after `from`, with its offset, or `None` once every whole line on disk
@@ -67,6 +79,9 @@ impl LogReader {
                 }
                 continue;
             };
+            if segment.lines.is_none() {
+                segment.lines = Some(segment_lines(&self.manifest, segment)?);
+            }
             if let Some(entry) = segment.read_entry()? {
                 if !segment.started {
                     ensure!(
@@ -107,53 +122,28 @@ impl LogReader {
             ensure!(segment.line.is_empty(), "{} ends mid-line", segment.path.display());
             // Release this segment before the next is read into memory.
             self.segment = None;
-            self.segment = Some((i + 1, self.open_segment(i + 1)?));
+            self.segment = Some((i + 1, self.open_segment(i + 1)));
         }
     }
 
     /// Opens the segment that holds `from.seq`, once the log has any segment.
     /// Error cases:
     /// - segments exist but none holds `from.seq`, so the start of the log is missing
-    /// - the segment cannot be opened (see `open_segment`)
     fn open_start(&mut self) -> anyhow::Result<()> {
         let Some(i) = self.segments.iter().rposition(|(first, _)| *first <= self.from.seq) else {
             ensure!(self.segments.is_empty(), "no segment in {} holds seq {}", self.dir.display(), self.from.seq);
             return Ok(());
         };
-        self.segment = Some((i, self.open_segment(i)?));
+        self.segment = Some((i, self.open_segment(i)));
         Ok(())
     }
 
-    /// Opens segment `i`. A segment the manifest lists is read whole and checked against its
-    /// listing before any of it is yielded, since the host can rewrite files on disk.
-    /// Error cases:
-    /// - the file cannot be opened or read
-    /// - a listed segment's size or SHA-256 differs from its listing
-    fn open_segment(&self, i: usize) -> anyhow::Result<OpenSegment> {
+    /// Segment `i`, to be read from its start.
+    fn open_segment(&self, i: usize) -> OpenSegment {
         let (first_seq, path) = &self.segments[i];
-        let listed = self.manifest.borrow().get(*first_seq).cloned();
-        let lines: Box<dyn BufRead + Send> = match listed {
-            Some(listed) => {
-                let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-                let sha256 = hex::encode(Sha256::digest(&bytes));
-                ensure!(
-                    bytes.len() as u64 == listed.bytes && sha256 == listed.sha256,
-                    "{} does not match its listing in {MANIFEST}",
-                    path.display()
-                );
-                Box::new(Cursor::new(bytes))
-            }
-            // TODO: the segment still being written is read from host disk unchecked, to its end even
-            // if it completes meanwhile. Check it against the writer's running hash, or serve it from
-            // enclave memory, before relying on backfill for integrity; until then, replay against
-            // the signed checkpoints is the check.
-            None => {
-                let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-                Box::new(BufReader::new(file))
-            }
-        };
         let complete = i + 1 < self.segments.len();
-        Ok(OpenSegment { path: path.clone(), lines, line: Vec::new(), complete, started: false })
+        let (lines, consumed, line, started) = (None, 0, Vec::new(), false);
+        OpenSegment { first_seq: *first_seq, path: path.clone(), lines, consumed, line, complete, started }
     }
 }
 
@@ -163,12 +153,14 @@ impl OpenSegment {
     /// Error cases:
     /// - the file cannot be read, or the line is not a valid entry
     fn read_entry(&mut self) -> anyhow::Result<Option<LogEntry>> {
+        let lines = self.lines.as_mut().expect("a segment's contents are opened before it is read");
         loop {
-            self.lines.read_until(b'\n', &mut self.line).with_context(|| format!("reading {}", self.path.display()))?;
+            lines.read_until(b'\n', &mut self.line).with_context(|| format!("reading {}", self.path.display()))?;
             if self.line.last() != Some(&b'\n') {
                 return Ok(None);
             }
             let line = std::mem::take(&mut self.line);
+            self.consumed += line.len() as u64;
             if !line.trim_ascii().is_empty() {
                 let entry =
                     serde_json::from_slice(&line).with_context(|| format!("entry in {}", self.path.display()))?;
@@ -176,4 +168,37 @@ impl OpenSegment {
             }
         }
     }
+}
+
+/// The contents of `segment` from where its last read stopped. A segment the manifest lists is
+/// read whole and checked against its listing before any of it is yielded, since the host can
+/// rewrite files on disk.
+/// Error cases:
+/// - the file cannot be opened, read, or positioned
+/// - a listed segment's size or SHA-256 differs from its listing
+fn segment_lines(
+    manifest: &watch::Receiver<Manifest>,
+    segment: &OpenSegment,
+) -> anyhow::Result<Box<dyn BufRead + Send>> {
+    let path = &segment.path;
+    let listed = manifest.borrow().get(segment.first_seq).cloned();
+    let Some(listed) = listed else {
+        // TODO: the segment still being written is read from host disk unchecked, to the end of
+        // the batch even if it completes meanwhile. Check it against the writer's running hash, or
+        // serve it from enclave memory, before relying on backfill for integrity; until then,
+        // replay against the signed checkpoints is the check.
+        let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        file.seek(SeekFrom::Start(segment.consumed)).with_context(|| format!("seeking in {}", path.display()))?;
+        return Ok(Box::new(BufReader::new(file)));
+    };
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    ensure!(
+        bytes.len() as u64 == listed.bytes && sha256 == listed.sha256,
+        "{} does not match its listing in {MANIFEST}",
+        path.display()
+    );
+    let mut cursor = Cursor::new(bytes);
+    cursor.set_position(segment.consumed);
+    Ok(Box::new(cursor))
 }

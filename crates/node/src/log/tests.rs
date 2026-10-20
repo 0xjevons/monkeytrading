@@ -299,7 +299,8 @@ fn the_reader_refuses_a_completed_segment_that_differs_from_its_listing() {
     let path = dir.join(SEG_0);
     let text = fs::read_to_string(&path).unwrap();
     fs::write(&path, text.replacen("\"ts\":0,", "\"ts\":9,", 1)).unwrap();
-    let err = LogReader::open(&dir, Offset::start_of(0), manifest).err().unwrap();
+    let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest).unwrap();
+    let err = reader.next_entry().err().unwrap();
     assert!(format!("{err:#}").contains("does not match its listing"), "{err:#}");
 }
 
@@ -342,6 +343,46 @@ fn the_reader_refuses_a_segment_that_does_not_start_with_a_command() {
     let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest_of(&dir)).unwrap();
     let err = std::iter::from_fn(|| reader.next_entry().transpose()).find_map(Result::err).unwrap();
     assert!(format!("{err:#}").contains("does not start with a command"), "{err:#}");
+}
+
+#[test]
+fn a_released_reader_resumes_where_it_stopped_and_checks_its_segment_again() {
+    let dir = scratch_dir("reader-release");
+    write(&dir, 3, &[cmd(0), cmd(1), withdrawal(1), cmd(2), cmd(3)]);
+    let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest_of(&dir)).unwrap();
+    let mut seen = vec![reader.next_entry().unwrap().unwrap().0, reader.next_entry().unwrap().unwrap().0];
+    reader.release();
+    seen.extend(std::iter::from_fn(|| reader.next_entry().unwrap()).map(|(o, _)| o));
+    assert_eq!(seen, read_from(&dir, 0, 0).into_iter().map(|(seq, index)| Offset { seq, index }).collect::<Vec<_>>());
+
+    let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest_of(&dir)).unwrap();
+    reader.next_entry().unwrap();
+    reader.release();
+    let text = fs::read_to_string(dir.join(SEG_0)).unwrap();
+    fs::write(dir.join(SEG_0), text.replacen("\"ts\":10,", "\"ts\":19,", 1)).unwrap();
+    let err = reader.next_entry().err().unwrap();
+    assert!(format!("{err:#}").contains("does not match its listing"), "{err:#}");
+}
+
+#[test]
+fn a_segment_that_cannot_be_started_leaves_the_current_one_growing_until_it_can() {
+    let dir = scratch_dir("rotation-retry");
+    let manifest = watch::channel(Manifest::default()).0;
+    let mut writer = SegmentedLog::open(&dir).unwrap().into_writer(2, manifest).unwrap();
+    writer.append(&cmd(0)).unwrap();
+    writer.append(&cmd(1)).unwrap();
+    // A directory in the way of the staged file makes creating it fail.
+    let staged = dir.join(format!("{SEG_2}.tmp"));
+    fs::create_dir(&staged).unwrap();
+    writer.append(&cmd(2)).unwrap();
+    fs::remove_dir(&staged).unwrap();
+    writer.append(&cmd(3)).unwrap();
+    writer.flush().unwrap();
+
+    assert_eq!(read_all(&dir.join(SEG_0)).unwrap(), [cmd(0), cmd(1), cmd(2)]);
+    assert_eq!(read_all(&dir.join("00000000000000000003.jsonl")).unwrap(), [cmd(3)]);
+    let ranges: Vec<_> = Manifest::load(&dir).unwrap().segments.iter().map(|s| (s.first_seq, s.last_seq)).collect();
+    assert_eq!(ranges, [(0, 2)]);
 }
 
 // ── Helpers ──

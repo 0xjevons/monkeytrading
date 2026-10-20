@@ -13,7 +13,7 @@ use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::log::{LogEntry, parse_lines};
 
@@ -54,7 +54,12 @@ pub struct LogWriter {
     segment_commands: u64,
     /// Published for the archive and for stream readers, which trust it over the host's copy.
     manifest: watch::Sender<Manifest>,
+    /// Held from startup, so listing a segment needs no new file descriptor.
+    manifest_file: File,
+    dir_handle: File,
     open: Option<(Segment, BufWriter<File>)>,
+    /// A new segment could not be created; the current one keeps taking appends meanwhile.
+    rotation_failing: bool,
 }
 
 /// What the manifest needs to know about a segment, kept up to date as it is written.
@@ -161,7 +166,8 @@ impl SegmentedLog {
     /// A writer that appends to the last segment, or starts a new one at the next command if the
     /// manifest lists the last one. It publishes the manifest on `manifest`, starting now.
     /// Error cases:
-    /// - the directory cannot be created, or the manifest cannot be trimmed to its whole lines
+    /// - the directory cannot be created, opened, or synced
+    /// - the manifest cannot be trimmed to its whole lines, or opened for appending
     /// - the last segment cannot be opened for appending
     pub fn into_writer(self, segment_commands: u64, manifest: watch::Sender<Manifest>) -> anyhow::Result<LogWriter> {
         fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
@@ -173,6 +179,16 @@ impl SegmentedLog {
                 .open(&manifest_path)
                 .and_then(|f| f.set_len(self.manifest_len))
                 .with_context(|| format!("trimming {}", manifest_path.display()))?;
+        }
+        let created = !manifest_path.exists();
+        let manifest_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&manifest_path)
+            .with_context(|| format!("opening {}", manifest_path.display()))?;
+        let dir_handle = File::open(&self.dir).with_context(|| format!("opening {}", self.dir.display()))?;
+        if created {
+            dir_handle.sync_all().with_context(|| format!("syncing {}", self.dir.display()))?;
         }
         let open = match self.open {
             Some(segment) => {
@@ -186,7 +202,8 @@ impl SegmentedLog {
             None => None,
         };
         manifest.send_replace(self.manifest);
-        Ok(LogWriter { dir: self.dir, segment_commands, manifest, open })
+        let rotation_failing = false;
+        Ok(LogWriter { dir: self.dir, segment_commands, manifest, manifest_file, dir_handle, open, rotation_failing })
     }
 }
 
@@ -222,17 +239,39 @@ impl LogWriter {
         }
     }
 
-    /// Syncs and lists the current segment, if any, then creates the segment for `first_seq`.
-    /// The new file exists only once the old one is complete, which is what `LogReader` relies on.
+    /// Starts the segment for `first_seq`, first syncing and listing the current one, if any. The
+    /// new file takes its segment name only once the old one is listed, which `LogReader` relies on.
+    /// Creating it is the only step that needs a new file descriptor, so it runs first: if it fails
+    /// while a segment is open, that segment keeps taking appends and the next command retries.
     /// Error cases:
+    /// - the new segment cannot be created and no segment is open
+    /// - a segment by the new name already exists
     /// - the current segment cannot be flushed or synced, or its listing cannot be stored
-    /// - the new segment cannot be created, or already exists
+    /// - the new segment cannot be renamed into place
     fn start_segment(&mut self, first_seq: u64) -> anyhow::Result<()> {
+        let path = self.dir.join(segment_name(first_seq));
+        let staged = self.dir.join(format!("{}.tmp", segment_name(first_seq)));
+        let file = match OpenOptions::new().write(true).create(true).truncate(true).open(&staged) {
+            Ok(file) => file,
+            Err(e) if self.open.is_some() => {
+                if !self.rotation_failing {
+                    warn!(
+                        alert = "log_rotation_failed",
+                        seq = first_seq,
+                        "cannot start a log segment, so the current one grows: {e}"
+                    );
+                    self.rotation_failing = true;
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e).with_context(|| format!("creating {}", staged.display())),
+        };
+        ensure!(!path.exists(), "{} already exists", path.display());
         if let Some((segment, out)) = self.open.take() {
-            let file = out.into_inner().map_err(|e| e.into_error()).context("flushing log segment")?;
-            file.sync_all().context("syncing log segment")?;
+            let done = out.into_inner().map_err(|e| e.into_error()).context("flushing log segment")?;
+            done.sync_all().context("syncing log segment")?;
             let listed = segment.info();
-            append_listing(&self.dir, &listed)?;
+            self.list(&listed)?;
             info!(
                 file = %listed.file,
                 first_seq = listed.first_seq,
@@ -243,14 +282,21 @@ impl LogWriter {
             );
             self.manifest.send_modify(|m| m.segments.push(listed));
         }
-        let path = self.dir.join(segment_name(first_seq));
-        let file = OpenOptions::new()
-            .append(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
+        fs::rename(&staged, &path).with_context(|| format!("renaming {} into place", staged.display()))?;
         self.open = Some((Segment::empty(first_seq), BufWriter::new(file)));
+        if std::mem::take(&mut self.rotation_failing) {
+            info!(seq = first_seq, "log segments rotate again");
+        }
         Ok(())
+    }
+
+    /// Appends one listing to the manifest, durably, after the listed segment's directory entry.
+    /// Error cases:
+    /// - the directory or the manifest cannot be synced, or the manifest cannot be written
+    fn list(&mut self, listed: &SegmentInfo) -> anyhow::Result<()> {
+        self.dir_handle.sync_all().with_context(|| format!("syncing {}", self.dir.display()))?;
+        self.manifest_file.write_all(&listing_line(listed)?).context("writing manifest")?;
+        self.manifest_file.sync_all().context("syncing manifest")
     }
 }
 
@@ -317,23 +363,6 @@ pub(super) fn list_segments(dir: &Path) -> anyhow::Result<Vec<(u64, PathBuf)>> {
     }
     segments.sort_unstable_by_key(|(seq, _)| *seq);
     Ok(segments)
-}
-
-/// Appends one listing to the manifest in `dir`, durably.
-/// Error cases:
-/// - the manifest cannot be opened, written, or synced
-fn append_listing(dir: &Path, listed: &SegmentInfo) -> anyhow::Result<()> {
-    let path = dir.join(MANIFEST);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    // The segment's directory entry, and the manifest's on its first listing, must be durable
-    // before the listing is.
-    File::open(dir).and_then(|d| d.sync_all()).with_context(|| format!("syncing {}", dir.display()))?;
-    file.write_all(&listing_line(listed)?).context("writing manifest")?;
-    file.sync_all().context("syncing manifest")
 }
 
 /// One manifest line.
