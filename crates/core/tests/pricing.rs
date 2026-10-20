@@ -201,7 +201,7 @@ fn a_refused_quote_leaves_the_venues_stored_quote_in_place() {
     let stored = h.engine.markets()[&BTC].quotes.get("venue0").map(|q| (q.mid, q.ts));
     assert_eq!(stored, Some((f("100000"), quoted_at)));
     let ev = h.market_order(a, BTC, Side::Buy, "0.1", "99000");
-    assert!(matches!(rejection(&ev), Reject::NoPrice(PriceError::Divergent { .. })), "{ev:?}");
+    assert!(matches!(rejection(&ev), Reject::NoPrice { error: PriceError::Divergent { .. } }), "{ev:?}");
 }
 
 #[test]
