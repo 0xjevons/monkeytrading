@@ -7,7 +7,7 @@ use anyhow::Context;
 use rustls::crypto::ring;
 use rustls::{ClientConfig, RootCertStore};
 
-use super::Timing;
+use crate::feeds::venue::Timing;
 
 /// The TLS client config every venue connection shares: ring as the crypto provider, and
 /// Mozilla's roots compiled into the binary, so the host's certificate store is never trusted.

@@ -3,11 +3,12 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat};
 use engine_core::Engine;
-use engine_core::command::Command;
+use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::price::SourceQuote;
 use engine_core::types::{MarketId, Millis};
 use futures_util::{SinkExt, StreamExt};
@@ -23,19 +24,29 @@ use tracing::{Event, Subscriber};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
-use crate::config::{Venue, VenueConnection, VenueSymbol};
+use crate::clock::now_ms;
+use crate::config::{NodeConfig, Venue, VenueConnection, VenueSymbol};
 use crate::feeds::kraken;
 use crate::feeds::venue::{self, Timing};
-use crate::sequencer::Request;
+use crate::sequencer::{Query, Request};
 
 /// How long a test waits for anything before failing, so a broken feed never hangs the suite.
 pub const WAIT: Duration = Duration::from_secs(5);
+/// The committed dev config, whose genesis lists the markets the fake venues price.
+pub const DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/dev.toml");
 
 /// One alert's fields, by name.
 pub type Alert = BTreeMap<String, String>;
 
 /// A fake venue's accepted connection.
 pub type Conn = WebSocketStream<TcpStream>;
+
+/// An engine listing the dev genesis markets, applying commands as the sequencer does: in order,
+/// stamped with the host clock, never going back.
+pub struct FakeEngine {
+    engine: Engine,
+    next_seq: u64,
+}
 
 /// Collects the fields of every event that carries an `alert` field.
 struct AlertLayer(mpsc::UnboundedSender<Alert>);
@@ -61,6 +72,30 @@ impl Visit for Fields {
 
     fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
         self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl FakeEngine {
+    /// An engine with every dev genesis market listed.
+    pub fn new() -> Self {
+        let cfg = NodeConfig::load(Path::new(DEV)).expect("dev config");
+        let mut fake = FakeEngine { engine: Engine::new(), next_seq: 0 };
+        for market in cfg.genesis.markets {
+            fake.apply(Command::Admin(AdminCommand::UpsertMarket(market)));
+        }
+        fake
+    }
+
+    /// Stamps and applies one command.
+    pub fn apply(&mut self, cmd: Command) {
+        let ts = now_ms().max(self.engine.now());
+        self.engine.apply(&Sequenced { seq: self.next_seq, ts, cmd }).expect("applied in order");
+        self.next_seq += 1;
+    }
+
+    /// Runs a query against the engine as it stands.
+    pub fn answer(&self, query: Query) {
+        query(&self.engine);
     }
 }
 
@@ -132,8 +167,8 @@ pub fn stream(mut ws: Conn, messages: impl Fn() -> Vec<String> + Send + 'static)
     })
 }
 
-/// Runs a venue task for `venue` against `url`, returning what it sequences and its handle. Its
-/// queries are answered by an engine that holds no quotes.
+/// Runs a venue task for `venue` against `url`, returning what it sequences and its handle. What
+/// it sequences is also applied to a `FakeEngine`, which answers its queries.
 pub fn spawn_feed(
     venue: Venue,
     url: &str,
@@ -143,15 +178,16 @@ pub fn spawn_feed(
     let (feed_tx, mut feed_rx) = mpsc::channel(1024);
     let (tx, rx) = mpsc::channel(1024);
     tokio::spawn(async move {
-        let engine = Engine::new();
+        let mut engine = FakeEngine::new();
         loop {
             tokio::select! {
                 // The test dropped its receiver: hang up, so the feed sees the sequencer gone.
                 () = tx.closed() => return,
                 request = feed_rx.recv() => match request {
-                    Some(Request::Query(query)) => query(&engine),
-                    Some(submit) => {
-                        if tx.send(submit).await.is_err() {
+                    Some(Request::Query(query)) => engine.answer(query),
+                    Some(Request::Submit { cmd, reply }) => {
+                        engine.apply(cmd.clone());
+                        if tx.send(Request::Submit { cmd, reply }).await.is_err() {
                             return;
                         }
                     }

@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use engine_core::Engine;
 use engine_core::types::{MarketId, Millis};
 use futures_util::SinkExt;
 use tokio::sync::mpsc;
@@ -19,8 +18,8 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::clock::now_ms;
 use crate::config::Venue;
 use crate::feeds::tests::fake::{
-    WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_book, listen, next_alert, next_prices,
-    quote, send, spawn_feed, spawn_feed_into, stream,
+    FakeEngine, WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_book, listen, next_alert,
+    next_prices, quote, send, spawn_feed, spawn_feed_into, stream,
 };
 use crate::feeds::venue::{Book, Timing, to_quote};
 use crate::feeds::{bitstamp, kraken};
@@ -240,11 +239,14 @@ async fn quotes_the_sequencer_applies_too_late_do_not_count_as_the_venue_quoting
     let timing = Timing { stale_after: Duration::from_millis(200), ..fast(Duration::from_secs(2)) };
     let (tx, mut requests) = mpsc::channel(1024);
     tokio::spawn(async move {
-        let engine = Engine::new();
+        let mut engine = FakeEngine::new();
         while let Some(request) = requests.recv().await {
-            if let Request::Query(query) = request {
-                sleep(timing.stale_after * 2).await;
-                query(&engine);
+            match request {
+                Request::Submit { cmd, .. } => engine.apply(cmd),
+                Request::Query(query) => {
+                    sleep(timing.stale_after * 2).await;
+                    engine.answer(query);
+                }
             }
         }
     });

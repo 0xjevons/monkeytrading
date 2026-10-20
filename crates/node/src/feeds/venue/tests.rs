@@ -1,9 +1,9 @@
 use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 
-use super::setup::next_backoff;
 use super::*;
 use crate::config::VenueSymbol;
 use crate::feeds::tests::fake::{WAIT, capture_alerts, fast, next_alert};
+use crate::feeds::venue::setup::next_backoff;
 
 #[test]
 fn a_throttle_lets_one_alert_through_a_window_and_counts_the_rest() {
@@ -83,26 +83,15 @@ fn a_quote_further_ahead_than_the_engine_takes_is_dropped() {
 }
 
 #[test]
-fn the_engine_replaces_a_held_quote_unless_it_is_newer_and_reached() {
-    const NOW: Millis = 1_792_489_875_714;
-    assert!(replaces(NOW - 200, NOW - 100, NOW));
-    assert!(replaces(NOW - 100, NOW - 100, NOW));
-    assert!(!replaces(NOW - 100, NOW - 200, NOW));
-    assert!(!replaces(NOW, NOW - 200, NOW));
-    // The held quote is still ahead, as after the host clock is set back, so it gives way.
-    assert!(replaces(NOW + 500, NOW - 200, NOW));
-}
-
-#[test]
 fn a_quote_counts_within_the_tighter_of_the_feed_and_market_bounds() {
     const AT: Millis = 1_792_489_875_714;
-    assert!(counts(AT - 1_000, AT, 1_000, None));
-    assert!(!counts(AT - 1_001, AT, 1_000, None));
-    assert!(!counts(AT + 1, AT, 1_000, None));
-    // The engine's market rules are tighter than the feed's bound, or looser.
-    assert!(counts(AT - 500, AT, 1_000, Some(500)));
-    assert!(!counts(AT - 501, AT, 1_000, Some(500)));
-    assert!(!counts(AT - 1_001, AT, 1_000, Some(5_000)));
+    assert!(counts(AT - 1_000, AT, 1_000, 1_000));
+    assert!(!counts(AT - 1_001, AT, 1_000, 1_000));
+    assert!(!counts(AT + 1, AT, 1_000, 1_000));
+    // The market's rules are tighter than the feed's bound, or looser.
+    assert!(counts(AT - 500, AT, 1_000, 500));
+    assert!(!counts(AT - 501, AT, 1_000, 500));
+    assert!(!counts(AT - 1_001, AT, 1_000, 5_000));
 }
 
 #[tokio::test(start_paused = true)]

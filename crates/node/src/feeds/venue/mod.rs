@@ -26,7 +26,7 @@ use crate::config::{Venue, VenueConnection, VenuesSection};
 use crate::feeds::{bitstamp, coinbase, kraken};
 use crate::sequencer::{Query, Request};
 mod quotes;
-use quotes::{Pending, counts, replaces};
+use quotes::{Pending, counts};
 mod setup;
 use setup::next_attempt;
 pub use setup::tls_config;
@@ -104,10 +104,6 @@ struct VenueFeed {
     last_quote: BTreeMap<MarketId, Instant>,
     /// Markets alerted as silent that have not quoted since.
     silent: BTreeSet<MarketId>,
-    /// The time of the quote the engine holds from this venue per market, as far as this task
-    /// knows, seeded from the engine when the task starts. A quote the engine will not take in
-    /// its place is never counted as the venue quoting.
-    held: BTreeMap<MarketId, Millis>,
     refusals: Throttle,
     clock_alerts: Throttle,
 }
@@ -200,7 +196,6 @@ impl VenueFeed {
             quoted: false,
             last_quote,
             silent: BTreeSet::new(),
-            held: BTreeMap::new(),
             refusals: Throttle::default(),
             clock_alerts: Throttle::default(),
         }
@@ -211,7 +206,6 @@ impl VenueFeed {
     /// Error cases:
     /// - the sequencer has gone away
     async fn run(mut self) -> anyhow::Result<()> {
-        self.seed_from_engine().await?;
         let mut backoff = self.timing.reconnect_min;
         loop {
             self.quoted = false;
@@ -226,29 +220,11 @@ impl VenueFeed {
         }
     }
 
-    /// Seeds `held` with the quote times the engine already holds for this venue, so after a
-    /// restart a quote the engine will ignore never counts as the venue quoting.
-    /// Error cases:
-    /// - the sequencer has gone away
-    async fn seed_from_engine(&mut self) -> anyhow::Result<()> {
-        let (reply, held) = oneshot::channel();
-        let source = self.conn.venue.name();
-        let markets: Vec<MarketId> = self.markets.values().copied().collect();
-        let query: Query = Box::new(move |engine| {
-            let quotes = markets
-                .iter()
-                .filter_map(|market| Some((*market, engine.markets().get(market)?.quotes.get(source)?.ts)));
-            let _ = reply.send(quotes.collect());
-        });
-        self.tx.send(Request::Query(query)).await.map_err(|_| anyhow!("sequencer gone"))?;
-        self.held = held.await.context("sequencer gone")?;
-        Ok(())
-    }
-
     /// One connection: connect, subscribe, then read messages and sequence one quote per market
-    /// every `timing.interval`, the newest the host clock has reached (see `Pending`). A quote the
-    /// engine stores counts as the venue quoting that market once the sequencer has applied it, if
-    /// it is then no older than `timing.stale_after` or the market's `max_age_ms` (see `confirm`).
+    /// every `timing.interval`, the newest the host clock has reached (see `Pending`). Once the
+    /// sequencer has applied it, the venue counts as quoting that market while the quote the engine
+    /// holds from it is no older than `timing.stale_after` or the market's `max_age_ms` (see
+    /// `confirm`).
     /// Error cases:
     /// - connecting or subscribing fails or takes longer than `timing.timeout`
     /// - the connection sequences no fresh quote within `timing.timeout`, or the venue closes it
@@ -273,8 +249,8 @@ impl VenueFeed {
         let subscribed = Instant::now();
 
         let mut pending: BTreeMap<MarketId, Pending> = BTreeMap::new();
-        // Quotes sent and not yet confirmed, by market, and the one confirmation awaited.
-        let mut unconfirmed: BTreeMap<MarketId, Millis> = BTreeMap::new();
+        // Markets quoted and not yet confirmed, and the one confirmation awaited.
+        let mut unconfirmed: BTreeSet<MarketId> = BTreeSet::new();
         let mut confirming: Option<oneshot::Receiver<Vec<MarketId>>> = None;
         let mut flush = interval_at(subscribed + self.timing.interval, self.timing.interval);
         flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -301,12 +277,7 @@ impl VenueFeed {
                     let now = now_ms();
                     for (market, quotes) in &mut pending {
                         let Some(quote) = quotes.take(now) else { continue };
-                        // A quote the engine will not store over the one it holds never counts.
-                        let held = self.held.entry(*market).or_insert(quote.ts);
-                        if replaces(*held, quote.ts, now) {
-                            *held = quote.ts;
-                            unconfirmed.insert(*market, quote.ts);
-                        }
+                        unconfirmed.insert(*market);
                         let cmd = Command::Prices { market: *market, quotes: vec![quote] };
                         let request = Request::Submit { cmd, reply: None };
                         self.tx.send(request).await.map_err(|_| anyhow!("sequencer gone"))?;
@@ -327,20 +298,25 @@ impl VenueFeed {
         }
     }
 
-    /// Asks the sequencer, behind the quotes already sent, which of `sent` (each market's latest
-    /// quote time) count as the venue quoting. Each is judged once applied, at the time the
-    /// sequencer would stamp next and against the engine's market rules as they stand, so a quote a
-    /// lagging sequencer applies late counts as stale.
+    /// Asks the sequencer, behind the quotes already sent, for the `markets` where the venue
+    /// counts as quoting once they are applied: the engine lists the market, and the quote it holds
+    /// from this venue passes `counts` at the time the sequencer would stamp next. Judging what the
+    /// engine holds, not what was sent, means a market it does not list never counts, and a quote
+    /// a lagging sequencer applies late counts as stale.
     /// Error cases:
     /// - the sequencer has gone away
-    async fn confirm(&self, sent: BTreeMap<MarketId, Millis>) -> anyhow::Result<oneshot::Receiver<Vec<MarketId>>> {
+    async fn confirm(&self, markets: BTreeSet<MarketId>) -> anyhow::Result<oneshot::Receiver<Vec<MarketId>>> {
         let (reply, fresh) = oneshot::channel();
+        let source = self.conn.venue.name();
         let stale_after = Millis::try_from(self.timing.stale_after.as_millis()).unwrap_or(Millis::MAX);
         let query: Query = Box::new(move |engine| {
             let at = now_ms().max(engine.now());
-            let max_age_ms = |market: &MarketId| Some(engine.markets().get(market)?.spec.price_rules.max_age_ms);
-            let counted = sent.into_iter().filter(|(market, ts)| counts(*ts, at, stale_after, max_age_ms(market)));
-            let _ = reply.send(counted.map(|(market, _)| market).collect());
+            let quoting = |market: &MarketId| {
+                let Some(state) = engine.markets().get(market) else { return false };
+                let max_age_ms = state.spec.price_rules.max_age_ms;
+                state.quotes.get(source).is_some_and(|held| counts(held.ts, at, stale_after, max_age_ms))
+            };
+            let _ = reply.send(markets.into_iter().filter(quoting).collect());
         });
         self.tx.send(Request::Query(query)).await.map_err(|_| anyhow!("sequencer gone"))?;
         Ok(fresh)

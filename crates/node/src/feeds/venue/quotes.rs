@@ -1,5 +1,5 @@
-//! The quotes a venue task holds between sequencing ticks, and the engine's rules it applies to
-//! judge whether a sequenced quote counts as the venue quoting.
+//! The quotes a venue task holds between sequencing ticks, and the rule that judges whether the
+//! quote the engine holds counts as the venue quoting.
 
 use std::collections::BTreeMap;
 use std::mem::replace;
@@ -45,16 +45,8 @@ impl Pending {
     }
 }
 
-/// Whether the engine stores a quote dated `ts` in place of the one it holds dated `held`, at
-/// sequenced time `now`: unless the held one is newer and its time already reached.
-pub(super) fn replaces(held: Millis, ts: Millis, now: Millis) -> bool {
-    ts >= held || held > now
-}
-
-/// Whether a quote dated `ts`, applied by the sequencer by time `at`, counts as the venue quoting:
-/// its time reached, and no older than `stale_after` or the market's `max_age_ms` in the engine,
-/// when the engine lists the market.
-pub(super) fn counts(ts: Millis, at: Millis, stale_after: Millis, max_age_ms: Option<Millis>) -> bool {
-    let bound = max_age_ms.map_or(stale_after, |max_age| max_age.min(stale_after));
-    ts <= at && at.saturating_sub(ts) <= bound
+/// Whether a quote dated `ts` that the engine holds at sequenced time `at` counts as the venue
+/// quoting: its time reached, and no older than `stale_after` or the market's `max_age_ms`.
+pub(super) fn counts(ts: Millis, at: Millis, stale_after: Millis, max_age_ms: Millis) -> bool {
+    ts <= at && at.saturating_sub(ts) <= stale_after.min(max_age_ms)
 }

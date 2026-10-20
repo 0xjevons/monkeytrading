@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use engine_core::command::{Command, OrderKind, OrderRequest};
 use engine_core::event::{Event, Reject};
-use engine_core::price::{PriceError, SourceQuote};
+use engine_core::price::PriceError;
 use engine_core::types::{AccountId, MarketId, Millis, Side};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -76,18 +76,12 @@ async fn venues_going_down_age_out_and_the_index_runs_on_the_rest() {
 }
 
 #[tokio::test]
-async fn after_a_restart_quotes_older_than_the_engines_do_not_count_as_quoting() {
+async fn quotes_for_a_market_the_engine_does_not_list_do_not_count_as_quoting() {
     let (_guard, mut alerts) = capture_alerts();
-    let node = Node::start("restart").await;
-    // The engine already holds a Kraken BTC quote, as a replayed log can.
-    let held = now_ms();
-    let quote = SourceQuote { source: "kraken".into(), mid: BTC.2.parse().unwrap(), ts: held };
-    node.submit(Command::Prices { market: 1, quotes: vec![quote] }).await;
-
-    // The restarted feed's BTC quotes are stamped just before it, as from a venue whose clock
-    // stepped back, so the engine ignores them.
-    start_kraken_with_btc_at(&node, move || held - 1).await;
-    assert_btc_alerted_silent(&mut alerts).await;
+    let node = Node::start("unlisted").await;
+    // ETH/USD is mapped to a market the engine does not list, so it refuses every quote for it.
+    start_kraken(&node, &[(1, "BTC/USD"), (99, "ETH/USD")], now_ms).await;
+    assert_first_silent(&mut alerts, "ETH/USD").await;
 }
 
 #[tokio::test]
@@ -96,8 +90,8 @@ async fn quotes_older_than_the_engines_market_bound_do_not_count_as_quoting() {
     let node = Node::start("max-age").await;
     // Within the feed's own bound, but older than the engine's `max_age_ms` for the market, as
     // after its price rules are tightened, so the engine ignores them.
-    start_kraken_with_btc_at(&node, || now_ms() - MAX_AGE_MS - 500).await;
-    assert_btc_alerted_silent(&mut alerts).await;
+    start_kraken(&node, &[(1, "BTC/USD"), (2, "ETH/USD")], || now_ms() - MAX_AGE_MS - 500).await;
+    assert_first_silent(&mut alerts, "BTC/USD").await;
 }
 
 // ── Helpers ──
@@ -191,10 +185,10 @@ impl Node {
     }
 }
 
-/// Starts `venue`'s feed into `node` against a loopback venue that `serve` runs, and returns the
-/// Starts a Kraken feed into `node` with a wide freshness bound, so only the engine's rules can keep
-/// a quote from counting: its BTC quotes are stamped by `btc_at`, its ETH quotes normally.
-async fn start_kraken_with_btc_at(node: &Node, btc_at: impl Fn() -> Millis + Send + 'static) {
+/// Starts a Kraken feed into `node` for `symbols` with a wide freshness bound, so only the
+/// engine's rules can keep a quote from counting: its BTC quotes are stamped by `btc_at`, its ETH
+/// quotes normally.
+async fn start_kraken(node: &Node, symbols: &[(MarketId, &str)], btc_at: impl Fn() -> Millis + Send + 'static) {
     let (listener, url) = listen().await;
     tokio::spawn(async move {
         let (ws, _) = accept(&listener).await;
@@ -204,11 +198,11 @@ async fn start_kraken_with_btc_at(node: &Node, btc_at: impl Fn() -> Millis + Sen
         let _ = stream(ws, books).await;
     });
     let timing = Timing { stale_after: Duration::from_secs(60), ..fast(Duration::from_millis(300)) };
-    spawn_feed_into(node.tx.clone(), Venue::Kraken, &url, &[(1, "BTC/USD"), (2, "ETH/USD")], timing);
+    spawn_feed_into(node.tx.clone(), Venue::Kraken, &url, symbols, timing);
 }
 
-/// Waits for the first symbol alerted as silent, and checks it is BTC/USD.
-async fn assert_btc_alerted_silent(alerts: &mut mpsc::UnboundedReceiver<Alert>) {
+/// Waits for the first symbol alerted as silent, and checks it is `symbol`.
+async fn assert_first_silent(alerts: &mut mpsc::UnboundedReceiver<Alert>, symbol: &str) {
     let silent = async {
         loop {
             let alert = next_alert(alerts).await;
@@ -217,10 +211,11 @@ async fn assert_btc_alerted_silent(alerts: &mut mpsc::UnboundedReceiver<Alert>) 
             }
         }
     };
-    let alert = timeout(WAIT, silent).await.expect("BTC/USD alerted as silent");
-    assert_eq!(alert["symbol"], "BTC/USD");
+    let alert = timeout(WAIT, silent).await.expect("a symbol alerted as silent");
+    assert_eq!(alert["symbol"], symbol);
 }
 
+/// Starts `venue`'s feed into `node` against a loopback venue that `serve` runs, and returns the
 /// venue's task: aborting it takes the venue down.
 async fn start_venue(node: &Node, venue: Venue, serve: fn(TcpListener) -> JoinHandle<()>) -> JoinHandle<()> {
     let symbols: [(MarketId, &str); 2] = match venue {
