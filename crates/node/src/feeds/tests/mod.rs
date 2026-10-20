@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use engine_core::types::{MarketId, Millis};
+use engine_core::types::MarketId;
 use futures_util::SinkExt;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -209,7 +209,15 @@ async fn a_symbol_the_venue_never_quotes_is_alerted_and_resubscribed() {
 async fn stale_quotes_do_not_count_as_the_venue_quoting() {
     // A stuck venue repeats a book a minute old; the engine still gets it and judges its age.
     let stuck = now_ms() - 60_000;
-    assert_quotes_do_not_count(move || stuck).await;
+    let (_guard, mut alerts) = capture_alerts();
+    let (listener, url) = listen().await;
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &[(1, "BTC/USD")], fast(Duration::from_millis(300)));
+    let (ws, _) = accept(&listener).await;
+    stream(ws, move || vec![kraken_book("BTC/USD", "100", "101", stuck)]);
+    let (market, quotes) = next_prices(&mut rx).await;
+    assert_eq!((market, quotes[0].source.as_str()), (1, "kraken"));
+    let alert = next_alert(&mut alerts).await;
+    assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "BTC/USD"));
 }
 
 #[tokio::test]
@@ -434,20 +442,4 @@ fn books_no_working_venue_could_show_are_refused() {
     // toward zero at the ninth decimal.
     let accepted = to_quote(Venue::Kraken, &markets, book("BTC/USD", "100", "100.000000001", NOW + DAY), NOW);
     assert_eq!(accepted, Ok((1, quote(Venue::Kraken, "100", NOW + DAY))));
-}
-
-// ── Helpers ──
-
-/// Streams BTC quotes stamped by `stamp` to a feed and checks that, though sequenced, they leave
-/// the symbol silent.
-async fn assert_quotes_do_not_count(stamp: impl Fn() -> Millis + Send + 'static) {
-    let (_guard, mut alerts) = capture_alerts();
-    let (listener, url) = listen().await;
-    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &[(1, "BTC/USD")], fast(Duration::from_millis(300)));
-    let (ws, _) = accept(&listener).await;
-    stream(ws, move || vec![kraken_book("BTC/USD", "100", "101", stamp())]);
-    let (market, quotes) = next_prices(&mut rx).await;
-    assert_eq!((market, quotes[0].source.as_str()), (1, "kraken"));
-    let alert = next_alert(&mut alerts).await;
-    assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "BTC/USD"));
 }

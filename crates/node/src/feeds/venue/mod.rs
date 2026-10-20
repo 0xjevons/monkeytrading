@@ -13,6 +13,7 @@ pub(super) use validation::{check_size, check_time, to_quote};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
+use std::future::pending;
 use std::mem::take;
 use std::sync::Arc;
 use std::time::Duration;
@@ -257,14 +258,14 @@ impl VenueFeed {
         info!(venue = self.conn.venue.name(), "venue subscribed");
         let subscribed = Instant::now();
 
-        let mut pending: BTreeMap<MarketId, Pending> = BTreeMap::new();
+        let mut buffered: BTreeMap<MarketId, Pending> = BTreeMap::new();
         let mut flush = interval_at(subscribed + self.timing.interval, self.timing.interval);
         flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 message = stream.next() => {
                     match message.context("connection closed")?.context("read")? {
-                        Message::Text(text) => self.receive(&mut adapter, text.as_str(), &mut pending)?,
+                        Message::Text(text) => self.receive(&mut adapter, text.as_str(), &mut buffered)?,
                         Message::Binary(_) => self.refuse("binary message", ""),
                         Message::Close(frame) => bail!("closed by the venue: {frame:?}"),
                         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
@@ -273,7 +274,7 @@ impl VenueFeed {
                 fresh = async {
                     match &mut self.confirming {
                         Some((reply, _)) => reply.await,
-                        None => std::future::pending().await,
+                        None => pending().await,
                     }
                 } => {
                     self.confirming = None;
@@ -281,7 +282,7 @@ impl VenueFeed {
                 }
                 _ = flush.tick() => {
                     let now = now_ms();
-                    for (market, quotes) in &mut pending {
+                    for (market, quotes) in &mut buffered {
                         let Some(quote) = quotes.take(now) else { continue };
                         self.unconfirmed.insert(*market);
                         let cmd = Command::Prices { market: *market, quotes: vec![quote] };
@@ -344,7 +345,7 @@ impl VenueFeed {
         }
     }
 
-    /// Reads one text message into `pending`, refusing what does not parse or check.
+    /// Reads one text message into `buffered`, refusing what does not parse or check.
     /// Error cases:
     /// - the venue asked for a reconnect, or the adapter's state no longer matches the venue's,
     ///   including a refused book from an adapter that keeps state
@@ -352,7 +353,7 @@ impl VenueFeed {
         &mut self,
         adapter: &mut Adapter,
         text: &str,
-        pending: &mut BTreeMap<MarketId, Pending>,
+        buffered: &mut BTreeMap<MarketId, Pending>,
     ) -> anyhow::Result<()> {
         let now = now_ms();
         let books = match adapter.read(text, now) {
@@ -371,7 +372,7 @@ impl VenueFeed {
         for book in books {
             match to_quote(self.conn.venue, &self.markets, book, now) {
                 Ok((market, quote)) => {
-                    if let Err(lead_ms) = pending.entry(market).or_default().add(quote, now) {
+                    if let Err(lead_ms) = buffered.entry(market).or_default().add(quote, now) {
                         self.clock_ahead(market, lead_ms);
                     }
                 }

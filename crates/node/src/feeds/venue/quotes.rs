@@ -8,7 +8,8 @@ use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 use engine_core::types::Millis;
 
 /// One market's quotes received and not yet sequenced: the newest the host clock had reached when
-/// it arrived, and those dated ahead of it, kept by venue time until the clock reaches them. A host
+/// it arrived, and those dated ahead of it, kept by venue time until the clock reaches them or a
+/// later quote dated before them supersedes them, as when the venue's clock steps back. A host
 /// clock a little behind the venue then still prices from the venue, a moment late, rather than
 /// handing the engine quotes it cannot use yet. Quotes ahead are kept one per venue millisecond and
 /// at most `MAX_QUOTE_LEAD_MS` ahead, which bounds how many are held.
@@ -19,7 +20,9 @@ pub(super) struct Pending {
 }
 
 impl Pending {
-    /// Adds a quote received at host time `now`. Of two with the same time, the later one is kept.
+    /// Adds a quote received at host time `now`, dropping the quotes still ahead that are dated after
+    /// it, since they show an older state of the book. Of two with the same time, the later one is
+    /// kept.
     /// Error cases:
     /// - the quote is dated more than `MAX_QUOTE_LEAD_MS` ahead of `now`, which the engine
     ///   refuses, so it is dropped; the error is its lead
@@ -28,6 +31,7 @@ impl Pending {
         if lead > MAX_QUOTE_LEAD_MS {
             return Err(lead);
         }
+        self.ahead.retain(|ts, _| *ts <= quote.ts);
         if lead > 0 {
             self.ahead.insert(quote.ts, quote);
         } else if self.reached.as_ref().is_none_or(|reached| quote.ts >= reached.ts) {

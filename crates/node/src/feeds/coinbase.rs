@@ -15,6 +15,11 @@ use serde_json::value::RawValue;
 
 use crate::feeds::venue::{Book, Frame, Refusal, check_time};
 
+/// The most price levels kept on one side of a product's book, about ten times the deepest side
+/// Coinbase publishes (BTC-USD, some 21,000 levels in October 2026), so a venue fault cannot grow
+/// the book without bound.
+const MAX_LEVELS: usize = 200_000;
+
 /// The price levels of every product on one connection, rebuilt from `level2` messages.
 #[derive(Default)]
 pub(super) struct Books {
@@ -135,8 +140,8 @@ impl Books {
             }
             if update.new_quantity.is_zero() {
                 levels.remove(&update.price_level);
-            } else {
-                levels.insert(update.price_level);
+            } else if levels.insert(update.price_level) && levels.len() > MAX_LEVELS {
+                return Err(format!("{product_id} {} side past {MAX_LEVELS} levels", update.side));
             }
             let event_time = DateTime::parse_from_rfc3339(update.event_time)
                 .map_err(|e| format!("bad event_time {}: {e}", update.event_time))?
@@ -283,6 +288,29 @@ mod tests {
             books.read(SNAPSHOT, NOW).unwrap();
             assert!(matches!(books.read(&case, NOW), Err(Refusal::Connection(_))), "applied {case}");
         }
+    }
+
+    #[test]
+    fn a_book_side_past_its_level_cap_resyncs_the_connection() {
+        let bids = |sequence: u64, levels: std::ops::Range<usize>| {
+            let level = |i: usize| {
+                format!(
+                    r#"{{"side":"bid","event_time":"2026-10-20T09:51:15.761244Z","price_level":"1.{i:06}","new_quantity":"0.001"}}"#
+                )
+            };
+            let updates: Vec<String> = levels.map(level).collect();
+            let events = format!(r#"[{{"type":"update","product_id":"ETH-USD","updates":[{}]}}]"#, updates.join(","));
+            format!(
+                r#"{{"channel":"l2_data","timestamp":"2026-10-20T09:51:15.9Z","sequence_num":{sequence},"events":{events}}}"#
+            )
+        };
+        let mut books = Books::default();
+        books.read(SNAPSHOT, NOW).unwrap();
+        // The snapshot holds two bids, so this fills the side to the cap, which is still a book.
+        assert!(books.read(&bids(12, 0..MAX_LEVELS - 2), NOW).is_ok());
+        // One more level is past it.
+        let past = books.read(&bids(13, MAX_LEVELS..MAX_LEVELS + 1), NOW);
+        assert!(matches!(&past, Err(Refusal::Connection(reason)) if reason.contains("past 200000 levels")), "{past:?}");
     }
 
     #[test]

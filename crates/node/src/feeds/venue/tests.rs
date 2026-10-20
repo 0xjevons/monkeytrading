@@ -54,7 +54,7 @@ fn the_newest_quote_the_host_clock_has_reached_is_taken_and_those_ahead_wait() {
     let at = |ts: Millis| SourceQuote { source: "kraken".into(), mid: Fixed::from_int(100), ts };
     let mut pending = Pending::default();
     // Received over one tick from a venue whose clock is a little ahead of the host's.
-    for ts in [NOW - 300, NOW - 100, NOW + 400, NOW - 200, NOW + 40] {
+    for ts in [NOW - 300, NOW - 100, NOW + 40, NOW + 400] {
         assert_eq!(pending.add(at(ts), NOW), Ok(()));
     }
     assert_eq!(pending.take(NOW), Some(at(NOW - 100)));
@@ -62,6 +62,13 @@ fn the_newest_quote_the_host_clock_has_reached_is_taken_and_those_ahead_wait() {
     // Each quote ahead goes once the host clock reaches it.
     assert_eq!(pending.take(NOW + 40), Some(at(NOW + 40)));
     assert_eq!(pending.take(NOW + 1_000), Some(at(NOW + 400)));
+    assert_eq!(pending.take(NOW + 1_000), None);
+    // A later quote dated before those still ahead, as after the venue's clock steps back,
+    // supersedes them: they never go.
+    pending.add(at(NOW + 800), NOW).unwrap();
+    pending.add(at(NOW + 500), NOW).unwrap();
+    pending.add(at(NOW + 100), NOW + 100).unwrap();
+    assert_eq!(pending.take(NOW + 200), Some(at(NOW + 100)));
     assert_eq!(pending.take(NOW + 1_000), None);
     // Of a quote that waited and one received after its time, the newer goes; on a tie, the later.
     pending.add(at(NOW + 50), NOW).unwrap();
