@@ -1,20 +1,20 @@
 //! Accounting invariants under generated sessions. Each case sequences random client, feed,
 //! custody, and operator commands, with values inside and outside the engine's input bounds, and
 //! checks after every command that it did not panic, that cash is conserved, and that each market's
-//! aggregates match its accounts' positions.
+//! aggregates match its accounts' positions. The same sessions must reach every path that moves cash
+//! and every kind of out-of-bounds input, so the checks cannot pass vacuously.
 
 #[path = "../common/mod.rs"]
 mod common;
 mod session;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{HOUSE_CAPITAL, Harness, acct};
 use engine_core::event::{Event, Reject};
 use engine_core::types::MarketId;
 use engine_core::{Engine, Fixed};
-use proptest::proptest;
-use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngSeed, TestCaseError, TestRunner};
 use session::{Session, command, session};
 
@@ -23,11 +23,11 @@ const SEED: u64 = 0x5eed_0021;
 /// Sessions per run: enough to find edge-of-range panics, few enough to run in about a second.
 const CASES: u32 = 1_024;
 
-proptest! {
-    #![proptest_config(config())]
-
-    #[test]
-    fn accounting_invariants_hold_after_every_command(session in session()) {
+#[test]
+fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
+    // Coverage is recorded from the same sessions whose invariants are checked.
+    let reached = RefCell::new(BTreeSet::new());
+    let result = TestRunner::new(config()).run(&session(), |session| {
         let mut h = funded(&session);
         let mut inflow = h.deposits + Fixed::from_int(HOUSE_CAPITAL);
         check(&h.engine, inflow).map_err(TestCaseError::fail)?;
@@ -36,24 +36,14 @@ proptest! {
             let cmd = command(&step.action, &h.engine, h.ts);
             // `Harness::cmd` panics if the engine refuses the sequence; a panic fails the case.
             let events = h.cmd(cmd.clone());
+            reached.borrow_mut().extend(events.iter().map(path));
             inflow += cash_moved(&events);
             check(&h.engine, inflow).map_err(|e| TestCaseError::fail(format!("after {cmd:?}: {e}")))?;
         }
-    }
-}
-
-#[test]
-fn generated_sessions_reach_every_checked_path() {
-    let mut runner = TestRunner::new(config());
-    let mut reached = BTreeSet::new();
-    for _ in 0..config().cases {
-        let session = session().new_tree(&mut runner).expect("strategy generates").current();
-        let mut h = funded(&session);
-        for step in session.steps {
-            h.advance(step.advance_ms);
-            let cmd = command(&step.action, &h.engine, h.ts);
-            reached.extend(h.cmd(cmd).iter().map(path));
-        }
+        Ok(())
+    });
+    if let Err(failure) = result {
+        panic!("{failure}");
     }
     let expected = [
         "deposit",
@@ -71,6 +61,7 @@ fn generated_sessions_reach_every_checked_path() {
         "admin applied",
         "admin rejected",
     ];
+    let reached = reached.into_inner();
     let missed: Vec<&str> = expected.into_iter().filter(|p| !reached.contains(p)).collect();
     assert!(missed.is_empty(), "generated sessions never reach {missed:?}");
 }

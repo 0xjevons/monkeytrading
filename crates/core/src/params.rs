@@ -11,8 +11,9 @@ use crate::types::Millis;
 const MAX_RATE_BPS: i64 = 10_000;
 /// The most a multiplier or house cap may be: ten times.
 const MAX_MULTIPLE_BPS: i64 = 100_000;
-/// The longest markout horizon: one day. Markouts come due in fill order, so one that never came
-/// due would hold back every later one.
+/// The longest markout horizon: one day. A longer one can overflow a markout's due time, and
+/// markouts are marked in fill order, so one queued under a long horizon holds back every later one
+/// once the horizon is lowered.
 const MAX_HORIZON_MS: i64 = 86_400_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

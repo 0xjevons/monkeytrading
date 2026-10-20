@@ -185,7 +185,7 @@ fn resolve(price: Price, base: Fixed) -> Fixed {
 
 /// Funding for the three traders and up to 200 steps.
 pub(crate) fn session() -> impl Strategy<Value = Session> {
-    (proptest::array::uniform3(cash()), vec(step(), 1..200)).prop_map(|(funding, steps)| Session { funding, steps })
+    (proptest::array::uniform3(cash()), vec(step(), 1..=200)).prop_map(|(funding, steps)| Session { funding, steps })
 }
 
 /// A step: mostly a short clock move so quotes stay fresh, sometimes up to two days so sessions
@@ -273,7 +273,7 @@ fn admin() -> impl Strategy<Value = AdminCommand> {
     ]
 }
 
-/// The harness parameters with one field changed.
+/// The harness parameters with one field, or one stress level, changed.
 fn params_change() -> impl Strategy<Value = ProtocolParams> {
     let toxicity = |horizon_ms, ewma_weight_bps| ToxicityParams { horizon_ms, ewma_weight_bps, ..params().toxicity };
     prop_oneof![

@@ -4,11 +4,14 @@
 
 mod common;
 
+use std::any::Any;
 use std::fs;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
+use common::params;
 use common::reference::{ReferenceEntry, root_hex};
-use engine_core::command::Command;
+use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::{Engine, Fixed};
 
 #[test]
@@ -42,6 +45,16 @@ fn a_changed_command_is_reported_at_the_first_seq_it_alters() {
 }
 
 #[test]
+fn a_panicking_command_is_reported_at_its_seq() {
+    // The rollover after a timestamp past chrono's range cannot be computed, so applying parameters
+    // then panics; only a corrupt log carries such a timestamp.
+    let cmd = Command::Admin(AdminCommand::SetParams(params()));
+    let entries = [ReferenceEntry { sequenced: Sequenced { seq: 0, ts: i64::MAX, cmd }, root: root_hex([0; 32]) }];
+    let err = verify_roots(&entries).unwrap_err();
+    assert!(err.starts_with("seq 0 panicked: timestamp in range"), "{err}");
+}
+
+#[test]
 fn an_empty_log_does_not_verify() {
     assert_eq!(verify_roots(&[]), Err("empty log".to_owned()));
 }
@@ -51,7 +64,7 @@ fn an_empty_log_does_not_verify() {
 /// Replays `entries` on a fresh engine, comparing the state root after every command.
 /// Error cases:
 /// - no entries
-/// - the engine refuses a command's seq or timestamp
+/// - the engine refuses a command's seq or timestamp, or panics applying it
 /// - a root differs from the committed one; the message names the first such seq
 fn verify_roots(entries: &[ReferenceEntry]) -> Result<(), String> {
     if entries.is_empty() {
@@ -60,7 +73,10 @@ fn verify_roots(entries: &[ReferenceEntry]) -> Result<(), String> {
     let mut engine = Engine::new();
     entries.iter().try_for_each(|entry| {
         let seq = entry.sequenced.seq;
-        engine.apply(&entry.sequenced).map_err(|e| format!("seq {seq} refused: {e}"))?;
+        // A panic is caught so the failure still names the log and the seq.
+        panic::catch_unwind(AssertUnwindSafe(|| engine.apply(&entry.sequenced)))
+            .map_err(|payload| format!("seq {seq} panicked: {}", panic_message(payload.as_ref())))?
+            .map_err(|e| format!("seq {seq} refused: {e}"))?;
         let replayed = root_hex(engine.state_root());
         if replayed != entry.root {
             return Err(format!("root diverges at seq {seq}: committed {}, replay gives {replayed}", entry.root));
@@ -87,6 +103,15 @@ fn reference_logs() -> Vec<PathBuf> {
     }
     logs.sort();
     logs
+}
+
+/// The message a panic carried, when it is a string.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("")
 }
 
 /// The log's file name, which names its protocol version.

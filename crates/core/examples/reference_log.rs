@@ -9,12 +9,13 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, ErrorKind, Write};
 use std::path::PathBuf;
 
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
+use chrono::NaiveDate;
 use common::reference::{ReferenceEntry, root_hex};
-use common::{AAPL, BTC, ETH, Harness, acct, f, market, ny, params};
+use common::{AAPL, BTC, ETH, Harness, acct, f, market, ny, params, us_equities};
 use engine_core::Engine;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::Event;
@@ -47,11 +48,12 @@ fn main() -> anyhow::Result<()> {
         entries.push(ReferenceEntry { sequenced, root: root_hex(engine.state_root()) });
     }
 
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| format!("{}: a committed reference log is never regenerated", path.display()))?;
+    let file = OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| match e.kind() {
+        ErrorKind::AlreadyExists => {
+            anyhow!("{} exists; a committed reference log is never regenerated", path.display())
+        }
+        _ => anyhow!(e).context(format!("creating {}", path.display())),
+    })?;
     let mut out = BufWriter::new(file);
     for entry in &entries {
         serde_json::to_writer(&mut out, entry)?;
@@ -63,12 +65,13 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The scripted session: genesis, then funding, prices, every order kind, triggers, cancels,
-/// reduce-only, stress, toxicity, house capital, withdrawals, a session close and gapped open, a
-/// financing rollover, a close-out with bad debt, and admin changes, with a rejection of each kind
-/// along the way.
+/// The scripted session: genesis, then funding, prices, every order kind, triggers (one held back by
+/// its spread), cancels, reduce-only (one clipped to the position), stress, toxicity, a position
+/// flip, house capital, withdrawals, a session close and gapped open, financing rollovers over longs
+/// and a short, a two-position close-out with bad debt, two-band margin, an exchange holiday, and
+/// admin changes, with a rejection of each kind along the way.
 fn session() -> Vec<Sequenced> {
-    let (a, b, c, d, t, stranger) = (acct(1), acct(2), acct(3), acct(4), acct(5), acct(9));
+    let (a, b, c, d, t, e, stranger) = (acct(1), acct(2), acct(3), acct(4), acct(5), acct(6), acct(9));
     let mut h = Harness::new();
     h.admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 430 });
 
@@ -78,6 +81,7 @@ fn session() -> Vec<Sequenced> {
     h.deposit(c, "1000");
     h.deposit(d, "20000000");
     h.deposit(t, "10000");
+    h.deposit(e, "20000");
     let deposit =
         |amount: &str, chain_ref: &str| Command::Deposit { account: a, amount: f(amount), chain_ref: chain_ref.into() };
     h.cmd(deposit("250.5", "0xfeed:1"));
@@ -122,6 +126,9 @@ fn session() -> Vec<Sequenced> {
     // Stress: an operator floor, a fill paying its spread, then a divergence trigger and cooldown.
     h.admin(AdminCommand::SetStressFloor { market: Some(BTC), level: 1 });
     h.market_order(a, BTC, Side::Buy, "0.01", "101210");
+    // A buy limit at the mid triggers, but the 5bps spread prices it above the limit: it keeps
+    // resting until a later price brings the fill inside it.
+    h.order(a, BTC, Side::Buy, "0.01", OrderKind::Limit { price: f("101210") });
     h.admin(AdminCommand::SetStressFloor { market: Some(BTC), level: 0 });
     h.cmd(Command::Admin(AdminCommand::SetStressFloor { market: None, level: 5 }));
     h.quotes(BTC, &["101000", "101150"]);
@@ -136,6 +143,8 @@ fn session() -> Vec<Sequenced> {
     h.market_order(t, ETH, Side::Buy, "1", "3075");
     // A buy through a short: the 1.8 short closes at a loss and a 1.2 long opens at the fill price.
     h.market_order(b, ETH, Side::Buy, "3", "3075");
+    // A short held over the rollover, which receives the benchmark less the markup.
+    h.market_order(e, ETH, Side::Sell, "2", "3075");
 
     // Size spread on a large fill, then the house cap refusing a larger one.
     h.price(BTC, "101000");
@@ -171,8 +180,11 @@ fn session() -> Vec<Sequenced> {
     h.advance_to(ny(2026, 10, 21, 9, 30));
     h.price(AAPL, "220");
 
-    // A leveraged long gapped through its balance: close-out, liquidation fill, and bad debt.
+    // Leveraged longs gapped through the balance: a close-out that takes BTC (the larger loser) then
+    // ETH, and bad debt.
     h.price(BTC, "101000");
+    h.price(ETH, "3075");
+    h.market_order(c, ETH, Side::Buy, "0.2", "3075");
     h.market_order(c, BTC, Side::Buy, "0.09", "101000");
     h.advance(100);
     h.price(BTC, "80000");
@@ -189,6 +201,8 @@ fn session() -> Vec<Sequenced> {
     eth.min_order_notional = f("100");
     h.admin(AdminCommand::UpsertMarket(eth));
     h.price(ETH, "3075");
+    // A reduce-only sell of 5 against a long of 2 is clipped to 2.
+    h.cmd(Command::PlaceOrder(reducing(t, ETH, Side::Sell, "5", "3075")));
     h.market_order(b, ETH, Side::Buy, "0.01", "3075");
     // Margin of 10% up to 10,000 notional and 20% above: a 15,000 position needs 2,000.
     let mut sol = market(SOL, "SOL-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000);
@@ -198,7 +212,12 @@ fn session() -> Vec<Sequenced> {
     h.market_order(a, SOL, Side::Buy, "100", "150");
     h.cmd(Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 10_001 }));
     h.cmd(Command::Admin(AdminCommand::SetReduceOnly { market: UNLISTED, reduce_only: true }));
-    h.advance(60_000);
+    // An exchange holiday on Thursday keeps AAPL shut through its session hours.
+    let Schedule::Weekly { tz, windows, .. } = us_equities() else { unreachable!("US equities keep weekly hours") };
+    let holiday = NaiveDate::from_ymd_opt(2026, 10, 22).expect("a real date");
+    let schedule = Schedule::Weekly { tz, windows, closed_dates: vec![holiday] };
+    h.admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, schedule, 2_000)));
+    h.advance_to(ny(2026, 10, 22, 10, 0));
     h.cmd(Command::Tick);
     h.log
 }
