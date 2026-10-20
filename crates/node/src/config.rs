@@ -221,7 +221,7 @@ impl Venue {
     }
 
     /// The domain this venue's endpoints are served under.
-    pub fn domain(self) -> &'static str {
+    fn domain(self) -> &'static str {
         match self {
             Venue::Bitstamp => "bitstamp.net",
             Venue::Coinbase => "coinbase.com",
@@ -317,9 +317,6 @@ impl NodeConfig {
         }
         Ok(())
     }
-}
-
-impl NodeConfig {
     /// Checks `feeds.venues.stale_after` against the genesis market each venue symbol prices: a
     /// longer bound would count quotes the engine already drops as stale as the venue quoting.
     /// Error cases:

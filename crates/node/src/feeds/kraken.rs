@@ -1,6 +1,8 @@
 //! Kraken spot WebSocket v2. The `ticker` channel with `event_trigger = "bbo"` publishes on every
-//! change to the best bid or ask, stamped with the venue time. Prices arrive as JSON numbers, so
-//! they are read from the raw number text, never through a float.
+//! change to the best bid or ask, stamped with the venue time. It publishes nothing while the top
+//! holds, so a top that holds past a market's `max_age_ms` ages out in the engine and the index
+//! runs on the other venues until it moves. Prices and sizes arrive as JSON numbers, so they are
+//! read from the raw number text, never through a float.
 
 use chrono::DateTime;
 use engine_core::Fixed;
@@ -8,7 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use serde_json::value::RawValue;
 
-use crate::feeds::venue::{Book, Frame};
+use crate::feeds::venue::{Book, Frame, check_size};
 
 /// Every Kraken message: a channel message, or a reply to a method call.
 #[derive(Deserialize)]
@@ -29,7 +31,11 @@ struct Ticker<'a> {
     #[serde(borrow)]
     bid: &'a RawValue,
     #[serde(borrow)]
+    bid_qty: &'a RawValue,
+    #[serde(borrow)]
     ask: &'a RawValue,
+    #[serde(borrow)]
+    ask_qty: &'a RawValue,
     timestamp: &'a str,
 }
 
@@ -60,9 +66,12 @@ pub(super) fn parse(text: &str) -> Result<Frame, String> {
 
 /// One ticker's top of book.
 /// Error cases:
-/// - the bid or ask is not a plain decimal number, or the timestamp is not RFC 3339
+/// - a price or size is not a plain decimal number, or a size is out of range (see `check_size`)
+/// - the timestamp is not RFC 3339
 fn book(ticker: Ticker) -> Result<Book, String> {
-    let price = |raw: &RawValue| raw.get().parse::<Fixed>().map_err(|e| format!("bad price: {e}"));
+    let price = |raw: &RawValue| raw.get().parse::<Fixed>().map_err(|e| format!("bad number: {e}"));
+    check_size(&ticker.symbol, "bid", price(ticker.bid_qty)?)?;
+    check_size(&ticker.symbol, "ask", price(ticker.ask_qty)?)?;
     let ts = DateTime::parse_from_rfc3339(ticker.timestamp)
         .map_err(|e| format!("bad timestamp {}: {e}", ticker.timestamp))?
         .timestamp_millis();
@@ -112,6 +121,9 @@ mod tests {
             SNAPSHOT.replace(r#""bid":2379.13"#, r#""bid":2.37913e3"#),
             SNAPSHOT.replace(r#""ask":2379.14"#, r#""ask":"2379.14""#),
             SNAPSHOT.replace(r#""bid":2379.13"#, r#""bid":null"#),
+            SNAPSHOT.replace(r#""bid_qty":3.30968537"#, r#""bid_qty":0"#),
+            SNAPSHOT.replace(r#""ask_qty":3.78223814"#, r#""ask_qty":-1"#),
+            SNAPSHOT.replace(r#""ask_qty":3.78223814,"#, ""),
             SNAPSHOT.replace(r#""timestamp":"2026-10-20T09:43:52.289915Z""#, r#""timestamp":1792489432"#),
             SNAPSHOT.replace(r#""channel":"ticker""#, r#""channel":"book""#),
             r#"{"channel":"ticker","type":"update"}"#.to_owned(),

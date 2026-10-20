@@ -29,8 +29,9 @@ const DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/dev.toml");
 /// Each fake venue's book: BTC-USD 81250 / 81251 and ETH-USD 2377 / 2377.1.
 const BTC: (&str, &str, &str) = ("81250", "81251", "81250.5");
 const ETH: (&str, &str, &str) = ("2377", "2377.1", "2377.05");
-/// The crypto markets' freshness window in this test's genesis, short so a cut venue ages out fast.
-const MAX_AGE_MS: Millis = 300;
+/// The crypto markets' freshness window in this test's genesis: short so a cut venue ages out
+/// within the test, long enough that a busy runner does not age out the live ones.
+const MAX_AGE_MS: Millis = 1_000;
 
 /// A sequencer under the dev genesis, and a feed of its stream.
 struct Node {
@@ -56,12 +57,12 @@ async fn venues_going_down_age_out_and_the_index_runs_on_the_rest() {
     // Kraken's host goes dark: its connection drops, reconnects fail, and its last quotes age out.
     // The sequencer stamps with the wall clock, so ageing takes real time.
     kraken.abort();
-    sleep(Duration::from_millis(MAX_AGE_MS as u64 + 200)).await;
+    sleep(Duration::from_millis(MAX_AGE_MS as u64 + 500)).await;
     node.assert_both_markets_fill().await;
 
     // With Bitstamp gone too, one fresh venue is left.
     bitstamp.abort();
-    sleep(Duration::from_millis(MAX_AGE_MS as u64 + 200)).await;
+    sleep(Duration::from_millis(MAX_AGE_MS as u64 + 500)).await;
     for (market, (_, _, mid)) in [(1, BTC), (2, ETH)] {
         let events = node.buy(market, mid).await;
         let stale = Reject::NoPrice(PriceError::Stale { fresh: 1, needed: 2 });

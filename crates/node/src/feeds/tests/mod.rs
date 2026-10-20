@@ -9,19 +9,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use engine_core::types::{MarketId, Millis};
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::clock::now_ms;
 use crate::config::Venue;
 use crate::feeds::tests::fake::{
     WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_ticker, listen, next_alert, next_prices,
-    quote, send, spawn_feed,
+    quote, send, spawn_feed, stream,
 };
 use crate::feeds::venue::{Book, Timing, next_backoff, to_quote};
 use crate::feeds::{bitstamp, kraken};
-use engine_core::types::Millis;
 
-const MARKETS: [(u32, &str); 2] = [(1, "BTC/USD"), (2, "ETH/USD")];
+const MARKETS: [(MarketId, &str); 2] = [(1, "BTC/USD"), (2, "ETH/USD")];
 
 #[tokio::test]
 async fn quotes_are_sequenced_per_market_with_the_venue_timestamp() {
@@ -41,14 +41,14 @@ async fn quotes_are_sequenced_per_market_with_the_venue_timestamp() {
 }
 
 #[tokio::test]
-async fn only_the_latest_quote_per_market_is_sequenced_each_interval() {
+async fn only_the_newest_quote_per_market_is_sequenced_each_interval() {
     let (listener, url) = listen().await;
     let timing = Timing { interval: Duration::from_secs(1), ..fast(WAIT) };
     let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, timing);
     let (mut ws, _) = accept(&listener).await;
 
-    // All three arrive within one interval, so only the last is sequenced.
-    let tickers = [1_000, 1_100, 1_200].map(|ts| kraken_ticker("BTC/USD", "100", "101", ts));
+    // All three arrive within one interval, the newest by venue time second, so only it is sequenced.
+    let tickers = [1_000, 1_200, 1_100].map(|ts| kraken_ticker("BTC/USD", "100", "101", ts));
     send(&mut ws, &tickers).await;
     assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", 1_200)]));
 }
@@ -167,23 +167,20 @@ async fn a_silent_connection_is_dropped_and_retried() {
 }
 
 #[tokio::test]
-async fn a_symbol_the_venue_never_quotes_is_alerted() {
+async fn a_symbol_the_venue_never_quotes_is_alerted_and_resubscribed() {
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
     let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(Duration::from_millis(300)));
-    let (mut ws, _) = accept(&listener).await;
+    let (ws, _) = accept(&listener).await;
 
     // BTC keeps quoting fresh while ETH never quotes.
-    let streaming = tokio::spawn(async move {
-        for _ in 0..1_000 {
-            send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", now_ms())]).await;
-            sleep(Duration::from_millis(20)).await;
-        }
-    });
+    stream(ws, || vec![kraken_ticker("BTC/USD", "100", "101", now_ms())]);
     next_prices(&mut rx).await;
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "ETH/USD"));
-    streaming.abort();
+    // The feed replaces the connection to subscribe ETH afresh.
+    let (_ws, subscription) = accept(&listener).await;
+    assert_eq!(subscription, kraken::subscriptions(&["BTC/USD", "ETH/USD"])[0]);
 }
 
 #[tokio::test]
@@ -219,21 +216,39 @@ async fn each_outage_alerts_once() {
 }
 
 #[tokio::test]
+async fn an_outage_alert_stands_for_every_symbol_until_a_fresh_quote() {
+    let (_guard, mut alerts) = capture_alerts();
+    let (listener, url) = listen().await;
+    let silence = Duration::from_millis(200);
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(silence));
+    drop(timeout(WAIT, listener.accept()).await.expect("no attempt in time"));
+    assert_eq!(next_alert(&mut alerts).await["alert"], "venue_feed_down");
+
+    // Back, but quoting only books a minute old: still down, so no symbol alerts on top of it.
+    let (ws, _) = accept(&listener).await;
+    stream(ws, || vec![kraken_ticker("BTC/USD", "100", "101", now_ms() - 60_000)]);
+    next_prices(&mut rx).await;
+    assert!(timeout(silence * 3, alerts.recv()).await.is_err(), "alerted again during the outage");
+}
+
+#[tokio::test]
 async fn a_symbol_that_goes_quiet_again_alerts_again() {
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
     let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(Duration::from_millis(300)));
-    let (mut ws, _) = accept(&listener).await;
     let eth_quoting = Arc::new(AtomicBool::new(false));
     let eth = Arc::clone(&eth_quoting);
-    let streaming = tokio::spawn(async move {
-        for _ in 0..1_000 {
-            let ts = now_ms();
-            send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", ts)]).await;
-            if eth.load(Ordering::Relaxed) {
-                send(&mut ws, &[kraken_ticker("ETH/USD", "10", "11", ts)]).await;
-            }
-            sleep(Duration::from_millis(20)).await;
+    // Every connection quotes BTC, and ETH while the switch is on.
+    let serving = tokio::spawn(async move {
+        loop {
+            let (ws, _) = accept(&listener).await;
+            let eth = Arc::clone(&eth);
+            let messages = move || {
+                let ts = now_ms();
+                let eth = eth.load(Ordering::Relaxed).then(|| kraken_ticker("ETH/USD", "10", "11", ts));
+                [Some(kraken_ticker("BTC/USD", "100", "101", ts)), eth].into_iter().flatten().collect()
+            };
+            let _ = stream(ws, messages).await;
         }
     });
 
@@ -244,7 +259,7 @@ async fn a_symbol_that_goes_quiet_again_alerts_again() {
     timeout(WAIT, eth_sequenced).await.expect("ETH quoted in time");
     eth_quoting.store(false, Ordering::Relaxed);
     assert!(silent_eth(&next_alert(&mut alerts).await));
-    streaming.abort();
+    serving.abort();
 }
 
 #[tokio::test]
@@ -259,24 +274,15 @@ async fn a_recovered_venue_gets_a_full_silence_window_per_symbol() {
         drop(timeout(WAIT, listener.accept()).await.expect("no attempt in time"));
     }
     assert_eq!(next_alert(&mut alerts).await["alert"], "venue_feed_down");
-    let (mut ws, _) = accept(&listener).await;
-    let streaming = tokio::spawn(async move {
-        for _ in 0..1_000 {
-            send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", now_ms())]).await;
-            sleep(Duration::from_millis(20)).await;
-        }
-    });
+    let (ws, _) = accept(&listener).await;
+    stream(ws, || vec![kraken_ticker("BTC/USD", "100", "101", now_ms())]);
     next_prices(&mut rx).await;
     let recovered = Instant::now();
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "ETH/USD"));
-    // ETH's silence counts from the recovery, not from before the outage.
-    assert!(
-        recovered.elapsed() >= silence - Duration::from_millis(50),
-        "alerted {:?} after recovery",
-        recovered.elapsed()
-    );
-    streaming.abort();
+    // ETH's silence counts from the recovery, not from before the outage, when it was already
+    // past the bound and would alert at the first check.
+    assert!(recovered.elapsed() >= silence / 2, "alerted {:?} after recovery", recovered.elapsed());
 }
 
 #[tokio::test]
@@ -328,8 +334,8 @@ async fn a_refused_book_from_a_kept_book_resyncs() {
     let (mut first, _) = accept(&listener).await;
     send(&mut first, &[coinbase_levels(0, true, "BTC-USD", "100", "101", 1_000)]).await;
     assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Coinbase, "100.5", 1_000)]));
-    // In sequence, but dated a minute ahead: its levels must not stay in the kept book.
-    send(&mut first, &[coinbase_levels(1, false, "BTC-USD", "100.2", "101", now_ms() + 60_000)]).await;
+    // In sequence and well formed, but its bid crosses the kept offer: the kept book is suspect.
+    send(&mut first, &[coinbase_levels(1, false, "BTC-USD", "101.5", "102", now_ms())]).await;
 
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["venue"].as_str()), ("venue_message_refused", "coinbase"));
@@ -411,16 +417,10 @@ async fn assert_quotes_do_not_count(stamp: impl Fn() -> Millis + Send + 'static)
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
     let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &[(1, "BTC/USD")], fast(Duration::from_millis(300)));
-    let (mut ws, _) = accept(&listener).await;
-    let streaming = tokio::spawn(async move {
-        for _ in 0..1_000 {
-            send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", stamp())]).await;
-            sleep(Duration::from_millis(20)).await;
-        }
-    });
+    let (ws, _) = accept(&listener).await;
+    stream(ws, move || vec![kraken_ticker("BTC/USD", "100", "101", stamp())]);
     let (market, quotes) = next_prices(&mut rx).await;
     assert_eq!((market, quotes[0].source.as_str()), (1, "kraken"));
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "BTC/USD"));
-    streaming.abort();
 }

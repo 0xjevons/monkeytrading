@@ -202,12 +202,13 @@ impl VenueFeed {
         }
     }
 
-    /// One connection: connect, subscribe, then read messages and sequence the latest quote per
+    /// One connection: connect, subscribe, then read messages and sequence the newest quote per
     /// market every `timing.interval`. A quote no older than `timing.stale_after` when sequenced
     /// counts as the venue quoting that market.
     /// Error cases:
     /// - connecting or subscribing fails or takes longer than `timing.timeout`
     /// - the venue sends nothing for `timing.timeout`, closes, or asks for a reconnect
+    /// - a symbol goes silent, so the connection is replaced to resubscribe it
     /// - the connection fails, or the sequencer has gone away
     async fn relay(&mut self) -> anyhow::Result<Infallible> {
         let connector = Some(Connector::Rustls(self.tls.clone()));
@@ -253,7 +254,9 @@ impl VenueFeed {
                             self.delivered(market);
                         }
                     }
-                    self.check_silent();
+                    if self.check_silent() {
+                        bail!("resubscribing after a symbol went silent");
+                    }
                 }
                 () = sleep_until(deadline) => bail!("no message for {:?}", self.timing.timeout),
             }
@@ -287,7 +290,10 @@ impl VenueFeed {
         for book in books {
             match to_quote(self.conn.venue, &self.markets, book, now) {
                 Ok((market, quote)) => {
-                    pending.insert(market, quote);
+                    // Keep the newest by venue time, as the engine does, whatever order they arrive in.
+                    if pending.get(&market).is_none_or(|held| quote.ts >= held.ts) {
+                        pending.insert(market, quote);
+                    }
                 }
                 Err(reason) if adapter.keeps_state() => {
                     self.refuse(&reason, text);
@@ -319,12 +325,15 @@ impl VenueFeed {
     /// Alerts once for each symbol that has gone `timing.timeout` without a fresh quote sequenced,
     /// across reconnects: one the venue accepted but never publishes, or whose quotes arrive stale
     /// or ahead of the host clock. An outage already alerted stands for every symbol.
-    fn check_silent(&mut self) {
+    /// Returns whether a symbol went silent on this check, so the connection is replaced once to
+    /// subscribe it afresh; a symbol already silent does not trigger another.
+    fn check_silent(&mut self) -> bool {
         if self.down {
-            return;
+            return false;
         }
         let venue = self.conn.venue.name();
         let now = Instant::now();
+        let mut newly_silent = false;
         for (symbol, market) in &self.markets {
             let quiet = self.last_quote.get(market).is_some_and(|at| now.duration_since(*at) >= self.timing.timeout);
             if quiet && self.silent.insert(*market) {
@@ -332,8 +341,10 @@ impl VenueFeed {
                     alert = "venue_symbol_silent",
                     venue, symbol, market, "no fresh quote for {:?}", self.timing.timeout
                 );
+                newly_silent = true;
             }
         }
+        newly_silent
     }
 
     /// Logs a refused message, alerting at most once per `REFUSAL_REALERT`.
@@ -414,6 +425,16 @@ pub(super) fn to_quote(
     }
     check_time(&symbol, ts, now)?;
     Ok((market, SourceQuote { source: venue.name().to_owned(), mid: (bid + ask).div_int(2), ts }))
+}
+
+/// Refuses a top-of-book size no working venue could show.
+/// Error cases:
+/// - `size` is not positive, or is above `Fixed::MAX_INPUT`
+pub(super) fn check_size(symbol: &str, side: &str, size: Fixed) -> Result<(), String> {
+    if !size.is_valid_input() {
+        return Err(format!("{symbol} {side} size {size} out of range"));
+    }
+    Ok(())
 }
 
 /// Refuses a venue time no working venue could send at host time `now`.

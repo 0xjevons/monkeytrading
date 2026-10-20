@@ -13,7 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, accept_async};
 use tracing::field::{Field, Visit};
@@ -114,6 +114,20 @@ pub async fn send(ws: &mut Conn, messages: &[String]) {
     for message in messages {
         ws.send(Message::text(message.as_str())).await.expect("send");
     }
+}
+
+/// Sends `messages()` to the feed every 20ms until it closes the connection.
+pub fn stream(mut ws: Conn, messages: impl Fn() -> Vec<String> + Send + 'static) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            for message in messages() {
+                if ws.send(Message::text(message)).await.is_err() {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
 }
 
 /// Runs a venue task for `venue` against `url`, returning what it sequences and its handle.
