@@ -4,6 +4,8 @@
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
 
+pub mod reference;
+
 use chrono::TimeZone;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::{Event, Fill, Reject};
