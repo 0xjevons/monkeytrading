@@ -21,7 +21,7 @@ use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Seque
 use engine_core::event::Event;
 use engine_core::market::Tier;
 use engine_core::params::{ProtocolParams, ToxicityParams};
-use engine_core::price::SourceQuote;
+use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 use engine_core::session::Schedule;
 use engine_core::types::{AccountId, AssetClass, MarketId, OrderId, Side};
 
@@ -66,8 +66,9 @@ fn main() -> anyhow::Result<()> {
 /// The scripted session: genesis, then funding, prices, every order kind, triggers (one held back by
 /// its spread), cancels, reduce-only (one clipped to the position), stress, toxicity, a position
 /// flip, house capital, withdrawals, a session close and gapped open, financing rollovers over longs
-/// and a short, a two-position close-out with bad debt, two-band margin, an exchange holiday, and
-/// admin changes, with a rejection of each kind along the way.
+/// and a short, a two-position close-out with bad debt, two-band margin, an exchange holiday, admin
+/// changes, and venue quotes stamped ahead of the sequenced time, with a rejection of each kind along
+/// the way.
 fn session() -> Vec<Sequenced> {
     let (a, b, c, d, t, e, stranger) = (acct(1), acct(2), acct(3), acct(4), acct(5), acct(6), acct(9));
     let mut h = Harness::new();
@@ -219,6 +220,18 @@ fn session() -> Vec<Sequenced> {
     h.admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, schedule, 2_000)));
     h.advance_to(ny(2026, 10, 22, 10, 0));
     h.cmd(Command::Tick);
+
+    // Venue clocks: a quote stamped at the lead limit is kept, one a millisecond further ahead is
+    // refused and leaves the venue's stale quote in place, and the first venue's next quote, stamped
+    // earlier than its kept one, replaces it and prices the market.
+    let ts = h.ts;
+    let ahead = |source: &str, lead_ms| SourceQuote { source: source.into(), mid: f("80000"), ts: ts + lead_ms };
+    h.cmd(Command::Prices {
+        market: BTC,
+        quotes: vec![ahead("venue0", MAX_QUOTE_LEAD_MS), ahead("venue1", MAX_QUOTE_LEAD_MS + 1)],
+    });
+    h.advance(100);
+    h.quotes(BTC, &["80000", "80010"]);
     h.log
 }
 

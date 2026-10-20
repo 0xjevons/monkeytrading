@@ -82,9 +82,13 @@ Two suites guard replay and accounting:
 
 A change to engine state, its serialization, or what a command does changes the roots that existing
 logs replay to. It ships as a new protocol version, and the committed logs of earlier versions must
-keep passing unchanged. The engine has one protocol version today, `v1.jsonl`; versions that
-activate at a recorded seq arrive with signed client requests
-([#18](https://github.com/0xjevons/monkeytrading/issues/18)). For each later version:
+keep passing unchanged. The engine has two protocol versions today: `v1.jsonl` holds the original
+rules, and `v2.jsonl` adds two: a venue quote stamped more than `MAX_QUOTE_LEAD_MS` after the
+sequenced time is refused, and any quote replaces a stored one stamped after the sequenced time.
+Until versions that activate at a recorded seq arrive with signed client requests
+([#18](https://github.com/0xjevons/monkeytrading/issues/18)), the engine applies the latest rules
+from genesis; `v1.jsonl` still replays because none of its quotes is stamped ahead. For each later
+version:
 
 1. Extend the session in `examples/reference_log.rs` so it activates the new version and exercises
    the new rules.

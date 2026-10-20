@@ -62,6 +62,7 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
         "financing",
         "order out of range",
         "malformed quote",
+        "quote stamped ahead",
         "admin applied",
         "admin rejected",
     ];
@@ -149,6 +150,9 @@ fn path(event: &Event) -> &'static str {
             "order out of range"
         }
         Event::PricesRejected { reason, .. } if reason.starts_with("malformed") => "malformed quote",
+        Event::PricesRejected { reason, .. } if reason.ends_with("ahead of the sequenced time") => {
+            "quote stamped ahead"
+        }
         Event::AdminApplied => "admin applied",
         Event::AdminRejected { reason } if reason.ends_with("amount out of range") => "house capital out of range",
         // House capital refusals come back as admin rejections; keep them apart from operator ones.
