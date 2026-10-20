@@ -68,13 +68,16 @@ jobs:
         run: cargo test --workspace --locked
 
   # Every committed reference log must replay to its roots, and the accounting invariants must hold,
-  # on each platform a verifier may run. The `test` job runs both suites on x86_64 Linux.
+  # on each platform a verifier may run. The `test` job runs both suites on x86_64 Linux, and this
+  # job on aarch64 Linux, plus macOS on pushes to `main` and manual runs. PRs skip macOS because
+  # GitHub often never assigns a hosted macOS runner, which would fail `ci-passed`; engine-core uses
+  # no floats or OS calls, and aarch64 already covers a second architecture.
   reference-logs:
     name: reference-logs (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04-arm, macos-26]
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-24.04-arm"]') || fromJSON('["ubuntu-24.04-arm", "macos-26"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
