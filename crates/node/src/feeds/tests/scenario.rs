@@ -1,6 +1,7 @@
 //! The dev scenario offline: loopback Coinbase, Kraken, and Bitstamp venues price BTC-USD and
-//! ETH-USD through the sequencer under the committed dev genesis. With one venue unreachable the
-//! markets keep filling; with only one venue left, orders get `no_price`.
+//! ETH-USD through the sequencer under the dev genesis. Venues go down one at a time: with one
+//! down its quotes age out and the markets fill from the other two; with two down, orders get
+//! `no_price`.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -10,11 +11,11 @@ use std::time::Duration;
 use engine_core::command::{Command, OrderKind, OrderRequest};
 use engine_core::event::{Event, Reject};
 use engine_core::price::PriceError;
-use engine_core::types::{AccountId, MarketId, Side};
+use engine_core::types::{AccountId, MarketId, Millis, Side};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, timeout};
+use tokio::time::{interval, sleep, timeout};
 
 use crate::clock::now_ms;
 use crate::config::{NodeConfig, Venue};
@@ -28,6 +29,8 @@ const DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/dev.toml");
 /// Each fake venue's book: BTC-USD 81250 / 81251 and ETH-USD 2377 / 2377.1.
 const BTC: (&str, &str, &str) = ("81250", "81251", "81250.5");
 const ETH: (&str, &str, &str) = ("2377", "2377.1", "2377.05");
+/// The crypto markets' freshness window in this test's genesis, short so a cut venue ages out fast.
+const MAX_AGE_MS: Millis = 300;
 
 /// A sequencer under the dev genesis, and a feed of its stream.
 struct Node {
@@ -37,31 +40,28 @@ struct Node {
 }
 
 #[tokio::test]
-async fn a_blocked_venue_leaves_the_markets_priced_by_the_rest() {
-    let mut node = Node::start("blocked-one").await;
-    start_venue(&node, Venue::Coinbase, Some(serve_coinbase)).await;
-    start_venue(&node, Venue::Kraken, None).await;
-    start_venue(&node, Venue::Bitstamp, Some(serve_bitstamp)).await;
-    node.wait_for_quotes(&[(1, "coinbase"), (1, "bitstamp"), (2, "coinbase"), (2, "bitstamp")]).await;
+async fn venues_going_down_age_out_and_the_index_runs_on_the_rest() {
+    let mut node = Node::start("staged").await;
+    let _coinbase = start_venue(&node, Venue::Coinbase, serve_coinbase).await;
+    let kraken = start_venue(&node, Venue::Kraken, serve_kraken).await;
+    let bitstamp = start_venue(&node, Venue::Bitstamp, serve_bitstamp).await;
+    let every_quote: Vec<(MarketId, &str)> = [1, 2]
+        .into_iter()
+        .flat_map(|market| ["coinbase", "kraken", "bitstamp"].map(|source| (market, source)))
+        .collect();
+    node.wait_for_quotes(&every_quote).await;
     node.deposit().await;
+    node.assert_both_markets_fill().await;
 
-    for (market, (_, _, mid)) in [(1, BTC), (2, ETH)] {
-        let events = node.buy(market, mid).await;
-        let fill = events.iter().find_map(|event| if let Event::Fill(fill) = event { Some(fill) } else { None });
-        let fill = fill.unwrap_or_else(|| panic!("market {market} did not fill: {events:?}"));
-        assert_eq!(fill.index, mid.parse().unwrap());
-    }
-}
+    // Kraken's host goes dark: its connection drops, reconnects fail, and its last quotes age out.
+    // The sequencer stamps with the wall clock, so ageing takes real time.
+    kraken.abort();
+    sleep(Duration::from_millis(MAX_AGE_MS as u64 + 200)).await;
+    node.assert_both_markets_fill().await;
 
-#[tokio::test]
-async fn with_one_fresh_venue_orders_get_no_price() {
-    let mut node = Node::start("blocked-two").await;
-    start_venue(&node, Venue::Coinbase, None).await;
-    start_venue(&node, Venue::Kraken, Some(serve_kraken)).await;
-    start_venue(&node, Venue::Bitstamp, None).await;
-    node.wait_for_quotes(&[(1, "kraken"), (2, "kraken")]).await;
-    node.deposit().await;
-
+    // With Bitstamp gone too, one fresh venue is left.
+    bitstamp.abort();
+    sleep(Duration::from_millis(MAX_AGE_MS as u64 + 200)).await;
     for (market, (_, _, mid)) in [(1, BTC), (2, ETH)] {
         let events = node.buy(market, mid).await;
         let stale = Reject::NoPrice(PriceError::Stale { fresh: 1, needed: 2 });
@@ -75,9 +75,13 @@ async fn with_one_fresh_venue_orders_get_no_price() {
 // ── Helpers ──
 
 impl Node {
-    /// Sequences the committed dev genesis into a fresh log and runs the sequencer.
+    /// Sequences the committed dev genesis, with `MAX_AGE_MS` on the crypto markets, into a fresh
+    /// log and runs the sequencer.
     async fn start(name: &str) -> Self {
-        let cfg = NodeConfig::load(Path::new(DEV)).expect("dev config");
+        let mut cfg = NodeConfig::load(Path::new(DEV)).expect("dev config");
+        for market in cfg.genesis.markets.iter_mut().filter(|market| [1, 2].contains(&market.id)) {
+            market.price_rules.max_age_ms = MAX_AGE_MS;
+        }
         let dir = std::env::temp_dir().join(format!("engine-feeds-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -102,15 +106,28 @@ impl Node {
     async fn wait_for_quotes(&mut self, expected: &[(MarketId, &str)]) {
         let mut missing: BTreeSet<(MarketId, String)> =
             expected.iter().map(|(market, source)| (*market, (*source).to_owned())).collect();
-        while !missing.is_empty() {
-            let message = timeout(WAIT, self.stream.recv()).await.expect("quotes in time").expect("stream");
-            if let StreamMsg::Command { sequenced, .. } = message.as_ref()
-                && let Command::Prices { market, quotes } = &sequenced.cmd
-            {
-                quotes.iter().for_each(|quote| {
-                    missing.remove(&(*market, quote.source.clone()));
-                });
+        let arrivals = async {
+            while !missing.is_empty() {
+                let message = self.stream.recv().await.expect("stream");
+                if let StreamMsg::Command { sequenced, .. } = message.as_ref()
+                    && let Command::Prices { market, quotes } = &sequenced.cmd
+                {
+                    quotes.iter().for_each(|quote| {
+                        missing.remove(&(*market, quote.source.clone()));
+                    });
+                }
             }
+        };
+        timeout(WAIT, arrivals).await.expect("a quote from every venue in time");
+    }
+
+    /// Buys in both markets and checks each fills at the venues' shared mid.
+    async fn assert_both_markets_fill(&self) {
+        for (market, (_, _, mid)) in [(1, BTC), (2, ETH)] {
+            let events = self.buy(market, mid).await;
+            let fill = events.iter().find_map(|event| if let Event::Fill(fill) = event { Some(fill) } else { None });
+            let fill = fill.unwrap_or_else(|| panic!("market {market} did not fill: {events:?}"));
+            assert_eq!(fill.index, mid.parse().unwrap());
         }
     }
 
@@ -146,20 +163,18 @@ impl Node {
     }
 }
 
-/// Starts `venue`'s feed into `node`. With `serve`, a loopback venue streams it fresh quotes;
-/// without, its URL points at a port nothing listens on.
-async fn start_venue(node: &Node, venue: Venue, serve: Option<fn(TcpListener) -> JoinHandle<()>>) {
+/// Starts `venue`'s feed into `node` against a loopback venue that `serve` runs, and returns the
+/// venue's task: aborting it takes the venue down.
+async fn start_venue(node: &Node, venue: Venue, serve: fn(TcpListener) -> JoinHandle<()>) -> JoinHandle<()> {
     let symbols: [(MarketId, &str); 2] = match venue {
         Venue::Bitstamp => [(1, "btcusd"), (2, "ethusd")],
         Venue::Coinbase => [(1, "BTC-USD"), (2, "ETH-USD")],
         Venue::Kraken => [(1, "BTC/USD"), (2, "ETH/USD")],
     };
     let (listener, url) = listen().await;
-    match serve {
-        Some(serve) => drop(serve(listener)),
-        None => drop(listener),
-    }
+    let server = serve(listener);
     spawn_feed_into(node.tx.clone(), venue, &url, &symbols, fast(WAIT));
+    server
 }
 
 /// Serves Kraken tickers for both markets every 20ms, stamped now.

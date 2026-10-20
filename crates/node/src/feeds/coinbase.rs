@@ -90,7 +90,8 @@ impl Books {
     /// Applies `level2` events and returns the top of each changed product's book, stamped with
     /// the latest event time applied to it. A product whose book has an empty side has no top.
     /// Error cases:
-    /// - the events do not parse, an event type or side is unknown, or a quantity is negative
+    /// - the events do not parse, an event type or side is unknown, a price level is outside the
+    ///   valid input range, or a quantity is negative
     /// - an update arrives for a product with no snapshot, or an event has no updates
     fn apply(&mut self, events: &str) -> Result<Vec<Book>, String> {
         let events: Vec<Event> = serde_json::from_str(events).map_err(|e| format!("bad level2 events: {e}"))?;
@@ -122,6 +123,9 @@ impl Books {
                 "offer" => &mut depth.offers,
                 other => return Err(format!("unknown side {other}")),
             };
+            if !update.price_level.is_valid_input() {
+                return Err(format!("{product_id} price level {} out of range", update.price_level));
+            }
             if update.new_quantity.is_negative() {
                 return Err(format!("{product_id} negative quantity {}", update.new_quantity));
             }
@@ -246,6 +250,12 @@ mod tests {
             UPDATE.replace(r#""price_level":"2341.14""#, r#""price_level":"2341.1.4""#),
             UPDATE.replace(r#""side":"bid""#, r#""side":"ask""#),
             UPDATE.replace(r#""new_quantity":"0.001""#, r#""new_quantity":"-0.001""#),
+            // A level below the top that no working venue could quote, set or removed.
+            UPDATE.replace(r#""price_level":"2306.03""#, r#""price_level":"-1""#),
+            UPDATE.replace(
+                r#""price_level":"2306.03","new_quantity":"0.001""#,
+                r#""price_level":"0","new_quantity":"0""#,
+            ),
             UPDATE.replace("2026-10-20T09:51:15.761244Z", "later"),
             UPDATE.replace(r#""type":"update""#, r#""type":"delta""#),
             UPDATE.replace(r#""product_id":"ETH-USD""#, r#""product_id":"BTC-USD""#),

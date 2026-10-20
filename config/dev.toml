@@ -50,6 +50,7 @@ mock_mids = [
 timeout = "10s"
 reconnect_min = "500ms"
 reconnect_max = "30s"
+stale_after = "1s"
 
 [[feeds.venues.connections]]
 venue = "coinbase"

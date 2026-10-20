@@ -74,7 +74,8 @@ pub(super) struct Book {
     pub ts: Millis,
 }
 
-/// How often a venue task sequences quotes, and how it times out and reconnects.
+/// How often a venue task sequences quotes, how it times out and reconnects, and how old a quote
+/// may be and still count as the venue quoting.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     /// The most often one market's latest quote is sequenced.
@@ -82,6 +83,7 @@ pub struct Timing {
     pub timeout: Duration,
     pub reconnect_min: Duration,
     pub reconnect_max: Duration,
+    pub stale_after: Duration,
 }
 
 /// One venue's feed task and the alert state that outlives each connection.
@@ -92,11 +94,11 @@ struct VenueFeed {
     timing: Timing,
     tls: Arc<ClientConfig>,
     tx: mpsc::Sender<Request>,
-    /// Whether the venue is in an alerted outage that no quote has ended yet.
+    /// Whether the venue is in an alerted outage that no fresh quote has ended yet.
     down: bool,
-    /// Whether the current connection has delivered a quote.
+    /// Whether the current connection has sequenced a fresh quote.
     quoted: bool,
-    /// When each market last got a quote on the current connection.
+    /// When each market last had a fresh quote sequenced on the current connection.
     last_quote: BTreeMap<MarketId, Instant>,
     /// Markets alerted as silent that have not quoted since.
     silent: BTreeSet<MarketId>,
@@ -112,6 +114,7 @@ impl Timing {
             timeout: venues.timeout,
             reconnect_min: venues.reconnect_min,
             reconnect_max: venues.reconnect_max,
+            stale_after: venues.stale_after,
         }
     }
 }
@@ -135,6 +138,12 @@ impl Adapter {
         }
     }
 
+    /// Whether the adapter keeps state built from earlier messages, so a refused book means that
+    /// state can no longer be trusted.
+    fn keeps_state(&self) -> bool {
+        matches!(self, Adapter::Coinbase(_))
+    }
+
     /// Reads one venue message.
     /// Error cases:
     /// - the message is not one the venue's protocol defines, a field fails to parse, or the
@@ -151,7 +160,7 @@ impl Adapter {
 
 impl VenueFeed {
     /// Connects and relays until the connection fails, then retries after a backoff that doubles
-    /// while attempts deliver no quote and resets once one does.
+    /// while attempts sequence no fresh quote and resets once one does.
     /// Error cases:
     /// - the sequencer has gone away
     async fn run(mut self) -> anyhow::Result<()> {
@@ -172,7 +181,8 @@ impl VenueFeed {
     }
 
     /// One connection: connect, subscribe, then read messages and sequence the latest quote per
-    /// market every `timing.interval`.
+    /// market every `timing.interval`. A quote no older than `timing.stale_after` when sequenced
+    /// counts as the venue quoting that market.
     /// Error cases:
     /// - connecting or subscribing fails or takes longer than `timing.timeout`
     /// - the venue sends nothing for `timing.timeout`, closes, or asks for a reconnect
@@ -198,6 +208,7 @@ impl VenueFeed {
         let mut pending: BTreeMap<MarketId, SourceQuote> = BTreeMap::new();
         let mut flush = interval_at(subscribed + self.timing.interval, self.timing.interval);
         flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let stale_after = Millis::try_from(self.timing.stale_after.as_millis()).unwrap_or(Millis::MAX);
         let mut deadline = Instant::now() + self.timing.timeout;
         loop {
             tokio::select! {
@@ -211,9 +222,14 @@ impl VenueFeed {
                     }
                 }
                 _ = flush.tick() => {
+                    let now = now_ms();
                     for (market, quote) in std::mem::take(&mut pending) {
+                        let fresh = now.saturating_sub(quote.ts) <= stale_after;
                         let cmd = Command::Prices { market, quotes: vec![quote] };
                         self.tx.send(Request::Submit { cmd, reply: None }).await.map_err(|_| anyhow!("sequencer gone"))?;
+                        if fresh {
+                            self.delivered(market);
+                        }
                     }
                     self.check_silent();
                 }
@@ -224,7 +240,8 @@ impl VenueFeed {
 
     /// Reads one text message into `pending`, refusing what does not parse or check.
     /// Error cases:
-    /// - the venue asked for a reconnect, or the adapter's state no longer matches the venue's
+    /// - the venue asked for a reconnect, or the adapter's state no longer matches the venue's,
+    ///   including a refused book from an adapter that keeps state
     fn receive(
         &mut self,
         adapter: &mut Adapter,
@@ -249,7 +266,10 @@ impl VenueFeed {
             match to_quote(self.conn.venue, &self.markets, book, now) {
                 Ok((market, quote)) => {
                     pending.insert(market, quote);
-                    self.accepted(market);
+                }
+                Err(reason) if adapter.keeps_state() => {
+                    self.refuse(&reason, text);
+                    bail!("resyncing: {reason}");
                 }
                 Err(reason) => self.refuse(&reason, text),
             }
@@ -257,8 +277,8 @@ impl VenueFeed {
         Ok(())
     }
 
-    /// Records a quote for `market`, ending any outage or silence it was in.
-    fn accepted(&mut self, market: MarketId) {
+    /// Records a fresh quote sequenced for `market`, ending any outage or silence it was in.
+    fn delivered(&mut self, market: MarketId) {
         let venue = self.conn.venue.name();
         self.quoted = true;
         self.last_quote.insert(market, Instant::now());
@@ -271,15 +291,18 @@ impl VenueFeed {
         }
     }
 
-    /// Alerts once for each symbol that has gone `timing.timeout` without a quote on this
-    /// connection, such as one the venue accepted but never publishes.
+    /// Alerts once for each symbol that has gone `timing.timeout` without a fresh quote sequenced on
+    /// this connection: one the venue accepted but never publishes, or whose quotes arrive stale.
     fn check_silent(&mut self) {
         let venue = self.conn.venue.name();
         let now = Instant::now();
         for (symbol, market) in &self.markets {
             let quiet = self.last_quote.get(market).is_some_and(|at| now.duration_since(*at) >= self.timing.timeout);
             if quiet && self.silent.insert(*market) {
-                warn!(alert = "venue_symbol_silent", venue, symbol, market, "no quote for {:?}", self.timing.timeout);
+                warn!(
+                    alert = "venue_symbol_silent",
+                    venue, symbol, market, "no fresh quote for {:?}", self.timing.timeout
+                );
             }
         }
     }
@@ -299,8 +322,8 @@ impl VenueFeed {
         self.last_refusal_alert = Some(now);
     }
 
-    /// Logs a lost connection. A connection that delivered quotes is a routine drop; one that
-    /// delivered none starts an outage, alerted once until a quote ends it.
+    /// Logs a lost connection. A connection that sequenced fresh quotes is a routine drop; one that
+    /// sequenced none starts an outage, alerted once until a fresh quote ends it.
     fn dropped(&mut self, error: &anyhow::Error, retry_in: Duration) {
         let venue = self.conn.venue.name();
         if self.quoted {

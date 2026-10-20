@@ -23,8 +23,9 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `engine replay` to verify a published log, or a downloaded archive, against the open-source engine
 - Supervised tasks: any task stopping stops the node, and SIGTERM drains to a final checkpoint
 - Live crypto prices from Coinbase, Kraken, and Bitstamp over WebSocket: one supervised task per
-  venue, quotes stamped with the venue's own time, reconnects with backoff, and an alert for every
-  refused message, outage, or silent symbol
+  venue, quotes stamped with the venue's own time, and reconnects with backoff
+- Alerts for refused venue messages (at most one a minute per venue, counting the rest), venue
+  outages, and symbols with no fresh quote
 - Mock custody and a mock price feed for local development
 
 ## Repository Structure

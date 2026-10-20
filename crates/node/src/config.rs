@@ -144,17 +144,26 @@ pub struct FeedsSection {
     pub venues: Option<VenuesSection>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Live venue feeds.
+///
+/// TODO: this file comes from host storage, so the host chooses the venues and the symbol each
+/// market reads; the attestation must bind the config's hash before that choice is verifiable.
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VenuesSection {
-    /// Deadline to connect and subscribe, and the longest a connection may stay silent.
+    /// Deadline to connect and subscribe, the longest a connection may stay silent, and the
+    /// longest a symbol may go without a fresh quote before it is alerted.
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
-    /// The first reconnect delay; it doubles after each attempt that delivers no quote.
+    /// The first reconnect delay; it doubles after each attempt that sequences no fresh quote.
     #[serde(with = "humantime_serde")]
     pub reconnect_min: Duration,
     #[serde(with = "humantime_serde")]
     pub reconnect_max: Duration,
+    /// A quote older than this when sequenced does not count as its venue quoting: it ends no
+    /// outage or silence. Keep it at or below the markets' `max_age_ms`.
+    #[serde(with = "humantime_serde")]
+    pub stale_after: Duration,
     pub connections: Vec<VenueConnection>,
 }
 
@@ -162,8 +171,9 @@ pub struct VenuesSection {
 #[serde(deny_unknown_fields)]
 pub struct VenueConnection {
     pub venue: Venue,
-    /// The venue's public endpoint. Must be `wss://`: the host controls the network, so a
-    /// plaintext feed would let it forge prices.
+    /// The venue's public endpoint: `wss://` on the venue's own domain. The host controls the
+    /// network, so plaintext would let it forge prices, and TLS alone proves only the server's
+    /// name, not that it is the venue the quotes are labelled with.
     pub url: String,
     pub symbols: Vec<VenueSymbol>,
 }
@@ -208,6 +218,21 @@ impl Venue {
             Venue::Coinbase => "coinbase",
             Venue::Kraken => "kraken",
         }
+    }
+
+    /// The domain this venue's endpoints are served under.
+    pub fn domain(self) -> &'static str {
+        match self {
+            Venue::Bitstamp => "bitstamp.net",
+            Venue::Coinbase => "coinbase.com",
+            Venue::Kraken => "kraken.com",
+        }
+    }
+
+    /// Whether `host` is the venue's domain or one of its subdomains.
+    fn serves(self, host: &str) -> bool {
+        let domain = self.domain();
+        host.strip_suffix(domain).is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
     }
 }
 
@@ -295,12 +320,16 @@ impl VenuesSection {
     /// Checks the values that would otherwise fail silently: a venue quoting twice under one
     /// source name, a symbol that could mean two markets, or a feed the host could forge.
     /// Error cases:
-    /// - `timeout` or `reconnect_min` is zero, or `reconnect_min` exceeds `reconnect_max`
+    /// - `timeout`, `reconnect_min`, or `stale_after` is zero, or `reconnect_min` exceeds
+    ///   `reconnect_max`
     /// - no connections, a venue listed twice, or a connection with no symbols
-    /// - a URL that does not parse as `wss://` with a host
+    /// - a URL that does not parse as `wss://` with a host on the venue's own domain
     /// - a market or symbol listed twice on one connection
     fn validate(&self) -> anyhow::Result<()> {
-        ensure!(!self.timeout.is_zero() && !self.reconnect_min.is_zero(), "timeout and reconnect_min must be non-zero");
+        ensure!(
+            !self.timeout.is_zero() && !self.reconnect_min.is_zero() && !self.stale_after.is_zero(),
+            "timeout, reconnect_min, and stale_after must be non-zero"
+        );
         ensure!(self.reconnect_min <= self.reconnect_max, "reconnect_min exceeds reconnect_max");
         ensure!(!self.connections.is_empty(), "no connections");
         let mut venues = BTreeSet::new();
@@ -308,7 +337,9 @@ impl VenuesSection {
             let name = conn.venue.name();
             ensure!(venues.insert(conn.venue), "{name} is listed twice");
             let uri: Uri = conn.url.parse().with_context(|| format!("{name} url"))?;
-            ensure!(uri.scheme_str() == Some("wss") && uri.host().is_some(), "{name} url must be wss:// with a host");
+            ensure!(uri.scheme_str() == Some("wss"), "{name} url must be wss://");
+            let domain = conn.venue.domain();
+            ensure!(uri.host().is_some_and(|host| conn.venue.serves(host)), "{name} url must be on {domain}");
             ensure!(!conn.symbols.is_empty(), "{name} has no symbols");
             let mut markets = BTreeSet::new();
             let mut symbols = BTreeSet::new();
@@ -428,13 +459,17 @@ mod tests {
     #[test]
     fn venue_settings_that_would_fail_silently_are_refused() {
         type Edit = fn(&mut VenuesSection);
-        let cases: [(&str, Edit); 9] = [
+        let cases: [(&str, Edit); 13] = [
             ("non-zero", |v| v.timeout = Duration::ZERO),
             ("non-zero", |v| v.reconnect_min = Duration::ZERO),
+            ("non-zero", |v| v.stale_after = Duration::ZERO),
             ("exceeds reconnect_max", |v| v.reconnect_max = v.reconnect_min / 2),
             ("no connections", |v| v.connections.clear()),
             ("coinbase is listed twice", |v| v.connections.push(v.connections[0].clone())),
             ("must be wss://", |v| v.connections[0].url = "ws://advanced-trade-ws.coinbase.com".into()),
+            ("must be on coinbase.com", |v| v.connections[0].url = "wss://ws.kraken.com/v2".into()),
+            ("must be on coinbase.com", |v| v.connections[0].url = "wss://coinbase.com.example.net".into()),
+            ("must be on coinbase.com", |v| v.connections[0].url = "wss://evilcoinbase.com".into()),
             ("has no symbols", |v| v.connections[0].symbols.clear()),
             ("lists market 1 twice", |v| v.connections[0].symbols[1].market = 1),
             ("lists symbol BTC-USD twice", |v| v.connections[0].symbols[1].symbol = "BTC-USD".into()),

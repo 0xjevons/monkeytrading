@@ -81,6 +81,7 @@ pub fn fast(timeout: Duration) -> Timing {
         timeout,
         reconnect_min: Duration::from_millis(10),
         reconnect_max: Duration::from_millis(40),
+        stale_after: Duration::from_secs(1),
     }
 }
 
