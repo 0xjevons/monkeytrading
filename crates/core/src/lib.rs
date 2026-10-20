@@ -8,8 +8,8 @@
 //!   positions pay fixed-bps size spreads, which widen under stress.
 //! - Losers pay nothing; winners pay a flat fee on realised profit. Positions held overnight pay
 //!   or receive CFD financing.
-//! - Margin is shared across the account at professional-client leverage, with close-out at 50%
-//!   and negative balance protection.
+//! - Margin is shared across the account at professional-client leverage, with close-out at 50% and
+//!   negative balance protection.
 //! - RWA markets keep venue hours; nothing fills while a market is closed.
 
 pub mod account;

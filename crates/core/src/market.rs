@@ -21,8 +21,8 @@ pub struct MarketSpec {
     pub symbol: String,
     pub asset_class: AssetClass,
     pub schedule: Schedule,
-    /// Margin bands by position notional (USD): each band's
-    /// rate applies to the slice of notional inside it.
+    /// Margin bands by position notional (USD): each band's rate applies to the slice of notional
+    /// inside it.
     pub margin_tiers: Vec<Tier>,
     /// Size spread bands. Spread is charged only on the slice of a trade that grows the account's
     /// absolute position notional through each band, so normal size pays zero and splitting a
