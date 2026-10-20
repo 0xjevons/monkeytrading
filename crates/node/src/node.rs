@@ -80,10 +80,11 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         chain_id: cfg.custody.chain_id,
         vault,
         clock: now_ms,
+        client_auth: client_auth.clone(),
     };
     let mut seq = Sequencer::recover(seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
-    seq.activate_protocol(&client_auth)
+    seq.activate_protocol()
         .inspect_err(|e| error!(alert = "protocol_activation_failed", "refusing to serve: {e:#}"))?;
     if seq.needs_genesis() {
         info!(markets = cfg.genesis.markets.len(), "sequencing genesis");

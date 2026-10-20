@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use engine_core::auth::ClientAuth;
 use engine_core::command::Command;
 use engine_core::event::{CancelReason, Event, Fill, Reject};
 use engine_core::price::PriceError;
@@ -109,6 +110,7 @@ pub fn sequencer_config(dir: &Path, manifest: watch::Sender<Manifest>) -> Sequen
         chain_id: 31337,
         vault: AccountId([0; 20]),
         clock: now_ms,
+        client_auth: ClientAuth::Unsigned,
     }
 }
 

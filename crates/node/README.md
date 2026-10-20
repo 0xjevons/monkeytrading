@@ -40,8 +40,9 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/api/mod.rs` — REST routes, request signature checks, and the request span
 - `src/api/stream.rs` — the WebSocket stream: backfill from disk, then live
 - `src/api/archive.rs` — the archive routes: the manifest and completed segments
-- `src/api/tests.rs` — API tests, including signed requests and the resumable stream and archive
-  dev scenario
+- `src/api/auth_tests.rs` — signed-request API tests: signatures, nonces, expiries, refused
+  accounts, and racing requests
+- `src/api/tests.rs` — API tests, including the resumable stream and archive dev scenario
 - `src/test_support.rs` — the shared test harness
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
 - `src/config.rs` — the node config schema and validation
@@ -51,7 +52,8 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
 - `tests/reference_logs.rs` — replays every committed node reference log, events included
 - `tests/reference/` — one node-format reference log per protocol version, never regenerated
-- `tests/replay.rs` — replays a log the node wrote before protocol versions, kept in `tests/fixtures/`
+- `tests/replay.rs` — replays a log the node wrote before protocol versions, kept in
+  `tests/fixtures/`
 
 ## Usage
 

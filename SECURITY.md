@@ -73,9 +73,11 @@ unsigned requests, exist for local testing and make no security claims of their 
 does `POST /v1/dev/deposit`, which the node serves only with mock custody. A weakness in them is in
 scope when a production configuration can reach it, or when whoever runs an attested enclave can
 switch them on, since the node reads its configuration from the machine it runs on. A production
-configuration uses hardware attestation, on-chain custody, live prices, and signed requests, and
-none of these is finished: the node can request an attestation report through configfs-tsm, but
-attestation on SEV-SNP hardware and a verifier for it are still being built, as are the other three.
+configuration uses hardware attestation, on-chain custody, live prices, and signed requests.
+Requests are signed, and the node refuses unsigned ones unless both the enclave and custody are
+mocks. The other three are not finished: the node can request an attestation report through
+configfs-tsm, but attestation on SEV-SNP hardware and a verifier for it are still being built, as
+are on-chain custody and live prices.
 
 Out of scope are volumetric denial of service, meaning attacks that work only by flooding the API or
 the network with traffic; social engineering of anyone involved with the project; and
@@ -91,15 +93,16 @@ with a check, and whoever runs it cannot alter the published log without detecti
 sign a state its rules do not produce, act for an account without its owner's signature, credit an
 account with funds that no deposit brought in, or pay out funds the engine did not approve. A
 finding that breaks one of these guarantees, or gets past one of those checks, is in scope even when
-it starts from an operator's key. Some of the checks behind them are still being built:
-`engine replay` does not yet verify checkpoint signatures; the node does not yet check the log it
-recovers from against anything its host cannot rewrite, so it accepts a truncated or rewritten one;
-the sequencer does not yet bound how far its host's clock may drift; the enclave's signing key does
-not yet survive a restart; requests are not yet signed; and the node does not yet refuse its
-development settings when it runs with hardware attestation, whose report vouches for the signing
-key but not for the configuration. A gap that this policy, an open issue, or a `TODO` in the code
-already records is known, so a report of it is not a new finding, though its details stay private
-under the disclosure timeline above; a way around a check that exists is a new finding.
+it starts from an operator's key. Some of the checks behind them are still being built: `engine
+replay` does not yet verify checkpoint signatures; the node does not yet check the log it recovers
+from against anything its host cannot rewrite, so it accepts a truncated or rewritten one; the
+sequencer does not yet bound how far its host's clock may drift; the enclave's signing key does not
+yet survive a restart; and the node refuses unsigned requests unless both the enclave and custody
+are mocks, but does not yet refuse mock custody or simulated prices when it runs with hardware
+attestation, whose report vouches for the signing key but not for the configuration. A gap that this
+policy, an open issue, or a `TODO` in the code already records is known, so a report of it is not a
+new finding, though its details stay private under the disclosure timeline above; a way around a
+check that exists is a new finding.
 
 ## Supported versions
 

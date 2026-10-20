@@ -252,10 +252,15 @@ impl Node {
         let (stream, _) = broadcast::channel(1024);
         let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
         let (manifest_tx, manifest) = watch::channel(Manifest::default());
-        let cfg =
-            SequencerConfig { chain_id: CHAIN_ID, vault: VAULT, clock: || NOW, ..sequencer_config(&dir, manifest_tx) };
+        let cfg = SequencerConfig {
+            chain_id: CHAIN_ID,
+            vault: VAULT,
+            clock: || NOW,
+            client_auth: auth.clone(),
+            ..sequencer_config(&dir, manifest_tx)
+        };
         let mut seq = Sequencer::recover(cfg, key.clone(), stream.clone(), withdrawals_tx).unwrap();
-        seq.activate_protocol(&auth).unwrap();
+        seq.activate_protocol().unwrap();
         seq.genesis(&dev_config().genesis).unwrap();
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(seq.run(rx));

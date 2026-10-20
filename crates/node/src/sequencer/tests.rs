@@ -230,8 +230,8 @@ async fn replay_refuses_a_checkpoint_after_an_approval_whose_signed_entry_is_mis
 #[test]
 fn a_fresh_log_records_client_auth_and_activates_the_latest_version_before_genesis() {
     let dir = scratch_dir("activation-fresh");
-    let mut seq = recover(&dir);
-    seq.activate_protocol(&signed(31_337)).unwrap();
+    let mut seq = recover(&dir, &signed(31_337));
+    seq.activate_protocol().unwrap();
     seq.genesis(&dev_config().genesis).unwrap();
     let entries = entries(&dir);
     let cmds = commands(&entries);
@@ -248,7 +248,7 @@ fn an_existing_v1_log_activates_at_its_next_seq_and_still_verifies() {
     fs::create_dir_all(&dir).unwrap();
     // A log written as one file before segments existed continues as the first segment.
     fs::copy(V1_DEV, dir.join("00000000000000000000.jsonl")).unwrap();
-    recover(&dir).activate_protocol(&signed(31_337)).unwrap();
+    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
     // The original 63 commands and 3 checkpoints, then the activation and its checkpoint.
     let replayed = replay(&entries(&dir)).unwrap();
     assert_eq!((replayed.commands, replayed.checkpoints), (65, 4));
@@ -258,9 +258,9 @@ fn an_existing_v1_log_activates_at_its_next_seq_and_still_verifies() {
 #[test]
 fn a_restart_with_the_recorded_client_auth_sequences_nothing() {
     let dir = scratch_dir("activation-restart");
-    recover(&dir).activate_protocol(&signed(31_337)).unwrap();
+    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
     let written = entries(&dir).len();
-    recover(&dir).activate_protocol(&signed(31_337)).unwrap();
+    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
     assert_eq!(entries(&dir).len(), written);
 }
 
@@ -269,21 +269,21 @@ fn a_genesis_cut_short_runs_again_on_restart() {
     let genesis = dev_config().genesis;
     for (name, partial) in [("after-activation", vec![]), ("mid-genesis", vec![genesis.params.clone()])] {
         let dir = scratch_dir(&format!("genesis-{name}"));
-        let mut seq = recover(&dir);
-        seq.activate_protocol(&signed(31_337)).unwrap();
+        let mut seq = recover(&dir, &signed(31_337));
+        seq.activate_protocol().unwrap();
         let partial = partial.into_iter().map(|params| Command::Admin(AdminCommand::SetParams(params))).collect();
         seq.sequence_required(partial).unwrap();
         drop(seq);
 
-        let mut seq = recover(&dir);
+        let mut seq = recover(&dir, &signed(31_337));
         assert!(seq.needs_genesis(), "{name}");
-        seq.activate_protocol(&signed(31_337)).unwrap();
+        seq.activate_protocol().unwrap();
         seq.genesis(&genesis).unwrap();
         drop(seq);
         let replayed = replay(&entries(&dir)).unwrap();
         assert_eq!(replayed.engine.markets().len(), genesis.markets.len(), "{name}");
         assert_eq!(replayed.engine.house_cash(), genesis.house_capital, "{name}");
-        assert!(!recover(&dir).needs_genesis(), "{name}");
+        assert!(!recover(&dir, &signed(31_337)).needs_genesis(), "{name}");
     }
 }
 
@@ -291,25 +291,49 @@ fn a_genesis_cut_short_runs_again_on_restart() {
 fn a_log_holding_only_client_auth_activates_on_restart() {
     let dir = scratch_dir("activation-auth-only");
     let auth = Command::Admin(AdminCommand::SetClientAuth(signed(31_337)));
-    recover(&dir).sequence_required(vec![auth.clone()]).unwrap();
-    recover(&dir).activate_protocol(&signed(31_337)).unwrap();
+    recover(&dir, &signed(31_337)).sequence_required(vec![auth.clone()]).unwrap();
+    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
     let written = entries(&dir);
     assert_eq!(commands(&written).iter().filter(|cmd| **cmd == auth).count(), 1);
     assert_eq!(replay(&written).unwrap().engine.protocol_version(), ProtocolVersion::LATEST);
-    recover(&dir).activate_protocol(&signed(31_337)).unwrap();
+    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
     assert_eq!(entries(&dir).len(), written.len());
 }
 
 #[test]
 fn a_log_recording_other_client_auth_refuses_to_start_and_writes_nothing() {
     let dir = scratch_dir("activation-mismatch");
-    recover(&dir).activate_protocol(&signed(31_337)).unwrap();
+    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
     let written = entries(&dir).len();
     for other in [ClientAuth::Unsigned, signed(1)] {
-        let err = recover(&dir).activate_protocol(&other).unwrap_err();
+        let err = try_recover(&dir, &other).0.err().unwrap();
         assert!(format!("{err:#}").contains("the log records client auth"), "{err:#}");
     }
     assert_eq!(entries(&dir).len(), written);
+}
+
+#[test]
+fn a_restart_under_other_client_auth_signs_no_withdrawal_the_log_ends_before() {
+    let dir = scratch_dir("activation-mismatch-withdrawal");
+    let mut seq = recover(&dir, &ClientAuth::Unsigned);
+    seq.activate_protocol().unwrap();
+    seq.genesis(&dev_config().genesis).unwrap();
+    seq.sequence(deposit(100, "dep-1")).unwrap();
+    seq.sequence(withdraw(40)).unwrap();
+    seq.flush().unwrap();
+    drop(seq);
+    // As if the process died after the withdraw command's line reached disk and before the rest.
+    let segment = last_segment(&dir);
+    let text = fs::read_to_string(&segment).unwrap();
+    let command = text.find(r#""cmd":{"type":"withdraw""#).unwrap();
+    let cut = &text[..command + text[command..].find('\n').unwrap() + 1];
+    fs::write(&segment, cut).unwrap();
+
+    let (recovered, mut withdrawals) = try_recover(&dir, &signed(31_337));
+    let err = recovered.err().unwrap();
+    assert!(format!("{err:#}").contains("the log records client auth"), "{err:#}");
+    assert!(withdrawals.try_recv().is_err(), "a withdrawal was signed under the other chain and vault");
+    assert_eq!(fs::read_to_string(&segment).unwrap(), cut);
 }
 
 // ── Helpers ──
@@ -330,12 +354,21 @@ fn signed(chain_id: u64) -> ClientAuth {
     ClientAuth::Eip712 { chain_id, vault: AccountId([0xaa; 20]) }
 }
 
-/// A sequencer recovered from the log in `dir`, with a fresh enclave key.
-fn recover(dir: &Path) -> Sequencer {
+/// A sequencer recovered from the log in `dir` under `client_auth`, with a fresh enclave key.
+fn recover(dir: &Path, client_auth: &ClientAuth) -> Sequencer {
+    try_recover(dir, client_auth).0.unwrap()
+}
+
+/// `recover`'s result, and what custody would receive from it.
+fn try_recover(
+    dir: &Path,
+    client_auth: &ClientAuth,
+) -> (anyhow::Result<Sequencer>, mpsc::UnboundedReceiver<SignedWithdrawal>) {
     let (stream, _) = broadcast::channel(16);
-    let (withdrawals, _) = mpsc::unbounded_channel();
+    let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
     let (manifest, _) = watch::channel(Manifest::default());
-    Sequencer::recover(sequencer_config(dir, manifest), Arc::new(EnclaveKey::generate()), stream, withdrawals).unwrap()
+    let cfg = SequencerConfig { client_auth: client_auth.clone(), ..sequencer_config(dir, manifest) };
+    (Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, withdrawals_tx), withdrawals)
 }
 
 /// Every entry of the log in `dir`.

@@ -76,6 +76,7 @@ pub struct Sequencer {
     withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     outbox: Vec<Arc<StreamMsg>>,
     clock: fn() -> Millis,
+    client_auth: ClientAuth,
 }
 
 pub struct SequencerConfig<'a> {
@@ -88,6 +89,8 @@ pub struct SequencerConfig<'a> {
     pub vault: AccountId,
     /// The clock commands are stamped with.
     pub clock: fn() -> Millis,
+    /// The client auth the config gives, which a log that records one must match.
+    pub client_auth: ClientAuth,
 }
 
 /// The result of replaying a log.
@@ -123,6 +126,7 @@ impl Sequencer {
     /// Error cases:
     /// - the log cannot be read, or fails its manifest check (see `SegmentedLog::open`) or replay
     ///   (see `replay`)
+    /// - the log records a client auth other than the config's
     /// - the log cannot be opened for appending, or written
     pub fn recover(
         cfg: SequencerConfig<'_>,
@@ -132,6 +136,11 @@ impl Sequencer {
     ) -> anyhow::Result<Self> {
         let log = SegmentedLog::open(cfg.log_dir)?;
         let Replayed { engine, commands, checkpoints, unsigned, .. } = replay(&log.entries)?;
+        // A config naming another client auth, and so another chain or vault, is the wrong one for
+        // this log: refuse before anything is written or signed under it.
+        if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
+            bail!("the log records client auth {recorded:?}, but the config gives {:?}", cfg.client_auth);
+        }
         let last_offset = log::last_offset(&log.entries)?;
         info!(commands, checkpoints, "recovered from log");
         let mut sequencer = Self {
@@ -149,6 +158,7 @@ impl Sequencer {
             withdrawals,
             outbox: Vec::new(),
             clock: cfg.clock,
+            client_auth: cfg.client_auth,
         };
         for (account, amount, nonce) in unsigned {
             let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
@@ -165,19 +175,16 @@ impl Sequencer {
         !self.engine.is_credited(GENESIS_REF)
     }
 
-    /// Records `client_auth` and activates the latest protocol version, whichever the log lacks,
-    /// then checkpoints. Both run at the log's next seq, so earlier commands keep the rules they
-    /// ran under.
+    /// Records the config's client auth and activates the latest protocol version, whichever the
+    /// log lacks, then checkpoints. Both run at the log's next seq, so earlier commands keep the
+    /// rules they ran under. `recover` has already refused a log that records other client auth.
     /// Error cases:
-    /// - the log records a client auth other than `client_auth`
     /// - the engine rejects either command
     /// - the log cannot be written
-    pub fn activate_protocol(&mut self, client_auth: &ClientAuth) -> anyhow::Result<()> {
+    pub fn activate_protocol(&mut self) -> anyhow::Result<()> {
         let mut cmds = Vec::new();
-        match self.engine.client_auth() {
-            None => cmds.push(Command::Admin(AdminCommand::SetClientAuth(client_auth.clone()))),
-            Some(recorded) if recorded == client_auth => {}
-            Some(recorded) => bail!("the log records client auth {recorded:?}, but the config gives {client_auth:?}"),
+        if self.engine.client_auth().is_none() {
+            cmds.push(Command::Admin(AdminCommand::SetClientAuth(self.client_auth.clone())));
         }
         if self.engine.protocol_version() < ProtocolVersion::LATEST {
             cmds.push(Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }));
