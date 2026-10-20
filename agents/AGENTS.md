@@ -24,7 +24,9 @@ an index: load only the rule whose hint matches the current action.
   boot. Every section rejects unknown keys.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate.
 - **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, and `cargo-deny`, on
-  every push to `main` and every PR. Actions are pinned by commit SHA.
+  every push to `main` and every PR. Actions are pinned by commit SHA. `ci-passed` is the one check
+  branch rules require: it passes only when every other job succeeded, so each new job must be
+  added to its `needs`.
 - **agents/** — this index, `rules/`, and `skills/` (incl. `skills/vendor/` pull-on-demand
   packs); root `AGENTS.md` / `CLAUDE.md` symlink to `agents/AGENTS.md`.
 - **Cargo.toml** — workspace manifest, shared dependencies, and the Cargo profiles (release keeps
