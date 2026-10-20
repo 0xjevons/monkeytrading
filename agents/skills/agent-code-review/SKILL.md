@@ -87,10 +87,9 @@ diff. Walk every applicable section of the development checklist in order, desig
 each finding with the severity guide. In current-agent mode, re-check each accepted finding against
 its source before writing the final report.
 
-On a later round over the same branch or PR, the current agent also reads the `fixes.md`
-([Fixing an accepted finding](#fixing-an-accepted-finding)) of every earlier run whose `scope.md`
-names that branch or PR, and checks that each recorded invariant holds across the new diff; a site
-where one fails is a finding.
+When the branch under review — in PR scope, the PR's head branch — has fix notes in this checkout
+([Fixing an accepted finding](#fixing-an-accepted-finding)), the current agent also checks that
+each invariant they record holds across the diff; a site where one fails is a finding.
 
 ## Final report
 
@@ -166,15 +165,17 @@ fixes its class, not only the cited instance:
    state.
 3. **Test the class.** Add a test that covers the class, as a property or table test where one
    fits, not only the cited scenario, and mutation-check it as
-   [development-checklist](../../rules/development-checklist.md#13-tests) requires.
+   [development-checklist](../../rules/development-checklist.md#13-tests) requires. A finding no
+   test can cover, such as wording, skips this step.
 4. **Re-read the fix diff** before the next review round, against the finding's scenario and its
    neighbours, to check that the fix creates no mirror-image defect.
-5. **Record the invariant and the sites fixed** in the round's notes, so the next round checks the
-   class instead of rediscovering it: `fixes.md` in the run directory of the review that accepted
-   the finding, or, when addressing PR comments, the item's `Changes` and its reply.
+5. **Record the invariant and the sites fixed** in the branch's fix notes, the gitignored
+   `agents/.processes/fixes/<branch>.md` in the checkout, under a heading for the round, so every
+   later round checks the class instead of rediscovering it. A later fix that changes a recorded
+   invariant rewrites its entry.
 
-The next round still reviews the full diff; the recorded invariants add to what it checks and
-never narrow it.
+Every round still reviews the full diff; the recorded invariants add to what it checks and never
+narrow it.
 
 ## Non-negotiable rules
 

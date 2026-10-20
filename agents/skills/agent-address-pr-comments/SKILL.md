@@ -148,7 +148,8 @@ tags, headings, lists, code blocks, restating the comment, or AI signature.
 
 - Fix each `Fix` item by class, as
   [Fixing an accepted finding](../agent-code-review/SKILL.md#fixing-an-accepted-finding) says: its
-  invariant and the sites fixed go in the item's `Changes`, and its reply states the invariant.
+  invariant and the sites fixed go in the branch's fix notes and the item's `Changes`, and its reply
+  states the invariant.
 - Check every fix against the applicable sections of
   [development-checklist](../../rules/development-checklist.md): a fix must not open a new
   concurrency, crash-recovery, or test gap, and it must remove the failure, not just the flagged
@@ -175,7 +176,7 @@ Number every item and keep the numbers in later discussion:
 1. https://github.com/<org>/<repo>/pull/42#discussion_r3845829157
    Comment: A chain read can hang indefinitely.
    Severity: High — it blocks the update loop.
-   Changes: Added a per-call timeout to every chain read.
+   Changes: Every chain read is bounded — added a timeout to the block, log, and receipt reads.
    Reply: Fixed — every chain read is bounded, so a hung endpoint errors instead of stalling.
 ```
 
