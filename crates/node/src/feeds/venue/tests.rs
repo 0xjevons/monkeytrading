@@ -1,3 +1,6 @@
+use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
+
+use super::setup::next_backoff;
 use super::*;
 use crate::config::VenueSymbol;
 use crate::feeds::tests::fake::{WAIT, capture_alerts, fast, next_alert};
@@ -46,21 +49,60 @@ async fn clock_alerts_are_held_to_one_a_window() {
 }
 
 #[test]
-fn the_newest_quote_the_engine_can_use_is_sequenced() {
+fn the_newest_quote_the_host_clock_has_reached_is_taken_and_those_ahead_wait() {
     const NOW: Millis = 1_792_489_875_714;
     let at = |ts: Millis| SourceQuote { source: "kraken".into(), mid: Fixed::from_int(100), ts };
-    let received = |times: &[Millis]| times.iter().map(|ts| at(*ts)).collect::<VecDeque<_>>();
-    // A host clock a little behind the venue: the newest already reached is used, not the newest.
-    assert_eq!(select(&received(&[NOW - 300, NOW - 100, NOW + 40, NOW - 200]), NOW), Some(at(NOW - 100)));
-    assert_eq!(select(&received(&[NOW - 100, NOW]), NOW), Some(at(NOW)));
-    // Every quote ahead, as after the host clock is set back a little: the newest the engine
-    // takes goes, and it skips it rather than keep pricing from older quotes.
-    assert_eq!(select(&received(&[NOW + 50, NOW + 80, NOW + 60]), NOW), Some(at(NOW + 80)));
-    // Past the engine's lead, which it would refuse: nearer quotes only, or none.
-    let limit = NOW + MAX_QUOTE_LEAD_MS;
-    assert_eq!(select(&received(&[NOW + 50, limit, limit + 1]), NOW), Some(at(limit)));
-    assert_eq!(select(&received(&[limit + 1, limit + 60_000]), NOW), None);
-    assert_eq!(select(&VecDeque::new(), NOW), None);
+    let mut pending = Pending::default();
+    // Received over one tick from a venue whose clock is a little ahead of the host's.
+    for ts in [NOW - 300, NOW - 100, NOW + 400, NOW - 200, NOW + 40] {
+        assert_eq!(pending.add(at(ts), NOW), Ok(()));
+    }
+    assert_eq!(pending.take(NOW), Some(at(NOW - 100)));
+    assert_eq!(pending.take(NOW), None);
+    // Each quote ahead goes once the host clock reaches it.
+    assert_eq!(pending.take(NOW + 40), Some(at(NOW + 40)));
+    assert_eq!(pending.take(NOW + 1_000), Some(at(NOW + 400)));
+    assert_eq!(pending.take(NOW + 1_000), None);
+    // Of a quote that waited and one received after its time, the newer goes; on a tie, the later.
+    pending.add(at(NOW + 50), NOW).unwrap();
+    pending.add(SourceQuote { mid: Fixed::from_int(101), ..at(NOW + 50) }, NOW + 60).unwrap();
+    assert_eq!(pending.take(NOW + 60).map(|quote| quote.mid), Some(Fixed::from_int(101)));
+    pending.add(at(NOW + 70), NOW).unwrap();
+    pending.add(at(NOW + 80), NOW + 90).unwrap();
+    assert_eq!(pending.take(NOW + 90), Some(at(NOW + 80)));
+}
+
+#[test]
+fn a_quote_further_ahead_than_the_engine_takes_is_dropped() {
+    const NOW: Millis = 1_792_489_875_714;
+    let at = |ts: Millis| SourceQuote { source: "kraken".into(), mid: Fixed::from_int(100), ts };
+    let mut pending = Pending::default();
+    assert_eq!(pending.add(at(NOW + MAX_QUOTE_LEAD_MS), NOW), Ok(()));
+    assert_eq!(pending.add(at(NOW + MAX_QUOTE_LEAD_MS + 1), NOW), Err(MAX_QUOTE_LEAD_MS + 1));
+    assert_eq!(pending.take(NOW + 60_000), Some(at(NOW + MAX_QUOTE_LEAD_MS)));
+}
+
+#[test]
+fn the_engine_replaces_a_held_quote_unless_it_is_newer_and_reached() {
+    const NOW: Millis = 1_792_489_875_714;
+    assert!(replaces(NOW - 200, NOW - 100, NOW));
+    assert!(replaces(NOW - 100, NOW - 100, NOW));
+    assert!(!replaces(NOW - 100, NOW - 200, NOW));
+    assert!(!replaces(NOW, NOW - 200, NOW));
+    // The held quote is still ahead, as after the host clock is set back, so it gives way.
+    assert!(replaces(NOW + 500, NOW - 200, NOW));
+}
+
+#[test]
+fn a_quote_counts_within_the_tighter_of_the_feed_and_market_bounds() {
+    const AT: Millis = 1_792_489_875_714;
+    assert!(counts(AT - 1_000, AT, 1_000, None));
+    assert!(!counts(AT - 1_001, AT, 1_000, None));
+    assert!(!counts(AT + 1, AT, 1_000, None));
+    // The engine's market rules are tighter than the feed's bound, or looser.
+    assert!(counts(AT - 500, AT, 1_000, Some(500)));
+    assert!(!counts(AT - 501, AT, 1_000, Some(500)));
+    assert!(!counts(AT - 1_001, AT, 1_000, Some(5_000)));
 }
 
 #[tokio::test(start_paused = true)]
@@ -85,13 +127,22 @@ async fn a_recovery_gives_every_symbol_a_full_silence_window() {
 }
 
 #[test]
-fn a_full_buffer_drops_its_oldest_quote() {
-    let at = |ts: Millis| SourceQuote { source: "kraken".into(), mid: Fixed::from_int(100), ts };
-    let mut quotes = VecDeque::new();
-    (0..=MAX_PENDING as Millis).for_each(|ts| push_pending(&mut quotes, at(ts)));
-    assert_eq!(quotes.len(), MAX_PENDING);
-    assert_eq!(quotes.front(), Some(&at(1)));
-    assert_eq!(quotes.back(), Some(&at(MAX_PENDING as Millis)));
+fn backoff_doubles_up_to_its_cap() {
+    let max = Duration::from_secs(30);
+    assert_eq!(next_backoff(Duration::from_millis(500), max), Duration::from_secs(1));
+    assert_eq!(next_backoff(Duration::from_secs(20), max), max);
+    assert_eq!(next_backoff(max, max), max);
+}
+
+#[test]
+fn a_connection_that_quoted_retries_at_once_and_one_that_did_not_backs_off() {
+    let timing =
+        Timing { reconnect_min: Duration::from_millis(500), reconnect_max: Duration::from_secs(30), ..fast(WAIT) };
+    let grown = Duration::from_secs(8);
+    // A routine drop resets the backoff, whatever it had grown to.
+    assert_eq!(next_attempt(grown, true, &timing), (timing.reconnect_min, Duration::from_secs(1)));
+    // A failed attempt waits the current backoff and doubles it for the next.
+    assert_eq!(next_attempt(grown, false, &timing), (grown, Duration::from_secs(16)));
 }
 
 // ── Helpers ──

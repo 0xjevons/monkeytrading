@@ -3,7 +3,7 @@
 //! sequencer has gone away: a failed connection is retried inside the task with backoff, and while
 //! it is down the venue's last quotes age out in the engine, which prices from the other venues.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::mem::take;
 use std::sync::Arc;
@@ -12,7 +12,6 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use engine_core::Fixed;
 use engine_core::command::Command;
-use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 use engine_core::types::{MarketId, Millis};
 use futures_util::{SinkExt, StreamExt};
 use rustls::ClientConfig;
@@ -26,7 +25,10 @@ use crate::clock::now_ms;
 use crate::config::{Venue, VenueConnection, VenuesSection};
 use crate::feeds::{bitstamp, coinbase, kraken};
 use crate::sequencer::{Query, Request};
+mod quotes;
+use quotes::{Pending, counts, replaces};
 mod setup;
+use setup::next_attempt;
 pub use setup::tls_config;
 mod validation;
 pub(super) use validation::{check_size, check_time, to_quote};
@@ -36,8 +38,6 @@ pub(super) use validation::{check_size, check_time, to_quote};
 const REALERT_AFTER: Duration = Duration::from_secs(60);
 /// How much of a refused message its log line keeps.
 const EXCERPT_CHARS: usize = 200;
-/// The most quotes kept per market between two sequencing ticks; the oldest go first.
-const MAX_PENDING: usize = 256;
 /// A venue's protocol on one connection: its subscribe messages, and a reader that keeps any
 /// state the venue's messages build on, such as an order book.
 enum Adapter {
@@ -246,8 +246,9 @@ impl VenueFeed {
     }
 
     /// One connection: connect, subscribe, then read messages and sequence one quote per market
-    /// every `timing.interval` (see `select`). A quote no older than `timing.stale_after` when sequenced
-    /// counts as the venue quoting that market.
+    /// every `timing.interval`, the newest the host clock has reached (see `Pending`). A quote the
+    /// engine stores counts as the venue quoting that market once the sequencer has applied it, if
+    /// it is then no older than `timing.stale_after` or the market's `max_age_ms` (see `confirm`).
     /// Error cases:
     /// - connecting or subscribing fails or takes longer than `timing.timeout`
     /// - the connection sequences no fresh quote within `timing.timeout`, or the venue closes it
@@ -271,10 +272,12 @@ impl VenueFeed {
         info!(venue = self.conn.venue.name(), "venue subscribed");
         let subscribed = Instant::now();
 
-        let mut pending: BTreeMap<MarketId, VecDeque<SourceQuote>> = BTreeMap::new();
+        let mut pending: BTreeMap<MarketId, Pending> = BTreeMap::new();
+        // Quotes sent and not yet confirmed, by market, and the one confirmation awaited.
+        let mut unconfirmed: BTreeMap<MarketId, Millis> = BTreeMap::new();
+        let mut confirming: Option<oneshot::Receiver<Vec<MarketId>>> = None;
         let mut flush = interval_at(subscribed + self.timing.interval, self.timing.interval);
         flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let stale_after = Millis::try_from(self.timing.stale_after.as_millis()).unwrap_or(Millis::MAX);
         loop {
             tokio::select! {
                 message = stream.next() => {
@@ -285,29 +288,31 @@ impl VenueFeed {
                         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                     }
                 }
+                fresh = async {
+                    match &mut confirming {
+                        Some(reply) => reply.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    confirming = None;
+                    fresh.map_err(|_| anyhow!("sequencer gone"))?.into_iter().for_each(|market| self.delivered(market));
+                }
                 _ = flush.tick() => {
                     let now = now_ms();
-                    for (market, quotes) in take(&mut pending) {
-                        let lead = quotes.iter().map(|quote| quote.ts - now).max();
-                        if let Some(lead) = lead.filter(|lead| *lead > MAX_QUOTE_LEAD_MS) {
-                            self.clock_ahead(market, lead);
-                        }
-                        let Some(quote) = select(&quotes, now) else { continue };
-                        // As the engine judges it: it takes the quote in place of the one it holds
-                        // unless that one is newer and already reached, and counts it once its time
-                        // is reached and while it is no older than the bound.
-                        let held = self.held.entry(market).or_insert(quote.ts);
-                        let taken = quote.ts >= *held || *held > now;
-                        if taken {
+                    for (market, quotes) in &mut pending {
+                        let Some(quote) = quotes.take(now) else { continue };
+                        // A quote the engine will not store over the one it holds never counts.
+                        let held = self.held.entry(*market).or_insert(quote.ts);
+                        if replaces(*held, quote.ts, now) {
                             *held = quote.ts;
+                            unconfirmed.insert(*market, quote.ts);
                         }
-                        let fresh = taken && quote.ts <= now && now - quote.ts <= stale_after;
-                        let cmd = Command::Prices { market, quotes: vec![quote] };
+                        let cmd = Command::Prices { market: *market, quotes: vec![quote] };
                         let request = Request::Submit { cmd, reply: None };
                         self.tx.send(request).await.map_err(|_| anyhow!("sequencer gone"))?;
-                        if fresh {
-                            self.delivered(market);
-                        }
+                    }
+                    if confirming.is_none() && !unconfirmed.is_empty() {
+                        confirming = Some(self.confirm(take(&mut unconfirmed)).await?);
                     }
                     if self.check_silent() {
                         bail!("resubscribing after a symbol went silent");
@@ -322,6 +327,25 @@ impl VenueFeed {
         }
     }
 
+    /// Asks the sequencer, behind the quotes already sent, which of `sent` (each market's latest
+    /// quote time) count as the venue quoting. Each is judged once applied, at the time the
+    /// sequencer would stamp next and against the engine's market rules as they stand, so a quote a
+    /// lagging sequencer applies late counts as stale.
+    /// Error cases:
+    /// - the sequencer has gone away
+    async fn confirm(&self, sent: BTreeMap<MarketId, Millis>) -> anyhow::Result<oneshot::Receiver<Vec<MarketId>>> {
+        let (reply, fresh) = oneshot::channel();
+        let stale_after = Millis::try_from(self.timing.stale_after.as_millis()).unwrap_or(Millis::MAX);
+        let query: Query = Box::new(move |engine| {
+            let at = now_ms().max(engine.now());
+            let max_age_ms = |market: &MarketId| Some(engine.markets().get(market)?.spec.price_rules.max_age_ms);
+            let counted = sent.into_iter().filter(|(market, ts)| counts(*ts, at, stale_after, max_age_ms(market)));
+            let _ = reply.send(counted.map(|(market, _)| market).collect());
+        });
+        self.tx.send(Request::Query(query)).await.map_err(|_| anyhow!("sequencer gone"))?;
+        Ok(fresh)
+    }
+
     /// Reads one text message into `pending`, refusing what does not parse or check.
     /// Error cases:
     /// - the venue asked for a reconnect, or the adapter's state no longer matches the venue's,
@@ -330,7 +354,7 @@ impl VenueFeed {
         &mut self,
         adapter: &mut Adapter,
         text: &str,
-        pending: &mut BTreeMap<MarketId, VecDeque<SourceQuote>>,
+        pending: &mut BTreeMap<MarketId, Pending>,
     ) -> anyhow::Result<()> {
         let now = now_ms();
         let books = match adapter.read(text, now) {
@@ -349,7 +373,9 @@ impl VenueFeed {
         for book in books {
             match to_quote(self.conn.venue, &self.markets, book, now) {
                 Ok((market, quote)) => {
-                    push_pending(pending.entry(market).or_default(), quote);
+                    if let Err(lead_ms) = pending.entry(market).or_default().add(quote, now) {
+                        self.clock_ahead(market, lead_ms);
+                    }
                 }
                 Err(reason) if adapter.keeps_state() => {
                     self.refuse(&reason, text);
@@ -380,7 +406,8 @@ impl VenueFeed {
 
     /// Alerts once for each symbol that has gone `timing.timeout` without a fresh quote sequenced,
     /// across reconnects: one the venue accepted but never publishes, or whose quotes arrive stale
-    /// or ahead of the host clock. An outage already alerted stands for every symbol.
+    /// or too far ahead of the host clock, or reach the engine late. An outage already alerted
+    /// stands for every symbol.
     /// Returns whether a symbol went silent on this check, so the connection is replaced once to
     /// subscribe it afresh; a symbol already silent does not trigger another.
     fn check_silent(&mut self) -> bool {
@@ -404,11 +431,11 @@ impl VenueFeed {
     }
 
     /// Alerts, at most once per `REALERT_AFTER`, that a quote for `market` is dated `lead_ms` ahead
-    /// of the host clock, past the `MAX_QUOTE_LEAD_MS` the engine accepts, so it was held back: the
+    /// of the host clock, past the `MAX_QUOTE_LEAD_MS` the engine accepts, so it was dropped: the
     /// venue's clock or the host's is wrong.
     ///
     /// TODO: the sequencer stamps with the untrusted host clock. One set back by more than
-    /// `MAX_QUOTE_LEAD_MS` holds back every quote, and the engine keeps pricing from the quotes it
+    /// `MAX_QUOTE_LEAD_MS` drops every quote, and the engine keeps pricing from the quotes it
     /// holds, judged against a sequenced time that a stalled host clock also stalls; the trusted
     /// time bound closes this.
     fn clock_ahead(&mut self, market: MarketId, lead_ms: Millis) {
@@ -457,37 +484,6 @@ pub async fn run(
     tx: mpsc::Sender<Request>,
 ) -> anyhow::Result<()> {
     VenueFeed::new(conn, timing, tls, tx).run().await
-}
-
-/// Adds a quote received for a market, dropping the oldest once `MAX_PENDING` are held.
-pub(super) fn push_pending(quotes: &mut VecDeque<SourceQuote>, quote: SourceQuote) {
-    if quotes.len() == MAX_PENDING {
-        quotes.pop_front();
-    }
-    quotes.push_back(quote);
-}
-
-/// The quote to sequence for a market from those received since the last tick: the newest the
-/// engine can use at host time `now`; when every one is dated after it, the newest the engine still
-/// takes, at most `MAX_QUOTE_LEAD_MS` ahead, which it skips until the sequenced time reaches it;
-/// and none when every one is further ahead, since the engine would refuse it. A host clock a
-/// little behind the venue then still prices from the venue.
-pub(super) fn select(quotes: &VecDeque<SourceQuote>, now: Millis) -> Option<SourceQuote> {
-    let newest_by = |limit: Millis| quotes.iter().filter(|quote| quote.ts <= limit).max_by_key(|quote| quote.ts);
-    newest_by(now).or_else(|| newest_by(now.saturating_add(MAX_QUOTE_LEAD_MS))).cloned()
-}
-
-/// The wait before the next connection attempt, and the backoff after that. A connection that
-/// sequenced a fresh quote retries after `reconnect_min`; otherwise the wait is `backoff`, and the
-/// next one doubles it up to `reconnect_max`.
-pub(super) fn next_attempt(backoff: Duration, quoted: bool, timing: &Timing) -> (Duration, Duration) {
-    let wait = if quoted { timing.reconnect_min } else { backoff };
-    (wait, next_backoff(wait, timing.reconnect_max))
-}
-
-/// The delay after `current`: double it, capped at `max`.
-pub(super) fn next_backoff(current: Duration, max: Duration) -> Duration {
-    current.saturating_mul(2).min(max)
 }
 
 #[cfg(test)]

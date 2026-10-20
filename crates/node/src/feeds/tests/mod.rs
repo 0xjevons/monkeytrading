@@ -9,8 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use engine_core::Engine;
 use engine_core::types::{MarketId, Millis};
 use futures_util::SinkExt;
+use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -18,10 +20,11 @@ use crate::clock::now_ms;
 use crate::config::Venue;
 use crate::feeds::tests::fake::{
     WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_book, listen, next_alert, next_prices,
-    quote, send, spawn_feed, stream,
+    quote, send, spawn_feed, spawn_feed_into, stream,
 };
-use crate::feeds::venue::{Book, Timing, next_attempt, next_backoff, to_quote};
+use crate::feeds::venue::{Book, Timing, to_quote};
 use crate::feeds::{bitstamp, kraken};
+use crate::sequencer::Request;
 
 const MARKETS: [(MarketId, &str); 2] = [(1, "BTC/USD"), (2, "ETH/USD")];
 
@@ -212,9 +215,45 @@ async fn stale_quotes_do_not_count_as_the_venue_quoting() {
 }
 
 #[tokio::test]
-async fn quotes_ahead_of_the_host_clock_do_not_count_as_the_venue_quoting() {
-    // Within the tolerated lead, but the engine skips each until the host clock reaches it.
-    assert_quotes_do_not_count(|| now_ms() + 500).await;
+async fn quotes_a_little_ahead_of_the_host_clock_are_sequenced_once_it_reaches_them() {
+    let (_guard, mut alerts) = capture_alerts();
+    let (listener, url) = listen().await;
+    let window = Duration::from_millis(500);
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &[(1, "BTC/USD")], fast(window));
+    let (ws, _) = accept(&listener).await;
+
+    // Each quote is dated further ahead than the sequencing interval, so every tick also holds
+    // newer quotes not yet reached. Each goes once reached, and the venue counts as quoting.
+    stream(ws, || vec![kraken_book("BTC/USD", "100", "101", now_ms() + 100)]);
+    let (_, quotes) = next_prices(&mut rx).await;
+    assert!(quotes[0].ts <= now_ms(), "sequenced before the host clock reached it");
+    sleep(window * 3).await;
+    assert!(alerts.try_recv().is_err(), "the venue was alerted");
+}
+
+#[tokio::test]
+async fn quotes_the_sequencer_applies_too_late_do_not_count_as_the_venue_quoting() {
+    let (_guard, mut alerts) = capture_alerts();
+    let (listener, url) = listen().await;
+    // A sequencer that has fallen behind: it reaches each query, and so has applied the quotes
+    // sent before it, only after the feed's freshness bound, though well within the silence window.
+    let timing = Timing { stale_after: Duration::from_millis(200), ..fast(Duration::from_secs(2)) };
+    let (tx, mut requests) = mpsc::channel(1024);
+    tokio::spawn(async move {
+        let engine = Engine::new();
+        while let Some(request) = requests.recv().await {
+            if let Request::Query(query) = request {
+                sleep(timing.stale_after * 2).await;
+                query(&engine);
+            }
+        }
+    });
+    let _feed = spawn_feed_into(tx, Venue::Kraken, &url, &[(1, "BTC/USD")], timing);
+    let (ws, _) = accept(&listener).await;
+
+    stream(ws, || vec![kraken_book("BTC/USD", "100", "101", now_ms())]);
+    let alert = next_alert(&mut alerts).await;
+    assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "BTC/USD"));
 }
 
 #[tokio::test]
@@ -422,25 +461,6 @@ fn books_no_working_venue_could_show_are_refused() {
     // toward zero at the ninth decimal.
     let accepted = to_quote(Venue::Kraken, &markets, book("BTC/USD", "100", "100.000000001", NOW + DAY), NOW);
     assert_eq!(accepted, Ok((1, quote(Venue::Kraken, "100", NOW + DAY))));
-}
-
-#[test]
-fn backoff_doubles_up_to_its_cap() {
-    let max = Duration::from_secs(30);
-    assert_eq!(next_backoff(Duration::from_millis(500), max), Duration::from_secs(1));
-    assert_eq!(next_backoff(Duration::from_secs(20), max), max);
-    assert_eq!(next_backoff(max, max), max);
-}
-
-#[test]
-fn a_connection_that_quoted_retries_at_once_and_one_that_did_not_backs_off() {
-    let timing =
-        Timing { reconnect_min: Duration::from_millis(500), reconnect_max: Duration::from_secs(30), ..fast(WAIT) };
-    let grown = Duration::from_secs(8);
-    // A routine drop resets the backoff, whatever it had grown to.
-    assert_eq!(next_attempt(grown, true, &timing), (timing.reconnect_min, Duration::from_secs(1)));
-    // A failed attempt waits the current backoff and doubles it for the next.
-    assert_eq!(next_attempt(grown, false, &timing), (grown, Duration::from_secs(16)));
 }
 
 // ── Helpers ──

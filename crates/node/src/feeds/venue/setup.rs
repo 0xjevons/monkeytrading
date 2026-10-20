@@ -1,10 +1,13 @@
-//! The TLS client config the venue connections share.
+//! What every venue connection shares: the TLS client config, and the backoff between attempts.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use rustls::crypto::ring;
 use rustls::{ClientConfig, RootCertStore};
+
+use super::Timing;
 
 /// The TLS client config every venue connection shares: ring as the crypto provider, and
 /// Mozilla's roots compiled into the binary, so the host's certificate store is never trusted.
@@ -22,4 +25,17 @@ pub fn tls_config() -> anyhow::Result<Arc<ClientConfig>> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(Arc::new(config))
+}
+
+/// The wait before the next connection attempt, and the backoff after that. A connection that
+/// sequenced a fresh quote retries after `reconnect_min`; otherwise the wait is `backoff`, and the
+/// next one doubles it up to `reconnect_max`.
+pub(super) fn next_attempt(backoff: Duration, quoted: bool, timing: &Timing) -> (Duration, Duration) {
+    let wait = if quoted { timing.reconnect_min } else { backoff };
+    (wait, next_backoff(wait, timing.reconnect_max))
+}
+
+/// The delay after `current`: double it, capped at `max`.
+pub(super) fn next_backoff(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
 }
