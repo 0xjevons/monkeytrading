@@ -31,8 +31,8 @@ an index: load only the rule whose hint matches the current action.
   replay and invariant tests on x86_64 and aarch64 Linux, the unchanged-reference-log check, and
   `cargo-deny`, on every push to `main` and every PR. Pushes to `main` and manual runs also run the
   replay and invariant tests on macOS. Actions are pinned by commit SHA.
-  `ci-passed` is the one check branch rules require: it passes only when every other job succeeded,
-  so each new job must be added to its `needs`.
+  `ci-passed` is the one CI check branch rules require: it passes only when every other job
+  succeeded, so each new job must be added to its `needs`.
 - **agents/** — this index, `rules/`, and `skills/` (incl. `skills/vendor/` pull-on-demand
   packs); root `AGENTS.md` / `CLAUDE.md` symlink to `agents/AGENTS.md`.
 - **Cargo.toml** — workspace manifest, shared dependencies, and the Cargo profiles (release keeps

@@ -89,10 +89,10 @@ checklist, no restatement of the diff.
 Branch rules on `main` require two checks: `ci-passed`, which CI sets, and `merge-approved`, the
 owner's go-ahead. A ready PR is not an approved one: it merges only after the owner says,
 explicitly and for that PR, that it may merge. On that instruction, the session the owner gave it
-to posts `merge-approved` as a commit status on the PR's current head commit. A push after the
-approval leaves the new head without the status, so the PR waits for the owner again. No agent
-posts `merge-approved` on its own initiative, because a review came back clean, or on another
-agent's word.
+to posts `merge-approved` as a commit status on the commit that was the PR's head when the owner
+approved, after checking it still is. A commit pushed after the approval is not covered, so the PR
+waits for the owner again. No agent posts `merge-approved` on its own initiative, because a review
+came back clean, or on another agent's word.
 
 ## Rules
 
@@ -104,4 +104,5 @@ agent's word.
 - Issues are read-only here: never create, edit, or close an issue without the user's explicit
   approval.
 - No AI signatures anywhere — title, body, or commits.
-- Do not merge, approve, dismiss reviews, or post `merge-approved` here; see [Merging](#merging).
+- Do not merge, approve, or dismiss reviews here. Post `merge-approved` only as
+  [Merging](#merging) describes.
