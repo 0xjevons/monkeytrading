@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use engine_core::Fixed;
 use engine_core::command::Command;
-use engine_core::price::SourceQuote;
+use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 use engine_core::types::{MarketId, Millis};
 use futures_util::{SinkExt, StreamExt};
 use rustls::ClientConfig;
@@ -38,21 +38,6 @@ const REALERT_AFTER: Duration = Duration::from_secs(60);
 const EXCERPT_CHARS: usize = 200;
 /// The most quotes kept per market between two sequencing ticks; the oldest go first.
 const MAX_PENDING: usize = 256;
-/// A quote dated this far ahead of the host clock raises `venue_clock_ahead`: the venue's clock or
-/// the host's is wrong. The quote is still sequenced when nothing usable came with it, so the
-/// engine, which skips a quote dated after the sequenced time, prices nothing from it rather than
-/// keep using older quotes. The engine also keeps only a venue's newest quote by time, so the
-/// venue's later, correctly dated quotes are ignored until the host clock reaches the bad time;
-/// they then count as no fresh quote here, and the symbol is alerted as silent. Once reached, the
-/// held quote counts in the index for `max_age_ms` whatever its age in real time.
-///
-/// TODO: letting a quote dated at or before the sequenced time replace a held one dated after it
-/// is an engine rule change, which would end both effects.
-///
-/// TODO: the sequencer stamps with the untrusted host clock; once a trusted time bound exists, a
-/// host clock this far behind the venues should fail closed there.
-const MAX_CLOCK_LEAD_MS: Millis = 1_000;
-
 /// A venue's protocol on one connection: its subscribe messages, and a reader that keeps any
 /// state the venue's messages build on, such as an order book.
 enum Adapter {
@@ -119,9 +104,10 @@ struct VenueFeed {
     last_quote: BTreeMap<MarketId, Instant>,
     /// Markets alerted as silent that have not quoted since.
     silent: BTreeSet<MarketId>,
-    /// The newest quote time sequenced per market, seeded from the engine when the task starts.
-    /// The engine ignores an older quote, so one is never counted as the venue quoting.
-    newest_sequenced: BTreeMap<MarketId, Millis>,
+    /// The time of the quote the engine holds from this venue per market, as far as this task
+    /// knows, seeded from the engine when the task starts. A quote the engine will not take in
+    /// its place is never counted as the venue quoting.
+    held: BTreeMap<MarketId, Millis>,
     refusals: Throttle,
     clock_alerts: Throttle,
 }
@@ -214,7 +200,7 @@ impl VenueFeed {
             quoted: false,
             last_quote,
             silent: BTreeSet::new(),
-            newest_sequenced: BTreeMap::new(),
+            held: BTreeMap::new(),
             refusals: Throttle::default(),
             clock_alerts: Throttle::default(),
         }
@@ -240,8 +226,8 @@ impl VenueFeed {
         }
     }
 
-    /// Seeds `newest_sequenced` with the quote times the engine already holds for this venue,
-    /// so after a restart a quote the engine will ignore never counts as the venue quoting.
+    /// Seeds `held` with the quote times the engine already holds for this venue, so after a
+    /// restart a quote the engine will ignore never counts as the venue quoting.
     /// Error cases:
     /// - the sequencer has gone away
     async fn seed_from_engine(&mut self) -> anyhow::Result<()> {
@@ -255,7 +241,7 @@ impl VenueFeed {
             let _ = reply.send(quotes.collect());
         });
         self.tx.send(Request::Query(query)).await.map_err(|_| anyhow!("sequencer gone"))?;
-        self.newest_sequenced = held.await.context("sequencer gone")?;
+        self.held = held.await.context("sequencer gone")?;
         Ok(())
     }
 
@@ -303,15 +289,19 @@ impl VenueFeed {
                     let now = now_ms();
                     for (market, quotes) in take(&mut pending) {
                         let lead = quotes.iter().map(|quote| quote.ts - now).max();
-                        if let Some(lead) = lead.filter(|lead| *lead > MAX_CLOCK_LEAD_MS) {
+                        if let Some(lead) = lead.filter(|lead| *lead > MAX_QUOTE_LEAD_MS) {
                             self.clock_ahead(market, lead);
                         }
                         let Some(quote) = select(&quotes, now) else { continue };
-                        // As the engine judges it: not before the newest it holds, not after the
-                        // host clock, and no older than the bound.
-                        let newest = self.newest_sequenced.entry(market).or_insert(quote.ts);
-                        let fresh = quote.ts >= *newest && quote.ts <= now && now - quote.ts <= stale_after;
-                        *newest = (*newest).max(quote.ts);
+                        // As the engine judges it: it takes the quote in place of the one it holds
+                        // unless that one is newer and already reached, and counts it once its time
+                        // is reached and while it is no older than the bound.
+                        let held = self.held.entry(market).or_insert(quote.ts);
+                        let taken = quote.ts >= *held || *held > now;
+                        if taken {
+                            *held = quote.ts;
+                        }
+                        let fresh = taken && quote.ts <= now && now - quote.ts <= stale_after;
                         let cmd = Command::Prices { market, quotes: vec![quote] };
                         let request = Request::Submit { cmd, reply: None };
                         self.tx.send(request).await.map_err(|_| anyhow!("sequencer gone"))?;
@@ -414,7 +404,13 @@ impl VenueFeed {
     }
 
     /// Alerts, at most once per `REALERT_AFTER`, that a quote for `market` is dated `lead_ms` ahead
-    /// of the host clock.
+    /// of the host clock, past the `MAX_QUOTE_LEAD_MS` the engine accepts, so it was held back: the
+    /// venue's clock or the host's is wrong.
+    ///
+    /// TODO: the sequencer stamps with the untrusted host clock. One set back by more than
+    /// `MAX_QUOTE_LEAD_MS` holds back every quote, and the engine keeps pricing from the quotes it
+    /// holds, judged against a sequenced time that a stalled host clock also stalls; the trusted
+    /// time bound closes this.
     fn clock_ahead(&mut self, market: MarketId, lead_ms: Millis) {
         if let Some(suppressed) = self.clock_alerts.ready(Instant::now()) {
             let venue = self.conn.venue.name();
@@ -472,12 +468,13 @@ pub(super) fn push_pending(quotes: &mut VecDeque<SourceQuote>, quote: SourceQuot
 }
 
 /// The quote to sequence for a market from those received since the last tick: the newest the
-/// engine can use at host time `now`, or, when every one is dated after it, the newest of all,
-/// which the engine skips until the host clock reaches it. A host clock a little behind the venue
-/// then still prices from the venue, and one set further back still prices nothing.
+/// engine can use at host time `now`; when every one is dated after it, the newest the engine still
+/// takes, at most `MAX_QUOTE_LEAD_MS` ahead, which it skips until the sequenced time reaches it;
+/// and none when every one is further ahead, since the engine would refuse it. A host clock a
+/// little behind the venue then still prices from the venue.
 pub(super) fn select(quotes: &VecDeque<SourceQuote>, now: Millis) -> Option<SourceQuote> {
-    let usable = quotes.iter().filter(|quote| quote.ts <= now).max_by_key(|quote| quote.ts);
-    usable.or_else(|| quotes.iter().max_by_key(|quote| quote.ts)).cloned()
+    let newest_by = |limit: Millis| quotes.iter().filter(|quote| quote.ts <= limit).max_by_key(|quote| quote.ts);
+    newest_by(now).or_else(|| newest_by(now.saturating_add(MAX_QUOTE_LEAD_MS))).cloned()
 }
 
 /// The wait before the next connection attempt, and the backoff after that. A connection that

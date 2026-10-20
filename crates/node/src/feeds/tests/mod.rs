@@ -154,25 +154,21 @@ async fn a_connection_with_no_fresh_quote_is_replaced_even_while_down() {
 }
 
 #[tokio::test]
-async fn a_venue_time_far_ahead_of_the_host_clock_is_sequenced_and_alerted() {
+async fn a_quote_too_far_ahead_for_the_engine_is_held_back_and_alerted() {
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
-    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &[(1, "BTC/USD")], fast(Duration::from_millis(300)));
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &[(1, "BTC/USD")], fast(WAIT));
     let (mut ws, _) = accept(&listener).await;
 
-    // The engine skips it until the host clock reaches it, so it prices nothing meanwhile, where
-    // refusing it would leave the engine on older quotes when the host clock is the one behind.
-    let ts = now_ms() + 60_000;
-    send(&mut ws, &[kraken_book("BTC/USD", "100", "101", ts)]).await;
-    assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", ts)]));
+    // The engine refuses a quote stamped more than a second past its time, so the feed does not
+    // sequence one, and says why.
+    send(&mut ws, &[kraken_book("BTC/USD", "100", "101", now_ms() + 60_000)]).await;
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["venue"].as_str()), ("venue_clock_ahead", "kraken"));
-
-    // Correctly dated quotes follow, but the engine holds the newer bad one and ignores them, so
-    // they do not count as the venue quoting.
-    stream(ws, || vec![kraken_book("BTC/USD", "100", "101", now_ms())]);
-    let alert = next_alert(&mut alerts).await;
-    assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "BTC/USD"));
+    // The next, correctly dated quote is the first one sequenced.
+    let ts = now_ms();
+    send(&mut ws, &[kraken_book("BTC/USD", "100", "102", ts)]).await;
+    assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "101", ts)]));
 }
 
 #[tokio::test]

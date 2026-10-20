@@ -21,8 +21,9 @@ use crate::clock::now_ms;
 use crate::config::{NodeConfig, Venue};
 use crate::feeds::tests::fake::{
     WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_book, listen, next_alert, send,
-    spawn_feed_into,
+    spawn_feed_into, stream,
 };
+use crate::feeds::venue::Timing;
 use crate::sequencer::{Request, Sequencer, SequencerConfig, StreamMsg};
 use crate::tee::EnclaveKey;
 
@@ -66,7 +67,7 @@ async fn venues_going_down_age_out_and_the_index_runs_on_the_rest() {
     sleep(Duration::from_millis(MAX_AGE_MS as u64 + 500)).await;
     for (market, (_, _, mid)) in [(1, BTC), (2, ETH)] {
         let events = node.buy(market, mid).await;
-        let stale = Reject::NoPrice(PriceError::Stale { fresh: 1, needed: 2 });
+        let stale = Reject::NoPrice { error: PriceError::Stale { fresh: 1, needed: 2 } };
         assert!(
             events.iter().any(|event| matches!(event, Event::OrderRejected { reason, .. } if *reason == stale)),
             "market {market}: {events:?}"
@@ -75,23 +76,27 @@ async fn venues_going_down_age_out_and_the_index_runs_on_the_rest() {
 }
 
 #[tokio::test]
-async fn after_a_restart_quotes_the_engine_ignores_do_not_count_as_quoting() {
+async fn after_a_restart_quotes_older_than_the_engines_do_not_count_as_quoting() {
     let (_guard, mut alerts) = capture_alerts();
     let node = Node::start("restart").await;
-    // The engine already holds a Kraken quote dated an hour ahead, as a replayed log can.
-    let ahead = SourceQuote { source: "kraken".into(), mid: BTC.2.parse().unwrap(), ts: now_ms() + 3_600_000 };
-    node.submit(Command::Prices { market: 1, quotes: vec![ahead] }).await;
+    // The engine already holds a Kraken BTC quote, as a replayed log can.
+    let held = now_ms();
+    let quote = SourceQuote { source: "kraken".into(), mid: BTC.2.parse().unwrap(), ts: held };
+    node.submit(Command::Prices { market: 1, quotes: vec![quote] }).await;
 
-    // The feed starts afresh, and Kraken's correctly dated BTC quotes are ignored by the engine.
+    // The restarted feed's BTC quotes are stamped just before it, as from a venue whose clock
+    // stepped back, so the engine ignores them. ETH quotes normally.
     let (listener, url) = listen().await;
-    serve_kraken(listener);
-    spawn_feed_into(
-        node.tx.clone(),
-        Venue::Kraken,
-        &url,
-        &[(1, "BTC/USD"), (2, "ETH/USD")],
-        fast(Duration::from_millis(300)),
-    );
+    tokio::spawn(async move {
+        let (ws, _) = accept(&listener).await;
+        let books = move || {
+            vec![kraken_book("BTC/USD", BTC.0, BTC.1, held - 1), kraken_book("ETH/USD", ETH.0, ETH.1, now_ms())]
+        };
+        let _ = stream(ws, books).await;
+    });
+    // A wide freshness bound, so only the engine's rule can keep the BTC quotes from counting.
+    let timing = Timing { stale_after: Duration::from_secs(60), ..fast(Duration::from_millis(300)) };
+    spawn_feed_into(node.tx.clone(), Venue::Kraken, &url, &[(1, "BTC/USD"), (2, "ETH/USD")], timing);
     let silent = async {
         loop {
             let alert = next_alert(&mut alerts).await;

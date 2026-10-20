@@ -9,13 +9,11 @@ use engine_core::types::{MarketId, Millis};
 use crate::config::Venue;
 use crate::feeds::venue::Book;
 
-/// The furthest a venue time may lead the host clock. Beyond it the time is no clock error but a
-/// corrupt timestamp, such as one in the wrong unit, and the engine would hold it as the venue's
-/// newest quote for as long as it leads. Leads up to it are sequenced, so a host clock set back by
-/// less fails closed.
-///
-/// TODO: a host clock set back further makes every venue time look corrupt, so the engine keeps
-/// pricing from the quotes it already holds; a trusted time bound in the sequencer closes this.
+/// The furthest a venue time may lead the host clock and still be clock skew. Beyond it the
+/// message is corrupt, such as a time in the wrong unit, so it is refused, and the Coinbase and
+/// Kraken books resync rather than keep a change from it. A smaller lead past the engine's
+/// `MAX_QUOTE_LEAD_MS` is only held back when quotes are sequenced; that check alone would drop the
+/// quote but keep the corrupt change in a kept book.
 const MAX_PLAUSIBLE_LEAD_MS: Millis = 24 * 60 * 60 * 1_000;
 
 /// The venue's mid for one book and the market it prices, refusing a book no working venue

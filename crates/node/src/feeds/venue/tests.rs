@@ -53,9 +53,13 @@ fn the_newest_quote_the_engine_can_use_is_sequenced() {
     // A host clock a little behind the venue: the newest already reached is used, not the newest.
     assert_eq!(select(&received(&[NOW - 300, NOW - 100, NOW + 40, NOW - 200]), NOW), Some(at(NOW - 100)));
     assert_eq!(select(&received(&[NOW - 100, NOW]), NOW), Some(at(NOW)));
-    // Every quote ahead, as after the host clock is set back: the newest goes, and the engine
-    // skips it rather than keep pricing from older quotes.
+    // Every quote ahead, as after the host clock is set back a little: the newest the engine
+    // takes goes, and it skips it rather than keep pricing from older quotes.
     assert_eq!(select(&received(&[NOW + 50, NOW + 80, NOW + 60]), NOW), Some(at(NOW + 80)));
+    // Past the engine's lead, which it would refuse: nearer quotes only, or none.
+    let limit = NOW + MAX_QUOTE_LEAD_MS;
+    assert_eq!(select(&received(&[NOW + 50, limit, limit + 1]), NOW), Some(at(limit)));
+    assert_eq!(select(&received(&[limit + 1, limit + 60_000]), NOW), None);
     assert_eq!(select(&VecDeque::new(), NOW), None);
 }
 
