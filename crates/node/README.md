@@ -205,14 +205,15 @@ log`). History is public, like the log.
 The history index is a SQLite file in `history.dir`, derived from the log alone. A supervised task
 follows the log as a stream subscriber does, from disk and then live, and writes on its own thread,
 so the sequencer never waits for it; once caught up, history trails the log by the batch being
-written. Each write
-stores the account events of a batch of commands, keyed by cursor, and the last command taken, in
-one transaction. Events whose command is older than `history.retention`, counted back from the
-newest command in the index, leave it; the log keeps them. Before the node recovers its log, the
-index checks that the log holds the last command it took, unchanged, and resumes after it. If the
-log ends before that command or holds another one there, the log was rolled back or replaced, and
-the node refuses to start (`history_recovery_failed`) with the log as it found it. A power loss can
-also leave the index ahead of the log, since neither syncs every write. Removing `history.dir` rebuilds the index from the log's segments.
+written. Each write stores the account events of a batch of commands, keyed by cursor, and the last
+command taken, in one transaction. Events whose command is older than `history.retention`, counted
+back from the newest command in the index, leave it; the log keeps them. Before the node recovers
+its log, the index checks that the log holds the last command it took, unchanged, and resumes after
+it. If the log ends before that command or holds another one there, the log was rolled back or
+replaced, and the node refuses to start (`history_recovery_failed`) with the log as it found it. A
+power loss can also leave the index ahead of the log, since neither syncs every write. SQLite opens
+the file in defensive mode, with its schema untrusted and cell sizes checked, and refuses a schema
+this code did not create. Removing `history.dir` rebuilds the index from the log's segments.
 Commands logged before events were recorded add nothing to history.
 
 ## Configuration

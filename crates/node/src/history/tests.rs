@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::Arc;
@@ -14,11 +15,12 @@ use tokio::sync::{Semaphore, broadcast};
 use tokio::time::timeout;
 
 use crate::api::MAX_BACKFILLS;
+use crate::config::HistorySection;
 use crate::log::SegmentedLog;
 use crate::sequencer::StreamMsg;
 use crate::test_support::{
-    RETENTION, TRADER, TestHistory, TestSequencer, assert_a_dropped_read_keeps_its_permit, deposit, every_event,
-    logged_history, scratch_dir, withdraw,
+    RETENTION, SEGMENT_COMMANDS, TRADER, TestHistory, TestSequencer, assert_a_dropped_read_keeps_its_permit, deposit,
+    every_event, logged_history, scratch_dir, withdraw,
 };
 
 const A: AccountId = AccountId([0xa; 20]);
@@ -251,6 +253,79 @@ async fn pages_wait_until_the_index_has_taken_the_log_it_started_on() {
         let page = reader.page(query()).await.unwrap().expect("caught up");
         assert_eq!(page.events, logged_history(&dir, TRADER), "{case}");
     }
+}
+
+/// The writer lets readers in once it has written a command at or past the tip it was given, and
+/// never before; without a tip it leaves the flag to `catch_up_to`.
+#[test]
+fn the_writer_lets_readers_in_once_it_writes_the_tip() {
+    // (tip, commands written, readers let in)
+    for (tip, seqs, let_in) in
+        [(Some(5), [3, 4], false), (Some(5), [4, 5], true), (Some(5), [6, 7], true), (None, [1, 2], false)]
+    {
+        let writer = Writer::open(&file(&index_dir("writer-ready")), ms(RETENTION)).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        seqs.iter().for_each(|seq| tx.try_send(command(*seq, 0, Vec::new())).unwrap());
+        drop(tx);
+        let (ready, readers) = watch::channel(false);
+        writer.run(rx, ready, tip).unwrap();
+        assert_eq!(*readers.borrow(), let_in, "tip {tip:?}, wrote {seqs:?}");
+    }
+}
+
+/// `catch_up_to` lets readers in at once only when the index already holds the tip.
+#[tokio::test]
+async fn readers_wait_for_a_tip_the_index_has_not_taken() {
+    let (dir, index) = (scratch_dir("history-tip"), index_dir("tip"));
+    indexed_log(&dir, &index, 1).await;
+    let next = last_command_seq(&dir) + 1;
+    let cfg = HistorySection { dir: index.clone(), retention: RETENTION };
+    // (tip, readers let in at once)
+    for (tip, at_once) in [(None, true), (Some(next - 1), true), (Some(next), false), (Some(next + 1), false)] {
+        let mut history = History::open(&cfg, &dir).unwrap();
+        assert_eq!(history.resume_at, Offset::start_of(next));
+        history.catch_up_to(tip);
+        assert_eq!(*history.ready.borrow(), at_once, "tip {tip:?}");
+    }
+}
+
+/// A history failure carries its cause: an unusable index directory, a damaged log segment at the
+/// startup check (blamed on the log, not the index), and one the feed meets while catching up.
+#[tokio::test]
+async fn a_history_failure_names_its_cause() {
+    let (dir, index) = (scratch_dir("history-causes"), index_dir("causes"));
+    let occupied = scratch_dir("history-causes-file");
+    File::create(&occupied).unwrap();
+    let cfg = HistorySection { dir: occupied.join("history"), retention: RETENTION };
+    let err = History::open(&cfg, &dir).err().expect("no directory under a file");
+    assert!(format!("{err:#}").contains("creating"), "{err:#}");
+
+    indexed_log(&dir, &index, 1).await;
+    let last = last_command_seq(&dir);
+    // More commands complete the segment that holds the index's last command.
+    let node = TestSequencer::start(&dir, 1024);
+    for n in 0..SEGMENT_COMMANDS {
+        node.submit(deposit(1, &format!("after-{n}"))).await;
+    }
+    node.stop().await;
+    let manifest = Manifest::load(&dir).unwrap();
+    let holding = manifest.segments.iter().find(|s| s.first_seq <= last && last <= s.last_seq).unwrap();
+    OpenOptions::new().append(true).open(dir.join(&holding.file)).unwrap().write_all(b"\n").unwrap();
+    let cfg = HistorySection { dir: index.clone(), retention: RETENTION };
+    let err = format!("{:#}", History::open(&cfg, &dir).err().expect("a damaged segment"));
+    assert!(err.contains("reading the log") && err.contains("does not match its listing"), "{err}");
+    assert!(!err.contains("remove the directory"), "{err}");
+
+    let fresh = HistorySection { dir: index_dir("causes-fresh"), retention: RETENTION };
+    let mut history = History::open(&fresh, &dir).unwrap();
+    history.catch_up_to(None);
+    let (live, subscriber) = broadcast::channel(1);
+    drop(live);
+    let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
+    let manifest = watch::channel(manifest).1;
+    let feed = Feed::new(subscriber, dir.clone(), manifest, backfills, Some(history.resume_at()));
+    let err = timeout(Duration::from_secs(10), history.run(feed)).await.unwrap().expect_err("the feed fails");
+    assert!(format!("{err:#}").contains("does not match its listing"), "{err:#}");
 }
 
 #[tokio::test]

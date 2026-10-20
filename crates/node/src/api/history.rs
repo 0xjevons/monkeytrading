@@ -26,6 +26,7 @@ pub struct HistoryParams {
     before: Option<Offset>,
     /// Only events after this cursor.
     after: Option<Offset>,
+    /// Most events in the page: 1 to `MAX_LIMIT`, `DEFAULT_LIMIT` when absent.
     limit: Option<usize>,
 }
 

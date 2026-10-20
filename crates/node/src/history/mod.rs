@@ -5,9 +5,11 @@
 //! it has taken every command the log held at startup. History is public, like the log it comes
 //! from.
 //!
-//! TODO: the index sits on host disk, which the host can rewrite between runs and during one. Each
-//! event served names its place in the log, where anyone can check it; keeping the index in enclave
-//! memory or on an integrity-protected volume would bound it.
+//! TODO: the index sits on host disk, which the host can rewrite between runs and during one. SQLite
+//! reads it in defensive mode and refuses a schema this code did not create, which bounds what a
+//! rewritten file can make it run, but the rows themselves are unchecked. Each event served names
+//! its place in the log, where anyone can check it; keeping the index in enclave memory or on an
+//! integrity-protected volume would bound them.
 
 mod store;
 pub use store::Reader;
@@ -95,21 +97,24 @@ impl History {
     /// recovery writes to the log, so a refusal leaves the log as it was found.
     /// Error cases:
     /// - the retention is invalid, or the index cannot be opened or read (see `Writer::open`)
-    /// - the log or its manifest cannot be read, or the log does not hold the last command the
-    ///   index took, unchanged, at its seq
+    /// - the log or its manifest cannot be read
+    /// - the log does not hold the last command the index took, unchanged, at its seq
     pub fn open(cfg: &HistorySection, log_dir: &Path) -> anyhow::Result<Self> {
         let path = cfg.dir.join(INDEX_FILE);
         let writer = Writer::open(&path, cfg.retention_ms().context("history.retention")?)?;
         let resume_at = match writer.last_command()? {
             None => Offset::start_of(0),
             Some(last) => {
-                check_in_log(&last, log_dir).with_context(|| {
-                    format!(
-                        "the history index in {} does not match the log; once the log is known to be right, remove the directory to rebuild the index",
-                        cfg.dir.display()
-                    )
-                })?;
-                Offset::start_of(last.sequenced.seq + 1)
+                let seq = last.sequenced.seq;
+                let logged = logged_command(seq, log_dir).context("reading the log to check the history index")?;
+                ensure!(
+                    logged.as_ref() == Some(&last),
+                    "the history index in {} does not match the log: the log ends before seq {seq}, the last \
+                     command the index took, or holds another command there. Once the log is known to be right, \
+                     remove the directory to rebuild the index",
+                    cfg.dir.display()
+                );
+                Offset::start_of(seq + 1)
             }
         };
         info!(dir = %cfg.dir.display(), from = %resume_at, "history index opened");
@@ -123,6 +128,7 @@ impl History {
         self.ready_at = tip.filter(|tip| *tip >= self.resume_at.seq);
         if self.ready_at.is_none() {
             self.ready.send_replace(true);
+            info!(?tip, "history index holds the log's tip");
         }
     }
 
@@ -191,21 +197,17 @@ pub fn account_of(event: &Event) -> Option<AccountId> {
     }
 }
 
-/// Checks that the log in `log_dir` holds `last` at its seq, reading completed segments against the
-/// manifest on disk, which recovery checks the same way.
+/// The command the log in `log_dir` holds at `seq`, or `None` when it ends before it. Completed
+/// segments are read against the manifest on disk, which recovery checks the same way.
 /// Error cases:
 /// - the manifest or the log cannot be read (see `LogReader`)
-/// - the log ends before `last`'s seq, or holds another command there
-fn check_in_log(last: &CommandEntry, log_dir: &Path) -> anyhow::Result<()> {
-    let at = Offset::start_of(last.sequenced.seq);
+fn logged_command(seq: u64, log_dir: &Path) -> anyhow::Result<Option<CommandEntry>> {
+    let at = Offset::start_of(seq);
     let manifest = watch::channel(Manifest::load(log_dir)?).1;
-    let logged = LogReader::open(log_dir, at, manifest)?.next_entry()?;
-    ensure!(
-        logged == Some((at, LogEntry::Command(last.clone()))),
-        "the log ends before seq {seq}, or holds another command there than the one the index took",
-        seq = at.seq
-    );
-    Ok(())
+    Ok(match LogReader::open(log_dir, at, manifest)?.next_entry()? {
+        Some((offset, LogEntry::Command(command))) if offset == at => Some(command),
+        _ => None,
+    })
 }
 
 #[cfg(test)]

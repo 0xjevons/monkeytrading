@@ -131,6 +131,8 @@ impl TestHistory {
 
     /// The task's result once it has taken the whole log, which it ends with after the sequencer
     /// stops.
+    /// Error cases:
+    /// - the history task failed (see `History::run`)
     pub async fn finish(self) -> anyhow::Result<()> {
         timeout(Duration::from_secs(10), self.task).await.expect("the history task ends in time").expect("history task")
     }
