@@ -31,6 +31,8 @@ an index: load only the rule whose hint matches the current action.
   overflow checks on).
 - **deny.toml** — `cargo-deny` policy: advisories, allowed licenses, bans, and sources.
 - **rustfmt.toml** — `max_width = 120`.
+- **README.md** — the public introduction: what the engine does, its status, a quick start, the
+  roadmap, and how to contribute. Keep its quick start and status in step with the code.
 - **LICENSE** — Apache License 2.0.
 
 ## Commands
