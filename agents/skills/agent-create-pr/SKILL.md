@@ -119,10 +119,10 @@ After the merge, still in the main checkout, the session cleans up the PR's head
 - **On `origin`**, only for a PR from this repository (`isCrossRepository` is false), with a lease
   on the approved commit:
   `git push --force-with-lease="refs/heads/$BRANCH:$SHA" origin --delete "$BRANCH"`.
-- **Its worktree:** `git worktree remove` on the linked worktree that has the branch checked out,
-  or `git switch main` when the main checkout has it.
-- **Locally:** `git branch -D "$BRANCH"` only while the branch points at `$SHA`. A branch with
-  commits after `$SHA` stays, and the session reports them (`git log --oneline "$SHA..$BRANCH"`).
+- **Locally**, only while the branch points at `$SHA`: `git worktree remove` on the linked worktree
+  that has it checked out, or `git switch main` when the main checkout has it, then
+  `git branch -D "$BRANCH"`. A branch with commits after `$SHA` keeps its worktree, and the session
+  reports those commits (`git log --oneline "$SHA..$BRANCH"`).
 
 If GitHub or git refuses any step, the session reports why and stops.
 
