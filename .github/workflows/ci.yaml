@@ -68,13 +68,13 @@ jobs:
         run: cargo test --workspace --locked
 
   # Every committed reference log must replay to its roots, and the accounting invariants must hold,
-  # on each platform a verifier may run.
+  # on each platform a verifier may run. The `test` job runs both suites on x86_64 Linux.
   reference-logs:
     name: reference-logs (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26]
+        os: [ubuntu-24.04-arm, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
