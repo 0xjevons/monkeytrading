@@ -39,11 +39,15 @@ const EXCERPT_CHARS: usize = 200;
 /// The most quotes kept per market between two sequencing ticks; the oldest go first.
 const MAX_PENDING: usize = 256;
 /// A quote dated this far ahead of the host clock raises `venue_clock_ahead`: the venue's clock or
-/// the host's is wrong. The quote is still sequenced, so the engine, which skips a quote dated
-/// after the sequenced time, prices nothing from it rather than keep using older quotes. The
-/// engine also keeps only a venue's newest quote by time, so the venue's later, correctly dated
-/// quotes are ignored until the host clock reaches the bad time; they then count as no fresh
-/// quote here, and the symbol is alerted as silent.
+/// the host's is wrong. The quote is still sequenced when nothing usable came with it, so the
+/// engine, which skips a quote dated after the sequenced time, prices nothing from it rather than
+/// keep using older quotes. The engine also keeps only a venue's newest quote by time, so the
+/// venue's later, correctly dated quotes are ignored until the host clock reaches the bad time;
+/// they then count as no fresh quote here, and the symbol is alerted as silent. Once reached, the
+/// held quote counts in the index for `max_age_ms` whatever its age in real time.
+///
+/// TODO: letting a quote dated at or before the sequenced time replace a held one dated after it
+/// is an engine rule change, which would end both effects.
 ///
 /// TODO: the sequencer stamps with the untrusted host clock; once a trusted time bound exists, a
 /// host clock this far behind the venues should fail closed there.
@@ -179,16 +183,16 @@ impl Adapter {
         matches!(self, Adapter::Coinbase(_) | Adapter::Kraken(_))
     }
 
-    /// Reads one venue message.
+    /// Reads one venue message at host time `now`.
     /// Error cases:
     /// - the message is not one the venue's protocol defines, a field fails to parse, or the
     ///   venue reported an error
     /// - the message cannot be applied to the state kept for this connection
-    fn read(&mut self, text: &str) -> Result<Frame, Refusal> {
+    fn read(&mut self, text: &str, now: Millis) -> Result<Frame, Refusal> {
         match self {
             Adapter::Bitstamp => bitstamp::parse(text).map_err(Refusal::Message),
-            Adapter::Coinbase(books) => books.read(text),
-            Adapter::Kraken(books) => books.read(text),
+            Adapter::Coinbase(books) => books.read(text, now),
+            Adapter::Kraken(books) => books.read(text, now),
         }
     }
 }
@@ -338,7 +342,8 @@ impl VenueFeed {
         text: &str,
         pending: &mut BTreeMap<MarketId, VecDeque<SourceQuote>>,
     ) -> anyhow::Result<()> {
-        let books = match adapter.read(text) {
+        let now = now_ms();
+        let books = match adapter.read(text, now) {
             Ok(Frame::Books(books)) => books,
             Ok(Frame::Control) => return Ok(()),
             Ok(Frame::Reconnect) => bail!("the venue asked for a reconnect"),
@@ -352,13 +357,9 @@ impl VenueFeed {
             }
         };
         for book in books {
-            match to_quote(self.conn.venue, &self.markets, book) {
+            match to_quote(self.conn.venue, &self.markets, book, now) {
                 Ok((market, quote)) => {
-                    let quotes = pending.entry(market).or_default();
-                    if quotes.len() == MAX_PENDING {
-                        quotes.pop_front();
-                    }
-                    quotes.push_back(quote);
+                    push_pending(pending.entry(market).or_default(), quote);
                 }
                 Err(reason) if adapter.keeps_state() => {
                     self.refuse(&reason, text);
@@ -460,6 +461,14 @@ pub async fn run(
     tx: mpsc::Sender<Request>,
 ) -> anyhow::Result<()> {
     VenueFeed::new(conn, timing, tls, tx).run().await
+}
+
+/// Adds a quote received for a market, dropping the oldest once `MAX_PENDING` are held.
+pub(super) fn push_pending(quotes: &mut VecDeque<SourceQuote>, quote: SourceQuote) {
+    if quotes.len() == MAX_PENDING {
+        quotes.pop_front();
+    }
+    quotes.push_back(quote);
 }
 
 /// The quote to sequence for a market from those received since the last tick: the newest the

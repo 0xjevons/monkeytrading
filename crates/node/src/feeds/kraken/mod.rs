@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use chrono::DateTime;
 use crc32fast::Hasher;
 use engine_core::Fixed;
+use engine_core::types::Millis;
 use serde::Deserialize;
 use serde_json::json;
 use serde_json::value::RawValue;
@@ -77,18 +78,18 @@ struct RawLevel<'a> {
 }
 
 impl Books {
-    /// Reads one Kraken message, applying and verifying any book change in it.
+    /// Reads one Kraken message at host time `now`, applying and verifying any book change in it.
     /// Error cases:
     /// - an unknown channel or method, or a failed subscription (the connection carries on)
     /// - a `book` message that does not parse or apply, or whose checksum does not match the
     ///   kept book (the connection resyncs)
-    pub(super) fn read(&mut self, text: &str) -> Result<Frame, Refusal> {
+    pub(super) fn read(&mut self, text: &str, now: Millis) -> Result<Frame, Refusal> {
         let message: Message =
             serde_json::from_str(text).map_err(|e| Refusal::Message(format!("unparseable message: {e}")))?;
         match (message.channel, message.method) {
             (Some("book"), None) => {
                 let data = message.data.ok_or_else(|| Refusal::Connection("book without data".into()))?;
-                self.apply(message.kind, data.get()).map(Frame::Books).map_err(Refusal::Connection)
+                self.apply(message.kind, data.get(), now).map(Frame::Books).map_err(Refusal::Connection)
             }
             (Some("heartbeat" | "status"), None) => Ok(Frame::Control),
             (None, Some("subscribe")) if message.success == Some(true) => Ok(Frame::Control),
@@ -103,10 +104,10 @@ impl Books {
     /// has no top.
     /// Error cases:
     /// - as for `apply_book`
-    fn apply(&mut self, kind: Option<&str>, data: &str) -> Result<Vec<Book>, String> {
+    fn apply(&mut self, kind: Option<&str>, data: &str, now: Millis) -> Result<Vec<Book>, String> {
         let books: Vec<BookData> = serde_json::from_str(data).map_err(|e| format!("bad book: {e}"))?;
         let tops: Vec<Option<Book>> =
-            books.into_iter().map(|book| self.apply_book(kind, book)).collect::<Result<_, _>>()?;
+            books.into_iter().map(|book| self.apply_book(kind, book, now)).collect::<Result<_, _>>()?;
         Ok(tops.into_iter().flatten().collect())
     }
 
@@ -115,8 +116,8 @@ impl Books {
     /// - the message type is unknown, or an update arrives for a symbol with no snapshot
     /// - a price or size is not a plain decimal, a price is out of range, or a size is negative
     /// - the kept book's checksum differs from the venue's
-    /// - the timestamp is not RFC 3339, or is before the epoch
-    fn apply_book(&mut self, kind: Option<&str>, book: BookData) -> Result<Option<Book>, String> {
+    /// - the timestamp is not RFC 3339, or is implausible at `now` (see `check_time`)
+    fn apply_book(&mut self, kind: Option<&str>, book: BookData, now: Millis) -> Result<Option<Book>, String> {
         let BookData { symbol, bids, asks, checksum, timestamp } = book;
         let depth = match kind {
             Some("snapshot") => {
@@ -137,7 +138,7 @@ impl Books {
         let ts = DateTime::parse_from_rfc3339(timestamp)
             .map_err(|e| format!("bad timestamp {timestamp}: {e}"))?
             .timestamp_millis();
-        check_time(&symbol, ts)?;
+        check_time(&symbol, ts, now)?;
         let top = depth.bids.last_key_value().zip(depth.asks.first_key_value());
         Ok(top.map(|((bid, _), (ask, _))| Book { symbol, bid: *bid, ask: *ask, ts }))
     }

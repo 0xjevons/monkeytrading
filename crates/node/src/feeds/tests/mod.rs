@@ -45,7 +45,8 @@ async fn quotes_are_sequenced_per_market_with_the_venue_timestamp() {
 #[tokio::test]
 async fn only_the_newest_quote_per_market_is_sequenced_each_interval() {
     let (listener, url) = listen().await;
-    let timing = Timing { interval: Duration::from_secs(1), ..fast(WAIT) };
+    // A wide interval, so all three land in it even on a busy runner.
+    let timing = Timing { interval: Duration::from_secs(3), ..fast(WAIT) };
     let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, timing);
     let (mut ws, _) = accept(&listener).await;
 
@@ -400,6 +401,7 @@ async fn the_feed_stops_when_the_sequencer_goes_away() {
 #[test]
 fn books_no_working_venue_could_show_are_refused() {
     const NOW: i64 = 1_792_489_875_714;
+    const DAY: i64 = 24 * 60 * 60 * 1_000;
     let markets = BTreeMap::from([("BTC/USD".to_owned(), 1)]);
     let book = |symbol: &str, bid: &str, ask: &str, ts| Book {
         symbol: symbol.into(),
@@ -414,14 +416,16 @@ fn books_no_working_venue_could_show_are_refused() {
         ("out of range", book("BTC/USD", "0", "100", 1)),
         ("out of range", book("BTC/USD", "100", "1000000000.1", 1)),
         ("before the epoch", book("BTC/USD", "100", "101", -1)),
+        ("than any clock error", book("BTC/USD", "100", "101", NOW + DAY + 1)),
     ];
     for (expected, book) in refused {
-        let err = to_quote(Venue::Kraken, &markets, book).unwrap_err();
+        let err = to_quote(Venue::Kraken, &markets, book, NOW).unwrap_err();
         assert!(err.contains(expected), "expected {expected:?}, got {err}");
     }
-    // The mid truncates toward zero at the ninth decimal.
-    let accepted = to_quote(Venue::Kraken, &markets, book("BTC/USD", "100", "100.000000001", NOW));
-    assert_eq!(accepted, Ok((1, quote(Venue::Kraken, "100", NOW))));
+    // A time up to a day ahead is a clock error, not a corrupt one, and passes; the mid truncates
+    // toward zero at the ninth decimal.
+    let accepted = to_quote(Venue::Kraken, &markets, book("BTC/USD", "100", "100.000000001", NOW + DAY), NOW);
+    assert_eq!(accepted, Ok((1, quote(Venue::Kraken, "100", NOW + DAY))));
 }
 
 #[test]

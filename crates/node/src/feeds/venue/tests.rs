@@ -80,6 +80,16 @@ async fn a_recovery_gives_every_symbol_a_full_silence_window() {
     assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "ETH/USD"));
 }
 
+#[test]
+fn a_full_buffer_drops_its_oldest_quote() {
+    let at = |ts: Millis| SourceQuote { source: "kraken".into(), mid: Fixed::from_int(100), ts };
+    let mut quotes = VecDeque::new();
+    (0..=MAX_PENDING as Millis).for_each(|ts| push_pending(&mut quotes, at(ts)));
+    assert_eq!(quotes.len(), MAX_PENDING);
+    assert_eq!(quotes.front(), Some(&at(1)));
+    assert_eq!(quotes.back(), Some(&at(MAX_PENDING as Millis)));
+}
+
 // ── Helpers ──
 
 /// A Kraken feed for `symbols` that is never run, for calling its alert paths directly.

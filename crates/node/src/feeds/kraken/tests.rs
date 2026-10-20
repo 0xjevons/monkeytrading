@@ -13,6 +13,8 @@ const UPDATES: [&str; 7] = [
     // Adds an ask inside the top ten, pushing the tenth out: only truncation keeps the checksum.
     r#"{"channel":"book","type":"update","data":[{"symbol":"ETH/USD","bids":[],"asks":[{"price":2387.41,"qty":0.68997503}],"checksum":412518972,"timestamp":"2026-10-20T12:34:44.401610Z"}]}"#,
 ];
+/// The host time messages are read at: just after the recorded ones.
+const NOW: Millis = 1_792_499_685_000;
 const HEARTBEAT: &str = r#"{"channel":"heartbeat"}"#;
 const STATUS: &str = r#"{"channel":"status","type":"update","data":[{"version":"2.0.10","system":"online","api_version":"v2","connection_id":5169314452737955867,"upcoming_maintenance":[],"emergency":[]}]}"#;
 const SUBSCRIBED: &str = r#"{"method":"subscribe","result":{"channel":"book","depth":10,"snapshot":true,"symbol":"ETH/USD"},"success":true,"time_in":"2026-10-20T12:34:28.967739Z","time_out":"2026-10-20T12:34:28.967768Z"}"#;
@@ -21,45 +23,51 @@ const REJECTED: &str = r#"{"error":"Currency pair not supported BTC/USX","method
 #[test]
 fn a_snapshot_gives_its_verified_top_at_the_venue_time() {
     // 2026-10-20T12:34:44.332552Z, truncated to the millisecond.
-    assert_eq!(Books::default().read(SNAPSHOT), Ok(top("2387.34", "2387.35", 1_792_499_684_332)));
+    assert_eq!(Books::default().read(SNAPSHOT, NOW), Ok(top("2387.34", "2387.35", 1_792_499_684_332)));
 }
 
 #[test]
 fn every_verified_update_publishes_the_top_at_its_time() {
     let mut books = Books::default();
-    books.read(SNAPSHOT).unwrap();
+    books.read(SNAPSHOT, NOW).unwrap();
     // The first three change sizes only: the top holds but is published at each update's time.
     let times = [338, 389, 390, 401, 401, 401, 401].map(|ms| 1_792_499_684_000 + ms);
     for (update, ts) in UPDATES.iter().zip(times) {
-        assert_eq!(books.read(update), Ok(top("2387.34", "2387.35", ts)), "{update}");
+        assert_eq!(books.read(update, NOW), Ok(top("2387.34", "2387.35", ts)), "{update}");
     }
 }
 
 #[test]
 fn a_corrupted_checksum_resyncs_without_a_quote() {
     let mut books = Books::default();
-    books.read(SNAPSHOT).unwrap();
+    books.read(SNAPSHOT, NOW).unwrap();
     let corrupted = UPDATES[0].replace(r#""checksum":3352854302"#, r#""checksum":3352854303"#);
-    assert!(matches!(books.read(&corrupted), Err(Refusal::Connection(reason)) if reason.contains("checksum mismatch")));
+    assert!(
+        matches!(books.read(&corrupted, NOW), Err(Refusal::Connection(reason)) if reason.contains("checksum mismatch"))
+    );
 }
 
 #[test]
 fn a_corrupted_level_resyncs_without_a_quote() {
     let mut books = Books::default();
-    books.read(SNAPSHOT).unwrap();
+    books.read(SNAPSHOT, NOW).unwrap();
     // The price is valid and in sequence, but not the venue's: only the checksum shows it.
     let corrupted = UPDATES[0].replace(r#""qty":3.07562993"#, r#""qty":3.07562994"#);
-    assert!(matches!(books.read(&corrupted), Err(Refusal::Connection(reason)) if reason.contains("checksum mismatch")));
+    assert!(
+        matches!(books.read(&corrupted, NOW), Err(Refusal::Connection(reason)) if reason.contains("checksum mismatch"))
+    );
 }
 
 #[test]
 fn a_missed_update_is_caught_by_the_next_checksum() {
     let mut books = Books::default();
-    books.read(SNAPSHOT).unwrap();
-    books.read(UPDATES[0]).unwrap();
-    books.read(UPDATES[1]).unwrap();
+    books.read(SNAPSHOT, NOW).unwrap();
+    books.read(UPDATES[0], NOW).unwrap();
+    books.read(UPDATES[1], NOW).unwrap();
     // UPDATES[2] never arrives; the book misses its new bid size.
-    assert!(matches!(books.read(UPDATES[3]), Err(Refusal::Connection(reason)) if reason.contains("checksum mismatch")));
+    assert!(
+        matches!(books.read(UPDATES[3], NOW), Err(Refusal::Connection(reason)) if reason.contains("checksum mismatch"))
+    );
 }
 
 #[test]
@@ -73,13 +81,14 @@ fn malformed_books_resync_with_their_reason() {
         ("bad book", UPDATES[0].replace(r#""checksum":3352854302,"#, "")),
         ("bad timestamp", UPDATES[0].replace("2026-10-20T12:34:44.338822Z", "later")),
         ("before the epoch", UPDATES[0].replace("2026-10-20T12:34:44.338822Z", "1969-12-31T23:59:59.999Z")),
+        ("than any clock error", UPDATES[0].replace("2026-10-20T12:34:44.338822Z", "2026-10-22T12:34:44.338822Z")),
         ("unknown book message type", UPDATES[0].replace(r#""type":"update""#, r#""type":"delta""#)),
         ("update before snapshot", UPDATES[0].replace("ETH/USD", "SOL/USD")),
     ];
     for (expected, case) in cases {
         let mut books = Books::default();
-        books.read(SNAPSHOT).unwrap();
-        let refused = books.read(&case);
+        books.read(SNAPSHOT, NOW).unwrap();
+        let refused = books.read(&case, NOW);
         assert!(
             matches!(&refused, Err(Refusal::Connection(reason)) if reason.contains(expected)),
             "{expected}: {refused:?}"
@@ -90,32 +99,32 @@ fn malformed_books_resync_with_their_reason() {
 #[test]
 fn a_new_snapshot_replaces_the_book() {
     let mut books = Books::default();
-    books.read(SNAPSHOT).unwrap();
-    UPDATES.iter().for_each(|update| drop(books.read(update).unwrap()));
+    books.read(SNAPSHOT, NOW).unwrap();
+    UPDATES.iter().for_each(|update| drop(books.read(update, NOW).unwrap()));
     // One level a side: its checksum holds only if nothing of the earlier book is kept.
     let checksum = checksum([("2390.00", "1.00000000"), ("2389.00", "2.00000000")].into_iter());
     let snapshot = format!(
         r#"{{"channel":"book","type":"snapshot","data":[{{"symbol":"ETH/USD","bids":[{{"price":2389.00,"qty":2.00000000}}],"asks":[{{"price":2390.00,"qty":1.00000000}}],"checksum":{checksum},"timestamp":"2026-10-20T12:34:45.000000Z"}}]}}"#
     );
-    assert_eq!(books.read(&snapshot), Ok(top("2389", "2390", 1_792_499_685_000)));
+    assert_eq!(books.read(&snapshot, NOW), Ok(top("2389", "2390", 1_792_499_685_000)));
 }
 
 #[test]
 fn heartbeats_status_and_acknowledgements_carry_no_price() {
     let mut books = Books::default();
-    assert_eq!(books.read(HEARTBEAT), Ok(Frame::Control));
-    assert_eq!(books.read(STATUS), Ok(Frame::Control));
-    assert_eq!(books.read(SUBSCRIBED), Ok(Frame::Control));
+    assert_eq!(books.read(HEARTBEAT, NOW), Ok(Frame::Control));
+    assert_eq!(books.read(STATUS, NOW), Ok(Frame::Control));
+    assert_eq!(books.read(SUBSCRIBED, NOW), Ok(Frame::Control));
 }
 
 #[test]
 fn a_failed_subscription_or_unknown_message_is_refused() {
     let mut books = Books::default();
     assert!(
-        matches!(books.read(REJECTED), Err(Refusal::Message(reason)) if reason.contains("Currency pair not supported"))
+        matches!(books.read(REJECTED, NOW), Err(Refusal::Message(reason)) if reason.contains("Currency pair not supported"))
     );
-    assert!(matches!(books.read(r#"{"channel":"trade"}"#), Err(Refusal::Message(_))));
-    assert!(matches!(books.read("{"), Err(Refusal::Message(_))));
+    assert!(matches!(books.read(r#"{"channel":"trade"}"#, NOW), Err(Refusal::Message(_))));
+    assert!(matches!(books.read("{", NOW), Err(Refusal::Message(_))));
 }
 
 #[test]
