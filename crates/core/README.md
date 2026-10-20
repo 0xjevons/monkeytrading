@@ -19,6 +19,11 @@ this crate and reproduce the signed state roots exactly.
 - Markout-based toxicity scoring that widens spreads for flow that picks off stale prices
 - Deposits credited at most once per chain reference, and all external numbers bounded
 - A keccak-256 state root over the canonical state encoding
+- Versioned rules: a log activates each protocol version at a recorded seq, and a log that never
+  does replays under `V2`, the rules every log starts under, to its original roots
+- From protocol `V3`, client auth recorded in the log: EIP-712 signatures, per-account nonces, and
+  expiries on every order, cancel, and withdrawal, checked by the engine so a replay proves each
+  request was its account's, or unsigned requests in dev logs
 
 ## Repository Structure
 
@@ -28,6 +33,10 @@ this crate and reproduce the signed state roots exactly.
 - `src/closeout.rs` — account close-out and bad-debt write-off
 - `src/funds.rs` — deposits, withdrawals, house capital, and overnight financing
 - `src/admin.rs` — operator commands and stress levels
+- `src/auth.rs` — client auth, request signatures and nonces, and the check every client request
+  passes
+- `src/eip712.rs` — the EIP-712 domain, the request types clients sign, and signer recovery
+- `src/protocol.rs` — protocol versions, and how to add one
 - `src/fixed.rs` — `Fixed`, the 9-decimal fixed-point type used for all money
 - `src/market.rs` — market listings and tier tables
 - `src/params.rs` — protocol parameters, stress levels, toxicity, and the rollover clock
@@ -44,7 +53,10 @@ this crate and reproduce the signed state roots exactly.
   differs
 - `tests/invariants/` — property tests over generated sessions (`main.rs`) and the session generator
   (`session.rs`)
+- `tests/fixtures/eip712.json` — EIP-712 test vectors: API bodies, wallet typed data, and
+  signatures
 - `examples/reference_log.rs` — writes the reference log for a new protocol version
+- `examples/sign_request.rs` — a client signing a request body for the API
 
 ## Usage
 
@@ -59,6 +71,18 @@ let root = engine.state_root();
 
 The node crate (`engine-node`) stamps and logs every command before applying it; a verifier
 replays that log with the same calls.
+
+A client signs each request with its account key under the EIP-712 domain of the vault, with the
+account's next nonce and an expiry at most five minutes ahead:
+
+```bash
+SIGNER_KEY=<private key> cargo run -p engine-core --example sign_request -- \
+    <chain id> <vault> <nonce> <expires at> <order|cancel|withdrawal> '<unsigned body>'
+```
+
+## Configuration
+
+`SIGNER_KEY`: the account's private key, hex, for the `sign_request` example.
 
 ## Testing
 
@@ -82,16 +106,15 @@ Two suites guard replay and accounting:
 
 A change to engine state, its serialization, or what a command does changes the roots that existing
 logs replay to. It ships as a new protocol version, and the committed logs of earlier versions must
-keep passing unchanged. The engine has two protocol versions today: `v1.jsonl` holds the original
-rules, and `v2.jsonl` adds two: a venue quote stamped more than `MAX_QUOTE_LEAD_MS` after the
-sequenced time is refused, and any quote replaces a stored one stamped after the sequenced time.
-Until versions that activate at a recorded seq arrive with signed client requests
-([#18](https://github.com/0xjevons/monkeytrading/issues/18)), the engine applies the latest rules
-from genesis; `v1.jsonl` still replays because none of its quotes is stamped ahead. For each later
-version:
+keep passing unchanged. `v1.jsonl` holds the original rules, and `v2.jsonl` adds two: a venue quote
+stamped more than `MAX_QUOTE_LEAD_MS` after the sequenced time is refused, and any quote replaces a
+stored one stamped after the sequenced time. Both predate activation, so every log starts under
+their combined rules, which `src/protocol.rs` names `V2`; `v1.jsonl` still replays because none of
+its quotes is stamped ahead. `V3` adds signed client requests and activates at a recorded seq; its
+log is `v3.jsonl`. For each later version:
 
-1. Extend the session in `examples/reference_log.rs` so it activates the new version and exercises
-   the new rules.
+1. Add the version in code as `src/protocol.rs` lists, then extend the session in
+   `examples/reference_log.rs` so it activates the new version and exercises the new rules.
 2. Write the version's log, which the generator refuses to do over an existing file:
    `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`
 3. Write the node's log from it, with the events each command emits:

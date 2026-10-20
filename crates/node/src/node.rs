@@ -19,6 +19,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::api::{ApiState, MAX_BACKFILLS, router};
+use crate::clock::now_ms;
 use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProvider};
 use crate::log::Manifest;
 use crate::sequencer::{Request, Sequencer, SequencerConfig};
@@ -43,8 +44,8 @@ pub fn init_logging(level: &str) -> anyhow::Result<()> {
 /// Runs the node until a shutdown signal, or until the first supervised task stops.
 /// Error cases:
 /// - operator rotation is enabled, or the custody provider is not implemented
-/// - attesting the enclave key, recovering the log, sequencing genesis, or binding the listener
-///   fails
+/// - attesting the enclave key, recovering the log, activating the protocol (including a log that
+///   records another client auth), sequencing genesis, or binding the listener fails
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
 pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.operator.rotation_enabled {
@@ -67,6 +68,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     info!(enclave = %key.address_hex(), provider = %attestation.provider, "enclave key attested");
 
     let vault: AccountId = cfg.custody.vault.parse().context("custody.vault")?;
+    let client_auth = cfg.client_auth()?;
     let (stream_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
     let (withdrawals_tx, withdrawals_rx) = mpsc::unbounded_channel();
     let (manifest_tx, manifest_rx) = watch::channel(Manifest::default());
@@ -77,10 +79,13 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         checkpoint_every: cfg.node.checkpoint_every,
         chain_id: cfg.custody.chain_id,
         vault,
+        clock: now_ms,
     };
     let mut seq = Sequencer::recover(seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
-    if seq.is_fresh() {
+    seq.activate_protocol(&client_auth)
+        .inspect_err(|e| error!(alert = "protocol_activation_failed", "refusing to serve: {e:#}"))?;
+    if seq.needs_genesis() {
         info!(markets = cfg.genesis.markets.len(), "sequencing genesis");
         seq.genesis(&cfg.genesis)?;
     }
@@ -112,8 +117,9 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         tx,
         stream: stream_tx,
         attestation,
-        auth: cfg.node.auth,
+        auth: client_auth,
         dev_deposits,
+        clock: now_ms,
         log_dir: cfg.node.log_dir.clone(),
         manifest: manifest_rx,
         backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),

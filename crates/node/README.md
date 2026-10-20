@@ -13,6 +13,9 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - Signed checkpoints and withdrawals, bound to the chain id and vault, from an attested key
 - Attestation through Linux configfs-tsm, covering TDX and SEV-SNP, or a clearly marked mock
 - REST API for orders, cancels, withdrawals, and reads, plus a WebSocket stream of the log
+- Orders, cancels, and withdrawals signed by the account (EIP-712), checked before they are
+  sequenced; `auth = "none"` trusts the account field and runs only with the mock TEE and custody
+- The latest protocol version and the client auth activated at boot, at the log's next seq
 - Stream offsets of `<seq>:<index>`: a subscriber starts or resumes at any offset, reads the log
   from disk, then goes live, getting each message once; one that falls behind resumes from disk
 - Segmented log: completed segments and a manifest of their seq ranges and SHA-256 hashes are a
@@ -26,17 +29,19 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/main.rs` — the `engine` binary: `run` and `replay`
 - `src/lib.rs` — module index
 - `src/node.rs` — startup, task supervision, and shutdown
-- `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, alerts, and log replay
-- `src/sequencer/tests.rs` — sequencer and replay tests
+- `src/sequencer/mod.rs` — the sequencer, protocol activation, genesis, stream messages,
+  checkpoints, alerts, and log replay
+- `src/sequencer/tests.rs` — sequencer, activation, genesis restart, and replay tests
 - `src/log/mod.rs` — the JSON-lines log format, stream offsets, and the single-file reader
 - `src/log/segments.rs` — segment files, rotation, the manifest, and recovery checks
 - `src/log/reader.rs` — reads the log from any offset while it is being written
 - `src/log/checked.rs` — reads a completed segment in chunks checked against its listing
 - `src/log/tests.rs` — log format, segment, and reader tests
-- `src/api/mod.rs` — REST routes and the request span
+- `src/api/mod.rs` — REST routes, request signature checks, and the request span
 - `src/api/stream.rs` — the WebSocket stream: backfill from disk, then live
 - `src/api/archive.rs` — the archive routes: the manifest and completed segments
-- `src/api/tests.rs` — API tests, including the resumable stream and archive dev scenario
+- `src/api/tests.rs` — API tests, including signed requests and the resumable stream and archive
+  dev scenario
 - `src/test_support.rs` — the shared test harness
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
 - `src/config.rs` — the node config schema and validation
@@ -46,6 +51,7 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
 - `tests/reference_logs.rs` — replays every committed node reference log, events included
 - `tests/reference/` — one node-format reference log per protocol version, never regenerated
+- `tests/replay.rs` — replays a log the node wrote before protocol versions, kept in `tests/fixtures/`
 
 ## Usage
 
@@ -63,9 +69,9 @@ jq -r '.file' archive/manifest.jsonl |
 ```
 
 Endpoints: `GET /v1/health`, `GET /v1/attestation`, `GET /v1/markets`, `GET /v1/house`,
-`GET /v1/accounts/{address}`, `POST /v1/orders`, `POST /v1/orders/cancel`, `POST /v1/withdrawals`,
-`POST /v1/dev/deposit` (mock custody only), `GET /v1/stream` (WebSocket), and
-`GET /v1/archive/{file}` (`manifest.jsonl` or a segment it lists).
+`GET /v1/accounts/{address}`, `GET /v1/accounts/{address}/nonce`, `POST /v1/orders`,
+`POST /v1/orders/cancel`, `POST /v1/withdrawals`, `POST /v1/dev/deposit` (mock custody only),
+`GET /v1/stream` (WebSocket), and `GET /v1/archive/{file}` (`manifest.jsonl` or a segment it lists).
 
 `/v1/stream` is live from now by default. `?from=<seq>` starts at the first message of `seq`
 (`from=0` is the whole log), and `?after=<seq>:<index>` resumes after the `offset` of the last
@@ -86,6 +92,23 @@ segment. If a new segment cannot be created, the current one keeps growing and t
 (`log_rotation_failed`) until it can. A log written as one file before segments existed continues as
 the first segment: move it to `<log_dir>/00000000000000000000.jsonl`. Every segment is kept, since
 recovery replays the log from genesis.
+
+With `auth = "eip712"`, each order, cancel, and withdrawal body carries
+`"auth": { "nonce": <next nonce>, "expires_at": <ms>, "signature": "0x…" }`: the account's EIP-712
+signature under the domain of `custody.vault` on `custody.chain_id` (see `engine-core`'s
+`sign_request` example). `expires_at` is the latest time, in milliseconds since the Unix epoch, at
+which the request itself is accepted; a limit or stop order it places rests until it fills or is
+cancelled. A missing or invalid signature is refused with 401, an expired request with 400, a
+signed request from an account that has never been credited with 403, and a nonce other than the
+account's next with 409 and the `expected` nonce; none of these reaches the log. A request
+refused with 403 or 409 uses no nonce, so it stays valid until its `expires_at`: resubmit that same
+request once its nonce is next, or let it expire before signing different content at that nonce.
+An expiry more than five minutes ahead is sequenced and rejected with `expiry_too_far`, which uses
+the nonce. Two requests that race for one nonce are both sequenced, and the engine rejects the
+second with `invalid_nonce`.
+
+The first start records `auth`, and under `eip712` the custody chain id and vault, in the log;
+changing any of them needs a fresh log.
 
 ## Configuration
 

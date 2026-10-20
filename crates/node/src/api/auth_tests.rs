@@ -1,0 +1,344 @@
+//! API tests for signed client requests: signatures, nonces, expiries, and the account trust path.
+
+use super::*;
+use std::path::PathBuf;
+
+use axum::body::{Body, to_bytes};
+use axum::http::Request as HttpRequest;
+use engine_core::auth::MAX_EXPIRY_AHEAD_MS;
+use engine_core::command::OrderKind;
+use engine_core::eip712;
+use engine_core::price::SourceQuote;
+use engine_core::types::{Millis, Side};
+use k256::ecdsa::SigningKey;
+use serde_json::Value;
+use tower::ServiceExt;
+
+use crate::log::{LogEntry, SegmentedLog};
+use crate::sequencer::{Sequencer, SequencerConfig, SignedWithdrawal, replay};
+use crate::tee::{EnclaveKey, MockAttestor, attest_key};
+use crate::test_support::{dev_config, scratch_dir, sequencer_config};
+
+const VECTORS: &str = include_str!("../../../core/tests/fixtures/eip712.json");
+/// The time the test sequencer stamps every command with, and the API checks expiries against
+/// unless a test gives it another clock: Tue 20 Oct 2026 14:00 UTC.
+const NOW: Millis = 1_792_504_800_000;
+const CHAIN_ID: u64 = 31_337;
+const VAULT: AccountId = AccountId([0xaa; 20]);
+
+#[tokio::test]
+async fn a_signed_order_fills_and_a_reused_or_ahead_nonce_stays_out_of_the_log() {
+    let node = Node::start("stale", signed()).await;
+    let client = SigningKey::from_slice(&[1; 32]).unwrap();
+    node.fund(&client).await;
+
+    let order = signed_order(&client, 0, "0.1");
+    let (status, events) = node.post("/v1/orders", order.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(events.as_array().unwrap().iter().any(|e| e["type"] == "fill"), "{events}");
+
+    let invalid_nonce = (StatusCode::CONFLICT, serde_json::json!({ "error": "invalid nonce", "expected": 1 }));
+    assert_eq!(node.post("/v1/orders", order.clone()).await, invalid_nonce);
+    assert_eq!(node.post("/v1/orders", signed_order(&client, 5, "0.1")).await, invalid_nonce);
+
+    let mut altered = signed_order(&client, 1, "0.1");
+    altered["qty"] = "0.2".into();
+    let (status, body) = node.post("/v1/orders", altered).await;
+    assert_eq!((status, body["error"].as_str()), (StatusCode::UNAUTHORIZED, Some("invalid signature")));
+
+    // Only the first order reached the log, and the log replays under the rules it recorded.
+    let entries = node.entries();
+    let orders = entries
+        .iter()
+        .filter(|e| matches!(e, LogEntry::Command(c) if matches!(c.sequenced.cmd, Command::PlaceOrder(_))));
+    assert_eq!(orders.count(), 1);
+    assert_eq!(replay(&entries).unwrap().engine.client_auth(), Some(&signed()));
+}
+
+#[tokio::test]
+async fn an_unsigned_request_is_refused_before_it_is_sequenced() {
+    let node = Node::start("unsigned", signed()).await;
+    let client = SigningKey::from_slice(&[1; 32]).unwrap();
+    node.fund(&client).await;
+    let account = account_of(&client);
+    let mut order = signed_order(&client, 0, "0.1");
+    order.as_object_mut().unwrap().remove("auth");
+    let requests = [
+        ("/v1/orders", order),
+        ("/v1/orders/cancel", serde_json::json!({ "account": account, "order_id": 0 })),
+        ("/v1/withdrawals", serde_json::json!({ "account": account, "amount": "100" })),
+    ];
+    let logged = node.entries().len();
+    for (path, body) in requests {
+        let (status, body) = node.post(path, body).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::UNAUTHORIZED, Some("missing signature")), "{path}");
+    }
+    assert_eq!(node.entries().len(), logged);
+}
+
+#[tokio::test]
+async fn a_signed_request_from_an_account_never_credited_stays_out_of_the_log() {
+    let node = Node::start("uncredited", signed()).await;
+    let stranger = SigningKey::from_slice(&[9; 32]).unwrap();
+    let logged = node.entries().len();
+    let (status, body) = node.post("/v1/orders", signed_order(&stranger, 0, "0.1")).await;
+    assert_eq!((status, body["error"].as_str()), (StatusCode::FORBIDDEN, Some("account has never been credited")));
+    assert_eq!(node.entries().len(), logged);
+}
+
+#[tokio::test]
+async fn an_expired_request_stays_out_of_the_log_and_a_too_far_one_uses_its_nonce() {
+    let node = Node::start("expiry", signed()).await;
+    let client = SigningKey::from_slice(&[1; 32]).unwrap();
+    node.fund(&client).await;
+    let logged = node.entries().len();
+    let (status, body) = node.post("/v1/orders", signed_order_until(&client, 0, "0.1", NOW - 1)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().starts_with("request expired"), "{body}");
+    assert_eq!(node.entries().len(), logged);
+
+    // Refused by the engine, which uses the nonce, so the request can never run once its expiry
+    // comes within the bound.
+    let too_far = signed_order_until(&client, 0, "0.1", NOW + MAX_EXPIRY_AHEAD_MS + 1);
+    let (status, events) = node.post("/v1/orders", too_far.clone()).await;
+    assert_eq!((status, events[0]["reason"]["kind"].as_str()), (StatusCode::OK, Some("expiry_too_far")), "{events}");
+    let invalid_nonce = (StatusCode::CONFLICT, serde_json::json!({ "error": "invalid nonce", "expected": 1 }));
+    assert_eq!(node.post("/v1/orders", too_far).await, invalid_nonce);
+}
+
+#[tokio::test]
+async fn a_request_expired_by_the_clock_stays_out_of_the_log_though_sequenced_time_lags() {
+    // The API's clock runs a minute and a millisecond past the last sequenced time.
+    let node = Node::start_with_clock("clock", signed(), || NOW + 60_001).await;
+    let client = SigningKey::from_slice(&[1; 32]).unwrap();
+    node.fund(&client).await;
+    let logged = node.entries().len();
+    let (status, body) = node.post("/v1/orders", signed_order(&client, 0, "0.1")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().starts_with("request expired"), "{body}");
+    assert_eq!(node.entries().len(), logged);
+}
+
+#[tokio::test]
+async fn a_request_expired_by_sequenced_time_stays_out_of_the_log_though_the_clock_lags() {
+    // The API's clock reads the epoch, far behind sequenced time.
+    let node = Node::start_with_clock("lagging-clock", signed(), || 0).await;
+    let client = SigningKey::from_slice(&[1; 32]).unwrap();
+    node.fund(&client).await;
+    let last_sequenced = node.state.query(|e| e.now()).await.ok().expect("the sequencer is running");
+    let logged = node.entries().len();
+    let (status, body) = node.post("/v1/orders", signed_order_until(&client, 0, "0.1", last_sequenced - 1)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().starts_with("request expired"), "{body}");
+    assert_eq!(node.entries().len(), logged);
+}
+
+#[tokio::test]
+async fn two_copies_of_a_withdrawal_that_both_pass_the_api_are_paid_once() {
+    let mut node = Node::start("race", signed()).await;
+    let client = SigningKey::from_slice(&[1; 32]).unwrap();
+    node.fund(&client).await;
+    let (account, amount, expires_at) = (account_of(&client), "100".parse::<Fixed>().unwrap(), NOW + 60_000);
+    let hash = |domain: &Eip712Domain, auth: &RequestAuth| {
+        withdrawal_hash(domain, account, amount, auth.nonce, auth.expires_at)
+    };
+    let signature =
+        eip712::sign(&client, &withdrawal_hash(&eip712::domain(CHAIN_ID, VAULT), account, amount, 0, expires_at));
+    let auth = RequestAuth { nonce: 0, expires_at, signature };
+    // Both copies pass the API's checks before either is sequenced, as two racing requests can.
+    let first = node.state.authorise(account, Some(auth.clone()), hash).await.ok().expect("passes the API");
+    let second = node.state.authorise(account, Some(auth), hash).await.ok().expect("passes the API");
+    let withdraw = |auth| Command::Withdraw { account, amount, auth };
+    let approved = node.state.submit(withdraw(first)).await.ok().expect("the sequencer is running");
+    let refused = node.state.submit(withdraw(second)).await.ok().expect("the sequencer is running");
+    assert!(matches!(&approved[..], [Event::WithdrawalApproved { .. }]), "{approved:?}");
+    let expected = Reject::InvalidNonce { expected: 1 };
+    assert!(matches!(&refused[..], [Event::WithdrawalRejected { reason, .. }] if *reason == expected), "{refused:?}");
+    assert!(node.withdrawals.try_recv().is_ok());
+    assert!(node.withdrawals.try_recv().is_err(), "a second payout was signed");
+}
+
+#[tokio::test]
+async fn signed_cancels_and_withdrawals_reach_the_engine_and_advance_the_nonce() {
+    let node = Node::start("cancel", signed()).await;
+    let client = SigningKey::from_slice(&[1; 32]).unwrap();
+    node.fund(&client).await;
+    let (account, domain) = (account_of(&client), eip712::domain(CHAIN_ID, VAULT));
+
+    let mut limit: OrderRequest = serde_json::from_value(signed_order(&client, 0, "0.1")).unwrap();
+    limit.kind = OrderKind::Limit { price: "90000".parse().unwrap() };
+    let expires_at = NOW + 60_000;
+    let signature = eip712::sign(&client, &order_hash(&domain, &limit, 0, expires_at));
+    limit.auth = Some(RequestAuth { nonce: 0, expires_at, signature });
+    let (_, events) = node.post("/v1/orders", serde_json::to_value(&limit).unwrap()).await;
+    let order_id = events[0]["order_id"].as_u64().unwrap();
+
+    let signature = eip712::sign(&client, &cancel_hash(&domain, account, order_id, 1, expires_at));
+    let auth = RequestAuth { nonce: 1, expires_at, signature };
+    let cancel = serde_json::json!({ "account": account, "order_id": order_id, "auth": auth });
+    let (_, events) = node.post("/v1/orders/cancel", cancel).await;
+    assert_eq!(events[0]["type"], "order_cancelled", "{events}");
+
+    let amount: Fixed = "100".parse().unwrap();
+    let signature = eip712::sign(&client, &withdrawal_hash(&domain, account, amount, 2, expires_at));
+    let auth = RequestAuth { nonce: 2, expires_at, signature };
+    let withdrawal = serde_json::json!({ "account": account, "amount": amount, "auth": auth });
+    let (_, events) = node.post("/v1/withdrawals", withdrawal).await;
+    assert_eq!(events[0]["type"], "withdrawal_approved", "{events}");
+
+    let (status, nonce) = node.get(&format!("/v1/accounts/{account}/nonce")).await;
+    assert_eq!((status, nonce), (StatusCode::OK, serde_json::json!({ "next_nonce": 3 })));
+}
+
+#[tokio::test]
+async fn without_signatures_the_account_field_is_trusted() {
+    let node = Node::start("trusted", ClientAuth::Unsigned).await;
+    let client = SigningKey::from_slice(&[1; 32]).unwrap();
+    node.fund(&client).await;
+    // A signature, valid or not, is dropped rather than sequenced.
+    let mut order = signed_order(&client, 7, "0.1");
+    order["qty"] = "0.2".into();
+    let (status, events) = node.post("/v1/orders", order).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(events.as_array().unwrap().iter().any(|e| e["type"] == "fill"), "{events}");
+    let sequenced = node.entries().into_iter().find_map(|e| match e {
+        LogEntry::Command(c) => match c.sequenced.cmd {
+            Command::PlaceOrder(req) => Some(req),
+            _ => None,
+        },
+        _ => None,
+    });
+    assert_eq!(sequenced.map(|req| req.auth), Some(None));
+}
+
+#[test]
+fn the_published_signing_vectors_are_bodies_the_api_accepts() {
+    let vectors: Value = serde_json::from_str(VECTORS).unwrap();
+    for vector in vectors["requests"].as_array().unwrap() {
+        let mut body = vector["body"].clone();
+        let (nonce, expires_at, signature) = (&vector["nonce"], &vector["expires_at"], &vector["signature"]);
+        body["auth"] = serde_json::json!({ "nonce": nonce, "expires_at": expires_at, "signature": signature });
+        let parsed = match vector["kind"].as_str().unwrap() {
+            "order" => serde_json::from_value::<OrderRequest>(body).map(drop),
+            "cancel" => serde_json::from_value::<CancelRequest>(body).map(drop),
+            "withdrawal" => serde_json::from_value::<WithdrawalRequest>(body).map(drop),
+            other => panic!("unknown request kind {other}"),
+        };
+        assert!(parsed.is_ok(), "{}: {parsed:?}", vector["kind"]);
+    }
+}
+
+// ── Helpers ──
+
+/// A node API over a running sequencer on a fresh log, with the dev genesis and `auth` recorded.
+struct Node {
+    app: Router,
+    state: ApiState,
+    dir: PathBuf,
+    withdrawals: mpsc::UnboundedReceiver<SignedWithdrawal>,
+}
+
+impl Node {
+    /// Recovers a sequencer on a fresh log named after `name`, activates the protocol, sequences
+    /// the dev genesis, and serves the API over it.
+    async fn start(name: &str, auth: ClientAuth) -> Self {
+        Node::start_with_clock(name, auth, || NOW).await
+    }
+
+    /// `start`, with the API checking expiries against `clock` while the sequencer stamps `NOW`.
+    async fn start_with_clock(name: &str, auth: ClientAuth, clock: fn() -> Millis) -> Self {
+        let dir = scratch_dir(&format!("auth-{name}"));
+        let key = Arc::new(EnclaveKey::generate());
+        let (stream, _) = broadcast::channel(1024);
+        let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
+        let (manifest_tx, manifest) = watch::channel(Manifest::default());
+        let cfg =
+            SequencerConfig { chain_id: CHAIN_ID, vault: VAULT, clock: || NOW, ..sequencer_config(&dir, manifest_tx) };
+        let mut seq = Sequencer::recover(cfg, key.clone(), stream.clone(), withdrawals_tx).unwrap();
+        seq.activate_protocol(&auth).unwrap();
+        seq.genesis(&dev_config().genesis).unwrap();
+        let (tx, rx) = mpsc::channel(1024);
+        tokio::spawn(seq.run(rx));
+        let attestation = Arc::new(attest_key(&MockAttestor, &key).unwrap());
+        let state = ApiState {
+            tx,
+            stream,
+            attestation,
+            auth,
+            dev_deposits: true,
+            clock,
+            log_dir: dir.clone(),
+            manifest,
+            backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
+        };
+        Node { app: router(state.clone()), state, dir, withdrawals }
+    }
+
+    /// Every entry of the node's log, as flushed so far.
+    fn entries(&self) -> Vec<LogEntry> {
+        SegmentedLog::open(&self.dir).unwrap().entries
+    }
+
+    /// Credits `client`'s account through the dev deposit and prices BTC at 100000.
+    async fn fund(&self, client: &SigningKey) {
+        let deposit = serde_json::json!({ "account": account_of(client), "amount": "100000" });
+        assert_eq!(self.post("/v1/dev/deposit", deposit).await.0, StatusCode::OK);
+        let quotes = ["a", "b"]
+            .map(|venue| SourceQuote { source: venue.into(), mid: "100000".parse().unwrap(), ts: NOW })
+            .to_vec();
+        self.state.submit(Command::Prices { market: 1, quotes }).await.ok().expect("the sequencer is running");
+    }
+
+    /// The status and JSON body of a POST of `body` to `path`.
+    async fn post(&self, path: &str, body: Value) -> (StatusCode, Value) {
+        let request =
+            HttpRequest::post(path).header("content-type", "application/json").body(Body::from(body.to_string()));
+        self.send(request.unwrap()).await
+    }
+
+    /// The status and JSON body of a GET of `path`.
+    async fn get(&self, path: &str) -> (StatusCode, Value) {
+        self.send(HttpRequest::get(path).body(Body::empty()).unwrap()).await
+    }
+
+    /// Serves one request and reads its JSON response.
+    async fn send(&self, request: HttpRequest<Body>) -> (StatusCode, Value) {
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+}
+
+/// Signed requests under the test chain and vault.
+fn signed() -> ClientAuth {
+    ClientAuth::Eip712 { chain_id: CHAIN_ID, vault: VAULT }
+}
+
+/// The account `key` controls.
+fn account_of(key: &SigningKey) -> AccountId {
+    eip712::address(key.verifying_key())
+}
+
+/// A BTC market buy of `qty` quoted at 100000, signed by `key` with `nonce` to expire in a minute,
+/// as a JSON body.
+fn signed_order(key: &SigningKey, nonce: u64, qty: &str) -> Value {
+    signed_order_until(key, nonce, qty, NOW + 60_000)
+}
+
+/// `signed_order` expiring at `expires_at`.
+fn signed_order_until(key: &SigningKey, nonce: u64, qty: &str, expires_at: Millis) -> Value {
+    let mut req = OrderRequest {
+        account: account_of(key),
+        client_id: 1,
+        market: 1,
+        side: Side::Buy,
+        qty: qty.parse().unwrap(),
+        kind: OrderKind::Market { quoted: "100000".parse().unwrap(), max_slippage_bps: None },
+        reduce_only: false,
+        auth: None,
+    };
+    let hash = order_hash(&eip712::domain(CHAIN_ID, VAULT), &req, nonce, expires_at);
+    req.auth = Some(RequestAuth { nonce, expires_at, signature: eip712::sign(key, &hash) });
+    serde_json::to_value(&req).unwrap()
+}

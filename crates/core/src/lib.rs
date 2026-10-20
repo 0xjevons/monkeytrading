@@ -11,11 +11,16 @@
 //! - Margin is shared across the account at professional-client leverage, with close-out at 50% and
 //!   negative balance protection.
 //! - RWA markets keep venue hours; nothing fills while a market is closed.
+//! - Rules are versioned, and a log activates each version at a recorded seq. From `V3`, orders,
+//!   cancels, and withdrawals are authorised as the log's client auth records: by the account's
+//!   EIP-712 signature, next nonce, and expiry, or, in dev logs only, unsigned.
 
 pub mod account;
 mod admin;
+pub mod auth;
 mod closeout;
 pub mod command;
+pub mod eip712;
 pub mod engine;
 pub use engine::{Engine, SequenceError};
 pub mod event;
@@ -26,5 +31,6 @@ mod funds;
 pub mod market;
 pub mod params;
 pub mod price;
+pub mod protocol;
 pub mod session;
 pub mod types;

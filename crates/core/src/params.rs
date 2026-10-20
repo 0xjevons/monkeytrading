@@ -9,6 +9,8 @@ use crate::types::Millis;
 
 /// The most any per-trade rate may be: 100%.
 const MAX_RATE_BPS: i64 = 10_000;
+/// The largest benchmark rate accepted, either sign: 100% a year.
+pub const MAX_BENCHMARK_BPS: i64 = 10_000;
 /// The most a multiplier or house cap may be: ten times.
 const MAX_MULTIPLE_BPS: i64 = 100_000;
 /// The longest markout horizon: one hour. A horizon near `i64::MAX` overflows a markout's due time,

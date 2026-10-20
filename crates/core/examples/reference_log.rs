@@ -15,8 +15,9 @@ use std::path::PathBuf;
 use anyhow::anyhow;
 use chrono::NaiveDate;
 use common::reference::{ReferenceEntry, root_hex};
-use common::{AAPL, BTC, ETH, Harness, UNLISTED, acct, f, market, ny, params, us_equities};
+use common::{AAPL, BTC, Client, ETH, Harness, UNLISTED, acct, f, market, ny, params, us_equities};
 use engine_core::Engine;
+use engine_core::auth::MAX_EXPIRY_AHEAD_MS;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::Event;
 use engine_core::market::Tier;
@@ -63,15 +64,18 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The scripted session: genesis, then funding, prices, every order kind, triggers (one held back by
-/// its spread), cancels, reduce-only (one clipped to the position), stress, toxicity, a position
-/// flip, house capital, withdrawals, a session close and gapped open, financing rollovers over longs
-/// and a short, a two-position close-out with bad debt, two-band margin, an exchange holiday, admin
-/// changes, and venue quotes stamped ahead of the sequenced time, with a rejection of each kind along
-/// the way.
+/// The scripted session under the latest protocol version: client auth and activation, genesis,
+/// then funding, prices, every order kind, signed requests refused for each auth reason, triggers
+/// (one held back by its spread), cancels, reduce-only (one clipped to the position), stress,
+/// toxicity, a position flip, house capital, withdrawals, a session close and gapped open, financing
+/// rollovers over longs and a short, a two-position close-out with bad debt, two-band margin, an
+/// exchange holiday, admin changes, and venue quotes stamped ahead of the sequenced time, with a
+/// rejection of each kind along the way. Every client request is signed by its account's key unless
+/// the comment says otherwise.
 fn session() -> Vec<Sequenced> {
-    let (a, b, c, d, t, e, stranger) = (acct(1), acct(2), acct(3), acct(4), acct(5), acct(6), acct(9));
-    let mut h = Harness::new();
+    let mut h = Harness::signed();
+    let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
+    let stranger = h.signer(9);
     h.admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 430 });
 
     // Funding, and deposits refused as a duplicate reference or out of range.
@@ -106,12 +110,22 @@ fn session() -> Vec<Sequenced> {
     h.market_order(a, BTC, Side::Buy, "0", "100000.123456789");
     h.market_order(a, UNLISTED, Side::Buy, "1", "1");
 
+    // Signed requests refused: unsigned, signed by another key, a reused nonce, an expired request,
+    // and an expiry too far ahead. The last two use their nonces.
+    h.market_order(acct(8), BTC, Side::Buy, "0.01", "100000.123456789");
+    let key_a = |expires_at| Client { expires_at, ..Client::new(1) };
+    let forger = Client { expires_at: h.ts + 60_000, ..Client::new(7) };
+    h.cmd(forger.order(h.engine.next_request_nonce(a), small_buy(a)));
+    h.cmd(key_a(h.ts + 60_000).order(0, small_buy(a)));
+    h.cmd(key_a(h.ts - 1).order(h.engine.next_request_nonce(a), small_buy(a)));
+    h.cmd(key_a(h.ts + MAX_EXPIRY_AHEAD_MS + 1).order(h.engine.next_request_nonce(a), small_buy(a)));
+
     // Resting orders: a limit and a stop that trigger, one cancelled, and an unknown cancel.
     h.order(a, BTC, Side::Sell, "0.05", OrderKind::Limit { price: f("101000") });
     h.order(b, ETH, Side::Buy, "1", OrderKind::Stop { price: f("3050") });
     let cancelled = accepted(&h.order(a, BTC, Side::Buy, "0.01", OrderKind::Limit { price: f("90000") }));
-    h.cmd(Command::CancelOrder { account: a, order_id: cancelled });
-    h.cmd(Command::CancelOrder { account: a, order_id: 999 });
+    h.cmd(Command::CancelOrder { account: a, order_id: cancelled, auth: None });
+    h.cmd(Command::CancelOrder { account: a, order_id: 999, auth: None });
     h.advance(500);
     h.quotes(BTC, &["101200", "101250", "101210"]);
     h.price(ETH, "3060");
@@ -160,9 +174,9 @@ fn session() -> Vec<Sequenced> {
     h.cmd(capital("-1000000000", "0xcap:3"));
 
     // Withdrawals: approved, beyond free cash, and out of range.
-    h.cmd(Command::Withdraw { account: a, amount: f("1000") });
-    h.cmd(Command::Withdraw { account: c, amount: f("1000000") });
-    h.cmd(Command::Withdraw { account: a, amount: f("0") });
+    h.cmd(Command::Withdraw { account: a, amount: f("1000"), auth: None });
+    h.cmd(Command::Withdraw { account: c, amount: f("1000000"), auth: None });
+    h.cmd(Command::Withdraw { account: a, amount: f("0"), auth: None });
 
     // Venue hours: a stop rests over the close, nothing trades while shut, and the stop fills at
     // the gapped open. The financing rollover at 22:00 London falls in between.
@@ -245,6 +259,21 @@ fn reducing(account: AccountId, market: MarketId, side: Side, qty: &str, quoted:
         qty: f(qty),
         kind: OrderKind::Market { quoted: f(quoted), max_slippage_bps: None },
         reduce_only: true,
+        auth: None,
+    }
+}
+
+/// A 0.01 BTC market buy for `account`, quoted at the session's first BTC mid, unsigned.
+fn small_buy(account: AccountId) -> OrderRequest {
+    OrderRequest {
+        account,
+        client_id: 9,
+        market: BTC,
+        side: Side::Buy,
+        qty: f("0.01"),
+        kind: OrderKind::Market { quoted: f("100000.123456789"), max_slippage_bps: None },
+        reduce_only: false,
+        auth: None,
     }
 }
 

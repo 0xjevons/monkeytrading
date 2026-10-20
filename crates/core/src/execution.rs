@@ -10,7 +10,9 @@
 
 use crate::Fixed;
 use crate::account::RestingOrder;
+use crate::auth::RequestAuth;
 use crate::command::{OrderKind, OrderRequest};
+use crate::eip712::{cancel_hash, order_hash};
 use crate::engine::{Engine, Markout};
 use crate::event::{CancelReason, Event, Fill, Reject};
 use crate::market::staircase;
@@ -54,12 +56,16 @@ struct Priced {
 }
 
 impl Engine {
-    /// Fills a market order now, or rests a limit or stop order, emitting acceptance or rejection.
+    /// Authorises the request, then fills a market order now or rests a limit or stop order,
+    /// emitting acceptance or rejection.
     pub(crate) fn place_order(&mut self, req: &OrderRequest, events: &mut Vec<Event>) {
         let reject = |reason, events: &mut Vec<Event>| {
             events.push(Event::OrderRejected { account: req.account, client_id: req.client_id, reason })
         };
-        if let Err(reason) = self.validate_order(req) {
+        let authorised = self.authorise(req.account, req.auth.as_ref(), |domain, auth| {
+            order_hash(domain, req, auth.nonce, auth.expires_at)
+        });
+        if let Err(reason) = authorised.and_then(|()| self.validate_order(req)) {
             return reject(reason, events);
         }
         self.refresh_session(req.market, events);
@@ -107,9 +113,19 @@ impl Engine {
         }
     }
 
-    /// Cancels a resting order on the client's request.
-    pub(crate) fn cancel_order(&mut self, account: AccountId, order_id: OrderId, events: &mut Vec<Event>) {
-        if self.remove_order(account, order_id).is_some() {
+    /// Authorises the request, then cancels a resting order on the client's request.
+    pub(crate) fn cancel_order(
+        &mut self,
+        account: AccountId,
+        order_id: OrderId,
+        auth: Option<&RequestAuth>,
+        events: &mut Vec<Event>,
+    ) {
+        if let Err(reason) = self.authorise(account, auth, |domain, auth| {
+            cancel_hash(domain, account, order_id, auth.nonce, auth.expires_at)
+        }) {
+            events.push(Event::OrderRejected { account, client_id: 0, reason });
+        } else if self.remove_order(account, order_id).is_some() {
             events.push(Event::OrderCancelled { account, order_id, reason: CancelReason::Client });
         } else {
             events.push(Event::OrderRejected { account, client_id: 0, reason: Reject::UnknownOrder });

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Fixed;
 use crate::price::PriceError;
-use crate::types::{AccountId, MarketId, OrderId, Side};
+use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
 
 /// Engine outputs. Clients and the custody layer act on events; they never
 /// read state directly.
@@ -123,6 +123,23 @@ pub enum Reject {
     InvalidAmount,
     /// A custody reference that was already credited.
     DuplicateReference,
+    /// An unsigned request, where the rules in force require a signature.
+    MissingSignature,
+    /// A signature that is not the account's over this request, or one the rules in force cannot
+    /// check.
+    InvalidSignature,
+    /// A nonce other than the account's next: already used, or ahead of it.
+    InvalidNonce {
+        expected: u64,
+    },
+    /// A signed request sequenced after its expiry.
+    Expired {
+        expires_at: Millis,
+    },
+    /// A signed request whose expiry lies more than `MAX_EXPIRY_AHEAD_MS` past the sequenced time.
+    ExpiryTooFar {
+        latest: Millis,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
