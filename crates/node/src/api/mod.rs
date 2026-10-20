@@ -4,6 +4,7 @@
 
 mod archive;
 mod stream;
+pub(crate) use stream::MAX_BACKFILLS;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -23,7 +24,7 @@ use engine_core::types::{AccountId, MarketId, OrderId};
 use engine_core::{Engine, Fixed};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, info_span};
 
@@ -54,6 +55,8 @@ pub struct ApiState {
     pub log_dir: PathBuf,
     /// The log writer's manifest, held in enclave memory.
     pub manifest: watch::Receiver<Manifest>,
+    /// Permits for stream subscribers reading from disk.
+    pub backfills: Arc<Semaphore>,
 }
 
 #[derive(Serialize)]

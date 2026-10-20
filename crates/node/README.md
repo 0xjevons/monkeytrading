@@ -73,8 +73,11 @@ The log is a directory (`node.log_dir`) of segment files named for their first s
 `manifest.jsonl`, which gets one line per completed segment with its seq range, size, and SHA-256.
 The node loads the manifest at recovery, after checking it against the segment files, and then
 holds it in memory, adding each segment it completes. The archive serves that copy, not the file
-on disk, and backfill checks each completed segment against it before streaming from it. A log written as one file before
-segments existed continues as the first segment: move it to
+on disk. Backfill checks a segment against it when the segment is already complete as backfill
+opens it; the segment still being written, and one that completes while backfill reads it, are
+read from disk unchecked, and replay against the signed checkpoints is the check for them. Each
+subscriber reading from disk holds up to one completed segment in memory, and at most 16 read at
+once. A log written as one file before segments existed continues as the first segment: move it to
 `<log_dir>/00000000000000000000.jsonl`. Every segment is kept, since recovery replays the log from
 genesis.
 

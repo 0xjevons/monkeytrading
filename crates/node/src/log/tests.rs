@@ -4,7 +4,9 @@ use std::io::Write as _;
 
 use engine_core::Fixed;
 use engine_core::command::Command;
-use engine_core::types::AccountId;
+use engine_core::event::{CancelReason, Fill, Reject};
+use engine_core::price::PriceError;
+use engine_core::types::{AccountId, Side};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
@@ -48,6 +50,16 @@ fn a_command_entry_carries_its_events_through_the_file_format() {
     let line = serde_json::to_string(&entry).unwrap();
     assert!(line.contains(r#""events":[{"type":"deposited""#), "{line}");
     assert_eq!(serde_json::from_str::<LogEntry>(&line).unwrap(), entry);
+}
+
+#[test]
+fn every_event_and_rejection_reason_survives_the_file_format() {
+    let entry = LogEntry::Command(CommandEntry {
+        sequenced: Sequenced { seq: 1, ts: 5, cmd: Command::Tick },
+        events: Some(every_event()),
+    });
+    let line = serde_json::to_string(&entry).unwrap();
+    assert_eq!(serde_json::from_str::<LogEntry>(&line).unwrap(), entry, "{line}");
 }
 
 #[test]
@@ -330,6 +342,102 @@ fn cmd(seq: u64) -> LogEntry {
         sequenced: Sequenced { seq, ts: seq as i64 * 10, cmd: Command::Tick },
         events: Some(Vec::new()),
     })
+}
+
+/// One event of each kind, and an order rejection for each reason. The matches stop compiling when
+/// a variant is added, until it has a sample here.
+fn every_event() -> Vec<Event> {
+    let (account, amount, market) = (AccountId([1; 20]), Fixed::from_int(5), 2);
+    let reasons = [
+        Reject::UnknownMarket,
+        Reject::UnknownOrder,
+        Reject::InvalidOrder { reason: "qty".into() },
+        Reject::MarketClosed,
+        Reject::ReduceOnly,
+        Reject::NoPrice { error: PriceError::Stale { fresh: 1, needed: 2 } },
+        Reject::NoPrice { error: PriceError::Divergent { divergence_bps: 30 } },
+        Reject::Slippage { quoted: amount, live: amount, slippage_bps: 5 },
+        Reject::InsufficientMargin { equity: amount, required: amount },
+        Reject::InsufficientFunds { available: amount },
+        Reject::HouseCapacity,
+        Reject::InvalidAmount,
+        Reject::DuplicateReference,
+    ];
+    for reason in &reasons {
+        match reason {
+            Reject::UnknownMarket
+            | Reject::UnknownOrder
+            | Reject::InvalidOrder { .. }
+            | Reject::MarketClosed
+            | Reject::ReduceOnly
+            | Reject::NoPrice { .. }
+            | Reject::Slippage { .. }
+            | Reject::InsufficientMargin { .. }
+            | Reject::InsufficientFunds { .. }
+            | Reject::HouseCapacity
+            | Reject::InvalidAmount
+            | Reject::DuplicateReference => {}
+        }
+    }
+    let fill = Fill {
+        account,
+        order_id: 3,
+        market,
+        side: Side::Sell,
+        qty: amount,
+        price: amount,
+        index: amount,
+        spread_bps: 4,
+        realised_pnl: -amount,
+        profit_fee: Fixed::ZERO,
+        position: amount,
+        liquidation: true,
+    };
+    let mut events: Vec<_> =
+        reasons.into_iter().map(|reason| Event::OrderRejected { account, client_id: 1, reason }).collect();
+    events.extend([
+        Event::Deposited { account, amount },
+        Event::DepositRejected { account, amount, chain_ref: "0xab:1".into(), reason: Reject::DuplicateReference },
+        Event::WithdrawalApproved { account, amount, nonce: 1 },
+        Event::WithdrawalRejected { account, amount, reason: Reject::InsufficientFunds { available: amount } },
+        Event::HouseCapitalMoved { amount, nav: amount },
+        Event::OrderAccepted { account, client_id: 1, order_id: 3 },
+        Event::OrderCancelled { account, order_id: 3, reason: CancelReason::Client },
+        Event::OrderCancelled { account, order_id: 3, reason: CancelReason::Unfillable },
+        Event::Fill(fill),
+        Event::CloseOut { account, equity: amount, margin: amount },
+        Event::BadDebt { account, amount },
+        Event::Financing { account, market, amount: -amount },
+        Event::MarketOpened { market },
+        Event::MarketClosed { market },
+        Event::StressChanged { market, level: 2 },
+        Event::PricesRejected { market, reason: "stale quote".into() },
+        Event::AdminApplied,
+        Event::AdminRejected { reason: "bad params".into() },
+    ]);
+    for event in &events {
+        match event {
+            Event::Deposited { .. }
+            | Event::DepositRejected { .. }
+            | Event::WithdrawalApproved { .. }
+            | Event::WithdrawalRejected { .. }
+            | Event::HouseCapitalMoved { .. }
+            | Event::OrderAccepted { .. }
+            | Event::OrderRejected { .. }
+            | Event::OrderCancelled { .. }
+            | Event::Fill(_)
+            | Event::CloseOut { .. }
+            | Event::BadDebt { .. }
+            | Event::Financing { .. }
+            | Event::MarketOpened { .. }
+            | Event::MarketClosed { .. }
+            | Event::StressChanged { .. }
+            | Event::PricesRejected { .. }
+            | Event::AdminApplied
+            | Event::AdminRejected { .. } => {}
+        }
+    }
+    events
 }
 
 fn withdrawal(nonce: u64) -> LogEntry {

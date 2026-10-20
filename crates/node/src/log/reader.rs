@@ -131,9 +131,10 @@ impl LogReader {
                 );
                 Box::new(Cursor::new(bytes))
             }
-            // TODO: the segment still being written is read from host disk unchecked. Check it
-            // against the writer's running hash, or serve it from enclave memory, before relying on
-            // backfill for integrity; until then, replay against the signed checkpoints is the check.
+            // TODO: the segment still being written is read from host disk unchecked, to its end even
+            // if it completes meanwhile. Check it against the writer's running hash, or serve it from
+            // enclave memory, before relying on backfill for integrity; until then, replay against
+            // the signed checkpoints is the check.
             None => {
                 let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
                 Box::new(BufReader::new(file))

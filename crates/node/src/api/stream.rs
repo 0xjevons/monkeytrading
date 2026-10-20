@@ -1,21 +1,24 @@
 //! `/v1/stream`: the public log over a WebSocket. A subscriber that names an offset gets the log
 //! from there, read from disk, then live messages, each once and in offset order. A subscriber
 //! that falls behind the live channel reads from disk again from its last offset instead of being
-//! dropped.
+//! dropped. A subscriber that stops reading is closed, and can resume.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::Response;
+use futures_util::{Sink, SinkExt};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use tokio::task::spawn_blocking;
-use tracing::{Instrument, Span, error};
+use tokio::time::timeout;
+use tracing::{Instrument, Span, error, info};
 
 use crate::api::{ApiError, ApiState};
 use crate::log::{LogReader, Manifest, Offset};
@@ -23,6 +26,11 @@ use crate::sequencer::StreamMsg;
 
 /// Most messages read from disk per blocking call.
 const BACKFILL_BATCH: usize = 256;
+/// Subscribers reading from disk at once. Each holds up to one completed segment in memory, so
+/// this bounds backfill memory at this many segments.
+pub const MAX_BACKFILLS: usize = 16;
+/// How long one message may wait for a subscriber to take it before the subscriber is closed.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +46,9 @@ struct Feed {
     live: broadcast::Receiver<Arc<StreamMsg>>,
     log_dir: PathBuf,
     manifest: watch::Receiver<Manifest>,
+    /// Shared by every subscriber; held while reading from disk.
+    backfills: Arc<Semaphore>,
+    permit: Option<OwnedSemaphorePermit>,
     /// The lowest offset not yet yielded; `None` until a live-only feed yields its first message.
     next: Option<Offset>,
     /// Reading from disk until it reaches what has been written.
@@ -55,10 +66,11 @@ impl Feed {
         live: broadcast::Receiver<Arc<StreamMsg>>,
         log_dir: PathBuf,
         manifest: watch::Receiver<Manifest>,
+        backfills: Arc<Semaphore>,
         start: Option<Offset>,
     ) -> Self {
-        let backlog = VecDeque::new();
-        Self { live, log_dir, manifest, next: start, catching_up: start.is_some(), reader: None, backlog }
+        let (catching_up, reader, permit, backlog) = (start.is_some(), None, None, VecDeque::new());
+        Self { live, log_dir, manifest, backfills, permit, next: start, catching_up, reader, backlog }
     }
 
     /// The next message, or `None` once the sequencer has stopped.
@@ -71,12 +83,20 @@ impl Feed {
                 return Ok(Some(msg));
             }
             if self.catching_up {
-                let from = self.next.context("catching up with no offset to start from")?;
+                // Catching up starts only from a start offset, or after a lag once one is set.
+                let from = self.next.expect("a feed catches up from a known offset");
+                if self.permit.is_none() {
+                    let permit = self.backfills.clone().acquire_owned().await;
+                    self.permit = Some(permit.expect("the backfill semaphore is never closed"));
+                }
                 let (dir, manifest, reader) = (self.log_dir.clone(), self.manifest.clone(), self.reader.take());
                 let (reader, batch) = spawn_blocking(move || read_batch(&dir, manifest, from, reader))
                     .await
                     .context("log reader task")??;
                 self.catching_up = reader.is_some();
+                if !self.catching_up {
+                    self.permit = None;
+                }
                 self.reader = reader;
                 self.backlog.extend(batch);
                 continue;
@@ -112,13 +132,14 @@ pub async fn stream(
         (None, Some(seq)) => Some(Offset::start_of(seq)),
         (None, None) => None,
     };
-    let feed = Feed::new(s.stream.subscribe(), s.log_dir.clone(), s.manifest.clone(), start);
+    let feed = Feed::new(s.stream.subscribe(), s.log_dir.clone(), s.manifest.clone(), s.backfills.clone(), start);
     let span = Span::current();
     Ok(ws.on_upgrade(move |socket| forward(socket, feed).instrument(span)))
 }
 
-/// Sends the feed to one subscriber until it disconnects or the sequencer stops.
-async fn forward(mut socket: WebSocket, mut feed: Feed) {
+/// Sends the feed to one subscriber until it disconnects, stops reading for `SEND_TIMEOUT`, or the
+/// sequencer stops.
+async fn forward<S: Sink<Message> + Unpin>(mut socket: S, mut feed: Feed) {
     loop {
         let msg = match feed.next().await {
             Ok(Some(msg)) => msg,
@@ -136,8 +157,13 @@ async fn forward(mut socket: WebSocket, mut feed: Feed) {
                 return;
             }
         };
-        if socket.send(Message::Text(json.into())).await.is_err() {
-            return;
+        match timeout(SEND_TIMEOUT, socket.send(Message::Text(json.into()))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return,
+            Err(_) => {
+                info!(offset = %msg.offset, "closing a subscriber that stopped reading");
+                return;
+            }
         }
     }
 }
@@ -169,10 +195,13 @@ fn read_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
 
-    use engine_core::command::Command;
-    use tokio::time::timeout;
+    use engine_core::command::{Command, Sequenced};
+    use futures_util::FutureExt;
+
+    use crate::log::{CommandEntry, LogEntry};
 
     use crate::test_support::{TestSequencer, deposit, log_messages, scratch_dir, withdraw};
 
@@ -181,8 +210,13 @@ mod tests {
         let dir = scratch_dir("feed-from");
         let node = TestSequencer::start(&dir, 1024);
         node.submit(deposit(100, "dep-1")).await;
-        let mut feed =
-            Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), Some(Offset::start_of(0)));
+        let mut feed = Feed::new(
+            node.stream.subscribe(),
+            dir.clone(),
+            node.manifest.clone(),
+            permits(),
+            Some(Offset::start_of(0)),
+        );
         // These reach both the disk and the live channel before the feed reads either.
         node.submit(withdraw(40)).await;
         for n in 0..5 {
@@ -201,7 +235,8 @@ mod tests {
         let seq = node.tick_to_checkpoint().await;
         node.submit(withdraw(40)).await;
         let after = Offset::start_of(seq);
-        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), Some(after.next()));
+        let mut feed =
+            Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), permits(), Some(after.next()));
 
         let expected = log_messages(&dir, after.next());
         let got = take(&mut feed, expected.len()).await;
@@ -214,7 +249,7 @@ mod tests {
     async fn a_feed_that_falls_behind_the_live_channel_catches_up_from_disk() {
         let dir = scratch_dir("feed-lag");
         let node = TestSequencer::start(&dir, 2);
-        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), None);
+        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), permits(), None);
         node.submit(deposit(100, "dep-1")).await;
         let first = next_msg(&mut feed).await;
         for n in 0..20 {
@@ -230,10 +265,10 @@ mod tests {
     async fn a_live_feed_starts_at_the_next_message_and_one_that_lags_before_it_starts_later() {
         let dir = scratch_dir("feed-live");
         let node = TestSequencer::start(&dir, 2);
-        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), None);
+        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), permits(), None);
         assert_next_is_the_next_command(&node, &mut feed).await;
 
-        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), None);
+        let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), permits(), None);
         for n in 0..10 {
             node.submit(deposit(1, &format!("dep-{n}"))).await;
         }
@@ -249,15 +284,80 @@ mod tests {
         for n in 0..BACKFILL_BATCH {
             node.submit(deposit(1, &format!("dep-{n}"))).await;
         }
-        let mut feed =
-            Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), Some(Offset::start_of(0)));
+        let mut feed = Feed::new(
+            node.stream.subscribe(),
+            dir.clone(),
+            node.manifest.clone(),
+            permits(),
+            Some(Offset::start_of(0)),
+        );
         let expected = log_messages(&dir, Offset::start_of(0));
         assert!(expected.len() > BACKFILL_BATCH, "{}", expected.len());
         assert_eq!(take(&mut feed, expected.len()).await, expected);
         assert_next_is_the_next_command(&node, &mut feed).await;
     }
 
+    #[tokio::test]
+    async fn catching_up_holds_a_backfill_permit_until_it_reaches_what_is_written() {
+        let dir = scratch_dir("feed-permits");
+        let node = TestSequencer::start(&dir, 1024);
+        for n in 0..BACKFILL_BATCH {
+            node.submit(deposit(1, &format!("dep-{n}"))).await;
+        }
+        let backfills = Arc::new(Semaphore::new(1));
+        let feed =
+            |start| Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), backfills.clone(), start);
+        let (mut first, mut second) = (feed(Some(Offset::start_of(0))), feed(Some(Offset::start_of(0))));
+        next_msg(&mut first).await;
+        assert_eq!(backfills.available_permits(), 0);
+        assert!(second.next().now_or_never().is_none(), "a second backfill waits for the permit");
+
+        let expected = log_messages(&dir, Offset::start_of(0));
+        take(&mut first, expected.len() - 1).await;
+        assert_eq!(backfills.available_permits(), 1);
+        assert_eq!(take(&mut second, expected.len()).await, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subscriber_that_stops_reading_is_closed() {
+        let (live, subscriber) = broadcast::channel(4);
+        let manifest = watch::channel(Manifest::default()).1;
+        let feed = Feed::new(subscriber, PathBuf::new(), manifest, permits(), None);
+        let tick =
+            CommandEntry { sequenced: Sequenced { seq: 0, ts: 0, cmd: Command::Tick }, events: Some(Vec::new()) };
+        live.send(Arc::new(StreamMsg::new(Offset::start_of(0), LogEntry::Command(tick)))).unwrap();
+        assert!(timeout(2 * SEND_TIMEOUT, forward(Stalled, feed)).await.is_ok());
+        drop(live);
+    }
+
     // ── Helpers ──
+
+    /// A subscriber that never takes a message.
+    struct Stalled;
+
+    impl Sink<Message> for Stalled {
+        type Error = ();
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<(), ()>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<(), ()>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn permits() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(MAX_BACKFILLS))
+    }
 
     /// The feed's next message, failing the test if none comes within ten seconds.
     async fn next_msg(feed: &mut Feed) -> Arc<StreamMsg> {

@@ -83,7 +83,7 @@ async fn one_withdrawal_puts_command_withdrawal_and_checkpoint_at_one_seq() {
 }
 
 #[test]
-fn custody_gets_a_withdrawal_only_once_its_log_entry_is_flushed() {
+fn custody_gets_a_withdrawal_when_its_batch_is_flushed_not_when_it_is_signed() {
     let dir = scratch_dir("seq-custody");
     let (stream, _) = broadcast::channel(16);
     let (withdrawals_tx, mut withdrawals) = mpsc::unbounded_channel();

@@ -12,13 +12,13 @@ use engine_core::types::AccountId;
 use tokio::net::TcpListener;
 use tokio::signal::ctrl_c;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{interval, timeout};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use crate::api::{ApiState, router};
+use crate::api::{ApiState, MAX_BACKFILLS, router};
 use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProvider};
 use crate::log::Manifest;
 use crate::sequencer::{Request, Sequencer, SequencerConfig};
@@ -116,6 +116,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         dev_deposits,
         log_dir: cfg.node.log_dir.clone(),
         manifest: manifest_rx,
+        backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
     });
     info!(listen = %cfg.node.listen, "api up");
     tasks.spawn(async move { ("api", axum::serve(listener, app).await.context("api server")) });

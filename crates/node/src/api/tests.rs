@@ -143,6 +143,7 @@ async fn serve_with(node: &TestSequencer, dir: &Path, manifest: watch::Receiver<
         dev_deposits: true,
         log_dir: dir.to_owned(),
         manifest,
+        backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

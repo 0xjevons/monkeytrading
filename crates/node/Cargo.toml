@@ -16,6 +16,7 @@ engine-core.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 humantime-serde.workspace = true
 k256.workspace = true
@@ -31,6 +32,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-futures-util.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "test-util"] }
 tokio-tungstenite.workspace = true
