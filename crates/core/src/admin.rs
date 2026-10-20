@@ -16,7 +16,8 @@ impl Engine {
     /// Applies an operator command.
     /// Error cases:
     /// - `SetParams` with parameters that fail `ProtocolParams::validate`
-    /// - `UpsertMarket` with a spec that fails `MarketSpec::validate`
+    /// - `UpsertMarket` with a spec that fails `MarketSpec::validate`, or with dated closures or
+    ///   special sessions before `V4`
     /// - `SetBenchmarkRate` outside ±10000 bps a year
     /// - `SetStressFloor` before parameters are set, at a level that does not exist, or for an
     ///   unknown market
@@ -34,6 +35,9 @@ impl Engine {
             }
             AdminCommand::UpsertMarket(spec) => {
                 spec.validate()?;
+                if spec.schedule.has_exceptions() && self.protocol_version < ProtocolVersion::V4 {
+                    return Err(format!("dated closures and special sessions need protocol {:?}", ProtocolVersion::V4));
+                }
                 match self.markets.get_mut(&spec.id) {
                     Some(market) => market.spec = spec.clone(),
                     None => {

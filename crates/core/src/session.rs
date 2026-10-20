@@ -131,6 +131,12 @@ impl Schedule {
         }
     }
 
+    /// Whether the schedule lists any dated closure or special session.
+    pub fn has_exceptions(&self) -> bool {
+        matches!(self, Schedule::Weekly { closures, special_sessions, .. }
+            if !closures.is_empty() || !special_sessions.is_empty())
+    }
+
     /// Checks the schedule can ever open, and that every dated exception changes the hours where it
     /// starts, so a mistyped date or time is refused rather than ignored.
     /// Error cases:

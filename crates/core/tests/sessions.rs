@@ -5,8 +5,10 @@ mod common;
 
 use chrono::{TimeZone, Utc};
 use common::{AAPL, BTC, Harness, acct, f, fills, market, ny, rejection, us_equities};
+use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, OrderKind, Sequenced};
 use engine_core::event::{Event, Reject};
+use engine_core::protocol::ProtocolVersion;
 use engine_core::session::Schedule;
 use engine_core::types::{AssetClass, Side};
 use engine_core::{Engine, Fixed};
@@ -95,7 +97,7 @@ fn financing_after_downtime_charges_every_missed_day() {
 
 #[test]
 fn a_calendar_update_applies_from_its_seq() {
-    let mut h = Harness::new();
+    let mut h = v4();
     // Thu 22 Oct 2026 14:00: the listed calendar keeps AAPL open all afternoon.
     h.advance_to(ny(2026, 10, 22, 14, 0));
     assert!(h.cmd(Command::Tick).is_empty());
@@ -114,7 +116,7 @@ fn a_calendar_update_applies_from_its_seq() {
 
 #[test]
 fn a_calendar_update_that_changes_nothing_is_refused_and_the_calendar_kept() {
-    let mut h = Harness::new();
+    let mut h = v4();
     // A 13:00 close typed for Saturday 24 Oct, when the venue is already shut.
     let events = h.cmd(calendar_update(&["2026-10-24"]));
     assert!(matches!(&events[..], [Event::AdminRejected { reason }] if reason.contains("already shut")), "{events:?}");
@@ -123,7 +125,7 @@ fn a_calendar_update_that_changes_nothing_is_refused_and_the_calendar_kept() {
 
 #[test]
 fn a_log_with_a_calendar_update_replays_to_the_roots_it_recorded() {
-    let mut h = Harness::new();
+    let mut h = v4();
     let mut recorded = roots(&h.log);
     let mut step = |h: &mut Harness, cmd| {
         h.cmd(cmd);
@@ -140,7 +142,41 @@ fn a_log_with_a_calendar_update_replays_to_the_roots_it_recorded() {
     assert_eq!(roots(&h.log), recorded);
 }
 
+#[test]
+fn dated_exceptions_are_accepted_only_from_v4() {
+    // Under each version, a weekly schedule without exceptions is accepted, and one with an early
+    // close is accepted from V4 on.
+    let cases = [
+        (ProtocolVersion::V2, Harness::new()),
+        (ProtocolVersion::V3, Harness::v3(ClientAuth::Unsigned)),
+        (ProtocolVersion::V4, v4()),
+    ];
+    for (version, mut h) in cases {
+        assert_eq!(h.engine.protocol_version(), version);
+        let plain =
+            Command::Admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, us_equities(), 2_000)));
+        assert_eq!(h.cmd(plain), [Event::AdminApplied], "{version:?}");
+        let events = h.cmd(calendar_update(&["2026-10-22"]));
+        if version >= ProtocolVersion::V4 {
+            assert!(events.contains(&Event::AdminApplied), "{version:?}: {events:?}");
+            assert!(h.engine.markets()[&AAPL].spec.schedule.has_exceptions());
+        } else {
+            let refused =
+                matches!(&events[..], [Event::AdminRejected { reason }] if reason.contains("need protocol V4"));
+            assert!(refused, "{version:?}: {events:?}");
+            assert_eq!(h.engine.markets()[&AAPL].spec.schedule, us_equities());
+        }
+    }
+}
+
 // ── Helpers ──
+
+/// `Harness::v3` with unsigned client requests, moved on to `V4`, which allows dated exceptions.
+fn v4() -> Harness {
+    let mut h = Harness::v3(ClientAuth::Unsigned);
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V4 });
+    h
+}
 
 /// An admin command re-listing AAPL with a 13:00 New York close on each date.
 fn calendar_update(dates: &[&str]) -> Command {

@@ -41,10 +41,12 @@
 # sessions, `closed_dates` whole local days the venue is shut, `closures`
 # dated local [from, to) periods inside the windows (early closes, holiday
 # halts, and closures that run past midnight), and `special_sessions` dated
-# local periods the venue trades outside the windows. After launch, a calendar
-# change is an UpsertMarket admin command carrying the market's new schedule;
-# it applies from the seq it is sequenced at. A running node takes admin
-# commands through the operator command channel (#47).
+# local periods the venue trades outside the windows. Closures and special
+# sessions need protocol version V4, which the node activates before it
+# sequences genesis. After launch, a calendar change is an UpsertMarket admin
+# command carrying the market's new schedule; it applies from the seq it is
+# sequenced at. A running node takes admin commands through the operator
+# command channel (#47).
 #
 # Sourcing, as read on 2026-10-20. A venue's own publication decides, checked
 # against a second, independent source. Where the venue has published nothing,

@@ -23,6 +23,7 @@ use engine_core::event::Event;
 use engine_core::market::Tier;
 use engine_core::params::{ProtocolParams, ToxicityParams};
 use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
+use engine_core::protocol::ProtocolVersion;
 use engine_core::session::{Period, Schedule};
 use engine_core::types::{AccountId, AssetClass, MarketId, OrderId, Side};
 
@@ -253,8 +254,10 @@ fn session() -> Vec<Sequenced> {
     h.advance(100);
     h.quotes(BTC, &["80000", "80010"]);
 
-    // A calendar update: Friday closes at 13:00 and Saturday trades a special session. An order fills
-    // before the early close, is refused after it, and fills again in the special session.
+    // V4 activates at this seq, then a calendar update: Friday closes at 13:00 and Saturday trades a
+    // special session. An order fills before the early close, is refused after it, and fills again in
+    // the special session.
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V4 });
     let at = |local: &str| local.parse().expect("a local date and time");
     let schedule = Schedule::Weekly {
         tz,

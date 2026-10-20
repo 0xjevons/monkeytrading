@@ -247,7 +247,8 @@ impl NodeConfig {
     /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
     ///   no longer than `feeds.interval`
     /// - genesis parameters or a market spec fail validation
-    /// - genesis house capital or a benchmark rate is one the engine would refuse
+    /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
+    ///   engine would refuse, or genesis lists no market
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg: NodeConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
@@ -277,7 +278,8 @@ impl NodeConfig {
     /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
     ///   no longer than `feeds.interval`
     /// - genesis parameters or a market spec fail validation
-    /// - genesis house capital or a benchmark rate is one the engine would refuse
+    /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
+    ///   engine would refuse, or genesis lists no market
     fn validate(&self) -> anyhow::Result<()> {
         EnvFilter::try_new(&self.logging.level).context("logging.level")?;
         if self.node.tick.is_zero()
@@ -311,8 +313,13 @@ impl NodeConfig {
         self.genesis.params.validate().map_err(anyhow::Error::msg).context("genesis.params")?;
         // Genesis reruns on every boot until it completes, so a command the engine would refuse
         // fails here, before anything reaches the log.
-        if !self.genesis.house_capital.is_valid_input() {
-            anyhow::bail!("genesis.house_capital must be above zero and at most {}", Fixed::MAX_INPUT);
+        // Zero credits nothing; any other amount must be one the engine accepts.
+        if self.genesis.house_capital != Fixed::ZERO && !self.genesis.house_capital.is_valid_input() {
+            anyhow::bail!("genesis.house_capital must be zero, or above zero and at most {}", Fixed::MAX_INPUT);
+        }
+        // A genesis without capital ends with its last market listing, which `needs_genesis` reads.
+        if self.genesis.markets.is_empty() {
+            anyhow::bail!("genesis.markets is empty");
         }
         if let Some(b) =
             self.genesis.benchmarks.iter().find(|b| !(-MAX_BENCHMARK_BPS..=MAX_BENCHMARK_BPS).contains(&b.annual_bps))
@@ -422,18 +429,23 @@ mod tests {
     #[test]
     fn genesis_values_the_engine_would_refuse_fail_the_boot() {
         let dev = std::fs::read_to_string(DEV).unwrap();
-        let zero_capital = dev.replace("house_capital = \"10000000\"", "house_capital = \"0\"");
-        let wild_rate = dev.replace("{ name = \"SOFR\", annual_bps = 400 }", "{ name = \"SOFR\", annual_bps = 10001 }");
-        let min_rate = dev.replace(
-            "{ name = \"SOFR\", annual_bps = 400 }",
-            &format!("{{ name = \"SOFR\", annual_bps = {} }}", i64::MIN),
-        );
-        for text in [&zero_capital, &wild_rate, &min_rate] {
+        let capital =
+            |amount: &str| dev.replace("house_capital = \"10000000\"", &format!("house_capital = \"{amount}\""));
+        let rate = |bps: i64| {
+            dev.replace("{ name = \"SOFR\", annual_bps = 400 }", &format!("{{ name = \"SOFR\", annual_bps = {bps} }}"))
+        };
+        let no_markets = dev[..dev.find("[[genesis.markets]]").unwrap()]
+            .replace("house_capital = \"10000000\"", "house_capital = \"10000000\"\nmarkets = []");
+        let refused = [capital("-1"), capital("1000000000.000000001"), rate(10_001), rate(i64::MIN), no_markets];
+        for text in &refused {
             assert_ne!(text, &dev, "the replacement must change the config");
             assert!(toml::from_str::<NodeConfig>(text).unwrap().validate().is_err());
         }
-        let at_limit = dev.replace("{ name = \"SOFR\", annual_bps = 400 }", "{ name = \"SOFR\", annual_bps = -10000 }");
-        toml::from_str::<NodeConfig>(&at_limit).unwrap().validate().unwrap();
+        // A house that starts with no capital, and the rate limit itself, are accepted.
+        for text in [capital("0"), rate(-10_000)] {
+            assert_ne!(text, dev, "the replacement must change the config");
+            toml::from_str::<NodeConfig>(&text).unwrap().validate().unwrap();
+        }
     }
 
     #[test]

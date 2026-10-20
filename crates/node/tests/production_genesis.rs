@@ -9,8 +9,10 @@ use std::path::Path;
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
-use engine_core::command::{Command, Sequenced};
+use engine_core::auth::ClientAuth;
+use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::event::Event;
+use engine_core::protocol::ProtocolVersion;
 use engine_core::session::{Period, Schedule};
 use engine_core::types::{AssetClass, MarketId, Millis};
 use engine_core::{Engine, Fixed};
@@ -176,10 +178,10 @@ fn easter_week_2027_opens_and_closes_each_market_on_its_venue_hours() {
 
 // ── Helpers ──
 
-/// Sequences the production genesis at `start` as the node does, which leaves the house with no
-/// capital, then ticks once a minute until `end` and checks every market opens and closes exactly as
-/// `expected` says, while crypto never closes. Both ends fall on a weekend when every other venue is
-/// shut.
+/// Sequences the production genesis at `start` as the node does, after client auth and the latest
+/// protocol version, which leaves the house with no capital. Then ticks once a minute until `end` and
+/// checks every market opens and closes exactly as `expected` says, while crypto never closes. Both
+/// ends fall on a weekend when every other venue is shut.
 fn assert_week(test: &str, start: Millis, end: Millis, expected: Week) {
     let mut engine = Engine::new();
     let mut seq = 0;
@@ -188,7 +190,12 @@ fn assert_week(test: &str, start: Millis, end: Millis, expected: Week) {
         seq += 1;
         events
     };
-    for cmd in genesis_commands(&production_genesis(test)) {
+    // The node records client auth and activates the latest protocol version before genesis.
+    let activation = [
+        Command::Admin(AdminCommand::SetClientAuth(ClientAuth::Unsigned)),
+        Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }),
+    ];
+    for cmd in activation.into_iter().chain(genesis_commands(&production_genesis(test))) {
         let events = apply(&mut engine, start, cmd);
         assert!(!events.iter().any(|e| matches!(e, Event::AdminRejected { .. })), "{events:?}");
     }

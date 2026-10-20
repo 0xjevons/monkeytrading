@@ -171,10 +171,16 @@ impl Sequencer {
         Ok(sequencer)
     }
 
-    /// Whether genesis has yet to finish: its last command, the house capital credit, is not in
-    /// the log. Genesis commands are safe to repeat, so a genesis cut short runs again in full.
-    pub fn needs_genesis(&self) -> bool {
-        !self.engine.is_credited(GENESIS_REF)
+    /// Whether `genesis` has yet to finish: its last command is not in the log. That is the house
+    /// capital credit, or, for a house that starts with no capital, the last market listing.
+    /// Genesis commands are safe to repeat, so a genesis cut short runs again in full.
+    pub fn needs_genesis(&self, genesis: &Genesis) -> bool {
+        match genesis_commands(genesis).last() {
+            Some(Command::HouseCapital { .. }) => !self.engine.is_credited(GENESIS_REF),
+            Some(Command::Admin(AdminCommand::UpsertMarket(spec))) => !self.engine.markets().contains_key(&spec.id),
+            // `NodeConfig::validate` refuses a genesis without markets; parameters come first.
+            _ => self.engine.params().is_none(),
+        }
     }
 
     /// Records the config's client auth and activates the latest protocol version, whichever the

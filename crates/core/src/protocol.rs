@@ -31,11 +31,13 @@ pub enum ProtocolVersion {
     /// Orders, cancels, and withdrawals are authorised as the log's `ClientAuth` records: by the
     /// account's EIP-712 signature, next nonce, and expiry, or unsigned in dev logs.
     V3,
+    /// Schedules may carry dated closures and special sessions.
+    V4,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V3;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V4;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {
