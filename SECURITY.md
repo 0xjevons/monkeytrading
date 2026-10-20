@@ -60,8 +60,13 @@ The policy covers the code in this repository and what is built from it: `engine
 deterministic state machine that applies the trading rules; `engine-node`, which sequences commands
 into it, publishes the log and its signed checkpoints, and serves the public REST and WebSocket API;
 the custody vault contract that will hold collateral on Arbitrum One; and the enclave image the node
-runs in, together with the attestation that vouches for it. The vault contract and the enclave image
-are still being built, and each is in scope as soon as its code is published.
+runs in, together with the attestation that vouches for it. The vault contract takes deposits but
+cannot pay anything out yet, and is in scope as published here; the enclave image is still being
+built, and is in scope as soon as its code is published. A trading account must be able to sign
+requests with its own key, since the engine accepts no contract signatures: a contract wallet funds
+a key that signs for it through the vault's `depositFor`, and a balance credited to a contract
+account can be recovered only through the exit (#48), so a report of that alone is not a new
+finding.
 
 The findings that matter most let someone take funds they are not owed, fill an order at a price the
 rules do not allow, make the state the node reports differ from the state its published log replays
@@ -77,14 +82,15 @@ configuration uses hardware attestation, on-chain custody, live prices, and sign
 Requests are signed, and the node refuses unsigned ones unless both the enclave and custody are
 mocks. The other three are not finished: the node can request an attestation report through
 configfs-tsm, but attestation on SEV-SNP hardware and a verifier for it are still being built, as
-are on-chain custody and live prices.
+are live prices and on-chain custody, which credits vault deposits but does not yet pay withdrawals.
 
 Out of scope are volumetric denial of service, meaning attacks that work only by flooding the API or
-the network with traffic; social engineering of anyone involved with the project; and
-vulnerabilities in third-party services, such as the venues that supply prices, the Arbitrum
-network, the USDC contract, and the enclave hardware, which should be reported to their owners. How
-the engine handles what those services send it, including a venue that quotes a false price, is in
-scope.
+the network with traffic; social engineering of anyone involved with the project; reorganisations of
+Arbitrum One that undo a block after its batch reached Ethereum, the finality the custody adapter
+waits for; and vulnerabilities in third-party services, such as the venues that supply prices, the
+Arbitrum network, the USDC contract, and the enclave hardware, which should be reported to their
+owners. How the engine handles what those services send it, including a venue that quotes a false
+price, is in scope.
 
 Findings that need an operator's key or credentials to be compromised first are also out of scope,
 unless they defeat a guarantee the engine makes. The engine is designed not to trust whoever runs it
@@ -100,12 +106,16 @@ account history index is read from host disk with only its schema checked, and i
 by one command, the newest it has taken, though SQLite reads it in defensive mode and each event it
 serves names its place in the log, where anyone can check it; the sequencer, which bounds its host's
 clock with signed time, trusts the guest's monotonic clock without yet checking that the host cannot
-scale it; the enclave's signing key does not yet survive a restart; and the node refuses unsigned
-requests unless both the enclave and custody are mocks, but does not yet refuse mock custody or
-simulated prices when it runs with hardware attestation, whose report vouches for the signing key
-but not for the configuration. A gap that this policy, an open issue, or a `TODO` in the code
-already records is known, so a report of it is not a new finding, though its details stay private
-under the disclosure timeline above; a way around a check that exists is a new finding.
+scale it; the enclave's signing key does not yet survive a restart; the custody adapter trusts its
+RPC endpoint's answers, bounded only by the chain of block hashes it proves up to the finality tag
+and by the vault's deposit count, takes the vault, its token, and the finality tag from the
+host-supplied configuration, and keeps its deposit cursor on host storage, where a cursor moved
+forward skips deposits without an alert; and the node refuses unsigned requests unless both the
+enclave and custody are mocks, but does not yet refuse mock custody or simulated prices when it runs
+with hardware attestation, whose report vouches for the signing key but not for the configuration. A
+gap that this policy, an open issue, or a `TODO` in the code already records is known, so a report
+of it is not a new finding, though its details stay private under the disclosure timeline above; a
+way around a check that exists is a new finding.
 
 ## Supported versions
 

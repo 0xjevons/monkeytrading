@@ -6,6 +6,9 @@
 //! to the block the finality tag reported, and accepts logs and counts only from blocks on it.
 //! Delivery is at least once (a restart re-reads from the cursor); the engine's credited
 //! references make the credit happen once.
+//!
+//! A reorganisation that undoes a block after the finality tag reported it (on Arbitrum One,
+//! after its batch reached Ethereum) is outside the threat model: it may undo a credited deposit.
 
 use std::collections::BTreeMap;
 use std::future::Future;

@@ -184,6 +184,18 @@ EVM custody reads the vault through `custody.evm.rpc_url`, which must use HTTPS 
 this machine and must serve state at past blocks back to `custody.evm.start_block` (an archive
 node): catching up after downtime and rescanning both read past blocks.
 
+A vault deposit credits the trading account its event names: the caller for `deposit`, or the
+account `depositFor` names. The vault refuses deposits under 10 USDC or over 1e9 USDC. A trading
+account must be able to sign requests with its own key, since the engine accepts no contract
+signatures: a contract wallet funds a key that signs for it through `depositFor`, and a balance
+credited to a contract account can be recovered only through the exit (#48).
+
+The adapter trusts its RPC endpoint's answers as far as the chain of block hashes it proves up to
+the finality tag, and the vault's deposit count, bound them. It takes the vault, its token, and the
+finality tag from the host-supplied config, and keeps its cursor on host storage. Reorganisations
+of Arbitrum One that undo a block after its batch reached Ethereum, the finality it waits for, are
+outside its threat model.
+
 Endpoints: `GET /v1/health`, `GET /v1/attestation`, `GET /v1/markets`, `GET /v1/house`,
 `GET /v1/accounts/{address}`, `GET /v1/accounts/{address}/nonce`,
 `GET /v1/accounts/{address}/history`, `POST /v1/orders`, `POST /v1/orders/cancel`,

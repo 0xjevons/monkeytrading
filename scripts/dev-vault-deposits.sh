@@ -2,8 +2,8 @@
 # Dev scenario for vault deposits, on a local Anvil chain with a node on config/anvil.toml:
 #   1. start Anvil and deploy a mock USDC and the vault;
 #   2. run a node with custody.provider = "evm" against them;
-#   3. deposit as a trader and as the house, restart the node mid-way (once with its cursor lost),
-#      and deposit again;
+#   3. deposit as a trader, for the trader from another account, and as the house, restart the
+#      node mid-way (once with its cursor lost), and deposit again;
 #   4. reorg a deposit away before it is final, then include the same transaction again.
 # Passes when every deposit is credited once, only after the configured confirmations, house NAV
 # equals the house deposits, and the node's log replays.
@@ -109,7 +109,7 @@ cd "$root/contracts"
 # `--constructor-args` takes every argument after it, so the contract and its arguments go last.
 create() { forge create --rpc-url "$rpc" --private-key "$deployer_key" --broadcast --json "$@" | jq -r '.deployedTo'; }
 usdc="$(create test/mocks/MockUSDC.sol:MockUSDC)"
-vault="$(create src/Vault.sol:Vault --constructor-args "$usdc" "$usdc_units")"
+vault="$(create src/Vault.sol:Vault --constructor-args "$usdc")"
 cd "$root"
 grep -qi "vault = \"$vault\"" config/anvil.toml || fail "vault deployed at $vault, not the address config/anvil.toml names"
 grep -qi "usdc = \"$usdc\"" config/anvil.toml || fail "USDC deployed at $usdc, not the address config/anvil.toml names"
@@ -144,19 +144,27 @@ send "$vault" "depositToHouse(uint256)" $((5000000 * usdc_units)) --private-key 
 mine 3
 wait_for house_nav 5000000
 
+step "A deposit another account makes for the trader credits the trader"
+send "$vault" "depositFor(address,uint256)" "$trader" $((50 * usdc_units)) --private-key "$house_key"
+mine 3
+wait_for trader_balance 1050
+payer="$(cast wallet address --private-key "$house_key" | tr '[:upper:]' '[:lower:]')"
+[[ "$(curl -s "$api/v1/accounts/$payer" | jq -r '.balance // "none"')" == "none" ]] || fail "the paying account was credited"
+[[ "$(house_nav)" == "5000000" ]] || fail "a deposit for the trader changed house NAV"
+
 step "A deposit made while the node is down is credited after the restart"
 stop_node
 send "$vault" "deposit(uint256)" $((250 * usdc_units)) --private-key "$trader_key"
 mine 3
 start_node
-wait_for trader_balance 1250
+wait_for trader_balance 1300
 
 step "With its cursor lost, the node reads every deposit again and credits none twice"
 stop_node
 rm "$work/custody-cursor.json"
 start_node
-wait_for rescanned_deposits 3
-stays trader_balance 1250
+wait_for rescanned_deposits 4
+stays trader_balance 1300
 [[ "$(house_nav)" == "5000000" ]] || fail "house NAV changed on the rescan"
 
 step "A deposit reorged away before it is final is never credited"
@@ -166,23 +174,23 @@ raw="$(cast mktx "$vault" "deposit(uint256)" $((77 * usdc_units)) --private-key 
   --gas-limit 200000 --rpc-url "$rpc")"
 cast publish "$raw" --rpc-url "$rpc" >/dev/null
 mine 1
-stays trader_balance 1250
+stays trader_balance 1300
 cast rpc evm_revert "$snapshot" --rpc-url "$rpc" >/dev/null
 mine 5
-stays trader_balance 1250
+stays trader_balance 1300
 
 step "The same transaction included again is credited once"
 cast publish "$raw" --rpc-url "$rpc" >/dev/null
 mine 3
-wait_for trader_balance 1327
+wait_for trader_balance 1377
 mine 3
-stays trader_balance 1327
+stays trader_balance 1377
 
 step "The log holds one command per deposit and replays"
 stop_node
 deposits="$(jq -c 'select(.entry == "command" and (.cmd.type == "deposit" or .cmd.type == "house_capital"))' \
   "$work"/log/[0-9]*.jsonl | wc -l | tr -d ' ')"
-[[ "$deposits" == "4" ]] || fail "expected 4 deposit commands in the log, found $deposits"
+[[ "$deposits" == "5" ]] || fail "expected 5 deposit commands in the log, found $deposits"
 "$engine" replay --log "$work/log" | grep -q '^verified' || fail "the log does not replay"
 # Restarts, the rescan, and the reorg are all expected: none of them may raise an alert.
 if grep -q 'alert=' "$work/node.log"; then fail "unexpected alert: $(grep -m 1 'alert=' "$work/node.log")"; fi

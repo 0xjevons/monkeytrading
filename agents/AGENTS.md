@@ -28,9 +28,10 @@ an index: load only the rule whose hint matches the current action.
   crypto venue WebSockets (`feeds/`, one adapter per venue) and a mock. `tests/reference/` holds
   the node-format reference log per protocol version, with events, written once by
   `examples/reference_log.rs`. Its `README.md` lists every file.
-- **contracts/** — Foundry project for the custody vault. `src/Vault.sol` takes USDC deposits for
-  traders and for the house, between a minimum set at deployment and 1e9 USDC, under one deposit
-  id sequence; `test/` holds unit, fuzz, and invariant tests, with mock tokens in `test/mocks/`.
+- **contracts/** — Foundry project for the custody vault. `src/Vault.sol` takes USDC deposits of
+  10 to 1e9 USDC for the caller's trading account (`deposit`), for a named one (`depositFor`), or
+  for the house, under one deposit id sequence; `test/` holds unit, fuzz, and invariant tests, with
+  mock tokens and a contract wallet in `test/mocks/`.
   Dependencies (forge-std, OpenZeppelin) come from the Soldeer registry, pinned with checksums in
   `soldeer.lock` and installed into the gitignored `dependencies/`; there are no git submodules.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine,

@@ -6,7 +6,8 @@ import {Test, Vm} from "forge-std/Test.sol";
 import {Vault} from "../src/Vault.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 
-/// @notice Random trader and house deposits from a few actors, tracking what the events report.
+/// @notice Random deposits from a few actors through every entry point, tracking what the events
+/// report and checking each trader deposit names the account it was made for.
 contract VaultHandler is Test {
     MockUSDC internal usdc;
     Vault internal vault;
@@ -20,22 +21,31 @@ contract VaultHandler is Test {
         vault = vault_;
     }
 
-    function deposit(uint256 actorSeed, uint256 amount, bool toHouse) external {
+    function deposit(uint256 actorSeed, uint256 accountSeed, uint256 amount, uint8 entry) external {
         address actor = actors[actorSeed % actors.length];
-        amount = bound(amount, vault.minDeposit(), vault.MAX_DEPOSIT());
+        address account = actors[accountSeed % actors.length];
+        amount = bound(amount, vault.MIN_DEPOSIT(), vault.MAX_DEPOSIT());
+        entry = entry % 3;
         usdc.mint(actor, amount);
         vm.startPrank(actor);
         usdc.approve(address(vault), amount);
         vm.recordLogs();
-        uint256 id = toHouse ? vault.depositToHouse(amount) : vault.deposit(amount);
+        uint256 id;
+        if (entry == 0) id = vault.deposit(amount);
+        else if (entry == 1) id = vault.depositFor(account, amount);
+        else id = vault.depositToHouse(amount);
         vm.stopPrank();
 
         assertEq(id, depositsMade);
         depositsMade++;
-        // The vault emits one event per deposit; its only data word is the amount credited.
+        // The vault emits one event per deposit; its only data word is the amount credited, and
+        // its second topic the trader account, or the funder for the house.
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].emitter == address(vault)) amountReported += abi.decode(logs[i].data, (uint256));
+            if (logs[i].emitter != address(vault)) continue;
+            amountReported += abi.decode(logs[i].data, (uint256));
+            address named = address(uint160(uint256(logs[i].topics[2])));
+            assertEq(named, entry == 1 ? account : actor);
         }
     }
 }
@@ -47,7 +57,7 @@ contract VaultInvariantTest is Test {
 
     function setUp() public {
         usdc = new MockUSDC();
-        vault = new Vault(usdc, 1e6);
+        vault = new Vault(usdc);
         handler = new VaultHandler(usdc, vault);
         targetContract(address(handler));
     }
