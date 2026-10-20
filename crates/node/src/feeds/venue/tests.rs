@@ -16,9 +16,7 @@ fn a_throttle_lets_one_alert_through_a_window_and_counts_the_rest() {
 #[tokio::test(start_paused = true)]
 async fn refusals_alert_again_after_the_window_with_the_count_between() {
     let (_guard, mut alerts) = capture_alerts();
-    let symbols = vec![VenueSymbol { market: 1, symbol: "BTC/USD".into() }];
-    let conn = VenueConnection { venue: Venue::Kraken, url: "wss://ws.kraken.com/v2".into(), symbols };
-    let mut feed = VenueFeed::new(conn, fast(WAIT), tls_config().unwrap(), mpsc::channel(1).0);
+    let mut feed = kraken_feed();
 
     ["first", "second", "third"].into_iter().for_each(|reason| feed.refuse(reason, ""));
     tokio::time::advance(REALERT_AFTER).await;
@@ -29,4 +27,29 @@ async fn refusals_alert_again_after_the_window_with_the_count_between() {
     let again = next_alert(&mut alerts).await;
     assert_eq!((again["reason"].as_str(), again["suppressed"].as_str()), ("fourth", "2"));
     assert!(alerts.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn clock_alerts_are_held_to_one_a_window() {
+    let (_guard, mut alerts) = capture_alerts();
+    let mut feed = kraken_feed();
+
+    (0..5).for_each(|_| feed.clock_ahead(1, 60_000));
+    tokio::time::advance(REALERT_AFTER).await;
+    feed.clock_ahead(1, 60_000);
+
+    let first = next_alert(&mut alerts).await;
+    assert_eq!((first["alert"].as_str(), first["suppressed"].as_str()), ("venue_clock_ahead", "0"));
+    let again = next_alert(&mut alerts).await;
+    assert_eq!((again["alert"].as_str(), again["suppressed"].as_str()), ("venue_clock_ahead", "4"));
+    assert!(alerts.try_recv().is_err());
+}
+
+// ── Helpers ──
+
+/// A Kraken feed for BTC/USD that is never run, for calling its alert paths directly.
+fn kraken_feed() -> VenueFeed {
+    let symbols = vec![VenueSymbol { market: 1, symbol: "BTC/USD".into() }];
+    let conn = VenueConnection { venue: Venue::Kraken, url: "wss://ws.kraken.com/v2".into(), symbols };
+    VenueFeed::new(conn, fast(WAIT), tls_config().unwrap(), mpsc::channel(1).0)
 }
