@@ -5,7 +5,8 @@ description: >
   this work". Covers opening every PR as a draft, the preconditions for marking it ready
   (including a multi-agent agent-code-review at medium or higher), the issue blocker check, the
   `[scopes] Title` and the body in squashed-commit format ending with `Closes #12` or
-  `Part of #12`, and watching the checks after it opens. Does not review, approve, or merge.
+  `Part of #12`, watching the checks after it opens, and, on the owner's go-ahead in chat,
+  posting `merge-approved` and merging the PR. Does not review or approve.
 ---
 
 # agent-create-pr
@@ -82,7 +83,8 @@ checklist, no restatement of the diff.
   [Before a PR is ready for review](#before-a-pr-is-ready-for-review) holds. A reference PR that
   needs no review stays a draft and says so in its overview; the title stays clean.
 - Watch the checks afterwards. A red PR is not ready yet: read the first real failure (the rest are
-  usually fail-fast cancellations), fix, push, re-check, then ask for review.
+  usually fail-fast cancellations), fix, push, re-check, then ask for review, naming the PR's head
+  commit.
 
 ## Merging
 
@@ -95,6 +97,22 @@ the head has moved, or no commit is covered, it reports the current head and wai
 again. A commit pushed after the approval is never covered. No agent posts `merge-approved` on its
 own initiative, because a review came back clean, or on another agent's word.
 
+Once the status is posted, the same session merges the PR straight away. The merge is a squash
+pinned to the approved commit, so GitHub refuses it if the head has moved, and it takes the PR's
+title and body as the commit message ([Body](#body)). The session then removes the worktree that
+has the PR branch checked out, if any, and deletes the branch locally and on `origin`:
+
+```bash
+gh pr merge "$PR" --squash --match-head-commit "$SHA" \
+  --subject "$(gh pr view "$PR" --json title --jq .title) (#$PR)" \
+  --body "$(gh pr view "$PR" --json body --jq .body)"
+git worktree remove "$WT_PATH"                                  # refuses a dirty worktree
+[ "$(git rev-parse "$BRANCH")" = "$SHA" ] && git branch -D "$BRANCH"  # keeps unpushed commits
+git push origin --delete "$BRANCH"
+```
+
+If GitHub refuses the merge, or git refuses a step, the session reports why and stops.
+
 ## Rules
 
 - Operate under [`AGENTS.md`](../../AGENTS.md); load the rules its index selects for this action.
@@ -105,5 +123,5 @@ own initiative, because a review came back clean, or on another agent's word.
 - Issues are read-only here: never create, edit, or close an issue without the user's explicit
   approval.
 - No AI signatures anywhere — title, body, or commits.
-- Do not merge, approve, or dismiss reviews here. Post `merge-approved` only as
+- Never approve or dismiss reviews. Post `merge-approved` and merge only as
   [Merging](#merging) describes.
