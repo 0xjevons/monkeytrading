@@ -244,7 +244,9 @@ impl Engine {
         if !market.open {
             return Err(Reject::MarketClosed);
         }
-        let mid = compute_index(&market.quotes, &market.spec.price_rules, self.now).map_err(Reject::NoPrice)?.mid;
+        let mid = compute_index(&market.quotes, &market.spec.price_rules, self.now)
+            .map_err(|error| Reject::NoPrice { error })?
+            .mid;
         let acct = &self.accounts[&exec.account];
         let pos = acct.position(exec.market);
 
