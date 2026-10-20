@@ -23,8 +23,8 @@ a fix in mind, whether anyone else knows of the issue, and how you would like to
 
 We aim to acknowledge a report within three business days, and within ten business days of
 receiving it to tell you whether we can reproduce the issue, how severe we judge it, and what we
-plan to do. We aim to fix a vulnerability of a kind that the Scope section below lists as mattering
-most within 30 days of your report, and any other within 90 days of it, and we will keep you
+plan to do. We aim to fix, within 30 days of your report, a vulnerability of a kind that the Scope
+section below lists as mattering most, and any other within 90 days of it, and we will keep you
 informed until it is resolved. If we conclude that a report does not describe a vulnerability, we
 will explain why.
 
@@ -48,9 +48,10 @@ run yourself rather than on a live deployment; never accessing anyone else's dat
 engine publishes through its log and public API, and never changing or destroying it; not degrading
 the service for other users; and keeping the details private as this policy asks. If you come
 across a vulnerability while using a live deployment, trade only from your own accounts, stop as
-soon as you have seen the problem, report it, and keep at least what the problem gained you in the
-affected account until we have agreed with you how to return it. If you are unsure whether
-something you plan to do is covered, ask us before you do it.
+soon as you have seen the problem, and report it. Until we have agreed with you how to return what
+it gained you, place no further orders on the affected account unless we ask you to, and make no
+withdrawal that would leave it holding less than that gain. If you are unsure whether something you
+plan to do is covered, ask us before you do it.
 
 ## Scope
 
@@ -83,16 +84,19 @@ the engine handles what those services send it, including a venue that quotes a 
 scope.
 
 Findings that need an operator's key or credentials to be compromised first are also out of scope,
-unless they defeat a guarantee the engine makes. The engine is designed so that whoever runs it, and
-controls the machine it runs on, cannot alter the published log without detection, have the enclave
-sign a state its rules do not produce, credit an account with funds that no deposit brought in, or
-pay out funds the engine did not approve. A finding that breaks one of these guarantees is in scope
-even when it starts from an operator's key. Some of the checks behind them are still being built:
+unless they defeat a guarantee the engine makes. The engine is designed not to trust whoever runs it
+or the machine it runs on: it bounds anything it takes from that machine's clock, disk, or network
+with a check, and whoever runs it cannot alter the published log without detection, have the enclave
+sign a state its rules do not produce, act for an account without its owner's signature, credit an
+account with funds that no deposit brought in, or pay out funds the engine did not approve. A
+finding that breaks one of these guarantees, or gets past one of those checks, is in scope even when
+it starts from an operator's key. Some of the checks behind them are still being built:
 `engine replay` does not yet verify checkpoint signatures; the node does not yet check the log it
 recovers from against anything its host cannot rewrite, so it accepts a truncated or rewritten one;
-the enclave's signing key does not yet survive a restart; and the node does not yet refuse its
+the sequencer does not yet bound how far its host's clock may drift; the enclave's signing key does
+not yet survive a restart; requests are not yet signed; and the node does not yet refuse its
 development settings when it runs with hardware attestation, whose report vouches for the signing
-key but not for the configuration. A gap that this list, an open issue, or a `TODO` in the code
+key but not for the configuration. A gap that this policy, an open issue, or a `TODO` in the code
 already records is known, so a report of it is not a new finding, though its details stay private
 under the disclosure timeline above; a way around a check that exists is a new finding.
 
