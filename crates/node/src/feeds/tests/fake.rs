@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat};
@@ -25,15 +24,14 @@ use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 use crate::clock::now_ms;
-use crate::config::{NodeConfig, Venue, VenueConnection, VenueSymbol};
+use crate::config::{Venue, VenueConnection, VenueSymbol};
 use crate::feeds::kraken;
 use crate::feeds::venue::{self, Timing};
 use crate::sequencer::{Query, Request};
+use crate::test_support::dev_config;
 
 /// How long a test waits for anything before failing, so a broken feed never hangs the suite.
 pub const WAIT: Duration = Duration::from_secs(5);
-/// The committed dev config, whose genesis lists the markets the fake venues price.
-pub const DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/dev.toml");
 
 /// One alert's fields, by name.
 pub type Alert = BTreeMap<String, String>;
@@ -78,9 +76,8 @@ impl Visit for Fields {
 impl FakeEngine {
     /// An engine with every dev genesis market listed.
     pub fn new() -> Self {
-        let cfg = NodeConfig::load(Path::new(DEV)).expect("dev config");
         let mut fake = FakeEngine { engine: Engine::new(), next_seq: 0 };
-        for market in cfg.genesis.markets {
+        for market in dev_config().genesis.markets {
             fake.apply(Command::Admin(AdminCommand::UpsertMarket(market)));
         }
         fake

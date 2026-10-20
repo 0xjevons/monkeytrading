@@ -4,7 +4,6 @@
 //! `no_price`.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,21 +12,22 @@ use engine_core::event::{Event, Reject};
 use engine_core::price::PriceError;
 use engine_core::types::{AccountId, MarketId, Millis, Side};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout};
 
 use crate::clock::now_ms;
-use crate::config::{NodeConfig, Venue};
+use crate::config::Venue;
 use crate::feeds::tests::fake::{
     Alert, WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_book, listen, next_alert, send,
     spawn_feed_into, stream,
 };
 use crate::feeds::venue::Timing;
-use crate::sequencer::{Request, Sequencer, SequencerConfig, StreamMsg};
+use crate::log::Manifest;
+use crate::sequencer::{Request, Sequencer, SequencerConfig, StreamBody, StreamMsg};
 use crate::tee::EnclaveKey;
+use crate::test_support::{dev_config, scratch_dir, sequencer_config};
 
-const DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/dev.toml");
 /// Each fake venue's book: BTC-USD 81250 / 81251 and ETH-USD 2377 / 2377.1.
 const BTC: (&str, &str, &str) = ("81250", "81251", "81250.5");
 const ETH: (&str, &str, &str) = ("2377", "2377.1", "2377.05");
@@ -100,20 +100,19 @@ impl Node {
     /// Sequences the committed dev genesis, with `MAX_AGE_MS` on the crypto markets, into a fresh
     /// log and runs the sequencer.
     async fn start(name: &str) -> Self {
-        let mut cfg = NodeConfig::load(Path::new(DEV)).expect("dev config");
+        let mut cfg = dev_config();
         for market in cfg.genesis.markets.iter_mut().filter(|market| [1, 2].contains(&market.id)) {
             market.price_rules.max_age_ms = MAX_AGE_MS;
         }
-        let dir = std::env::temp_dir().join(format!("engine-feeds-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = scratch_dir(&format!("feeds-{name}"));
         let (stream_tx, stream) = broadcast::channel(65_536);
         let (withdrawals_tx, _) = mpsc::unbounded_channel();
+        let (manifest, _) = watch::channel(Manifest::default());
+        // The venues sequence thousands of quotes, so one segment holds the whole test.
         let seq_cfg = SequencerConfig {
-            log_path: &dir.join("log.jsonl"),
+            segment_commands: 1_000_000,
             checkpoint_every: 1_000,
-            chain_id: cfg.custody.chain_id,
-            vault: cfg.custody.vault.parse().expect("vault"),
+            ..sequencer_config(&dir, manifest)
         };
         let mut seq = Sequencer::recover(seq_cfg, Arc::new(EnclaveKey::generate()), stream_tx, withdrawals_tx)
             .expect("fresh sequencer");
@@ -131,8 +130,8 @@ impl Node {
         let arrivals = async {
             while !missing.is_empty() {
                 let message = self.stream.recv().await.expect("stream");
-                if let StreamMsg::Command { sequenced, .. } = message.as_ref()
-                    && let Command::Prices { market, quotes } = &sequenced.cmd
+                if let StreamBody::Command(entry) = &message.body
+                    && let Command::Prices { market, quotes } = &entry.sequenced.cmd
                 {
                     quotes.iter().for_each(|quote| {
                         missing.remove(&(*market, quote.source.clone()));

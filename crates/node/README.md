@@ -64,8 +64,8 @@ feeds. The same binary replays a published log and verifies its checkpoints.
   checksum; `src/feeds/kraken/tests.rs` replays recorded book messages against it
 - `src/feeds/tests/mod.rs` — venue tasks against loopback venues: what they sequence, refuse,
   and alert, and how they reconnect
-- `src/feeds/tests/fake.rs` — the loopback venues, the feed harness, and the alert capture the
-  feed tests use
+- `src/feeds/tests/fake.rs` — the loopback venues, the feed harness with an engine that applies
+  what the feed sequences, and the alert capture the feed tests use
 - `src/feeds/tests/scenario.rs` — the dev scenario through the sequencer and engine
 - `src/clock.rs` — the wall clock used to stamp commands
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
