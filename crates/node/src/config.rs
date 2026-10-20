@@ -231,8 +231,7 @@ impl Venue {
 
     /// Whether `host` is the venue's domain or one of its subdomains.
     fn serves(self, host: &str) -> bool {
-        let domain = self.domain();
-        host.strip_suffix(domain).is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
+        host.strip_suffix(self.domain()).is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
     }
 }
 

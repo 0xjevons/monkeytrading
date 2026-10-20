@@ -192,6 +192,7 @@ impl Node {
             qty,
             kind,
             reduce_only: false,
+            auth: None,
         };
         self.submit(Command::PlaceOrder(order)).await
     }
