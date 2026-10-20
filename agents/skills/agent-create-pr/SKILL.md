@@ -50,8 +50,11 @@ marked ready, may not.
   ([Fixing an accepted finding](../agent-code-review/SKILL.md#fixing-an-accepted-finding)).
 - **Multi-agent reviewed.** [agent-code-review](../agent-code-review/SKILL.md) ran in multi-agent
   mode at level `medium` or higher on the final diff, so Claude and Codex reviewers cross-validated
-  each other. Fix every accepted Critical, High, and Medium finding by class and run it again until
-  a run accepts none; Low and Nit findings may remain.
+  each other. Fix every accepted Critical, High, and Medium finding by class and run it again;
+  [The review loop](../agent-code-review/SKILL.md#the-review-loop) says when the rounds end — a
+  clean round, or the owner's consent to downgrade Mediums after round 5 — and on which commit the
+  PR is marked ready. Low and Nit findings remain unfixed after the last round, and a mechanical
+  rebase onto `main` after it needs no new round.
 - **Local checks** for the affected crates passed, per git-workflow; the full CI runs
   on the PR.
 

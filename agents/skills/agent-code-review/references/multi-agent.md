@@ -85,8 +85,9 @@ The run also contains:
 The current agent dedupes candidates by affected code and issue in
 `consolidated.md`, preserving reports and validation verdicts. Consensus is
 evidence, not proof: retain disagreements and their source evidence. Re-check
-consolidated candidates against the code and full conversation context before
-writing the final report. Preserve the `Reported by` and `Validated by` fields;
+consolidated candidates against the code and full conversation context, and run
+the fix-notes check from [Review](../SKILL.md#review), before writing the final
+report. Preserve the `Reported by` and `Validated by` fields;
 rejected and context-dependent candidates remain in `consolidated.md`.
 
 Never edit an initial or validation report after it is written. Never

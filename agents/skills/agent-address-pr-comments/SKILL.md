@@ -149,7 +149,8 @@ tags, headings, lists, code blocks, restating the comment, or AI signature.
 - Fix each `Fix` item by class, as
   [Fixing an accepted finding](../agent-code-review/SKILL.md#fixing-an-accepted-finding) says: its
   invariant and the sites fixed go in the branch's fix notes and the item's `Changes`, and its reply
-  states the invariant.
+  states the invariant. A review round over the fixes follows
+  [the review loop](../agent-code-review/SKILL.md#the-review-loop).
 - Check every fix against the applicable sections of
   [development-checklist](../../rules/development-checklist.md): a fix must not open a new
   concurrency, crash-recovery, or test gap, and it must remove the failure, not just the flagged

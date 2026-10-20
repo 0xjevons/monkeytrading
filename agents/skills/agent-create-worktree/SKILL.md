@@ -110,5 +110,6 @@ git -C "$REPO_ROOT" worktree prune
 - Never overwrite an existing worktree path, and never force a branch that is checked out
   elsewhere. The one reuse is moving a clean, detached review tree to the PR's new head.
 - Base a new branch on the repo's default branch unless told otherwise.
-- This skill only creates or removes the tree. It does not commit, push, or open a PR — that is
+- This skill only creates or removes the tree, and clears a new branch's leftover fix notes. It
+  does not commit, push, or open a PR — that is
   [agent-create-pr](../agent-create-pr/SKILL.md).

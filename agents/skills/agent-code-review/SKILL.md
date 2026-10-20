@@ -1,12 +1,13 @@
 ---
 name: agent-code-review
-description: Review a branch or GitHub PR against the team development checklist, with the current agent by default, or with independent Claude and Codex reviewers for each requested low, medium, or high review level. Writes local Markdown only; to post the findings on a GitHub PR, use agent-review-pr. Also says how any skill fixes an accepted finding — by class, not by instance.
+description: Review a branch or GitHub PR against the team development checklist, with the current agent by default, or with independent Claude and Codex reviewers for each requested low, medium, or high review level. Writes local Markdown only; to post the findings on a GitHub PR, use agent-review-pr. Also says how any skill fixes an accepted finding — by class, not by instance — and when a PR's review loop ends.
 ---
 
 # agent-code-review
 
 Load on request for a local, single-agent, or multi-agent code review of the current branch or a
-GitHub PR. This skill creates local Markdown only: it never posts review comments or applies a
+GitHub PR, before fixing an accepted finding, and to decide whether a PR's review loop has ended.
+This skill creates local Markdown only: it never posts review comments or applies a
 suggested fix. To draft the findings as comments on a GitHub PR, use
 [agent-review-pr](../agent-review-pr/SKILL.md), which runs this skill.
 
@@ -16,7 +17,7 @@ Load in this order:
 
 | File | When | Holds |
 | --- | --- | --- |
-| this file | every run | scope, current-agent review, final report, completion report, fixing an accepted finding |
+| this file | every run, every fix of a finding | scope, review, final report, completion report, fixing an accepted finding, the review loop |
 | [development-checklist](../../rules/development-checklist.md) | every run | everything a change must not miss |
 | [references/severity.md](references/severity.md) | every run | how to grade a finding |
 | [references/multi-agent.md](references/multi-agent.md) | multi-agent mode only | reviewer dispatch, cross-validation, consolidation |
@@ -87,9 +88,10 @@ diff. Walk every applicable section of the development checklist in order, desig
 each finding with the severity guide. In current-agent mode, re-check each accepted finding against
 its source before writing the final report.
 
-The current agent also checks that each invariant in the fix notes of the branch under review — in
-PR scope, the PR's head branch — holds across the diff
-([Fixing an accepted finding](#fixing-an-accepted-finding)); a site where one fails is a finding.
+In either mode, the current agent also checks that each invariant in the fix notes of the branch
+under review — in PR scope, the PR's head branch — holds across the diff
+([Fixing an accepted finding](#fixing-an-accepted-finding)). A site where one fails is a finding,
+unless the commits or the user show that the branch changed that invariant on purpose.
 
 ## Final report
 
@@ -152,9 +154,8 @@ A calling skill that prints its own report built from these fields skips this on
 ## Fixing an accepted finding
 
 This skill never fixes code. Whoever fixes an accepted finding — in a self-review, in the review
-loop before a PR is marked ready
-([agent-create-pr](../agent-create-pr/SKILL.md#before-a-pr-is-ready-for-review)), or when
-addressing PR comments ([agent-address-pr-comments](../agent-address-pr-comments/SKILL.md)) —
+loop before a PR is marked ready ([The review loop](#the-review-loop)), or when addressing PR
+comments ([agent-address-pr-comments](../agent-address-pr-comments/SKILL.md)) —
 fixes its class, not only the cited instance:
 
 1. **Name the invariant** the finding breaks, in one checkable sentence: "a refused signed request
@@ -171,8 +172,9 @@ fixes its class, not only the cited instance:
    neighbours, to check that the fix creates no mirror-image defect.
 5. **Record the invariant and the sites fixed** in the branch's fix notes, under a heading for the
    round, so every later round checks the class instead of rediscovering it. An entry stays only
-   while its fix is on the branch: a later fix that changes the invariant rewrites the entry, and a
-   fix that is reverted or rejected removes it. The notes are the gitignored
+   while the branch means its invariant to hold: any change that alters a recorded invariant — a
+   later fix, a revert, a rejected fix, or a change the user asks for — rewrites or removes the
+   entry. The notes are the gitignored
    `agents/.processes/fixes/<branch>.md` in the main checkout, which every worktree finds with
    `dirname "$(git rev-parse --path-format=absolute --git-common-dir)"`, with the PR's head branch
    name kept whole (`fixes/<user>/size-spread-tiers-gh12.md`). Only the agent that owns the PR
@@ -181,6 +183,28 @@ fixes its class, not only the cited instance:
 
 Every round still reviews the full diff; the recorded invariants add to what it checks and never
 narrow it.
+
+## The review loop
+
+A PR is marked ready through review rounds, numbered from the first on its branch. Each round runs
+this skill in multi-agent mode at `medium` or higher over the PR's full diff
+([agent-create-pr](../agent-create-pr/SKILL.md#before-a-pr-is-ready-for-review)), and every
+accepted Critical, High, and Medium finding is fixed by class before the next round.
+
+- **A clean round ends the loop.** A round that accepts no Critical, High, or Medium finding ends
+  it. After it, change no code, fix no Lows or Nits, and run no further rounds. Mark the PR ready
+  on exactly the commit that round reviewed, once `ci-passed` is green on it; the remaining Lows
+  and Nits go in the report to the owner, not into new commits. A mechanical rebase onto `main`
+  after it needs no new round, and the rebased commit stands in for the reviewed one; a rebase that
+  changes behaviour needs a new round. If `ci-passed` or a feature's dev scenario fails on that
+  commit, its fix is a new commit and the loop goes on.
+- **Critical and High have no round cap.** Keep fixing and re-reviewing until a round accepts none.
+- **Mediums get at most five rounds.** If round 5, or any later round run to clear Critical and
+  High, ends with no Critical or High but with Mediums remaining, stop. Report the remaining
+  Mediums to the owner, each with its title, `file:line`, and scenario, and ask for consent to
+  downgrade them to Low. With that consent, mark the PR ready on that round's commit with no
+  further code changes, and list the downgraded findings in the report to the owner; without it,
+  wait for the owner's direction.
 
 ## Non-negotiable rules
 
