@@ -66,6 +66,8 @@ feeds. The same binary replays a published log and verifies its checkpoints.
   and alert, and how they reconnect
 - `src/feeds/tests/fake.rs` — the loopback venues, the feed harness with an engine that applies
   what the feed sequences, and the alert capture the feed tests use
+- `src/feeds/tests/late.rs` — venue tasks against a sequencer that answers late: when a quote
+  counts as the venue quoting, and how a connection's last quotes are settled after it ends
 - `src/feeds/tests/scenario.rs` — the dev scenario through the sequencer and engine
 - `src/clock.rs` — the wall clock used to stamp commands
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
@@ -80,7 +82,8 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 # Run a local node with mock TEE, custody, and feeds (API on 127.0.0.1:8080)
 cargo run -p engine-node -- run --config config/dev.toml
 
-# Price BTC-USD and ETH-USD from live venues instead: set feeds.provider = "venues" in a copy
+# Price BTC-USD and ETH-USD from live venues instead, leaving the other markets unpriced: set
+# feeds.provider = "venues" in a copy
 cargo run -p engine-node -- run --config <copy of config/dev.toml>
 
 # Verify a node's log directory, a downloaded archive, or a single log file

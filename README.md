@@ -76,7 +76,8 @@ as such; attestation on AMD SEV-SNP hardware, and a verifier for it, are being b
 You need the latest stable Rust on Linux or macOS, and `jq` for the second example. Start a local
 node with a mock enclave, mock custody, and simulated prices; its API listens on `127.0.0.1:8080`,
 which you can change with `node.listen` in `config/dev.toml`. Set `feeds.provider = "venues"` in a
-copy of it to price BTC-USD and ETH-USD from Coinbase, Kraken, and Bitstamp instead.
+copy of it to price BTC-USD and ETH-USD from Coinbase, Kraken, and Bitstamp instead; the other
+markets then have no price, so their orders get `no_price`.
 
 ```bash
 cargo test --workspace

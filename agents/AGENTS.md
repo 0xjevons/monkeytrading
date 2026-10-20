@@ -27,11 +27,11 @@ an index: load only the rule whose hint matches the current action.
   node-format reference log per protocol version, with events, written once by
   `examples/reference_log.rs`. Its `README.md` lists every file.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine;
-  `feeds.provider = "venues"` prices its crypto markets from live venues instead.
-  Its `[genesis]` section is protocol: it is sequenced into the log as admin commands on first boot.
-  `node.auth`, with `custody.chain_id` and `custody.vault` under `eip712`, is recorded in the log
-  when it first activates protocol versions, so changing it needs a fresh log. Every section rejects
-  unknown keys.
+  `feeds.provider = "venues"` prices its crypto markets from live venues instead, leaving the
+  others unpriced. Its `[genesis]` section is protocol: it is sequenced into the log as admin
+  commands on first boot. `node.auth`, with `custody.chain_id` and `custody.vault` under `eip712`,
+  is recorded in the log when it first activates protocol versions, so changing it needs a fresh
+  log. Every section rejects unknown keys.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate, and
   `check-reference-logs.sh`, which fails a branch that changes a committed reference log.
 - **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, the reference-log

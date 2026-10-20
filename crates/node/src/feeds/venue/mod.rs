@@ -3,6 +3,14 @@
 //! sequencer has gone away: a failed connection is retried inside the task with backoff, and while
 //! it is down the venue's last quotes age out in the engine, which prices from the other venues.
 
+mod quotes;
+use quotes::{Pending, counts};
+mod setup;
+use setup::next_attempt;
+pub use setup::tls_config;
+mod validation;
+pub(super) use validation::{check_size, check_time, to_quote};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::mem::take;
@@ -25,19 +33,13 @@ use crate::clock::now_ms;
 use crate::config::{Venue, VenueConnection, VenuesSection};
 use crate::feeds::{bitstamp, coinbase, kraken};
 use crate::sequencer::{Query, Request};
-mod quotes;
-use quotes::{Pending, counts};
-mod setup;
-use setup::next_attempt;
-pub use setup::tls_config;
-mod validation;
-pub(super) use validation::{check_size, check_time, to_quote};
 
 /// After a refused-message or clock alert, the same alert from the same venue waits this long, so
 /// a venue that changes its format raises one alert a minute, not one per message.
 const REALERT_AFTER: Duration = Duration::from_secs(60);
 /// How much of a refused message its log line keeps.
 const EXCERPT_CHARS: usize = 200;
+
 /// A venue's protocol on one connection: its subscribe messages, and a reader that keeps any
 /// state the venue's messages build on, such as an order book.
 enum Adapter {
@@ -104,6 +106,10 @@ struct VenueFeed {
     last_quote: BTreeMap<MarketId, Instant>,
     /// Markets alerted as silent that have not quoted since.
     silent: BTreeSet<MarketId>,
+    /// Markets the current connection has sequenced quotes for that no confirmation covers yet.
+    unconfirmed: BTreeSet<MarketId>,
+    /// The one confirmation awaited, and the markets it covers (see `confirm`).
+    confirming: Option<(oneshot::Receiver<Vec<MarketId>>, BTreeSet<MarketId>)>,
     refusals: Throttle,
     clock_alerts: Throttle,
 }
@@ -196,6 +202,8 @@ impl VenueFeed {
             quoted: false,
             last_quote,
             silent: BTreeSet::new(),
+            unconfirmed: BTreeSet::new(),
+            confirming: None,
             refusals: Throttle::default(),
             clock_alerts: Throttle::default(),
         }
@@ -210,6 +218,7 @@ impl VenueFeed {
         loop {
             self.quoted = false;
             let Err(error) = self.relay().await;
+            self.settle().await;
             if self.tx.is_closed() {
                 return Err(error.context("sequencer gone"));
             }
@@ -249,9 +258,6 @@ impl VenueFeed {
         let subscribed = Instant::now();
 
         let mut pending: BTreeMap<MarketId, Pending> = BTreeMap::new();
-        // Markets quoted and not yet confirmed, and the one confirmation awaited.
-        let mut unconfirmed: BTreeSet<MarketId> = BTreeSet::new();
-        let mut confirming: Option<oneshot::Receiver<Vec<MarketId>>> = None;
         let mut flush = interval_at(subscribed + self.timing.interval, self.timing.interval);
         flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
@@ -265,25 +271,26 @@ impl VenueFeed {
                     }
                 }
                 fresh = async {
-                    match &mut confirming {
-                        Some(reply) => reply.await,
+                    match &mut self.confirming {
+                        Some((reply, _)) => reply.await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    confirming = None;
+                    self.confirming = None;
                     fresh.map_err(|_| anyhow!("sequencer gone"))?.into_iter().for_each(|market| self.delivered(market));
                 }
                 _ = flush.tick() => {
                     let now = now_ms();
                     for (market, quotes) in &mut pending {
                         let Some(quote) = quotes.take(now) else { continue };
-                        unconfirmed.insert(*market);
+                        self.unconfirmed.insert(*market);
                         let cmd = Command::Prices { market: *market, quotes: vec![quote] };
                         let request = Request::Submit { cmd, reply: None };
                         self.tx.send(request).await.map_err(|_| anyhow!("sequencer gone"))?;
                     }
-                    if confirming.is_none() && !unconfirmed.is_empty() {
-                        confirming = Some(self.confirm(take(&mut unconfirmed)).await?);
+                    if self.confirming.is_none() && !self.unconfirmed.is_empty() {
+                        let markets = take(&mut self.unconfirmed);
+                        self.confirming = Some((self.confirm(markets.clone()).await?, markets));
                     }
                     if self.check_silent() {
                         bail!("resubscribing after a symbol went silent");
@@ -320,6 +327,21 @@ impl VenueFeed {
         });
         self.tx.send(Request::Query(query)).await.map_err(|_| anyhow!("sequencer gone"))?;
         Ok(fresh)
+    }
+
+    /// Settles what the ended connection sequenced, so one that quoted just before it ended is not
+    /// taken for a failed attempt: one last confirmation covers every market not yet confirmed,
+    /// waiting at most `timing.timeout` for the answer.
+    async fn settle(&mut self) {
+        let mut markets = take(&mut self.unconfirmed);
+        markets.extend(self.confirming.take().into_iter().flat_map(|(_, covered)| covered));
+        if markets.is_empty() {
+            return;
+        }
+        let confirmed = async { anyhow::Ok(self.confirm(markets).await?.await?) };
+        if let Ok(Ok(fresh)) = timeout(self.timing.timeout, confirmed).await {
+            fresh.into_iter().for_each(|market| self.delivered(market));
+        }
     }
 
     /// Reads one text message into `pending`, refusing what does not parse or check.

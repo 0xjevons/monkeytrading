@@ -1,5 +1,6 @@
 # Local development config: mock TEE, mock custody, mock feeds. Set
-# feeds.provider = "venues" to price the crypto markets from live venues.
+# feeds.provider = "venues" to price the crypto markets from live venues;
+# the other markets then have no price.
 #
 # Everything under [genesis] is protocol. On first boot it is sequenced into
 # the public log as admin commands, so the rules every fill ran under are on
