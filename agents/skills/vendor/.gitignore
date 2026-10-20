@@ -1,0 +1,3 @@
+# Vendored packs are pulled on demand by pull.sh (see sources.md); never committed.
+# Ignore every pack directory; keep the manifest, pull.sh, sources.md, and this file.
+/*/

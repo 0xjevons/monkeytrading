@@ -1,0 +1,9 @@
+# Vendored skill packs — pinned to an upstream commit, pulled on demand by pull.sh.
+# Format (tab-separated): <pack>\t<tarball-url pinned to commit>\t<subtree>
+#   subtree "." extracts the whole repo into skills/vendor/<pack>/;
+#   otherwise only that subdirectory of the repo becomes the pack root.
+# Refresh: bump the commit in the URL (latest default-branch hash) and re-run `pull.sh --force <pack>`.
+ethskills	https://github.com/austintgriffith/ethskills/archive/191dcc1ead0182aab16d4c742bee8b15f2d0d8d7.tar.gz	.
+evm-audit-skills	https://github.com/austintgriffith/evm-audit-skills/archive/071192ce7e40068f21eda63652848d298815f68e.tar.gz	.
+pashov-skills	https://github.com/pashov/skills/archive/f6c7f0de9cce16f6aa9c57aaac104f0dee90582e.tar.gz	.
+rust-skills	https://github.com/actionbook/rust-skills/archive/fa60f7931223646fb71c4586b4a6c8545016076a.tar.gz	.

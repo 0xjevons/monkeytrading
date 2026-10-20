@@ -1,0 +1,5 @@
+- **Severity:** {{SEVERITY}}
+- **Complexity:** {{COMPLEXITY}}
+- **Confidence:** {{CONFIDENCE}}
+- **Issue:** {{ISSUE}}
+- **Suggested fix:** {{SUGGESTED_FIX}}

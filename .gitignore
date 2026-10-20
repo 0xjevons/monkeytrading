@@ -1,2 +1,8 @@
 /target
 /data
+
+# Claude Code local project dir
+.claude/
+
+# Agent process artifacts: code-review runs and similar (do not commit)
+agents/.processes/
