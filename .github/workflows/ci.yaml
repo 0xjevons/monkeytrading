@@ -67,6 +67,45 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  # Every committed reference log must replay to its roots, and the accounting invariants must hold,
+  # on each platform a verifier may run. The `test` job runs both suites on x86_64 Linux.
+  reference-logs:
+    name: reference-logs (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Replay reference logs
+        run: cargo test -p engine-core --locked --test reference_logs
+      - name: Check accounting invariants
+        if: ${{ !cancelled() }}
+        run: cargo test -p engine-core --locked --test invariants
+
+  reference-logs-frozen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check committed reference logs are unchanged
+        env:
+          # A PR against its base, a push against the commit it replaced, a manual run against main.
+          BASE: >-
+            ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha
+            || github.event_name == 'push' && github.event.before
+            || 'origin/main' }}
+        run: ./scripts/check-reference-logs.sh "$BASE"
+
   cargo-deny:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -82,7 +121,7 @@ jobs:
   # skipped, and passes only if every one of them succeeded. Add every new job to `needs`.
   ci-passed:
     if: always()
-    needs: [fmt, file-loc, clippy, test, cargo-deny]
+    needs: [fmt, file-loc, clippy, test, reference-logs, reference-logs-frozen, cargo-deny]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

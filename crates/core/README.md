@@ -36,7 +36,15 @@ this crate and reproduce the signed state roots exactly.
 - `src/account.rs` — accounts, netted positions, and resting orders
 - `src/command.rs` / `src/event.rs` — engine inputs and outputs
 - `src/types.rs` — ids, sides, and asset classes
-- `tests/` — protocol tests through `Engine::apply`, with a shared harness in `tests/common/`
+- `tests/` — protocol tests through `Engine::apply`, with a shared harness and the reference-log
+  format in `tests/common/`
+- `tests/reference/` — one reference log per protocol version: each line is a sequenced command and
+  the state root after it
+- `tests/reference_logs.rs` — replays every reference log and fails at the first seq whose root
+  differs
+- `tests/invariants/` — property tests over generated sessions (`main.rs`) and the session generator
+  (`session.rs`)
+- `examples/reference_log.rs` — writes the reference log for a new protocol version
 
 ## Usage
 
@@ -57,6 +65,32 @@ replays that log with the same calls.
 ```bash
 cargo test -p engine-core
 ```
+
+Two suites guard replay and accounting:
+
+- `cargo test -p engine-core --test reference_logs` replays every log in `tests/reference/` and fails
+  at the first seq whose state root differs from the committed one. CI runs it on x86_64 Linux,
+  aarch64 Linux, and macOS, and `scripts/check-reference-logs.sh` fails a branch that changes,
+  renames, or deletes a committed log.
+- `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed. Each
+  mixes client, feed, custody, and operator commands, with values inside and outside the input
+  bounds, and checks after every command that nothing panicked, cash is conserved, and every
+  market's aggregates match its accounts' positions. Raise `CASES` or change `SEED` in
+  `tests/invariants/main.rs` to search further.
+
+### Adding a protocol version
+
+A change to engine state, its serialization, or what a command does changes the roots that existing
+logs replay to. It ships as a new protocol version, and the committed logs of earlier versions must
+keep passing unchanged. The engine has one protocol version today, `v1.jsonl`; versions that
+activate at a recorded seq arrive with signed client requests
+([#18](https://github.com/0xjevons/monkeytrading/issues/18)). For each later version:
+
+1. Extend the session in `examples/reference_log.rs` so it activates the new version and exercises
+   the new rules.
+2. Write the version's log, which the generator refuses to do over an existing file:
+   `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`
+3. Commit the file. The replay test and CI pick it up with no other change.
 
 ## Authors
 

@@ -14,7 +14,10 @@ an index: load only the rule whose hint matches the current action.
   sessions, house exposure caps, and toxicity scoring. It does no IO and uses no clocks,
   randomness, or floats. `impl Engine` is split by area (`engine.rs`, `execution.rs`,
   `closeout.rs`, `funds.rs`, `admin.rs`). Unit tests sit inline; protocol tests are in `tests/`
-  by area, with the shared harness in `tests/common/`. Its `README.md` lists every file.
+  by area, with the shared harness in `tests/common/`. `tests/reference/` holds one reference log
+  per protocol version, written once by `examples/reference_log.rs` and replayed to its roots by
+  `tests/reference_logs.rs`; `tests/invariants/` holds the property tests. Its `README.md` lists
+  every file.
 - **crates/node/** — `engine-node`, binary `engine` (`main.rs` over `lib.rs`). Contains the
   sequencer, the public log with signed checkpoints, `engine replay`, the REST and WebSocket API,
   TEE attestation (configfs-tsm for TDX and SEV-SNP), and the custody and price-feed adapters
@@ -22,11 +25,13 @@ an index: load only the rule whose hint matches the current action.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine.
   Its `[genesis]` section is protocol: it is sequenced into the log as admin commands on first
   boot. Every section rejects unknown keys.
-- **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate.
-- **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, and `cargo-deny`, on
-  every push to `main` and every PR. Actions are pinned by commit SHA. `ci-passed` is the one check
-  branch rules require: it passes only when every other job succeeded, so each new job must be
-  added to its `needs`.
+- **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate, and
+  `check-reference-logs.sh`, which fails a branch that changes a committed reference log.
+- **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, the reference-log
+  replay and invariant tests on x86_64 Linux, aarch64 Linux, and macOS, the unchanged-reference-log
+  check, and `cargo-deny`, on every push to `main` and every PR. Actions are pinned by commit SHA.
+  `ci-passed` is the one check branch rules require: it passes only when every other job succeeded,
+  so each new job must be added to its `needs`.
 - **agents/** — this index, `rules/`, and `skills/` (incl. `skills/vendor/` pull-on-demand
   packs); root `AGENTS.md` / `CLAUDE.md` symlink to `agents/AGENTS.md`.
 - **Cargo.toml** — workspace manifest, shared dependencies, and the Cargo profiles (release keeps
@@ -46,6 +51,12 @@ Run from the repo root:
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Format check: `cargo fmt --all -- --check`
 - File line cap: `./scripts/check-file-loc.sh`
+- Reference logs: `cargo test -p engine-core --test reference_logs` replays them;
+  `./scripts/check-reference-logs.sh [base]` checks none changed since `base` (default
+  `origin/main`)
+- Property tests: `cargo test -p engine-core --test invariants`
+- New protocol version's reference log:
+  `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`
 - Supply chain: `cargo deny check` (CI runs it; install `cargo-deny` to run it locally)
 - Run a local node: `cargo run -p engine-node -- run --config config/dev.toml` (or set
   `CONFIG_PATH`); the API listens on `127.0.0.1:8080`, the log goes to `data/dev/log.jsonl`
@@ -61,7 +72,10 @@ Run from the repo root:
 - **Replay is the audit.** The sequenced log is public, and anyone can replay it against this code
   to check the signed state roots. A change to `engine-core` state, its serialization, or its
   semantics changes the roots that existing logs carry, so it needs a stated plan for replaying
-  logs written by the older code.
+  logs written by the older code. Each protocol version has a reference log in
+  `crates/core/tests/reference/`, committed once and never regenerated; CI replays every one on
+  each platform, so a rule change ships as a new protocol version with its own log
+  (`crates/core/README.md`, "Adding a protocol version").
 - **The host is untrusted.** Inside the enclave, the host controls the clock, disk, and network.
   Code that trusts any of them names the check that bounds it, or a `TODO` that says what is
   missing.

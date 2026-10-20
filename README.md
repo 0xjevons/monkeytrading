@@ -116,8 +116,9 @@ crate's README describes its files.
 ## Contributing
 
 Work is tracked in GitHub issues, and pull requests against `main` are welcome. CI checks
-formatting, file length, lints, tests, and dependency advisories and licences; run the same checks
-locally before opening a pull request. The code's conventions are documented in
+formatting, file length, lints, tests, and dependency advisories and licences, and replays the
+committed reference logs on x86_64 Linux, aarch64 Linux, and macOS; run the same checks locally
+before opening a pull request. The code's conventions are documented in
 [`agents/AGENTS.md`](agents/AGENTS.md).
 
 ## Security
