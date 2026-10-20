@@ -123,8 +123,10 @@ same checks locally before opening a pull request. The code's conventions are do
 
 ## Security
 
-Please report vulnerabilities privately to william.jevons@proton.me. A security policy and a bug
-bounty will be published before launch.
+Please report vulnerabilities privately to william.jevons@proton.me rather than in a public issue.
+The [security policy](SECURITY.md) explains what a report should include, how quickly to expect a
+response, how disclosure is coordinated, and which components are in scope. A bug bounty will be
+announced before launch.
 
 ## License
 
