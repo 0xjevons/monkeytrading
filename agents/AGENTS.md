@@ -68,6 +68,9 @@ Run from the repo root:
 
 - Default branch `main`; issues and milestones live in GitHub Issues on
   `0xjevons/monkeytrading`.
+- **Merging needs the owner's go-ahead.** Branch rules require `ci-passed` and `merge-approved`;
+  only the owner's explicit approval of a PR, given in chat, leads to `merge-approved` being posted
+  ([agent-create-pr](skills/agent-create-pr/SKILL.md#merging)).
 - **`engine-core` is deterministic.** No clocks, randomness, floats, `HashMap` iteration, or IO.
   Time comes only from the sequencer's stamp, and money is `Fixed`.
 - **Replay is the audit.** The sequenced log is public, and anyone can replay it against this code
