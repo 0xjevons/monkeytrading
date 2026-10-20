@@ -315,7 +315,8 @@ impl Sequencer {
 /// (`engine replay`).
 /// Error cases:
 /// - a command out of sequence or with time running backwards
-/// - logged events that differ from the replayed ones
+/// - logged events that differ from the replayed ones, or a command without logged events after
+///   one with them
 /// - a withdrawal entry that does not match the next unmatched withdrawal its command approved
 /// - a withdrawal approved by a command logged with its events, with no withdrawal entry before
 ///   the next command or checkpoint
@@ -325,14 +326,18 @@ pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
     let mut engine = Engine::new();
     let (mut commands, mut checkpoints) = (0, 0);
     // Withdrawals the last command approved that no withdrawal entry has matched yet. Entries
-    // written before events were logged have no withdrawal entries, so only later ones must match.
+    // written before events were logged have no withdrawal entries. Once a command carries its
+    // events, every later one must, and every approval must be signed.
     let mut approved = VecDeque::new();
-    let mut must_sign = false;
+    let mut logs_events = false;
     for entry in entries {
         match entry {
             LogEntry::Command(c) => {
-                ensure_signed(must_sign, &approved, engine.last_seq())?;
+                ensure_signed(logs_events, &approved, engine.last_seq())?;
                 let seq = c.sequenced.seq;
+                if logs_events && c.events.is_none() {
+                    bail!("seq {seq} has no logged events, though earlier commands do");
+                }
                 let events = engine.apply(&c.sequenced).with_context(|| format!("applying seq {seq}"))?;
                 if c.events.as_ref().is_some_and(|logged| *logged != events) {
                     bail!("events logged at seq {seq} differ from the events replay gives");
@@ -344,7 +349,7 @@ pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
                         _ => None,
                     })
                     .collect();
-                must_sign = c.events.is_some();
+                logs_events = c.events.is_some();
                 commands += 1;
             }
             LogEntry::Withdrawal(w) => {
@@ -353,7 +358,7 @@ pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
                 }
             }
             LogEntry::Checkpoint(cp) => {
-                ensure_signed(must_sign, &approved, engine.last_seq())?;
+                ensure_signed(logs_events, &approved, engine.last_seq())?;
                 if engine.last_seq() != Some(cp.seq) {
                     bail!("checkpoint for seq {} found after seq {:?}", cp.seq, engine.last_seq());
                 }
@@ -365,7 +370,7 @@ pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
             }
         }
     }
-    let unsigned = if must_sign { approved.into() } else { Vec::new() };
+    let unsigned = if logs_events { approved.into() } else { Vec::new() };
     Ok(Replayed { engine, commands, checkpoints, unsigned })
 }
 

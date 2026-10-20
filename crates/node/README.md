@@ -53,7 +53,7 @@ cargo run -p engine-node -- run --config config/dev.toml
 cargo run -p engine-node -- replay --log data/dev/log
 
 # Download the archive: the manifest, then each segment it lists
-curl -o archive/manifest.jsonl http://127.0.0.1:8080/v1/archive/manifest.jsonl
+curl --create-dirs -o archive/manifest.jsonl http://127.0.0.1:8080/v1/archive/manifest.jsonl
 jq -r '.file' archive/manifest.jsonl |
   xargs -I{} curl -o archive/{} http://127.0.0.1:8080/v1/archive/{}
 ```
@@ -66,12 +66,14 @@ Endpoints: `GET /v1/health`, `GET /v1/attestation`, `GET /v1/markets`, `GET /v1/
 `/v1/stream` is live from now by default. `?from=<seq>` starts at the first message of `seq`
 (`from=0` is the whole log), and `?after=<seq>:<index>` resumes after the `offset` of the last
 message received. Each message carries its `offset`: the command of a seq is index 0, then its
-withdrawals, then any checkpoint.
+withdrawals, then any checkpoint. A command logged before events were recorded in the log streams
+without its `events` key.
 
 The log is a directory (`node.log_dir`) of segment files named for their first seq, plus
 `manifest.jsonl`, which gets one line per completed segment with its seq range, size, and SHA-256.
-The archive serves the manifest the node holds in memory, not the copy on disk, and backfill checks
-each completed segment against it before streaming from it. A log written as one file before
+The node loads the manifest at recovery, after checking it against the segment files, and then
+holds it in memory, adding each segment it completes. The archive serves that copy, not the file
+on disk, and backfill checks each completed segment against it before streaming from it. A log written as one file before
 segments existed continues as the first segment: move it to
 `<log_dir>/00000000000000000000.jsonl`. Every segment is kept, since recovery replays the log from
 genesis.

@@ -192,6 +192,21 @@ async fn a_restart_signs_a_withdrawal_the_log_ends_before_and_hands_it_to_custod
     assert!(replay(&SegmentedLog::open(&dir).unwrap().entries).unwrap().unsigned.is_empty());
 }
 
+#[tokio::test]
+async fn replay_refuses_a_command_without_logged_events_after_ones_with_them() {
+    let dir = scratch_dir("seq-events-cutover");
+    let node = TestSequencer::start(&dir, 16);
+    node.submit(deposit(100, "dep-1")).await;
+    node.stop().await;
+    let mut entries = SegmentedLog::open(&dir).unwrap().entries;
+    let last_command = entries.iter().rposition(|e| matches!(e, LogEntry::Command(_))).unwrap();
+    if let LogEntry::Command(c) = &mut entries[last_command] {
+        c.events = None;
+    }
+    let err = replay(&entries).err().unwrap();
+    assert!(format!("{err:#}").contains("has no logged events, though earlier commands do"), "{err:#}");
+}
+
 // ── Helpers ──
 
 /// The segment file the log appends to.

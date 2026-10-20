@@ -324,18 +324,16 @@ pub(super) fn list_segments(dir: &Path) -> anyhow::Result<Vec<(u64, PathBuf)>> {
 /// - the manifest cannot be opened, written, or synced
 fn append_listing(dir: &Path, listed: &SegmentInfo) -> anyhow::Result<()> {
     let path = dir.join(MANIFEST);
-    let created = !path.exists();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
+    // The segment's directory entry, and the manifest's on its first listing, must be durable
+    // before the listing is.
+    File::open(dir).and_then(|d| d.sync_all()).with_context(|| format!("syncing {}", dir.display()))?;
     file.write_all(&listing_line(listed)?).context("writing manifest")?;
-    file.sync_all().context("syncing manifest")?;
-    if created {
-        File::open(dir).and_then(|d| d.sync_all()).with_context(|| format!("syncing {}", dir.display()))?;
-    }
-    Ok(())
+    file.sync_all().context("syncing manifest")
 }
 
 /// One manifest line.

@@ -242,6 +242,21 @@ mod tests {
         assert_eq!(take(&mut feed, expected.len()).await, expected);
     }
 
+    #[tokio::test]
+    async fn a_feed_backfills_past_one_batch_from_disk() {
+        let dir = scratch_dir("feed-batches");
+        let node = TestSequencer::start(&dir, 1024);
+        for n in 0..BACKFILL_BATCH {
+            node.submit(deposit(1, &format!("dep-{n}"))).await;
+        }
+        let mut feed =
+            Feed::new(node.stream.subscribe(), dir.clone(), node.manifest.clone(), Some(Offset::start_of(0)));
+        let expected = log_messages(&dir, Offset::start_of(0));
+        assert!(expected.len() > BACKFILL_BATCH, "{}", expected.len());
+        assert_eq!(take(&mut feed, expected.len()).await, expected);
+        assert_next_is_the_next_command(&node, &mut feed).await;
+    }
+
     // ── Helpers ──
 
     /// The feed's next message, failing the test if none comes within ten seconds.

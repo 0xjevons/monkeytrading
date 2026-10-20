@@ -1,6 +1,7 @@
 //! `/v1/archive/{file}`: the log's completed segments and their manifest, for anyone to download
-//! and check with `engine replay --log <dir>`. The manifest comes from enclave memory, not the
-//! host's copy on disk, so a downloader can check each segment file against it.
+//! and check with `engine replay --log <dir>`. The manifest is the copy the log writer holds in
+//! enclave memory: loaded at recovery once the segment files match it, then extended as segments
+//! complete. The host's later edits to the file on disk do not reach it.
 
 use axum::body::Body;
 use axum::extract::{Path, State};

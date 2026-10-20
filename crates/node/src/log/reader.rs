@@ -39,14 +39,12 @@ impl LogReader {
     /// A reader for the log in `dir` that yields entries at or after `from`, starting in the
     /// segment that holds `from.seq`, and checks completed segments against `manifest`.
     /// Error cases:
-    /// - the directory cannot be listed, or the segment cannot be opened (see `open_segment`)
+    /// - the directory cannot be listed, or the start segment is missing or cannot be opened (see
+    ///   `open_start`)
     pub fn open(dir: &Path, from: Offset, manifest: watch::Receiver<Manifest>) -> anyhow::Result<Self> {
         let segments = list_segments(dir)?;
-        let start = segments.iter().rposition(|(first, _)| *first <= from.seq).or((!segments.is_empty()).then_some(0));
         let mut reader = Self { dir: dir.to_owned(), from, manifest, segments, segment: None, last: None };
-        if let Some(i) = start {
-            reader.segment = Some((i, reader.open_segment(i)?));
-        }
+        reader.open_start()?;
         Ok(reader)
     }
 
@@ -61,13 +59,23 @@ impl LogReader {
             let Some((i, segment)) = self.segment.as_mut() else {
                 // The log was empty when last listed.
                 self.segments = list_segments(&self.dir)?;
-                if self.segments.is_empty() {
+                self.open_start()?;
+                if self.segment.is_none() {
                     return Ok(None);
                 }
-                self.segment = Some((0, self.open_segment(0)?));
                 continue;
             };
             if let Some(entry) = segment.read_entry()? {
+                // A missing segment, or lines removed from one, shows up as a gap in the seqs.
+                if let (LogEntry::Command(c), Some(prev)) = (&entry, self.last) {
+                    let seq = c.sequenced.seq;
+                    ensure!(
+                        prev.seq.checked_add(1) == Some(seq),
+                        "{}: seq {seq} follows seq {}",
+                        segment.path.display(),
+                        prev.seq
+                    );
+                }
                 let offset = offset_of(self.last, &entry).with_context(|| segment.path.display().to_string())?;
                 self.last = Some(offset);
                 if offset >= self.from {
@@ -89,6 +97,19 @@ impl LogReader {
             ensure!(segment.line.is_empty(), "{} ends mid-line", segment.path.display());
             self.segment = Some((i + 1, self.open_segment(i + 1)?));
         }
+    }
+
+    /// Opens the segment that holds `from.seq`, once the log has any segment.
+    /// Error cases:
+    /// - segments exist but none holds `from.seq`, so the start of the log is missing
+    /// - the segment cannot be opened (see `open_segment`)
+    fn open_start(&mut self) -> anyhow::Result<()> {
+        let Some(i) = self.segments.iter().rposition(|(first, _)| *first <= self.from.seq) else {
+            ensure!(self.segments.is_empty(), "no segment in {} holds seq {}", self.dir.display(), self.from.seq);
+            return Ok(());
+        };
+        self.segment = Some((i, self.open_segment(i)?));
+        Ok(())
     }
 
     /// Opens segment `i`. A segment the manifest lists is read whole and checked against its

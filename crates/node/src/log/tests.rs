@@ -307,6 +307,22 @@ fn the_reader_refuses_a_completed_segment_that_ends_mid_line() {
     assert!(format!("{err:#}").contains("ends mid-line"), "{err:#}");
 }
 
+#[test]
+fn the_reader_refuses_a_seq_gap_or_a_missing_start_of_the_log() {
+    let dir = scratch_dir("reader-gap");
+    write(&dir, 2, &[cmd(0), cmd(1), cmd(2), cmd(3), cmd(4), cmd(5)]);
+    fs::remove_file(dir.join(SEG_2)).unwrap();
+    for from in [Offset::start_of(0), Offset::start_of(2)] {
+        let mut reader = LogReader::open(&dir, from, manifest_of(&dir)).unwrap();
+        let err = std::iter::from_fn(|| reader.next_entry().transpose()).find_map(Result::err).unwrap();
+        assert!(format!("{err:#}").contains("seq 4 follows seq 1"), "{err:#}");
+    }
+
+    fs::remove_file(dir.join(SEG_0)).unwrap();
+    let err = LogReader::open(&dir, Offset::start_of(0), manifest_of(&dir)).err().unwrap();
+    assert!(format!("{err:#}").contains("holds seq 0"), "{err:#}");
+}
+
 // ── Helpers ──
 
 fn cmd(seq: u64) -> LogEntry {
