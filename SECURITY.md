@@ -49,10 +49,10 @@ engine publishes through its log and public API, and never changing or destroyin
 the service for other users; and keeping the details private as this policy asks. If you come
 across a vulnerability while using a live deployment, trade only from your own accounts, stop as
 soon as you have seen the problem, and report it. To limit your risk you may then cancel the
-affected account's orders and reduce or close its positions, telling us when you do, but place no
-other orders on it. Until we have agreed with you how to return what the problem had gained you when
-you reported it, make no withdrawal that would take the account's balance below that amount. If you
-are unsure whether something you plan to do is covered, ask us before you do it.
+affected account's orders and reduce or close its positions, telling us when you do. Until we have
+agreed with you how to return what the problem gained the account, including through those orders,
+place no other orders on it and make no withdrawal that would take its balance below that amount.
+If you are unsure whether something you plan to do is covered, ask us before you do it.
 
 ## Scope
 
