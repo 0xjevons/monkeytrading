@@ -1,0 +1,53 @@
+# Supply-chain checks via cargo-deny: RUSTSEC advisories, licenses, bans, and sources.
+#
+# Run locally with `cargo deny check`. CI runs the same command in `.github/workflows/ci.yaml`.
+
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "warn"
+# Unmaintained notices on transitive crates surface in the log but do not gate CI. Promote to
+# "transitive" once the dependency tree allows it.
+unmaintained = "none"
+# Every entry needs a reason, a removal condition, and an `expires YYYY-MM-DD` on its own line, so
+# an ignore can't quietly become permanent.
+ignore = []
+
+[licenses]
+# SPDX expressions allowed workspace-wide. Add entries with a comment saying which crate needs it,
+# so reviewers don't have to re-derive why each was accepted.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Wildcard semver from crates.io auto-picks any version; workspace path deps carry an explicit
+# version instead.
+wildcards = "deny"
+allow-wildcard-paths = true
+# Duplicate transitive versions are mostly outside our control: visible, not gating.
+multiple-versions = "warn"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Only crates.io. Anything else is a supply-chain surface nobody has reviewed.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
