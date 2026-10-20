@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::crypto::ring;
 use rustls::{ClientConfig, RootCertStore};
 use tokio::sync::mpsc;
-use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, sleep_until, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tracing::{debug, info, warn};
@@ -27,15 +27,18 @@ use crate::config::{Venue, VenueConnection, VenuesSection};
 use crate::feeds::{bitstamp, coinbase, kraken};
 use crate::sequencer::Request;
 
-/// After a refused-message alert, further refusals from the same venue only count until this has
-/// passed, so a venue that changes its format raises one alert a minute, not one per message.
-const REFUSAL_REALERT: Duration = Duration::from_secs(60);
+/// After a refused-message or clock alert, the same alert from the same venue waits this long, so
+/// a venue that changes its format raises one alert a minute, not one per message.
+const REALERT_AFTER: Duration = Duration::from_secs(60);
 /// How much of a refused message its log line keeps.
 const EXCERPT_CHARS: usize = 200;
-/// The furthest a venue timestamp may lead the host clock. The engine keeps each venue's newest
-/// quote by time and skips one dated after the sequenced time, so a quote dated further ahead
-/// would block that venue's real quotes until the host clock caught up with it.
-pub(super) const MAX_CLOCK_LEAD_MS: Millis = 1_000;
+/// A quote dated this far ahead of the host clock raises `venue_clock_ahead`: the venue's clock or
+/// the host's is wrong. The quote is still sequenced, so the engine, which skips a quote dated
+/// after the sequenced time, prices nothing from it rather than keep using older quotes.
+///
+/// TODO: the sequencer stamps with the untrusted host clock; once a trusted time bound exists, a
+/// host clock this far behind the venues should fail closed there.
+const MAX_CLOCK_LEAD_MS: Millis = 1_000;
 
 /// A venue's protocol on one connection: its subscribe messages, and a reader that keeps any
 /// state the venue's messages build on, such as an order book.
@@ -105,6 +108,7 @@ struct VenueFeed {
     silent: BTreeSet<MarketId>,
     last_refusal_alert: Option<Instant>,
     refusals_since_alert: u64,
+    last_clock_alert: Option<Instant>,
 }
 
 impl Timing {
@@ -145,15 +149,15 @@ impl Adapter {
         matches!(self, Adapter::Coinbase(_))
     }
 
-    /// Reads one venue message at host time `now`.
+    /// Reads one venue message.
     /// Error cases:
     /// - the message is not one the venue's protocol defines, a field fails to parse, or the
     ///   venue reported an error
     /// - the message cannot be applied to the state kept for this connection
-    fn read(&mut self, text: &str, now: Millis) -> Result<Frame, Refusal> {
+    fn read(&mut self, text: &str) -> Result<Frame, Refusal> {
         match self {
             Adapter::Bitstamp => bitstamp::parse(text).map_err(Refusal::Message),
-            Adapter::Coinbase(books) => books.read(text, now),
+            Adapter::Coinbase(books) => books.read(text),
             Adapter::Kraken => kraken::parse(text).map_err(Refusal::Message),
         }
     }
@@ -178,6 +182,7 @@ impl VenueFeed {
             silent: BTreeSet::new(),
             last_refusal_alert: None,
             refusals_since_alert: 0,
+            last_clock_alert: None,
         }
     }
 
@@ -193,12 +198,10 @@ impl VenueFeed {
             if self.tx.is_closed() {
                 return Err(error.context("sequencer gone"));
             }
-            if self.quoted {
-                backoff = self.timing.reconnect_min;
-            }
-            self.dropped(&error, backoff);
-            sleep(backoff).await;
-            backoff = next_backoff(backoff, self.timing.reconnect_max);
+            let (wait, next) = next_attempt(backoff, self.quoted, &self.timing);
+            self.dropped(&error, wait);
+            sleep(wait).await;
+            backoff = next;
         }
     }
 
@@ -207,7 +210,8 @@ impl VenueFeed {
     /// counts as the venue quoting that market.
     /// Error cases:
     /// - connecting or subscribing fails or takes longer than `timing.timeout`
-    /// - the venue sends nothing for `timing.timeout`, closes, or asks for a reconnect
+    /// - the connection sequences no fresh quote within `timing.timeout`, or the venue closes it
+    ///   or asks for a reconnect
     /// - a symbol goes silent, so the connection is replaced to resubscribe it
     /// - the connection fails, or the sequencer has gone away
     async fn relay(&mut self) -> anyhow::Result<Infallible> {
@@ -231,11 +235,9 @@ impl VenueFeed {
         let mut flush = interval_at(subscribed + self.timing.interval, self.timing.interval);
         flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let stale_after = Millis::try_from(self.timing.stale_after.as_millis()).unwrap_or(Millis::MAX);
-        let mut deadline = Instant::now() + self.timing.timeout;
         loop {
             tokio::select! {
                 message = stream.next() => {
-                    deadline = Instant::now() + self.timing.timeout;
                     match message.context("connection closed")?.context("read")? {
                         Message::Text(text) => self.receive(&mut adapter, text.as_str(), &mut pending)?,
                         Message::Binary(_) => self.refuse("binary message", ""),
@@ -248,6 +250,9 @@ impl VenueFeed {
                     for (market, quote) in std::mem::take(&mut pending) {
                         // As the engine judges it: not after the host clock, and no older than the bound.
                         let fresh = quote.ts <= now && now - quote.ts <= stale_after;
+                        if quote.ts > now.saturating_add(MAX_CLOCK_LEAD_MS) {
+                            self.clock_ahead(market, quote.ts - now);
+                        }
                         let cmd = Command::Prices { market, quotes: vec![quote] };
                         self.tx.send(Request::Submit { cmd, reply: None }).await.map_err(|_| anyhow!("sequencer gone"))?;
                         if fresh {
@@ -257,8 +262,12 @@ impl VenueFeed {
                     if self.check_silent() {
                         bail!("resubscribing after a symbol went silent");
                     }
+                    // Covers a connection that stays open but carries nothing usable: silent,
+                    // heartbeats only, or every symbol refused, even while the venue is down.
+                    if !self.quoted && subscribed.elapsed() >= self.timing.timeout {
+                        bail!("no fresh quote for {:?}", self.timing.timeout);
+                    }
                 }
-                () = sleep_until(deadline) => bail!("no message for {:?}", self.timing.timeout),
             }
         }
     }
@@ -273,8 +282,7 @@ impl VenueFeed {
         text: &str,
         pending: &mut BTreeMap<MarketId, SourceQuote>,
     ) -> anyhow::Result<()> {
-        let now = now_ms();
-        let books = match adapter.read(text, now) {
+        let books = match adapter.read(text) {
             Ok(Frame::Books(books)) => books,
             Ok(Frame::Control) => return Ok(()),
             Ok(Frame::Reconnect) => bail!("the venue asked for a reconnect"),
@@ -288,7 +296,7 @@ impl VenueFeed {
             }
         };
         for book in books {
-            match to_quote(self.conn.venue, &self.markets, book, now) {
+            match to_quote(self.conn.venue, &self.markets, book) {
                 Ok((market, quote)) => {
                     // Keep the newest by venue time, as the engine does, whatever order they arrive in.
                     if pending.get(&market).is_none_or(|held| quote.ts >= held.ts) {
@@ -347,11 +355,23 @@ impl VenueFeed {
         newly_silent
     }
 
-    /// Logs a refused message, alerting at most once per `REFUSAL_REALERT`.
+    /// Alerts, at most once per `REALERT_AFTER`, that a quote for `market` is dated `lead_ms` ahead
+    /// of the host clock.
+    fn clock_ahead(&mut self, market: MarketId, lead_ms: Millis) {
+        let now = Instant::now();
+        if self.last_clock_alert.is_some_and(|at| now.duration_since(at) < REALERT_AFTER) {
+            return;
+        }
+        let venue = self.conn.venue.name();
+        warn!(alert = "venue_clock_ahead", venue, market, lead_ms, "venue time ahead of the host clock");
+        self.last_clock_alert = Some(now);
+    }
+
+    /// Logs a refused message, alerting at most once per `REALERT_AFTER`.
     fn refuse(&mut self, reason: &str, text: &str) {
         let venue = self.conn.venue.name();
         let now = Instant::now();
-        if self.last_refusal_alert.is_some_and(|at| now.duration_since(at) < REFUSAL_REALERT) {
+        if self.last_refusal_alert.is_some_and(|at| now.duration_since(at) < REALERT_AFTER) {
             self.refusals_since_alert += 1;
             debug!(venue, reason, "venue message refused");
             return;
@@ -404,16 +424,15 @@ pub async fn run(
 }
 
 /// The venue's mid for one book and the market it prices, refusing a book no working venue
-/// could show at host time `now`.
+/// could show.
 /// Error cases:
 /// - the symbol is not one this connection subscribed to
 /// - the bid or ask is outside the valid input range, or the book is crossed or locked
-/// - the timestamp is implausible (see `check_time`)
+/// - the timestamp is before the epoch
 pub(super) fn to_quote(
     venue: Venue,
     markets: &BTreeMap<String, MarketId>,
     book: Book,
-    now: Millis,
 ) -> Result<(MarketId, SourceQuote), String> {
     let Book { symbol, bid, ask, ts } = book;
     let market = *markets.get(&symbol).ok_or_else(|| format!("unsubscribed symbol {symbol}"))?;
@@ -423,7 +442,7 @@ pub(super) fn to_quote(
     if bid >= ask {
         return Err(format!("{symbol} book crossed: bid {bid}, ask {ask}"));
     }
-    check_time(&symbol, ts, now)?;
+    check_time(&symbol, ts)?;
     Ok((market, SourceQuote { source: venue.name().to_owned(), mid: (bid + ask).div_int(2), ts }))
 }
 
@@ -437,18 +456,23 @@ pub(super) fn check_size(symbol: &str, side: &str, size: Fixed) -> Result<(), St
     Ok(())
 }
 
-/// Refuses a venue time no working venue could send at host time `now`.
+/// Refuses a venue time no working venue could send. A time ahead of the host clock is not
+/// refused: refusing it would leave the engine on older quotes when the host clock is behind.
 /// Error cases:
 /// - `ts` is before the epoch
-/// - `ts` is more than `MAX_CLOCK_LEAD_MS` after `now`
-pub(super) fn check_time(symbol: &str, ts: Millis, now: Millis) -> Result<(), String> {
+pub(super) fn check_time(symbol: &str, ts: Millis) -> Result<(), String> {
     if ts < 0 {
         return Err(format!("{symbol} timestamp {ts} before the epoch"));
     }
-    if ts > now.saturating_add(MAX_CLOCK_LEAD_MS) {
-        return Err(format!("{symbol} timestamp {ts} is {}ms ahead of the host clock", ts.saturating_sub(now)));
-    }
     Ok(())
+}
+
+/// The wait before the next connection attempt, and the backoff after that. A connection that
+/// sequenced a fresh quote retries after `reconnect_min`; otherwise the wait is `backoff`, and the
+/// next one doubles it up to `reconnect_max`.
+pub(super) fn next_attempt(backoff: Duration, quoted: bool, timing: &Timing) -> (Duration, Duration) {
+    let wait = if quoted { timing.reconnect_min } else { backoff };
+    (wait, next_backoff(wait, timing.reconnect_max))
 }
 
 /// The delay after `current`: double it, capped at `max`.
@@ -457,26 +481,4 @@ pub(super) fn next_backoff(current: Duration, max: Duration) -> Duration {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::VenueSymbol;
-    use crate::feeds::tests::fake::{WAIT, capture_alerts, fast, next_alert};
-
-    #[tokio::test(start_paused = true)]
-    async fn refusals_alert_again_after_the_window_with_the_count_between() {
-        let (_guard, mut alerts) = capture_alerts();
-        let symbols = vec![VenueSymbol { market: 1, symbol: "BTC/USD".into() }];
-        let conn = VenueConnection { venue: Venue::Kraken, url: "wss://ws.kraken.com/v2".into(), symbols };
-        let mut feed = VenueFeed::new(conn, fast(WAIT), tls_config().unwrap(), mpsc::channel(1).0);
-
-        ["first", "second", "third"].into_iter().for_each(|reason| feed.refuse(reason, ""));
-        tokio::time::advance(REFUSAL_REALERT).await;
-        feed.refuse("fourth", "");
-
-        let first = next_alert(&mut alerts).await;
-        assert_eq!((first["reason"].as_str(), first["suppressed"].as_str()), ("first", "0"));
-        let again = next_alert(&mut alerts).await;
-        assert_eq!((again["reason"].as_str(), again["suppressed"].as_str()), ("fourth", "2"));
-        assert!(alerts.try_recv().is_err());
-    }
-}
+mod tests;

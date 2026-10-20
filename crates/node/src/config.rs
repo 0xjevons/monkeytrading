@@ -151,8 +151,8 @@ pub struct FeedsSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VenuesSection {
-    /// Deadline to connect and subscribe, the longest a connection may stay silent, and the
-    /// longest a symbol may go without a fresh quote before it is alerted.
+    /// Deadline to connect and subscribe, and the longest a connection, or one of its symbols, may
+    /// go without a fresh quote before the connection is replaced and the gap alerted.
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
     /// The first reconnect delay; it doubles after each attempt that sequences no fresh quote.
@@ -317,6 +317,7 @@ impl NodeConfig {
         }
         Ok(())
     }
+
     /// Checks `feeds.venues.stale_after` against the genesis market each venue symbol prices: a
     /// longer bound would count quotes the engine already drops as stale as the venue quoting.
     /// Error cases:

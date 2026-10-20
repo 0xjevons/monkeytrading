@@ -18,7 +18,7 @@ use crate::feeds::tests::fake::{
     WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_ticker, listen, next_alert, next_prices,
     quote, send, spawn_feed, stream,
 };
-use crate::feeds::venue::{Book, Timing, next_backoff, to_quote};
+use crate::feeds::venue::{Book, Timing, next_attempt, next_backoff, to_quote};
 use crate::feeds::{bitstamp, kraken};
 
 const MARKETS: [(MarketId, &str); 2] = [(1, "BTC/USD"), (2, "ETH/USD")];
@@ -69,7 +69,6 @@ async fn malformed_messages_and_books_are_refused_with_an_alert() {
         kraken_ticker("BTC/USD", "101", "100", 2_000),
         kraken_ticker("BTC/USD", "0", "100", 2_000),
         kraken_ticker("BTC/USD", "100", "1000000001", 2_000),
-        kraken_ticker("BTC/USD", "100", "102", now_ms() + 60_000),
         kraken_ticker("SOL/USD", "100", "101", 2_000),
     ];
     send(&mut ws, &messages).await;
@@ -105,23 +104,6 @@ async fn a_dropped_connection_reconnects_and_quotes_resume_without_an_alert() {
 }
 
 #[tokio::test]
-async fn a_connection_that_quoted_reconnects_without_growing_the_backoff() {
-    let (listener, url) = listen().await;
-    let timing = Timing { reconnect_max: Duration::from_secs(60), ..fast(WAIT) };
-    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, timing);
-    // Nine reconnects at 10ms each fit easily; doubling from 10ms would take over five seconds.
-    let reconnects = async {
-        for _ in 0..10 {
-            let (mut ws, _) = accept(&listener).await;
-            let ts = now_ms();
-            send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", ts)]).await;
-            assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", ts)]));
-        }
-    };
-    timeout(Duration::from_secs(2), reconnects).await.expect("the backoff grew between quoting connections");
-}
-
-#[tokio::test]
 async fn a_handshake_that_never_completes_times_out_and_alerts() {
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
@@ -152,18 +134,36 @@ async fn an_unreachable_venue_alerts_once_and_keeps_retrying() {
 }
 
 #[tokio::test]
-async fn a_silent_connection_is_dropped_and_retried() {
+async fn a_connection_with_no_fresh_quote_is_replaced_even_while_down() {
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
     let (_rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(Duration::from_millis(200)));
+    drop(timeout(WAIT, listener.accept()).await.expect("no attempt in time"));
+    assert_eq!(next_alert(&mut alerts).await["alert"], "venue_feed_down");
 
-    let (mut silent, _) = accept(&listener).await;
-    // One heartbeat, then nothing: the feed gives up on the connection and subscribes afresh.
-    send(&mut silent, &[r#"{"channel":"heartbeat"}"#.to_owned()]).await;
+    // The subscribe is refused and only heartbeats follow: the connection is alive but useless.
+    let (mut ws, _) = accept(&listener).await;
+    let refused = r#"{"error":"Currency pair not supported BTC/USD","method":"subscribe","success":false}"#;
+    send(&mut ws, &[refused.to_owned()]).await;
+    stream(ws, || vec![r#"{"channel":"heartbeat"}"#.to_owned()]);
     let (_next, subscription) = accept(&listener).await;
     assert_eq!(subscription, kraken::subscriptions(&["BTC/USD", "ETH/USD"])[0]);
-    let outage = async { while next_alert(&mut alerts).await["alert"] != "venue_feed_down" {} };
-    timeout(WAIT, outage).await.expect("no outage alert");
+}
+
+#[tokio::test]
+async fn a_venue_time_far_ahead_of_the_host_clock_is_sequenced_and_alerted() {
+    let (_guard, mut alerts) = capture_alerts();
+    let (listener, url) = listen().await;
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(WAIT));
+    let (mut ws, _) = accept(&listener).await;
+
+    // The engine skips it until the host clock reaches it, so it prices nothing meanwhile, where
+    // refusing it would leave the engine on older quotes when the host clock is the one behind.
+    let ts = now_ms() + 60_000;
+    send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", ts)]).await;
+    assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", ts)]));
+    let alert = next_alert(&mut alerts).await;
+    assert_eq!((alert["alert"].as_str(), alert["venue"].as_str()), ("venue_clock_ahead", "kraken"));
 }
 
 #[tokio::test]
@@ -389,16 +389,14 @@ fn books_no_working_venue_could_show_are_refused() {
         ("out of range", book("BTC/USD", "0", "100", 1)),
         ("out of range", book("BTC/USD", "100", "1000000000.1", 1)),
         ("before the epoch", book("BTC/USD", "100", "101", -1)),
-        ("1001ms ahead of the host clock", book("BTC/USD", "100", "101", NOW + 1_001)),
     ];
     for (expected, book) in refused {
-        let err = to_quote(Venue::Kraken, &markets, book, NOW).unwrap_err();
+        let err = to_quote(Venue::Kraken, &markets, book).unwrap_err();
         assert!(err.contains(expected), "expected {expected:?}, got {err}");
     }
-    // A time up to a second ahead of the host clock passes, and the mid truncates toward zero at
-    // the ninth decimal.
-    let accepted = to_quote(Venue::Kraken, &markets, book("BTC/USD", "100", "100.000000001", NOW + 1_000), NOW);
-    assert_eq!(accepted, Ok((1, quote(Venue::Kraken, "100", NOW + 1_000))));
+    // The mid truncates toward zero at the ninth decimal.
+    let accepted = to_quote(Venue::Kraken, &markets, book("BTC/USD", "100", "100.000000001", NOW));
+    assert_eq!(accepted, Ok((1, quote(Venue::Kraken, "100", NOW))));
 }
 
 #[test]
@@ -407,6 +405,17 @@ fn backoff_doubles_up_to_its_cap() {
     assert_eq!(next_backoff(Duration::from_millis(500), max), Duration::from_secs(1));
     assert_eq!(next_backoff(Duration::from_secs(20), max), max);
     assert_eq!(next_backoff(max, max), max);
+}
+
+#[test]
+fn a_connection_that_quoted_retries_at_once_and_one_that_did_not_backs_off() {
+    let timing =
+        Timing { reconnect_min: Duration::from_millis(500), reconnect_max: Duration::from_secs(30), ..fast(WAIT) };
+    let grown = Duration::from_secs(8);
+    // A routine drop resets the backoff, whatever it had grown to.
+    assert_eq!(next_attempt(grown, true, &timing), (timing.reconnect_min, Duration::from_secs(1)));
+    // A failed attempt waits the current backoff and doubles it for the next.
+    assert_eq!(next_attempt(grown, false, &timing), (grown, Duration::from_secs(16)));
 }
 
 // ── Helpers ──

@@ -44,6 +44,7 @@ pub(super) fn subscriptions(symbols: &[&str]) -> Vec<String> {
 /// Error cases:
 /// - an unknown event or channel, a missing field, an empty book side, a price, size, or time
 ///   that does not parse, or a top-of-book size out of range (see `check_size`)
+/// - bids not in descending or asks not in ascending price order, which could hide a crossing
 /// - a `bts:error` message from the venue
 pub(super) fn parse(text: &str) -> Result<Frame, String> {
     let message: Message = serde_json::from_str(text).map_err(|e| format!("unparseable message: {e}"))?;
@@ -52,6 +53,11 @@ pub(super) fn parse(text: &str) -> Result<Frame, String> {
             let symbol = message.channel.strip_prefix(CHANNEL_PREFIX).ok_or("data on an unknown channel")?;
             let book: OrderBook = serde_json::from_str(message.data.get()).map_err(|e| format!("bad book: {e}"))?;
             let micros: i64 = book.microtimestamp.parse().map_err(|e| format!("bad microtimestamp: {e}"))?;
+            let descending = book.bids.windows(2).all(|pair| pair[0].0 >= pair[1].0);
+            let ascending = book.asks.windows(2).all(|pair| pair[0].0 <= pair[1].0);
+            if !descending || !ascending {
+                return Err(format!("{symbol} book levels out of price order"));
+            }
             let (Some((bid, bid_size)), Some((ask, ask_size))) = (book.bids.first(), book.asks.first()) else {
                 return Err(format!("{symbol} book has an empty side"));
             };
@@ -123,6 +129,9 @@ mod tests {
             BOOK.replace(r#""channel":"order_book_ethusd""#, r#""channel":"live_trades_ethusd""#),
             BOOK.replace(r#""event":"data""#, r#""event":"bts:unknown""#),
             BOOK.replace(r#"["2379.38","18.981795"]"#, r#"["2379.38","0"]"#),
+            // Out of order, the first bid hides a better one that crosses the ask.
+            BOOK.replace(r#"["2379.32","0.019034"]"#, r#"["2379.40","0.019034"]"#),
+            BOOK.replace(r#"["2379.50","1.948232"]"#, r#"["2379.30","1.948232"]"#),
             BOOK.replace(r#"["2379.39","0.004202"]"#, r#"["2379.39","-0.004202"]"#),
             r#"{"event":"data","channel":"order_book_ethusd"}"#.to_owned(),
         ];

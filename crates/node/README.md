@@ -25,7 +25,7 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - Live crypto prices from Coinbase, Kraken, and Bitstamp over WebSocket: one supervised task per
   venue, quotes stamped with the venue's own time, and reconnects with backoff
 - Alerts for refused venue messages (at most one a minute per venue, counting the rest), venue
-  outages, and symbols with no fresh quote
+  outages, symbols with no fresh quote, and venue times well ahead of the host clock
 - Mock custody and a mock price feed for local development
 
 ## Repository Structure
@@ -52,7 +52,8 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/config.rs` — the node config schema and validation
 - `src/custody.rs` — the custody adapter (mock only so far)
 - `src/feeds/mod.rs` — the feed index and the mock feed
-- `src/feeds/venue.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect
+- `src/feeds/venue/mod.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect
+- `src/feeds/venue/tests.rs` — venue task unit tests on paused time
 - `src/feeds/coinbase.rs`, `src/feeds/kraken.rs`, `src/feeds/bitstamp.rs` — venue adapters
 - `src/feeds/tests/` — venue tasks against loopback venues, and the dev scenario through the
   sequencer

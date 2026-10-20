@@ -69,13 +69,13 @@ pub(super) fn parse(text: &str) -> Result<Frame, String> {
 /// - a price or size is not a plain decimal number, or a size is out of range (see `check_size`)
 /// - the timestamp is not RFC 3339
 fn book(ticker: Ticker) -> Result<Book, String> {
-    let price = |raw: &RawValue| raw.get().parse::<Fixed>().map_err(|e| format!("bad number: {e}"));
-    check_size(&ticker.symbol, "bid", price(ticker.bid_qty)?)?;
-    check_size(&ticker.symbol, "ask", price(ticker.ask_qty)?)?;
+    let decimal = |raw: &RawValue| raw.get().parse::<Fixed>().map_err(|e| format!("bad number: {e}"));
+    check_size(&ticker.symbol, "bid", decimal(ticker.bid_qty)?)?;
+    check_size(&ticker.symbol, "ask", decimal(ticker.ask_qty)?)?;
     let ts = DateTime::parse_from_rfc3339(ticker.timestamp)
         .map_err(|e| format!("bad timestamp {}: {e}", ticker.timestamp))?
         .timestamp_millis();
-    Ok(Book { symbol: ticker.symbol, bid: price(ticker.bid)?, ask: price(ticker.ask)?, ts })
+    Ok(Book { symbol: ticker.symbol, bid: decimal(ticker.bid)?, ask: decimal(ticker.ask)?, ts })
 }
 
 #[cfg(test)]
