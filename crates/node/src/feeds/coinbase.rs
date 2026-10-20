@@ -198,6 +198,18 @@ mod tests {
     }
 
     #[test]
+    fn a_new_snapshot_replaces_the_product_book() {
+        let mut books = Books::default();
+        books.read(SNAPSHOT).unwrap();
+        let resent = SNAPSHOT
+            .replace(r#""sequence_num":11"#, r#""sequence_num":12"#)
+            .replace(r#""price_level":"2376.8""#, r#""price_level":"2376.7""#)
+            .replace(r#""price_level":"2376.76""#, r#""price_level":"2376.69""#);
+        // The earlier snapshot's better bid at 2376.8 is gone.
+        assert_eq!(books.read(&resent), Ok(top("2376.7", "2376.81", 1_792_489_875_714)));
+    }
+
+    #[test]
     fn a_book_with_an_empty_side_has_no_top() {
         let mut books = Books::default();
         books.read(SNAPSHOT).unwrap();

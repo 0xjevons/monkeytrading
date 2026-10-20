@@ -181,7 +181,7 @@ fn serve_coinbase(listener: TcpListener) -> JoinHandle<()> {
     tokio::spawn(async move {
         let (mut ws, _) = accept(&listener).await;
         let mut every = interval(Duration::from_millis(20));
-        for sequence in (0..).step_by(2) {
+        for sequence in (0..u64::MAX).step_by(2) {
             every.tick().await;
             let (ts, snapshot) = (now_ms(), sequence == 0);
             let books = [

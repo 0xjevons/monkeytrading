@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
+use crate::clock::now_ms;
 use crate::config::Venue;
 use crate::feeds::tests::fake::{
     WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_ticker, listen, next_alert, next_prices,
@@ -53,20 +54,25 @@ async fn only_the_latest_quote_per_market_is_sequenced_each_interval() {
 async fn malformed_messages_and_books_are_refused_with_an_alert() {
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
-    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(WAIT));
+    // Every message lands within one interval, so a refused book accepted after the valid one
+    // would replace it as the quote sequenced.
+    let timing = Timing { interval: Duration::from_secs(1), ..fast(WAIT) };
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, timing);
     let (mut ws, _) = accept(&listener).await;
 
-    let refused = [
+    let messages = [
+        kraken_ticker("BTC/USD", "100", "101", 1_000),
         "not json".to_owned(),
-        kraken_ticker("BTC/USD", "101", "100", 1_000),
-        kraken_ticker("BTC/USD", "0", "100", 1_000),
-        kraken_ticker("SOL/USD", "100", "101", 1_000),
+        kraken_ticker("BTC/USD", "101", "100", 2_000),
+        kraken_ticker("BTC/USD", "0", "100", 2_000),
+        kraken_ticker("BTC/USD", "100", "1000000001", 2_000),
+        kraken_ticker("BTC/USD", "100", "102", now_ms() + 60_000),
+        kraken_ticker("SOL/USD", "100", "101", 2_000),
     ];
-    send(&mut ws, &refused).await;
-    send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", 2_000)]).await;
+    send(&mut ws, &messages).await;
 
     // Nothing refused reaches the sequencer, and the first refusal alerts.
-    assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", 2_000)]));
+    assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", 1_000)]));
     let alert = next_alert(&mut alerts).await;
     assert_eq!(alert["alert"], "venue_message_refused");
     assert_eq!(alert["venue"], "kraken");
@@ -91,6 +97,19 @@ async fn a_dropped_connection_reconnects_and_quotes_resume_without_an_alert() {
     assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "101", 2_000)]));
     // A connection that had been quoting is a routine drop, not an outage.
     assert!(alerts.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn a_connection_that_quoted_reconnects_without_growing_the_backoff() {
+    let (listener, url) = listen().await;
+    // Ten doublings from 10ms would wait over ten seconds in all, past `WAIT`.
+    let timing = Timing { reconnect_max: Duration::from_secs(60), ..fast(WAIT) };
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, timing);
+    for ts in 1..=10 {
+        let (mut ws, _) = accept(&listener).await;
+        send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", ts)]).await;
+        assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", ts)]));
+    }
 }
 
 #[tokio::test]
@@ -135,7 +154,7 @@ async fn a_symbol_the_venue_never_quotes_is_alerted() {
 
     // BTC keeps the connection busy while ETH never quotes.
     let streaming = tokio::spawn(async move {
-        for ts in 1_000.. {
+        for ts in 1_000..2_000 {
             send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", ts)]).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -195,6 +214,7 @@ async fn the_feed_stops_when_the_sequencer_goes_away() {
 
 #[test]
 fn books_no_working_venue_could_show_are_refused() {
+    const NOW: i64 = 1_792_489_875_714;
     let markets = BTreeMap::from([("BTC/USD".to_owned(), 1)]);
     let book = |symbol: &str, bid: &str, ask: &str, ts| Book {
         symbol: symbol.into(),
@@ -209,14 +229,16 @@ fn books_no_working_venue_could_show_are_refused() {
         ("out of range", book("BTC/USD", "0", "100", 1)),
         ("out of range", book("BTC/USD", "100", "1000000000.1", 1)),
         ("before the epoch", book("BTC/USD", "100", "101", -1)),
+        ("1001ms ahead of the host clock", book("BTC/USD", "100", "101", NOW + 1_001)),
     ];
     for (expected, book) in refused {
-        let err = to_quote(Venue::Kraken, &markets, book).unwrap_err();
+        let err = to_quote(Venue::Kraken, &markets, book, NOW).unwrap_err();
         assert!(err.contains(expected), "expected {expected:?}, got {err}");
     }
-    let accepted = to_quote(Venue::Kraken, &markets, book("BTC/USD", "100", "100.000000001", 0));
-    // The mid truncates toward zero at the ninth decimal.
-    assert_eq!(accepted, Ok((1, quote(Venue::Kraken, "100", 0))));
+    // A time up to a second ahead of the host clock passes, and the mid truncates toward zero at
+    // the ninth decimal.
+    let accepted = to_quote(Venue::Kraken, &markets, book("BTC/USD", "100", "100.000000001", NOW + 1_000), NOW);
+    assert_eq!(accepted, Ok((1, quote(Venue::Kraken, "100", NOW + 1_000))));
 }
 
 #[test]

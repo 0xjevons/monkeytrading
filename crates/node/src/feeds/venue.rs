@@ -22,6 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use tracing::{debug, info, warn};
 
+use crate::clock::now_ms;
 use crate::config::{Venue, VenueConnection, VenuesSection};
 use crate::feeds::{bitstamp, coinbase, kraken};
 use crate::sequencer::Request;
@@ -31,6 +32,10 @@ use crate::sequencer::Request;
 const REFUSAL_REALERT: Duration = Duration::from_secs(60);
 /// How much of a refused message its log line keeps.
 const EXCERPT_CHARS: usize = 200;
+/// The furthest a venue timestamp may lead the host clock. The engine keeps each venue's newest
+/// quote by time and skips one dated after the sequenced time, so a quote dated further ahead
+/// would block that venue's real quotes until the host clock caught up with it.
+const MAX_CLOCK_LEAD_MS: Millis = 1_000;
 
 /// A venue's protocol on one connection: its subscribe messages, and a reader that keeps any
 /// state the venue's messages build on, such as an order book.
@@ -239,8 +244,9 @@ impl VenueFeed {
                 bail!("resyncing: {reason}");
             }
         };
+        let now = now_ms();
         for book in books {
-            match to_quote(self.conn.venue, &self.markets, book) {
+            match to_quote(self.conn.venue, &self.markets, book, now) {
                 Ok((market, quote)) => {
                     pending.insert(market, quote);
                     self.accepted(market);
@@ -349,15 +355,16 @@ pub async fn run(
 }
 
 /// The venue's mid for one book and the market it prices, refusing a book no working venue
-/// could show.
+/// could show at host time `now`.
 /// Error cases:
 /// - the symbol is not one this connection subscribed to
 /// - the bid or ask is outside the valid input range, or the book is crossed or locked
-/// - the timestamp is before the epoch
+/// - the timestamp is before the epoch, or more than `MAX_CLOCK_LEAD_MS` after `now`
 pub(super) fn to_quote(
     venue: Venue,
     markets: &BTreeMap<String, MarketId>,
     book: Book,
+    now: Millis,
 ) -> Result<(MarketId, SourceQuote), String> {
     let Book { symbol, bid, ask, ts } = book;
     let market = *markets.get(&symbol).ok_or_else(|| format!("unsubscribed symbol {symbol}"))?;
@@ -370,6 +377,9 @@ pub(super) fn to_quote(
     let quote = SourceQuote { source: venue.name().to_owned(), mid: (bid + ask).div_int(2), ts };
     if !quote.is_well_formed() {
         return Err(format!("{symbol} timestamp {ts} before the epoch"));
+    }
+    if ts > now.saturating_add(MAX_CLOCK_LEAD_MS) {
+        return Err(format!("{symbol} timestamp {ts} is {}ms ahead of the host clock", ts.saturating_sub(now)));
     }
     Ok((market, quote))
 }
