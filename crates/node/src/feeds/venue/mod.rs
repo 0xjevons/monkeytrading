@@ -15,9 +15,8 @@ use engine_core::command::Command;
 use engine_core::price::SourceQuote;
 use engine_core::types::{MarketId, Millis};
 use futures_util::{SinkExt, StreamExt};
-use rustls::crypto::ring;
-use rustls::{ClientConfig, RootCertStore};
-use tokio::sync::mpsc;
+use rustls::ClientConfig;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
@@ -26,7 +25,9 @@ use tracing::{debug, info, warn};
 use crate::clock::now_ms;
 use crate::config::{Venue, VenueConnection, VenuesSection};
 use crate::feeds::{bitstamp, coinbase, kraken};
-use crate::sequencer::Request;
+use crate::sequencer::{Query, Request};
+mod setup;
+pub use setup::tls_config;
 mod validation;
 pub(super) use validation::{check_size, check_time, to_quote};
 
@@ -114,8 +115,8 @@ struct VenueFeed {
     last_quote: BTreeMap<MarketId, Instant>,
     /// Markets alerted as silent that have not quoted since.
     silent: BTreeSet<MarketId>,
-    /// The newest quote time sequenced per market. The engine ignores an older quote, so one is
-    /// never counted as the venue quoting.
+    /// The newest quote time sequenced per market, seeded from the engine when the task starts.
+    /// The engine ignores an older quote, so one is never counted as the venue quoting.
     newest_sequenced: BTreeMap<MarketId, Millis>,
     refusals: Throttle,
     clock_alerts: Throttle,
@@ -220,6 +221,7 @@ impl VenueFeed {
     /// Error cases:
     /// - the sequencer has gone away
     async fn run(mut self) -> anyhow::Result<()> {
+        self.seed_from_engine().await?;
         let mut backoff = self.timing.reconnect_min;
         loop {
             self.quoted = false;
@@ -232,6 +234,25 @@ impl VenueFeed {
             sleep(wait).await;
             backoff = next;
         }
+    }
+
+    /// Seeds `newest_sequenced` with the quote times the engine already holds for this venue,
+    /// so after a restart a quote the engine will ignore never counts as the venue quoting.
+    /// Error cases:
+    /// - the sequencer has gone away
+    async fn seed_from_engine(&mut self) -> anyhow::Result<()> {
+        let (reply, held) = oneshot::channel();
+        let source = self.conn.venue.name();
+        let markets: Vec<MarketId> = self.markets.values().copied().collect();
+        let query: Query = Box::new(move |engine| {
+            let quotes = markets
+                .iter()
+                .filter_map(|market| Some((*market, engine.markets().get(market)?.quotes.get(source)?.ts)));
+            let _ = reply.send(quotes.collect());
+        });
+        self.tx.send(Request::Query(query)).await.map_err(|_| anyhow!("sequencer gone"))?;
+        self.newest_sequenced = held.await.context("sequencer gone")?;
+        Ok(())
     }
 
     /// One connection: connect, subscribe, then read messages and sequence one quote per market
@@ -277,7 +298,8 @@ impl VenueFeed {
                 _ = flush.tick() => {
                     let now = now_ms();
                     for (market, quotes) in take(&mut pending) {
-                        if let Some(lead) = quotes.iter().map(|q| q.ts - now).max().filter(|lead| *lead > MAX_CLOCK_LEAD_MS) {
+                        let lead = quotes.iter().map(|quote| quote.ts - now).max();
+                        if let Some(lead) = lead.filter(|lead| *lead > MAX_CLOCK_LEAD_MS) {
                             self.clock_ahead(market, lead);
                         }
                         let Some(quote) = select(&quotes, now) else { continue };
@@ -287,7 +309,8 @@ impl VenueFeed {
                         let fresh = quote.ts >= *newest && quote.ts <= now && now - quote.ts <= stale_after;
                         *newest = (*newest).max(quote.ts);
                         let cmd = Command::Prices { market, quotes: vec![quote] };
-                        self.tx.send(Request::Submit { cmd, reply: None }).await.map_err(|_| anyhow!("sequencer gone"))?;
+                        let request = Request::Submit { cmd, reply: None };
+                        self.tx.send(request).await.map_err(|_| anyhow!("sequencer gone"))?;
                         if fresh {
                             self.delivered(market);
                         }
@@ -425,24 +448,6 @@ impl VenueFeed {
             debug!(venue, ?retry_in, "venue still down: {error:#}");
         }
     }
-}
-
-/// The TLS client config every venue connection shares: ring as the crypto provider, and
-/// Mozilla's roots compiled into the binary, so the host's certificate store is never trusted.
-///
-/// TODO: certificate validity is judged by the untrusted host clock and revocation is not
-/// checked, so a host holding an expired or revoked venue key could set the clock back and pose
-/// as the venue; a trusted time bound closes the first.
-/// Error cases:
-/// - the provider supports none of the safe default protocol versions
-pub fn tls_config() -> anyhow::Result<Arc<ClientConfig>> {
-    let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-    let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .context("TLS protocol versions")?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(Arc::new(config))
 }
 
 /// Streams one venue's quotes into the sequencer until the sequencer goes away.

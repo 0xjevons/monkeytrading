@@ -6,6 +6,7 @@ use std::fmt::Debug;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat};
+use engine_core::Engine;
 use engine_core::command::Command;
 use engine_core::price::SourceQuote;
 use engine_core::types::{MarketId, Millis};
@@ -131,15 +132,35 @@ pub fn stream(mut ws: Conn, messages: impl Fn() -> Vec<String> + Send + 'static)
     })
 }
 
-/// Runs a venue task for `venue` against `url`, returning what it sequences and its handle.
+/// Runs a venue task for `venue` against `url`, returning what it sequences and its handle. Its
+/// queries are answered by an engine that holds no quotes.
 pub fn spawn_feed(
     venue: Venue,
     url: &str,
     symbols: &[(MarketId, &str)],
     timing: Timing,
 ) -> (mpsc::Receiver<Request>, JoinHandle<anyhow::Result<()>>) {
+    let (feed_tx, mut feed_rx) = mpsc::channel(1024);
     let (tx, rx) = mpsc::channel(1024);
-    (rx, spawn_feed_into(tx, venue, url, symbols, timing))
+    tokio::spawn(async move {
+        let engine = Engine::new();
+        loop {
+            tokio::select! {
+                // The test dropped its receiver: hang up, so the feed sees the sequencer gone.
+                () = tx.closed() => return,
+                request = feed_rx.recv() => match request {
+                    Some(Request::Query(query)) => query(&engine),
+                    Some(submit) => {
+                        if tx.send(submit).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => return,
+                },
+            }
+        }
+    });
+    (rx, spawn_feed_into(feed_tx, venue, url, symbols, timing))
 }
 
 /// Runs a venue task for `venue` against `url`, sequencing into `tx`.

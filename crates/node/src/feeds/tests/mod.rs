@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use engine_core::types::{MarketId, Millis};
 use futures_util::SinkExt;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::clock::now_ms;
@@ -287,29 +287,6 @@ async fn a_symbol_that_goes_quiet_again_alerts_again() {
 }
 
 #[tokio::test]
-async fn a_recovered_venue_gets_a_full_silence_window_per_symbol() {
-    let (_guard, mut alerts) = capture_alerts();
-    let (listener, url) = listen().await;
-    let silence = Duration::from_millis(300);
-    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(silence));
-    // Down for longer than the silence bound, then back quoting BTC only.
-    let outage = Instant::now();
-    while outage.elapsed() < silence * 2 {
-        drop(timeout(WAIT, listener.accept()).await.expect("no attempt in time"));
-    }
-    assert_eq!(next_alert(&mut alerts).await["alert"], "venue_feed_down");
-    let (ws, _) = accept(&listener).await;
-    stream(ws, || vec![kraken_book("BTC/USD", "100", "101", now_ms())]);
-    next_prices(&mut rx).await;
-    let recovered = Instant::now();
-    let alert = next_alert(&mut alerts).await;
-    assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "ETH/USD"));
-    // ETH's silence counts from the recovery, not from before the outage, when it was already
-    // past the bound and would alert at the first check.
-    assert!(recovered.elapsed() >= silence / 2, "alerted {:?} after recovery", recovered.elapsed());
-}
-
-#[tokio::test]
 async fn silence_is_counted_across_reconnects() {
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
@@ -369,7 +346,7 @@ async fn a_refused_book_from_a_kept_book_resyncs() {
 }
 
 #[tokio::test]
-async fn a_kraken_book_that_fails_its_checksum_resubscribes_without_a_quote() {
+async fn a_kraken_book_that_fails_verification_resubscribes_without_a_quote() {
     let (_guard, mut alerts) = capture_alerts();
     let (listener, url) = listen().await;
     let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &[(1, "BTC/USD")], fast(WAIT));
@@ -380,6 +357,10 @@ async fn a_kraken_book_that_fails_its_checksum_resubscribes_without_a_quote() {
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["venue"].as_str()), ("venue_message_refused", "kraken"));
     assert!(alert["reason"].contains("checksum mismatch"), "{alert:?}");
+
+    // A book that verifies but is crossed is suspect too: it is dropped the same way.
+    let (mut crossed, _) = accept(&listener).await;
+    send(&mut crossed, &[kraken_book("BTC/USD", "101", "100", 1_500)]).await;
 
     // A fresh subscription brings a fresh snapshot, and only its top is sequenced.
     let (mut second, subscription) = accept(&listener).await;
@@ -405,8 +386,8 @@ async fn a_reconnect_request_ends_the_connection() {
 async fn the_feed_stops_when_the_sequencer_goes_away() {
     let (listener, url) = listen().await;
     let (rx, feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(WAIT));
-    drop(rx);
     let (mut ws, _) = accept(&listener).await;
+    drop(rx);
     send(&mut ws, &[kraken_book("BTC/USD", "100", "101", 1_000)]).await;
 
     let stopped = timeout(WAIT, feed).await.expect("feed kept running").expect("feed panicked");

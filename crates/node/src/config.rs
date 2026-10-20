@@ -243,7 +243,8 @@ impl NodeConfig {
     /// - `logging.level` is not a valid filter directive
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, or `feeds.interval` is zero
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
-    /// - `feeds.venues` is missing for `provider = "venues"`, or fails validation
+    /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
+    ///   no longer than `feeds.interval`
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital or a benchmark rate is one the engine would refuse
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -272,7 +273,8 @@ impl NodeConfig {
     /// - `logging.level` is not a valid filter directive
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, or `feeds.interval` is zero
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
-    /// - `feeds.venues` is missing for `provider = "venues"`, or fails validation
+    /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
+    ///   no longer than `feeds.interval`
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital or a benchmark rate is one the engine would refuse
     fn validate(&self) -> anyhow::Result<()> {
@@ -287,6 +289,11 @@ impl NodeConfig {
         match &self.feeds.venues {
             Some(venues) => {
                 venues.validate().context("feeds.venues")?;
+                // Silence is checked once an interval, so a longer interval would outlast the timeout.
+                ensure!(
+                    self.feeds.interval < venues.timeout,
+                    "feeds.interval must be shorter than feeds.venues.timeout"
+                );
                 self.check_stale_after(venues)?;
             }
             None if self.feeds.provider == FeedProvider::Venues => {
@@ -474,6 +481,14 @@ mod tests {
         cfg.feeds.venues.as_mut().unwrap().stale_after = Duration::from_millis(1_001);
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(err.contains("exceeds market BTC-USD max_age_ms (1000)"), "{err}");
+    }
+
+    #[test]
+    fn an_interval_that_outlasts_the_venue_timeout_is_refused() {
+        let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+        cfg.feeds.interval = cfg.feeds.venues.as_ref().unwrap().timeout;
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("feeds.interval must be shorter than feeds.venues.timeout"), "{err}");
     }
 
     #[test]

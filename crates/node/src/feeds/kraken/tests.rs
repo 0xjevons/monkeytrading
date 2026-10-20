@@ -1,13 +1,17 @@
 use super::*;
 
-// Recorded from wss://ws.kraken.com/v2: an ETH/USD snapshot and the four updates that followed it.
+// Recorded from wss://ws.kraken.com/v2: an ETH/USD snapshot and the seven updates that followed it.
 const SNAPSHOT: &str = r#"{"channel":"book","type":"snapshot","data":[{"symbol":"ETH/USD","bids":[{"price":2387.34,"qty":1.11000000},{"price":2387.16,"qty":0.03207130},{"price":2387.15,"qty":2.09886512},{"price":2387.14,"qty":0.01300000},{"price":2387.13,"qty":2.09456314},{"price":2387.06,"qty":0.47001888},{"price":2386.97,"qty":0.44710000},{"price":2386.96,"qty":0.20000000},{"price":2386.89,"qty":0.01600000},{"price":2386.87,"qty":1.54940553}],"asks":[{"price":2387.35,"qty":13.07562979},{"price":2387.42,"qty":1.89091043},{"price":2387.43,"qty":2.09430224},{"price":2387.52,"qty":4.24040608},{"price":2387.53,"qty":16.31597844},{"price":2387.54,"qty":31.41396556},{"price":2387.57,"qty":0.35563916},{"price":2387.59,"qty":0.44710000},{"price":2387.64,"qty":0.13118718},{"price":2387.69,"qty":1.35850000}],"checksum":602132210,"timestamp":"2026-10-20T12:34:44.332552Z"}]}"#;
-const UPDATES: [&str; 4] = [
+const UPDATES: [&str; 7] = [
     r#"{"channel":"book","type":"update","data":[{"symbol":"ETH/USD","bids":[],"asks":[{"price":2387.35,"qty":3.07562993}],"checksum":3352854302,"timestamp":"2026-10-20T12:34:44.338822Z"}]}"#,
     r#"{"channel":"book","type":"update","data":[{"symbol":"ETH/USD","bids":[],"asks":[{"price":2387.35,"qty":2.62852993}],"checksum":3241282715,"timestamp":"2026-10-20T12:34:44.389205Z"}]}"#,
     r#"{"channel":"book","type":"update","data":[{"symbol":"ETH/USD","bids":[{"price":2387.34,"qty":1.55710000}],"asks":[],"checksum":589154695,"timestamp":"2026-10-20T12:34:44.390458Z"}]}"#,
     // Removes a bid inside the top ten and adds one at the edge.
     r#"{"channel":"book","type":"update","data":[{"symbol":"ETH/USD","bids":[{"price":2387.15,"qty":0.00000000},{"price":2386.82,"qty":6.37118262}],"asks":[],"checksum":3655021122,"timestamp":"2026-10-20T12:34:44.401224Z"}]}"#,
+    r#"{"channel":"book","type":"update","data":[{"symbol":"ETH/USD","bids":[{"price":2387.14,"qty":0.70297503}],"asks":[],"checksum":3968313210,"timestamp":"2026-10-20T12:34:44.401224Z"}]}"#,
+    r#"{"channel":"book","type":"update","data":[{"symbol":"ETH/USD","bids":[],"asks":[{"price":2387.35,"qty":0.01675497}],"checksum":2862403204,"timestamp":"2026-10-20T12:34:44.401610Z"}]}"#,
+    // Adds an ask inside the top ten, pushing the tenth out: only truncation keeps the checksum.
+    r#"{"channel":"book","type":"update","data":[{"symbol":"ETH/USD","bids":[],"asks":[{"price":2387.41,"qty":0.68997503}],"checksum":412518972,"timestamp":"2026-10-20T12:34:44.401610Z"}]}"#,
 ];
 const HEARTBEAT: &str = r#"{"channel":"heartbeat"}"#;
 const STATUS: &str = r#"{"channel":"status","type":"update","data":[{"version":"2.0.10","system":"online","api_version":"v2","connection_id":5169314452737955867,"upcoming_maintenance":[],"emergency":[]}]}"#;
@@ -25,7 +29,7 @@ fn every_verified_update_publishes_the_top_at_its_time() {
     let mut books = Books::default();
     books.read(SNAPSHOT).unwrap();
     // The first three change sizes only: the top holds but is published at each update's time.
-    let times = [1_792_499_684_338, 1_792_499_684_389, 1_792_499_684_390, 1_792_499_684_401];
+    let times = [338, 389, 390, 401, 401, 401, 401].map(|ms| 1_792_499_684_000 + ms);
     for (update, ts) in UPDATES.iter().zip(times) {
         assert_eq!(books.read(update), Ok(top("2387.34", "2387.35", ts)), "{update}");
     }

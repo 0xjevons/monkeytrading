@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use engine_core::command::{Command, OrderKind, OrderRequest};
 use engine_core::event::{Event, Reject};
-use engine_core::price::PriceError;
+use engine_core::price::{PriceError, SourceQuote};
 use engine_core::types::{AccountId, MarketId, Millis, Side};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -20,7 +20,8 @@ use tokio::time::{interval, sleep, timeout};
 use crate::clock::now_ms;
 use crate::config::{NodeConfig, Venue};
 use crate::feeds::tests::fake::{
-    WAIT, accept, bitstamp_book, coinbase_levels, fast, kraken_book, listen, send, spawn_feed_into,
+    WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_book, listen, next_alert, send,
+    spawn_feed_into,
 };
 use crate::sequencer::{Request, Sequencer, SequencerConfig, StreamMsg};
 use crate::tee::EnclaveKey;
@@ -71,6 +72,36 @@ async fn venues_going_down_age_out_and_the_index_runs_on_the_rest() {
             "market {market}: {events:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn after_a_restart_quotes_the_engine_ignores_do_not_count_as_quoting() {
+    let (_guard, mut alerts) = capture_alerts();
+    let node = Node::start("restart").await;
+    // The engine already holds a Kraken quote dated an hour ahead, as a replayed log can.
+    let ahead = SourceQuote { source: "kraken".into(), mid: BTC.2.parse().unwrap(), ts: now_ms() + 3_600_000 };
+    node.submit(Command::Prices { market: 1, quotes: vec![ahead] }).await;
+
+    // The feed starts afresh, and Kraken's correctly dated BTC quotes are ignored by the engine.
+    let (listener, url) = listen().await;
+    serve_kraken(listener);
+    spawn_feed_into(
+        node.tx.clone(),
+        Venue::Kraken,
+        &url,
+        &[(1, "BTC/USD"), (2, "ETH/USD")],
+        fast(Duration::from_millis(300)),
+    );
+    let silent = async {
+        loop {
+            let alert = next_alert(&mut alerts).await;
+            if alert["alert"] == "venue_symbol_silent" {
+                return alert;
+            }
+        }
+    };
+    let alert = timeout(WAIT, silent).await.expect("BTC/USD alerted as silent");
+    assert_eq!(alert["symbol"], "BTC/USD");
 }
 
 // ── Helpers ──
