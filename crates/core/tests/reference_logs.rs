@@ -9,9 +9,10 @@ use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
-use common::params;
 use common::reference::{ReferenceEntry, root_hex};
+use common::{BTC, Harness, acct, params};
 use engine_core::command::{AdminCommand, Command, Sequenced};
+use engine_core::types::Side;
 use engine_core::{Engine, Fixed};
 
 #[test]
@@ -27,15 +28,15 @@ fn every_reference_log_replays_to_its_committed_roots() {
 
 #[test]
 fn a_changed_root_is_reported_at_its_seq() {
-    let mut entries = read(&reference_dir().join("v1.jsonl"));
-    entries[30].root = root_hex([0; 32]);
+    let mut entries = fresh_log();
+    entries[6].root = root_hex([0; 32]);
     let err = verify_roots(&entries).unwrap_err();
-    assert!(err.starts_with("root diverges at seq 30:"), "{err}");
+    assert!(err.starts_with("root diverges at seq 6:"), "{err}");
 }
 
 #[test]
 fn a_changed_command_is_reported_at_the_first_seq_it_alters() {
-    let mut entries = read(&reference_dir().join("v1.jsonl"));
+    let mut entries = fresh_log();
     // One extra unit of the smallest decimal on the first deposit changes every root from there on.
     let seq = entries.iter().position(|e| matches!(e.sequenced.cmd, Command::Deposit { .. })).expect("a deposit");
     let Command::Deposit { amount, .. } = &mut entries[seq].sequenced.cmd else { unreachable!("found above") };
@@ -57,6 +58,12 @@ fn a_panicking_command_is_reported_at_its_seq() {
 #[test]
 fn an_empty_log_does_not_verify() {
     assert_eq!(verify_roots(&[]), Err("empty log".to_owned()));
+}
+
+#[test]
+fn only_jsonl_logs_may_sit_in_the_reference_directory() {
+    assert_eq!(logs_among(&["v2.jsonl", ".DS_Store", "v1.jsonl"]), Ok(vec!["v1.jsonl", "v2.jsonl"]));
+    assert_eq!(logs_among(&["v1.jsonl", "v2.json"]), Err("v2.json"));
 }
 
 // ── Helpers ──
@@ -90,19 +97,47 @@ fn reference_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference")
 }
 
-/// Every file in the reference directory but hidden ones (such as `.DS_Store`), in name order;
-/// panics on one that is not a `.jsonl` log, so a misnamed log cannot go unreplayed.
+/// Every log in the reference directory, in name order; panics on a file `logs_among` refuses.
 fn reference_logs() -> Vec<PathBuf> {
-    let mut logs: Vec<PathBuf> = fs::read_dir(reference_dir())
+    let dir = reference_dir();
+    let names: Vec<String> = fs::read_dir(&dir)
         .expect("reference directory is readable")
-        .map(|entry| entry.expect("directory entry is readable").path())
-        .filter(|path| !name(path).starts_with('.'))
+        .map(|entry| entry.expect("directory entry is readable").file_name().to_string_lossy().into_owned())
         .collect();
-    if let Some(stray) = logs.iter().find(|path| !path.is_file() || path.extension().is_none_or(|ext| ext != "jsonl")) {
-        panic!("{} is not a .jsonl reference log", stray.display());
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let logs =
+        logs_among(&names).unwrap_or_else(|stray| panic!("{stray} in {} is not a .jsonl reference log", dir.display()));
+    logs.into_iter().map(|log| dir.join(log)).collect()
+}
+
+/// The `.jsonl` logs among a directory's file names, in name order, skipping hidden files such as
+/// `.DS_Store`.
+/// Error cases:
+/// - any other file, returned so a misnamed log cannot go unreplayed
+fn logs_among<'a>(names: &[&'a str]) -> Result<Vec<&'a str>, &'a str> {
+    let mut logs: Vec<&str> = names.iter().copied().filter(|name| !name.starts_with('.')).collect();
+    if let Some(stray) = logs.iter().find(|name| !name.ends_with(".jsonl")) {
+        return Err(stray);
     }
     logs.sort();
-    logs
+    Ok(logs)
+}
+
+/// A short log with the roots this build produces, so the verifier's own tests hold whatever the
+/// committed logs say.
+fn fresh_log() -> Vec<ReferenceEntry> {
+    let mut h = Harness::new();
+    h.deposit(acct(1), "1000");
+    h.price(BTC, "100000");
+    h.market_order(acct(1), BTC, Side::Buy, "0.001", "100000");
+    let mut engine = Engine::new();
+    h.log
+        .into_iter()
+        .map(|sequenced| {
+            engine.apply(&sequenced).expect("the harness sequenced it");
+            ReferenceEntry { root: root_hex(engine.state_root()), sequenced }
+        })
+        .collect()
 }
 
 /// The message a panic carried, when it is a string.
