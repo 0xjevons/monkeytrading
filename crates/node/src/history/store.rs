@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, bail, ensure};
 use engine_core::types::Millis;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, ToSql, params};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::spawn_blocking;
 use tracing::debug;
 
@@ -65,6 +65,8 @@ pub(super) struct Writer {
 pub struct Reader {
     path: PathBuf,
     permits: Arc<Semaphore>,
+    /// Set once the index has taken every command the log held when the node started.
+    ready: watch::Receiver<bool>,
 }
 
 impl Writer {
@@ -110,10 +112,15 @@ impl Writer {
     }
 
     /// Takes commands from `rx` until every sender is gone, writing whatever is queued in one
-    /// transaction at a time.
+    /// transaction at a time. Sets `ready` once a command at or past `ready_at` is written.
     /// Error cases:
     /// - a write fails (see `write`)
-    pub(super) fn run(mut self, mut rx: mpsc::Receiver<Arc<StreamMsg>>) -> anyhow::Result<()> {
+    pub(super) fn run(
+        mut self,
+        mut rx: mpsc::Receiver<Arc<StreamMsg>>,
+        ready: watch::Sender<bool>,
+        ready_at: Option<u64>,
+    ) -> anyhow::Result<()> {
         let mut batch = Vec::new();
         while let Some(msg) = rx.blocking_recv() {
             batch.push(msg);
@@ -122,18 +129,22 @@ impl Writer {
             {
                 batch.push(msg);
             }
-            self.write(&batch)?;
+            let written = self.write(&batch)?;
+            if ready_at.is_some_and(|at| written.is_some_and(|seq| seq >= at)) {
+                ready.send_replace(true);
+            }
             batch.clear();
         }
         Ok(())
     }
 
     /// In one transaction: stores the account events of the commands in `batch`, records the last
-    /// command as taken, and drops events older than the retention allows.
+    /// command as taken, and drops events older than the retention allows. Returns the seq of that
+    /// command, if `batch` holds one.
     /// Error cases:
     /// - the transaction fails
     /// - a seq is beyond SQLite's integer range, or an event or command cannot be encoded
-    pub(super) fn write(&mut self, batch: &[Arc<StreamMsg>]) -> anyhow::Result<()> {
+    pub(super) fn write(&mut self, batch: &[Arc<StreamMsg>]) -> anyhow::Result<Option<u64>> {
         let commands: Vec<&CommandEntry> = batch
             .iter()
             .filter_map(|msg| match &msg.body {
@@ -142,7 +153,7 @@ impl Writer {
             })
             .collect();
         let Some(last) = commands.last() else {
-            return Ok(());
+            return Ok(None);
         };
         let tx = self.conn.transaction().context("starting a history write")?;
         {
@@ -169,23 +180,33 @@ impl Writer {
         tx.execute("DELETE FROM events WHERE ts < ?1", [horizon]).context("dropping events past retention")?;
         tx.commit().context("committing a history write")?;
         debug!(seq = last.sequenced.seq, commands = commands.len(), "history index took commands");
-        Ok(())
+        Ok(Some(last.sequenced.seq))
     }
 }
 
 impl Reader {
-    /// A reader of the index at `path`, which the writer creates.
-    pub fn new(path: PathBuf) -> Self {
-        Self { path, permits: Arc::new(Semaphore::new(MAX_READS)) }
+    /// A reader of the index at `path`, which the writer creates, that serves pages once `ready`
+    /// is set.
+    pub fn new(path: PathBuf, ready: watch::Receiver<bool>) -> Self {
+        Self { path, permits: Arc::new(Semaphore::new(MAX_READS)), ready }
     }
 
-    /// One page of `query`, read on a blocking thread once one of `MAX_READS` permits is free.
+    /// One page of `query`, or `None` while the index is still taking the commands the log held
+    /// when the node started. It is read on a blocking thread holding one of `MAX_READS` permits,
+    /// which it keeps until the read ends even if the request is dropped.
     /// Error cases:
     /// - the index cannot be opened or read, or holds a row that does not parse
-    pub async fn page(&self, query: PageQuery) -> anyhow::Result<Page> {
-        let _permit = self.permits.acquire().await.expect("the read semaphore is never closed");
+    pub async fn page(&self, query: PageQuery) -> anyhow::Result<Option<Page>> {
+        if !*self.ready.borrow() {
+            return Ok(None);
+        }
+        let permit = self.permits.clone().acquire_owned().await.expect("the read semaphore is never closed");
         let path = self.path.clone();
-        spawn_blocking(move || read_page(&path, &query)).await.context("history reader task")?
+        let read = spawn_blocking(move || {
+            let _permit = permit;
+            read_page(&path, &query)
+        });
+        read.await.context("history reader task")?.map(Some)
     }
 }
 
@@ -247,7 +268,23 @@ fn bound(cursor: Option<Offset>, absent: i64) -> (i64, i64) {
 mod tests {
     use super::*;
 
-    use crate::test_support::scratch_dir;
+    use engine_core::types::AccountId;
+
+    use crate::test_support::{assert_a_dropped_read_keeps_its_permit, scratch_dir};
+
+    #[tokio::test]
+    async fn a_dropped_page_request_keeps_its_permit_until_its_read_ends() {
+        // Without a write-ahead log, a held write lock stalls readers too.
+        let dir = scratch_dir("history-read-permit");
+        fs::create_dir_all(&dir).unwrap();
+        let lock = Connection::open(dir.join("history.sqlite")).unwrap();
+        lock.execute_batch(SCHEMA).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let reader = Reader::new(dir.join("history.sqlite"), watch::channel(true).1);
+        let query = PageQuery { account: AccountId([1; 20]), kind: None, before: None, after: None, limit: 1 };
+        let release = || lock.execute_batch("ROLLBACK").unwrap();
+        assert_a_dropped_read_keeps_its_permit(&reader.permits, reader.page(query), release).await;
+    }
 
     #[test]
     fn a_page_reads_its_account_index_in_order_without_sorting() {

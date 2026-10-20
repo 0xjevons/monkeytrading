@@ -1,7 +1,8 @@
 use super::*;
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,11 +10,15 @@ use engine_core::Fixed;
 use engine_core::command::{Command, Sequenced};
 use engine_core::types::Millis;
 use rusqlite::Connection;
+use tokio::sync::{Semaphore, broadcast};
 use tokio::time::timeout;
 
+use crate::api::MAX_BACKFILLS;
+use crate::log::SegmentedLog;
 use crate::sequencer::StreamMsg;
 use crate::test_support::{
-    RETENTION, TRADER, TestHistory, TestSequencer, deposit, every_event, logged_history, scratch_dir, withdraw,
+    RETENTION, TRADER, TestHistory, TestSequencer, assert_a_dropped_read_keeps_its_permit, deposit, every_event,
+    logged_history, scratch_dir, withdraw,
 };
 
 const A: AccountId = AccountId([0xa; 20]);
@@ -70,7 +75,7 @@ async fn taking_the_same_commands_again_changes_nothing() {
     let path = file(&index_dir("idempotent"));
     let mut writer = Writer::open(&path, ms(RETENTION)).unwrap();
     writer.write(&sample_log()).unwrap();
-    let reader = Reader::new(path.clone());
+    let reader = Reader::new(path.clone(), ready());
     let once = every_page(&reader, A, None, 10).await;
     writer.write(&sample_log()).unwrap();
     writer.write(&sample_log()[1..]).unwrap();
@@ -84,7 +89,7 @@ async fn events_older_than_the_retention_leave_the_index() {
     let mut writer = Writer::open(&path, 1_000).unwrap();
     let deposit_a = || vec![Event::Deposited { account: A, amount: Fixed::from_int(1) }];
     writer.write(&[command(1, 0, deposit_a()), command(2, 500, deposit_a())]).unwrap();
-    let reader = Reader::new(path);
+    let reader = Reader::new(path, ready());
     assert_eq!(cursors(&every_page(&reader, A, None, 10).await), ["2:0", "1:0"]);
     // The horizon is 1_500 - 1_000: the event at 0 leaves, the one at exactly 500 stays.
     writer.write(&[command(3, 1_500, deposit_a())]).unwrap();
@@ -109,13 +114,15 @@ async fn the_index_follows_the_log_and_resumes_after_a_restart() {
     node.submit(withdraw(40)).await;
     node.stop().await;
     history.finish().await.unwrap();
-    let reader = Reader::new(file(&index));
+    let reader = Reader::new(file(&index), ready());
     let first = every_page(&reader, TRADER, None, 1).await;
     assert_eq!(first, logged_history(&dir, TRADER));
     assert_eq!(first.len(), 2);
 
+    let last = last_command_seq(&dir);
     let node = TestSequencer::start(&dir, 1024);
     let history = TestHistory::start(&node, &dir, &index).unwrap();
+    assert_eq!(history.resume_at, Offset::start_of(last + 1), "the index resumes after the last command it took");
     node.submit(withdraw(10)).await;
     node.stop().await;
     history.finish().await.unwrap();
@@ -135,7 +142,7 @@ async fn a_removed_index_is_rebuilt_from_the_log_segments() {
     }
     node.stop().await;
     history.finish().await.unwrap();
-    let reader = Reader::new(file(&index));
+    let reader = Reader::new(file(&index), ready());
     let served = every_page(&reader, TRADER, None, 3).await;
     assert_eq!(served.len(), 10);
 
@@ -143,6 +150,7 @@ async fn a_removed_index_is_rebuilt_from_the_log_segments() {
     let node = TestSequencer::start(&dir, 1024);
     assert!(node.manifest.borrow().segments.len() > 2, "the log spans several completed segments");
     let history = TestHistory::start(&node, &dir, &index).unwrap();
+    assert_eq!(history.resume_at, Offset::start_of(0));
     node.stop().await;
     history.finish().await.unwrap();
     assert_eq!(every_page(&reader, TRADER, None, 3).await, served);
@@ -176,7 +184,7 @@ async fn an_index_built_from_another_log_is_refused() {
         node.submit(deposit(7, &format!("other-{n}"))).await;
     }
     let err = TestHistory::start(&node, &other, &index).err().expect("refused");
-    assert!(format!("{err:#}").contains("is not the command the index took"), "{err:#}");
+    assert!(format!("{err:#}").contains("holds another command there"), "{err:#}");
 }
 
 #[tokio::test]
@@ -192,12 +200,92 @@ async fn the_sequencer_runs_on_while_the_index_writer_waits_on_its_file() {
         }
     };
     timeout(Duration::from_secs(3), sequenced).await.expect("the sequencer does not wait on the index");
-    let reader = Reader::new(file(&index));
+    let reader = Reader::new(file(&index), ready());
     assert!(every_page(&reader, TRADER, None, 200).await.is_empty(), "the writer took nothing while blocked");
     lock.execute_batch("ROLLBACK").unwrap();
     node.stop().await;
     history.finish().await.unwrap();
     assert_eq!(every_page(&reader, TRADER, None, 200).await.len(), 50);
+}
+
+/// Pages wait until the index has taken every command the log held when it started: a rebuild over
+/// a logged history and a restart behind the log answer `None` until then, while a restart with
+/// nothing left to take serves at once.
+#[tokio::test]
+async fn pages_wait_until_the_index_has_taken_the_log_it_started_on() {
+    // (case, deposits indexed before the restart, deposits logged while the index is down, served at once)
+    for (case, indexed, while_down, at_once) in
+        [("rebuild", None, 3, false), ("behind", Some(2), 3, false), ("caught-up", Some(2), 0, true)]
+    {
+        let (dir, index) = (scratch_dir(&format!("history-ready-{case}")), index_dir(&format!("ready-{case}")));
+        let node = TestSequencer::start(&dir, 1024);
+        match indexed {
+            Some(deposits) => {
+                let history = TestHistory::start(&node, &dir, &index).unwrap();
+                for n in 0..deposits {
+                    node.submit(deposit(1, &format!("dep-{n}"))).await;
+                }
+                node.stop().await;
+                history.finish().await.unwrap();
+            }
+            None => {
+                node.stop().await;
+                drop(Writer::open(&file(&index), ms(RETENTION)).unwrap());
+            }
+        }
+        let node = TestSequencer::start(&dir, 1024);
+        for n in 0..while_down {
+            node.submit(deposit(1, &format!("down-{n}"))).await;
+        }
+        let tip = node.next_seq().await.checked_sub(1);
+        // The writer cannot commit while this is held, so the index cannot catch up.
+        let lock = Connection::open(file(&index)).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let history = TestHistory::start_with_tip(&node, &dir, &index, tip).unwrap();
+        let query = || PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 200 };
+        assert_eq!(history.reader.page(query()).await.unwrap().is_some(), at_once, "{case}");
+        lock.execute_batch("ROLLBACK").unwrap();
+        let reader = history.reader.clone();
+        node.stop().await;
+        history.finish().await.unwrap();
+        let page = reader.page(query()).await.unwrap().expect("caught up");
+        assert_eq!(page.events, logged_history(&dir, TRADER), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_backfill_keeps_its_permit_until_its_read_ends() {
+    // A segment that is a pipe: opening it blocks until something opens its other end.
+    let dir = scratch_dir("history-backfill-permit");
+    fs::create_dir_all(&dir).unwrap();
+    let segment = dir.join("00000000000000000000.jsonl");
+    assert!(Process::new("mkfifo").arg(&segment).status().unwrap().success());
+    let permits = Arc::new(Semaphore::new(MAX_BACKFILLS));
+    let (live, subscriber) = broadcast::channel(1);
+    let manifest = watch::channel(Manifest::default()).1;
+    let mut feed = Feed::new(subscriber, dir.clone(), manifest, permits.clone(), Some(Offset::start_of(0)));
+    let release = || drop(OpenOptions::new().write(true).open(&segment).unwrap());
+    assert_a_dropped_read_keeps_its_permit(&permits, feed.next(), release).await;
+    drop(live);
+}
+
+#[tokio::test]
+async fn an_index_that_does_not_parse_fails_with_its_cause() {
+    let (dir, index) = (scratch_dir("history-corrupt"), index_dir("corrupt"));
+    indexed_log(&dir, &index, 1).await;
+    let edit = Connection::open(file(&index)).unwrap();
+    edit.execute_batch("UPDATE events SET event = 'not json'").unwrap();
+    let query = PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 10 };
+    let err = Reader::new(file(&index), ready()).page(query).await.expect_err("an unreadable event");
+    assert!(format!("{err:#}").contains("history event"), "{err:#}");
+
+    edit.execute_batch("UPDATE progress SET command = 'not json'").unwrap();
+    let node = TestSequencer::start(&dir, 16);
+    let err = TestHistory::start(&node, &dir, &index).err().expect("unreadable progress");
+    assert!(format!("{err:#}").contains("history progress"), "{err:#}");
+
+    let err = Writer::open(Path::new(":memory:"), 1).err().expect("no write-ahead log");
+    assert!(format!("{err:#}").contains("cannot use a write-ahead log"), "{err:#}");
 }
 
 #[tokio::test]
@@ -221,6 +309,21 @@ fn index_dir(name: &str) -> PathBuf {
 /// The index file in the index directory `index`.
 fn file(index: &Path) -> PathBuf {
     index.join(INDEX_FILE)
+}
+
+/// A ready flag already set, for readers of an index no writer is catching up.
+fn ready() -> watch::Receiver<bool> {
+    watch::channel(true).1
+}
+
+/// The seq of the last command in the log in `dir`.
+fn last_command_seq(dir: &Path) -> u64 {
+    let entries = SegmentedLog::open(dir).unwrap().entries;
+    let last = entries.iter().rev().find_map(|entry| match entry {
+        LogEntry::Command(command) => Some(command.sequenced.seq),
+        _ => None,
+    });
+    last.expect("the log holds a command")
 }
 
 fn ms(duration: Duration) -> Millis {
@@ -260,7 +363,7 @@ fn sample_log() -> Vec<Arc<StreamMsg>> {
 fn sample_index(name: &str) -> Reader {
     let path = file(&index_dir(name));
     Writer::open(&path, ms(RETENTION)).unwrap().write(&sample_log()).unwrap();
-    Reader::new(path)
+    Reader::new(path, ready())
 }
 
 /// Runs a node on `dir` with an index in `index` through `deposits` deposits, then stops both.
@@ -283,7 +386,7 @@ async fn page(
     limit: usize,
 ) -> Page {
     let query = PageQuery { account, kind: kind.map(str::to_owned), before, after, limit };
-    reader.page(query).await.unwrap()
+    reader.page(query).await.unwrap().expect("the index is caught up")
 }
 
 /// Every page from the newest, following `next`. Each page must hold only events older than the

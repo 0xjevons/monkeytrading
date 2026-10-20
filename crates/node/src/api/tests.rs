@@ -145,7 +145,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
         .filter_map(|event| account_of(&event))
         .collect();
     accounts.insert(TRADER);
-    let addr = serve_history(&index).await;
+    let addr = serve_history(Reader::new(index.join(INDEX_FILE), watch::channel(true).1)).await;
 
     let node = TestSequencer::start(&dir, 1024);
     let history = TestHistory::start(&node, &dir, &index).unwrap();
@@ -192,7 +192,7 @@ async fn history_refuses_a_malformed_address_cursor_kind_or_limit() {
     node.submit(deposit(100, "dep-1")).await;
     node.stop().await;
     history.finish().await.unwrap();
-    let addr = serve_history(&index).await;
+    let addr = serve_history(Reader::new(index.join(INDEX_FILE), watch::channel(true).1)).await;
     let path = format!("/v1/accounts/{TRADER}/history");
     for query in ["limit=200", "limit=1", "kind=deposited", "before=99999:0", "after=0:0"] {
         assert_eq!(get(addr, &format!("{path}?{query}")).await.0, 200, "{query}");
@@ -201,6 +201,22 @@ async fn history_refuses_a_malformed_address_cursor_kind_or_limit() {
         assert_eq!(get(addr, &format!("{path}?{query}")).await.0, 400, "{query}");
     }
     assert_eq!(get(addr, "/v1/accounts/0x1234/history").await.0, 400);
+}
+
+#[tokio::test]
+async fn history_answers_503_while_catching_up_and_500_when_unreadable() {
+    let (dir, index) = (scratch_dir("history-unavailable"), scratch_dir("history-unavailable-index"));
+    let node = TestSequencer::start(&dir, 16);
+    let history = TestHistory::start(&node, &dir, &index).unwrap();
+    node.submit(deposit(100, "dep-1")).await;
+    node.stop().await;
+    history.finish().await.unwrap();
+    let path = format!("/v1/accounts/{TRADER}/history");
+    let catching_up = serve_history(Reader::new(index.join(INDEX_FILE), watch::channel(false).1)).await;
+    assert_eq!(get(catching_up, &path).await, (503, br#"{"error":"history is catching up with the log"}"#.to_vec()));
+    rusqlite::Connection::open(index.join(INDEX_FILE)).unwrap().execute_batch("DROP TABLE events").unwrap();
+    let unreadable = serve_history(Reader::new(index.join(INDEX_FILE), watch::channel(true).1)).await;
+    assert_eq!(get(unreadable, &path).await, (500, br#"{"error":"internal error"}"#.to_vec()));
 }
 
 #[tokio::test]
@@ -244,13 +260,13 @@ async fn serve_with(node: &TestSequencer, dir: &Path, manifest: watch::Receiver<
         manifest,
         backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
         limits: Arc::new(ApiLimits::new(&dev_config().api)),
-        history: Reader::new(dir.join(INDEX_FILE)),
+        history: Reader::new(dir.join(INDEX_FILE), watch::channel(true).1),
     })
     .await
 }
 
-/// Serves the API with only the history index in `index` behind it, so it outlives any sequencer.
-async fn serve_history(index: &Path) -> SocketAddr {
+/// Serves the API with only `history` behind it, so it outlives any sequencer.
+async fn serve_history(history: Reader) -> SocketAddr {
     serve_state(ApiState {
         tx: mpsc::channel(1).0,
         stream: broadcast::channel(1).0,
@@ -262,7 +278,7 @@ async fn serve_history(index: &Path) -> SocketAddr {
         manifest: watch::channel(Manifest::default()).1,
         backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
         limits: Arc::new(ApiLimits::new(&dev_config().api)),
-        history: Reader::new(index.join(INDEX_FILE)),
+        history,
     })
     .await
 }

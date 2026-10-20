@@ -50,8 +50,9 @@ pub fn init_logging(level: &str) -> anyhow::Result<()> {
 /// Error cases:
 /// - operator rotation is enabled, or the custody provider is not implemented
 /// - `feeds.provider = "venues"` without `[feeds.venues]`, or the TLS config cannot be built
-/// - generating the TLS key, attesting the keys, recovering the log (including a log that records
-///   another client auth), opening the history index, or binding the listener fails
+/// - generating the TLS key, attesting the keys, opening the history index (including one the log
+///   does not match), recovering the log (including a log that records another client auth), or
+///   binding the listener fails
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
 pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.operator.rotation_enabled {
@@ -81,6 +82,11 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         "enclave and TLS keys attested"
     );
 
+    // Before recovery writes anything, so an index that contradicts the log stops the node with the
+    // log as it was found.
+    let mut history = History::open(&cfg.history, &cfg.node.log_dir)
+        .inspect_err(|e| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}"))?;
+
     let vault: AccountId = cfg.custody.vault.parse().context("custody.vault")?;
     let client_auth = cfg.client_auth()?;
     let (stream_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
@@ -108,8 +114,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         info!(markets = cfg.genesis.markets.len(), "genesis queued for the first trusted time sample");
         seq.genesis(&cfg.genesis)?;
     }
-    let history = History::open(&cfg.history, &cfg.node.log_dir, manifest_rx.clone())
-        .inspect_err(|e| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}"))?;
+    history.catch_up_to(seq.last_seq());
 
     let (tx, rx) = mpsc::channel::<Request>(CHANNEL_CAPACITY);
     // TODO: pin the sequencer to a dedicated core once latency matters.
@@ -235,4 +240,54 @@ fn stopped_task(joined: Option<Result<TaskResult, JoinError>>) -> anyhow::Error 
 /// - the sequencer panicked, or returned an error (a log write failure)
 fn sequencer_outcome(joined: Result<anyhow::Result<()>, JoinError>) -> anyhow::Result<()> {
     joined.context("sequencer task panicked")?.inspect_err(|e| error!(alert = "sequencer_failed", "{e:#}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::Path;
+
+    use crate::log::MANIFEST;
+    use crate::test_support::{TestHistory, TestSequencer, deposit, dev_config, scratch_dir};
+
+    #[tokio::test]
+    async fn a_history_index_the_log_contradicts_stops_the_node_before_it_writes_to_the_log() {
+        let (dir, index) = (scratch_dir("node-history-refused"), scratch_dir("node-history-refused-index"));
+        let node = TestSequencer::start(&dir, 1024);
+        let history = TestHistory::start(&node, &dir, &index).unwrap();
+        node.submit(deposit(1, "dep-1")).await;
+        // The log as it stands now, which a host that rolls the log back would restore.
+        let older = scratch_dir("node-history-refused-older");
+        fs::create_dir_all(&older).unwrap();
+        for file in fs::read_dir(&dir).unwrap() {
+            let file = file.unwrap();
+            fs::copy(file.path(), older.join(file.file_name())).unwrap();
+        }
+        node.submit(deposit(1, "dep-2")).await;
+        node.stop().await;
+        history.finish().await.unwrap();
+        // A listing a crash cut short, which recovery trims.
+        let mut manifest = OpenOptions::new().append(true).open(older.join(MANIFEST)).unwrap();
+        manifest.write_all(br#"{"file":"#).unwrap();
+        let before = files(&older);
+
+        let mut cfg = dev_config();
+        (cfg.node.log_dir, cfg.history.dir) = (older.clone(), index);
+        cfg.node.listen = "127.0.0.1:0".parse().unwrap();
+        let refused = timeout(Duration::from_secs(10), run(cfg)).await.expect("the node stops in time");
+        let err = refused.expect_err("the index took a command the log no longer holds");
+        assert!(format!("{err:#}").contains("does not match the log"), "{err:#}");
+        assert_eq!(files(&older), before, "the log is as it was found");
+    }
+
+    // ── Helpers ──
+
+    /// Every file in `dir` and its bytes.
+    fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        let names = fs::read_dir(dir).unwrap().map(|file| file.unwrap().file_name().into_string().unwrap());
+        names.map(|name| (name.clone(), fs::read(dir.join(name)).unwrap())).collect()
+    }
 }

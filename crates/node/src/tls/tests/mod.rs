@@ -338,7 +338,7 @@ impl TestNode {
             manifest: watch::channel(Manifest::default()).1,
             backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
             limits: limits.clone(),
-            history: Reader::new(PathBuf::new()),
+            history: Reader::new(PathBuf::new(), watch::channel(true).1),
         };
         let server = tokio::spawn(serve(listener, tls.config, router(state), limits, api));
         Self { port, attestation, stream, server, sequencer }

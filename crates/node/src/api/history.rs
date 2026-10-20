@@ -15,7 +15,7 @@ use crate::log::Offset;
 /// Events per page when the request sets no limit.
 const DEFAULT_LIMIT: usize = 50;
 /// Most events per page, which bounds what one request reads.
-pub const MAX_LIMIT: usize = 200;
+const MAX_LIMIT: usize = 200;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +33,7 @@ pub struct HistoryParams {
 /// `before`.
 /// Error cases:
 /// - the address is malformed, the kind unknown, or the limit outside 1 to `MAX_LIMIT`
+/// - the index has not yet taken every command the log held at startup
 /// - the index cannot be read
 pub async fn history(
     State(s): State<ApiState>,
@@ -55,5 +56,5 @@ pub async fn history(
         error!(alert = "history_unreadable", "{e:#}");
         ApiError::Internal
     })?;
-    Ok(Json(page))
+    page.map(Json).ok_or(ApiError::CatchingUp)
 }

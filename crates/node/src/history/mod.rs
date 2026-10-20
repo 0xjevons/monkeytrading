@@ -1,8 +1,9 @@
 //! Account history: every event that names an account, indexed from the log the sequencer
 //! publishes and served newest first. The index is derived from the log alone, never from engine
 //! state, so removing its file rebuilds it from the log's segments. On a restart it resumes after the
-//! last command it took, once that command is found unchanged in the log. History is public, like
-//! the log it comes from.
+//! last command it took, once that command is found unchanged in the log, and serves pages only once
+//! it has taken every command the log held at startup. History is public, like the log it comes
+//! from.
 //!
 //! TODO: the index sits on host disk, which the host can rewrite between runs and during one. Each
 //! event served names its place in the log, where anyone can check it; keeping the index in enclave
@@ -79,6 +80,10 @@ pub struct HistoryEvent {
 pub struct History {
     writer: Writer,
     reader: Reader,
+    /// Set once the index has taken every command the log held at startup; readers wait for it.
+    ready: watch::Sender<bool>,
+    /// The last command the log held at startup, while the index has yet to take it.
+    ready_at: Option<u64>,
     /// The first command the index has not taken.
     resume_at: Offset,
 }
@@ -86,18 +91,19 @@ pub struct History {
 impl History {
     /// Opens the index in `cfg.dir`, creating it if missing. An index that has taken commands must
     /// find the last of them unchanged in the log in `log_dir`: otherwise it was built from another
-    /// log, or the log has lost commands since, and serving it would mix the two.
+    /// log, or the log has lost commands since, and serving it would mix the two. Call it before
+    /// recovery writes to the log, so a refusal leaves the log as it was found.
     /// Error cases:
     /// - the retention is invalid, or the index cannot be opened or read (see `Writer::open`)
-    /// - the log cannot be read, ends before the last command the index took, or holds another
-    ///   command at its seq
-    pub fn open(cfg: &HistorySection, log_dir: &Path, manifest: watch::Receiver<Manifest>) -> anyhow::Result<Self> {
+    /// - the log or its manifest cannot be read, or the log does not hold the last command the
+    ///   index took, unchanged, at its seq
+    pub fn open(cfg: &HistorySection, log_dir: &Path) -> anyhow::Result<Self> {
         let path = cfg.dir.join(INDEX_FILE);
         let writer = Writer::open(&path, cfg.retention_ms().context("history.retention")?)?;
         let resume_at = match writer.last_command()? {
             None => Offset::start_of(0),
             Some(last) => {
-                check_in_log(&last, log_dir, manifest).with_context(|| {
+                check_in_log(&last, log_dir).with_context(|| {
                     format!(
                         "the history index in {} does not match the log; once the log is known to be right, remove the directory to rebuild the index",
                         cfg.dir.display()
@@ -107,7 +113,17 @@ impl History {
             }
         };
         info!(dir = %cfg.dir.display(), from = %resume_at, "history index opened");
-        Ok(Self { writer, reader: Reader::new(path), resume_at })
+        let (ready, ready_rx) = watch::channel(false);
+        Ok(Self { writer, reader: Reader::new(path, ready_rx), ready, ready_at: None, resume_at })
+    }
+
+    /// Records `tip`, the last command in the log once recovery has written to it: readers are let
+    /// in once the index has taken it, or now when it already has.
+    pub fn catch_up_to(&mut self, tip: Option<u64>) {
+        self.ready_at = tip.filter(|tip| *tip >= self.resume_at.seq);
+        if self.ready_at.is_none() {
+            self.ready.send_replace(true);
+        }
     }
 
     /// Where the index resumes: the first command it has not taken.
@@ -120,16 +136,17 @@ impl History {
         self.reader.clone()
     }
 
-    /// Takes every command `feed` yields into the index until the sequencer stops. A blocking thread
-    /// writes, so neither a slow disk nor a long catch-up reaches the sequencer: whatever the live
-    /// channel drops meanwhile, the feed reads from the log on disk.
+    /// Takes every command `feed` yields into the index until the sequencer stops, letting readers
+    /// in once it has taken the tip `catch_up_to` recorded. A blocking thread writes, so neither a
+    /// slow disk nor a long catch-up reaches the sequencer: whatever the live channel drops
+    /// meanwhile, the feed reads from the log on disk.
     /// Error cases:
     /// - the feed fails (see `Feed::next`)
     /// - the writer fails (see `Writer::write`) or panics
     pub async fn run(self, mut feed: Feed) -> anyhow::Result<()> {
         let (tx, rx) = mpsc::channel(QUEUE);
-        let writer = self.writer;
-        let mut written = spawn_blocking(move || writer.run(rx));
+        let (writer, ready, ready_at) = (self.writer, self.ready, self.ready_at);
+        let mut written = spawn_blocking(move || writer.run(rx, ready, ready_at));
         let forward = async move {
             while let Some(msg) = feed.next().await? {
                 // A closed queue means the writer stopped; its result says why.
@@ -174,20 +191,21 @@ pub fn account_of(event: &Event) -> Option<AccountId> {
     }
 }
 
-/// Checks that the log in `log_dir` holds `last` at its seq.
+/// Checks that the log in `log_dir` holds `last` at its seq, reading completed segments against the
+/// manifest on disk, which recovery checks the same way.
 /// Error cases:
-/// - the log cannot be read (see `LogReader`)
-/// - it ends before `last`'s seq, or holds another command there
-fn check_in_log(last: &CommandEntry, log_dir: &Path, manifest: watch::Receiver<Manifest>) -> anyhow::Result<()> {
+/// - the manifest or the log cannot be read (see `LogReader`)
+/// - the log ends before `last`'s seq, or holds another command there
+fn check_in_log(last: &CommandEntry, log_dir: &Path) -> anyhow::Result<()> {
     let at = Offset::start_of(last.sequenced.seq);
-    match LogReader::open(log_dir, at, manifest)?.next_entry()? {
-        Some((offset, LogEntry::Command(logged))) if offset == at => {
-            ensure!(logged == *last, "seq {} in the log is not the command the index took there", at.seq);
-            Ok(())
-        }
-        Some((offset, _)) => bail!("the log holds {offset} where the command of seq {} should be", at.seq),
-        None => bail!("the log ends before seq {}, the last command the index took", at.seq),
-    }
+    let manifest = watch::channel(Manifest::load(log_dir)?).1;
+    let logged = LogReader::open(log_dir, at, manifest)?.next_entry()?;
+    ensure!(
+        logged == Some((at, LogEntry::Command(last.clone()))),
+        "the log ends before seq {seq}, or holds another command there than the one the index took",
+        seq = at.seq
+    );
+    Ok(())
 }
 
 #[cfg(test)]

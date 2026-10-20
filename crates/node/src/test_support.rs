@@ -11,6 +11,7 @@ use engine_core::event::{CancelReason, Event, Fill, Reject};
 use engine_core::price::PriceError;
 use engine_core::types::{AccountId, Side};
 use engine_core::{Engine, Fixed};
+use futures_util::FutureExt;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -18,7 +19,7 @@ use tokio::time::timeout;
 use crate::api::{Feed, MAX_BACKFILLS};
 use crate::clock::{Clock, SystemClock};
 use crate::config::{HistorySection, NodeConfig};
-use crate::history::{History, HistoryEvent};
+use crate::history::{History, HistoryEvent, Reader};
 use crate::log::{LogEntry, LogReader, Manifest, Offset, SegmentedLog};
 use crate::sequencer::{Request, Sequencer, SequencerConfig, SignedWithdrawal, StreamMsg};
 use crate::tee::EnclaveKey;
@@ -98,22 +99,34 @@ impl TestSequencer {
     }
 }
 
-/// The task of a history index following a `TestSequencer`'s log.
+/// A history index following a `TestSequencer`'s log: its reader, where it resumed, and its task.
 pub struct TestHistory {
+    pub reader: Reader,
+    pub resume_at: Offset,
     task: JoinHandle<anyhow::Result<()>>,
 }
 
 impl TestHistory {
-    /// Opens the index in `index` against the log `node` writes in `dir`, and runs it.
+    /// Opens the index in `index` against the log `node` writes in `dir`, and runs it, with readers
+    /// let in at once.
     /// Error cases:
     /// - the index does not match the log (see `History::open`)
     pub fn start(node: &TestSequencer, dir: &Path, index: &Path) -> anyhow::Result<Self> {
+        Self::start_with_tip(node, dir, index, None)
+    }
+
+    /// As `start`, but readers are let in once the index has taken `tip`.
+    /// Error cases:
+    /// - the index does not match the log (see `History::open`)
+    pub fn start_with_tip(node: &TestSequencer, dir: &Path, index: &Path, tip: Option<u64>) -> anyhow::Result<Self> {
         let cfg = HistorySection { dir: index.to_owned(), retention: RETENTION };
-        let history = History::open(&cfg, dir, node.manifest.clone())?;
+        let mut history = History::open(&cfg, dir)?;
+        history.catch_up_to(tip);
         let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
-        let (live, manifest, start) = (node.stream.subscribe(), node.manifest.clone(), Some(history.resume_at()));
-        let feed = Feed::new(live, dir.to_owned(), manifest, backfills, start);
-        Ok(Self { task: tokio::spawn(history.run(feed)) })
+        let (reader, resume_at) = (history.reader(), history.resume_at());
+        let feed =
+            Feed::new(node.stream.subscribe(), dir.to_owned(), node.manifest.clone(), backfills, Some(resume_at));
+        Ok(Self { reader, resume_at, task: tokio::spawn(history.run(feed)) })
     }
 
     /// The task's result once it has taken the whole log, which it ends with after the sequencer
@@ -121,6 +134,23 @@ impl TestHistory {
     pub async fn finish(self) -> anyhow::Result<()> {
         timeout(Duration::from_secs(10), self.task).await.expect("the history task ends in time").expect("history task")
     }
+}
+
+/// Polls `read` once, so that it takes one of `permits` and starts blocking work that cannot finish
+/// yet, then drops it: the blocking work must keep the permit until `release` lets it end. It
+/// releases before asserting, so a failure never leaves the work blocked.
+pub async fn assert_a_dropped_read_keeps_its_permit(permits: &Semaphore, read: impl Future, release: impl FnOnce()) {
+    let free = permits.available_permits();
+    let mut read = Box::pin(read);
+    let waiting = (&mut read).now_or_never().is_none();
+    drop(read);
+    let held = free - permits.available_permits();
+    release();
+    assert!(waiting, "the read waits on its blocking work");
+    assert_eq!(held, 1, "the blocking work still holds the permit");
+    let every = u32::try_from(free).expect("few permits");
+    let back = timeout(Duration::from_secs(10), permits.acquire_many(every)).await;
+    drop(back.expect("the permit comes back once the work ends").expect("the semaphore is open"));
 }
 
 /// An empty directory for one test, named after it.

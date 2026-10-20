@@ -45,6 +45,8 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 #[derive(Debug)]
 pub enum ApiError {
     Unavailable,
+    /// The history index is still taking the commands the log held at startup.
+    CatchingUp,
     NotFound,
     BadRequest(String),
     /// The node failed to serve the request; the cause is logged where it happened.
@@ -137,6 +139,7 @@ impl IntoResponse for ApiError {
                 return (StatusCode::TOO_MANY_REQUESTS, [(RETRY_AFTER, secs.max(1).to_string())], body).into_response();
             }
             ApiError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "engine unavailable".to_owned()),
+            ApiError::CatchingUp => (StatusCode::SERVICE_UNAVAILABLE, "history is catching up with the log".to_owned()),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_owned()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_owned()),

@@ -187,6 +187,11 @@ impl Sequencer {
         Ok(sequencer)
     }
 
+    /// The seq of the last command in the log, if any.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.engine.last_seq()
+    }
+
     /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch is
     /// flushed before its replies, stream messages, and queries go out. A command trusted time
     /// refuses is dropped with its reply, which the API answers as unavailable.

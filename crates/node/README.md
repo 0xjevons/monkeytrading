@@ -198,18 +198,21 @@ Passing a page's `next` as `before` gives the next, older page, until `next` is 
 one event `type`: `deposited`, `deposit_rejected`, `withdrawal_approved`, `withdrawal_rejected`,
 `order_accepted`, `order_rejected`, `order_cancelled`, `fill`, `close_out`, `bad_debt`, or
 `financing`. `?limit=` is 1 to 200, 50 by default. A page is one search of a SQLite index that reads
-at most `limit` entries, and at most 16 pages are read at once. History is public, like the log.
+at most `limit + 1` entries, and at most 16 pages are read at once. Until the index has taken every
+command the log held when the node started, the route answers 503 (`history is catching up with the
+log`). History is public, like the log.
 
 The history index is a SQLite file in `history.dir`, derived from the log alone. A supervised task
 follows the log as a stream subscriber does, from disk and then live, and writes on its own thread,
-so the sequencer never waits for it; history trails the log by the batch being written. Each write
+so the sequencer never waits for it; once caught up, history trails the log by the batch being
+written. Each write
 stores the account events of a batch of commands, keyed by cursor, and the last command taken, in
 one transaction. Events whose command is older than `history.retention`, counted back from the
-newest command in the index, leave it; the log keeps them. At startup the index resumes after the
-last command it took, once it finds that command unchanged in the log. If the log ends before that
-command or holds another one there, the log was rolled back or replaced, and the node refuses to
-start (`history_recovery_failed`). A power loss can also leave the index ahead of the log, since
-neither syncs every write. Removing `history.dir` rebuilds the index from the log's segments.
+newest command in the index, leave it; the log keeps them. Before the node recovers its log, the
+index checks that the log holds the last command it took, unchanged, and resumes after it. If the
+log ends before that command or holds another one there, the log was rolled back or replaced, and
+the node refuses to start (`history_recovery_failed`) with the log as it found it. A power loss can
+also leave the index ahead of the log, since neither syncs every write. Removing `history.dir` rebuilds the index from the log's segments.
 Commands logged before events were recorded add nothing to history.
 
 ## Configuration
