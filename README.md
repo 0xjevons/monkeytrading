@@ -8,8 +8,9 @@ the record and confirm that the state it reports is the state its rules produce.
 house, in turn, is issued to the people who trade with it.
 
 > **Pre-launch.** The engine runs end to end on a single machine, with a mock enclave, mock
-> custody, and simulated prices. On-chain custody, hardware attestation, live market data, and the
-> house equity token are under construction. Nothing here holds real funds.
+> custody, and simulated prices, or live crypto prices from three venues. On-chain custody,
+> hardware attestation, live prices for other asset classes, and the house equity token are under
+> construction. Nothing here holds real funds.
 
 ## How it works
 
@@ -74,7 +75,9 @@ as such; attestation on AMD SEV-SNP hardware, and a verifier for it, are being b
 
 You need the latest stable Rust on Linux or macOS, and `jq` for the second example. Start a local
 node with a mock enclave, mock custody, and simulated prices; its API listens on `127.0.0.1:8080`,
-which you can change with `node.listen` in `config/dev.toml`.
+which you can change with `node.listen` in `config/dev.toml`. Set `feeds.provider = "venues"` in a
+copy of it to price BTC-USD and ETH-USD from Coinbase, Kraken, and Bitstamp instead; the other
+markets then have no price, so their orders get `no_price`.
 
 ```bash
 cargo test --workspace

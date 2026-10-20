@@ -4,17 +4,19 @@
 //! of the log; and the `[genesis]` section, sequenced after protocol activation. Everything else
 //! configures this node only.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, bail, ensure};
 use engine_core::Fixed;
 use engine_core::auth::ClientAuth;
 use engine_core::market::MarketSpec;
 use engine_core::params::{MAX_BENCHMARK_BPS, ProtocolParams};
-use engine_core::types::AccountId;
+use engine_core::types::{AccountId, MarketId};
 use serde::Deserialize;
+use tokio_tungstenite::tungstenite::http::Uri;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -49,7 +51,19 @@ pub enum CustodyProvider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedProvider {
+    /// A random walk quoted by three fake venues. Local development only.
     Mock,
+    /// Live venue WebSockets from `[feeds.venues]`, one supervised task per connection.
+    Venues,
+}
+
+/// A venue whose public WebSocket feed the node reads. Its name is the quote source in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Venue {
+    Bitstamp,
+    Coinbase,
+    Kraken,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,11 +134,56 @@ pub struct CustodySection {
 #[serde(deny_unknown_fields)]
 pub struct FeedsSection {
     pub provider: FeedProvider,
+    /// The mock feed's tick, and the most often a venue feed sequences one market's latest quote.
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
     /// Starting mids for the mock feed, by market id.
     #[serde(default)]
     pub mock_mids: Vec<MockMid>,
+    /// Required when `provider = "venues"`; validated whenever present.
+    pub venues: Option<VenuesSection>,
+}
+
+/// Live venue feeds.
+///
+/// TODO: this file comes from host storage, so the host chooses the venues and the symbol each
+/// market reads; the attestation must bind the config's hash before that choice is verifiable.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VenuesSection {
+    /// Deadline to connect and subscribe, and the longest a connection, or one of its symbols, may
+    /// go without a fresh quote before the connection is replaced and the gap alerted.
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+    /// The first reconnect delay; it doubles after each attempt that sequences no fresh quote.
+    #[serde(with = "humantime_serde")]
+    pub reconnect_min: Duration,
+    #[serde(with = "humantime_serde")]
+    pub reconnect_max: Duration,
+    /// A quote older than this, or than its market's `max_age_ms` in the engine, once sequenced
+    /// does not count as its venue quoting: it ends no outage or silence.
+    #[serde(with = "humantime_serde")]
+    pub stale_after: Duration,
+    pub connections: Vec<VenueConnection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VenueConnection {
+    pub venue: Venue,
+    /// The venue's public endpoint: `wss://` on the venue's own domain. The host controls the
+    /// network, so plaintext would let it forge prices, and TLS alone proves only the server's
+    /// name, not that it is the venue the quotes are labelled with.
+    pub url: String,
+    pub symbols: Vec<VenueSymbol>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VenueSymbol {
+    pub market: MarketId,
+    /// The venue's own name for the market's instrument, e.g. `BTC-USD`.
+    pub symbol: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +210,31 @@ pub struct Benchmark {
     pub annual_bps: i64,
 }
 
+impl Venue {
+    /// The source name this venue's quotes carry.
+    pub fn name(self) -> &'static str {
+        match self {
+            Venue::Bitstamp => "bitstamp",
+            Venue::Coinbase => "coinbase",
+            Venue::Kraken => "kraken",
+        }
+    }
+
+    /// The domain this venue's endpoints are served under.
+    fn domain(self) -> &'static str {
+        match self {
+            Venue::Bitstamp => "bitstamp.net",
+            Venue::Coinbase => "coinbase.com",
+            Venue::Kraken => "kraken.com",
+        }
+    }
+
+    /// Whether `host` is the venue's domain or one of its subdomains.
+    fn serves(self, host: &str) -> bool {
+        host.strip_suffix(self.domain()).is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
+    }
+}
+
 impl NodeConfig {
     /// Reads and validates the config file at `path`.
     /// Error cases:
@@ -158,6 +242,8 @@ impl NodeConfig {
     /// - `logging.level` is not a valid filter directive
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, or `feeds.interval` is zero
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
+    /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
+    ///   no longer than `feeds.interval`
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital or a benchmark rate is one the engine would refuse
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -186,6 +272,8 @@ impl NodeConfig {
     /// - `logging.level` is not a valid filter directive
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, or `feeds.interval` is zero
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
+    /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
+    ///   no longer than `feeds.interval`
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital or a benchmark rate is one the engine would refuse
     fn validate(&self) -> anyhow::Result<()> {
@@ -195,9 +283,21 @@ impl NodeConfig {
             || self.node.segment_commands == 0
             || self.feeds.interval.is_zero()
         {
-            anyhow::bail!(
-                "node.tick, node.checkpoint_every, node.segment_commands, and feeds.interval must be non-zero"
-            );
+            bail!("node.tick, node.checkpoint_every, node.segment_commands, and feeds.interval must be non-zero");
+        }
+        match &self.feeds.venues {
+            Some(venues) => {
+                venues.validate().context("feeds.venues")?;
+                // Silence is checked once an interval, so a longer interval would outlast the timeout.
+                ensure!(
+                    self.feeds.interval < venues.timeout,
+                    "feeds.interval must be shorter than feeds.venues.timeout"
+                );
+            }
+            None if self.feeds.provider == FeedProvider::Venues => {
+                bail!("feeds.provider = \"venues\" needs [feeds.venues]")
+            }
+            None => {}
         }
         // Unsigned requests let anyone act for any account, so they never run beside a real
         // enclave or real funds.
@@ -219,6 +319,42 @@ impl NodeConfig {
         }
         for m in &self.genesis.markets {
             m.validate().map_err(anyhow::Error::msg).with_context(|| format!("market {}", m.symbol))?;
+        }
+        Ok(())
+    }
+}
+
+impl VenuesSection {
+    /// Checks the values that would otherwise fail silently: a venue quoting twice under one
+    /// source name, a symbol that could mean two markets, or a feed the host could forge.
+    /// Error cases:
+    /// - `timeout`, `reconnect_min`, or `stale_after` is zero, or `reconnect_min` exceeds
+    ///   `reconnect_max`
+    /// - no connections, a venue listed twice, or a connection with no symbols
+    /// - a URL that does not parse as `wss://` with a host on the venue's own domain
+    /// - a market or symbol listed twice on one connection
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.timeout.is_zero() && !self.reconnect_min.is_zero() && !self.stale_after.is_zero(),
+            "timeout, reconnect_min, and stale_after must be non-zero"
+        );
+        ensure!(self.reconnect_min <= self.reconnect_max, "reconnect_min exceeds reconnect_max");
+        ensure!(!self.connections.is_empty(), "no connections");
+        let mut venues = BTreeSet::new();
+        for conn in &self.connections {
+            let name = conn.venue.name();
+            ensure!(venues.insert(conn.venue), "{name} is listed twice");
+            let uri: Uri = conn.url.parse().with_context(|| format!("{name} url"))?;
+            ensure!(uri.scheme_str() == Some("wss"), "{name} url must be wss://");
+            let domain = conn.venue.domain();
+            ensure!(uri.host().is_some_and(|host| conn.venue.serves(host)), "{name} url must be on {domain}");
+            ensure!(!conn.symbols.is_empty(), "{name} has no symbols");
+            let mut markets = BTreeSet::new();
+            let mut symbols = BTreeSet::new();
+            for s in &conn.symbols {
+                ensure!(markets.insert(s.market), "{name} lists market {} twice", s.market);
+                ensure!(symbols.insert(s.symbol.as_str()), "{name} lists symbol {} twice", s.symbol);
+            }
         }
         Ok(())
     }
@@ -303,5 +439,62 @@ mod tests {
         let text = std::fs::read_to_string(DEV).unwrap().replace("tick = \"250ms\"", "tick = \"0s\"");
         let cfg: NodeConfig = toml::from_str(&text).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn the_committed_venue_feeds_price_both_crypto_markets_from_three_venues() {
+        let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+        cfg.feeds.provider = FeedProvider::Venues;
+        cfg.validate().unwrap();
+        let connections = cfg.feeds.venues.unwrap().connections;
+        let venues: Vec<Venue> = connections.iter().map(|c| c.venue).collect();
+        assert_eq!(venues, [Venue::Coinbase, Venue::Kraken, Venue::Bitstamp]);
+        for conn in connections {
+            let markets: Vec<MarketId> = conn.symbols.iter().map(|s| s.market).collect();
+            assert_eq!(markets, [1, 2], "{}", conn.venue.name());
+        }
+    }
+
+    #[test]
+    fn an_interval_that_outlasts_the_venue_timeout_is_refused() {
+        let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+        cfg.feeds.interval = cfg.feeds.venues.as_ref().unwrap().timeout;
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("feeds.interval must be shorter than feeds.venues.timeout"), "{err}");
+    }
+
+    #[test]
+    fn venue_feeds_need_their_section() {
+        let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+        cfg.feeds.provider = FeedProvider::Venues;
+        cfg.feeds.venues = None;
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("needs [feeds.venues]"), "{err}");
+    }
+
+    #[test]
+    fn venue_settings_that_would_fail_silently_are_refused() {
+        type Edit = fn(&mut VenuesSection);
+        let cases: [(&str, Edit); 13] = [
+            ("non-zero", |v| v.timeout = Duration::ZERO),
+            ("non-zero", |v| v.reconnect_min = Duration::ZERO),
+            ("non-zero", |v| v.stale_after = Duration::ZERO),
+            ("exceeds reconnect_max", |v| v.reconnect_max = v.reconnect_min / 2),
+            ("no connections", |v| v.connections.clear()),
+            ("coinbase is listed twice", |v| v.connections.push(v.connections[0].clone())),
+            ("must be wss://", |v| v.connections[0].url = "ws://advanced-trade-ws.coinbase.com".into()),
+            ("must be on coinbase.com", |v| v.connections[0].url = "wss://ws.kraken.com/v2".into()),
+            ("must be on coinbase.com", |v| v.connections[0].url = "wss://coinbase.com.example.net".into()),
+            ("must be on coinbase.com", |v| v.connections[0].url = "wss://evilcoinbase.com".into()),
+            ("has no symbols", |v| v.connections[0].symbols.clear()),
+            ("lists market 1 twice", |v| v.connections[0].symbols[1].market = 1),
+            ("lists symbol BTC-USD twice", |v| v.connections[0].symbols[1].symbol = "BTC-USD".into()),
+        ];
+        for (expected, edit) in cases {
+            let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+            edit(cfg.feeds.venues.as_mut().unwrap());
+            let err = format!("{:#}", cfg.validate().unwrap_err());
+            assert!(err.contains(expected), "expected {expected:?}, got {err}");
+        }
     }
 }

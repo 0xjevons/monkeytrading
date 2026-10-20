@@ -22,7 +22,11 @@ feeds. The same binary replays a published log and verifies its checkpoints.
   public archive served over HTTP
 - `engine replay` to verify a published log, or a downloaded archive, against the open-source engine
 - Supervised tasks: any task stopping stops the node, and SIGTERM drains to a final checkpoint
-- Mock custody and price feeds for local development
+- Live crypto prices from Coinbase, Kraken, and Bitstamp over WebSocket: one supervised task per
+  venue, quotes stamped with the venue's own time, and reconnects with backoff
+- Alerts for refused venue messages (at most one a minute per venue, counting the rest), venue
+  outages, symbols with no fresh quote, and venue times well ahead of the host clock
+- Mock custody and a mock price feed for local development
 
 ## Repository Structure
 
@@ -47,7 +51,27 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
 - `src/config.rs` — the node config schema and validation
 - `src/custody.rs` — the custody adapter (mock only so far)
-- `src/feeds.rs` — price feed adapters (mock only so far)
+- `src/feeds/mod.rs` — the feed index and the mock feed
+- `src/feeds/venue/mod.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect
+- `src/feeds/venue/validation.rs` — the checks every venue's books pass before they are sequenced
+- `src/feeds/venue/confirm.rs` — confirming with the engine which markets the venue is quoting,
+  holding back markets it does not list, and settling a dropped connection's last quotes
+- `src/feeds/venue/quotes.rs` — the quotes held between ticks until the host clock reaches them,
+  and the rule that decides whether the quote the engine holds counts as the venue quoting
+- `src/feeds/venue/setup.rs` — the TLS client config and reconnect backoff every connection shares
+- `src/feeds/venue/tests.rs` — venue task unit tests: alert throttling and silence windows on
+  paused time, held quotes against the engine's rule, kept books for unsubscribed symbols, the
+  freshness rule, and backoff
+- `src/feeds/coinbase.rs`, `src/feeds/bitstamp.rs` — venue adapters
+- `src/feeds/kraken/mod.rs` — the Kraken adapter: a kept order book verified against Kraken's
+  checksum; `src/feeds/kraken/tests.rs` replays recorded book messages against it
+- `src/feeds/tests/mod.rs` — venue tasks against loopback venues: what they sequence, refuse,
+  and alert, and how they reconnect
+- `src/feeds/tests/fake.rs` — the loopback venues, the feed harness with an engine that applies
+  what the feed sequences, and the alert capture the feed tests use
+- `src/feeds/tests/late.rs` — venue tasks against a sequencer that answers late: when a quote
+  counts as the venue quoting, and how a connection's last quotes are settled after it ends
+- `src/feeds/tests/scenario.rs` — the dev scenario through the sequencer and engine
 - `src/clock.rs` — the wall clock used to stamp commands
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
 - `tests/reference_logs.rs` — replays every committed node reference log, events included
@@ -60,6 +84,10 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 ```bash
 # Run a local node with mock TEE, custody, and feeds (API on 127.0.0.1:8080)
 cargo run -p engine-node -- run --config config/dev.toml
+
+# Price BTC-USD and ETH-USD from live venues instead, leaving the other markets unpriced: set
+# feeds.provider = "venues" in a copy
+cargo run -p engine-node -- run --config <copy of config/dev.toml>
 
 # Verify a node's log directory, a downloaded archive, or a single log file
 cargo run -p engine-node -- replay --log data/dev/log

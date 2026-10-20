@@ -1,4 +1,6 @@
-# Local development config: mock TEE, mock custody, mock feeds.
+# Local development config: mock TEE, mock custody, mock feeds. Set
+# feeds.provider = "venues" to price the crypto markets from live venues;
+# the other markets then have no price.
 #
 # Everything under [genesis] is protocol. On first boot it is sequenced into
 # the public log as admin commands, so the rules every fill ran under are on
@@ -32,7 +34,7 @@ chain_id = 31337
 vault = "0x0000000000000000000000000000000000000000"
 
 [feeds]
-provider = "mock"
+provider = "mock" # "venues" streams live quotes from [feeds.venues]
 interval = "200ms"
 mock_mids = [
   { market = 1, mid = "100000" },
@@ -42,6 +44,29 @@ mock_mids = [
   { market = 30, mid = "2600" },
   { market = 40, mid = "230" },
 ]
+
+# Live crypto venues. Every venue here quotes against USD, so the index never
+# mixes quote currencies.
+[feeds.venues]
+timeout = "10s"
+reconnect_min = "500ms"
+reconnect_max = "30s"
+stale_after = "1s"
+
+[[feeds.venues.connections]]
+venue = "coinbase"
+url = "wss://advanced-trade-ws.coinbase.com"
+symbols = [{ market = 1, symbol = "BTC-USD" }, { market = 2, symbol = "ETH-USD" }]
+
+[[feeds.venues.connections]]
+venue = "kraken"
+url = "wss://ws.kraken.com/v2"
+symbols = [{ market = 1, symbol = "BTC/USD" }, { market = 2, symbol = "ETH/USD" }]
+
+[[feeds.venues.connections]]
+venue = "bitstamp"
+url = "wss://ws.bitstamp.net"
+symbols = [{ market = 1, symbol = "btcusd" }, { market = 2, symbol = "ethusd" }]
 
 [genesis]
 house_capital = "10000000"

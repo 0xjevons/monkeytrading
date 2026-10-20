@@ -25,6 +25,8 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "CC0-1.0",
+    # webpki-roots: Mozilla's CA bundle, compiled in so venue TLS never trusts the host's roots.
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MPL-2.0",
