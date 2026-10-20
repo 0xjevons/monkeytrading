@@ -15,23 +15,26 @@ engine-core.workspace = true
 
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 humantime-serde.workspace = true
 k256.workspace = true
 rand.workspace = true
+rustls.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 sha3.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "test-util"] }
-tokio-tungstenite.workspace = true
 tower.workspace = true

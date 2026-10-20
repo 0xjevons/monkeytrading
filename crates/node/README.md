@@ -22,7 +22,10 @@ feeds. The same binary replays a published log and verifies its checkpoints.
   public archive served over HTTP
 - `engine replay` to verify a published log, or a downloaded archive, against the open-source engine
 - Supervised tasks: any task stopping stops the node, and SIGTERM drains to a final checkpoint
-- Mock custody and price feeds for local development
+- Live crypto prices from Coinbase, Kraken, and Bitstamp over WebSocket: one supervised task per
+  venue, quotes stamped with the venue's own time, reconnects with backoff, and an alert for every
+  refused message, outage, or silent symbol
+- Mock custody and a mock price feed for local development
 
 ## Repository Structure
 
@@ -47,7 +50,11 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
 - `src/config.rs` — the node config schema and validation
 - `src/custody.rs` — the custody adapter (mock only so far)
-- `src/feeds.rs` — price feed adapters (mock only so far)
+- `src/feeds/mod.rs` — the feed index and the mock feed
+- `src/feeds/venue.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect
+- `src/feeds/coinbase.rs`, `src/feeds/kraken.rs`, `src/feeds/bitstamp.rs` — venue adapters
+- `src/feeds/tests/` — venue tasks against loopback venues, and the dev scenario through the
+  sequencer
 - `src/clock.rs` — the wall clock used to stamp commands
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
 - `tests/reference_logs.rs` — replays every committed node reference log, events included
@@ -60,6 +67,9 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 ```bash
 # Run a local node with mock TEE, custody, and feeds (API on 127.0.0.1:8080)
 cargo run -p engine-node -- run --config config/dev.toml
+
+# Price BTC-USD and ETH-USD from live venues instead: set feeds.provider = "venues" in a copy
+cargo run -p engine-node -- run --config <copy of config/dev.toml>
 
 # Verify a node's log directory, a downloaded archive, or a single log file
 cargo run -p engine-node -- replay --log data/dev/log

@@ -21,6 +21,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use crate::api::{ApiState, MAX_BACKFILLS, router};
 use crate::clock::now_ms;
 use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProvider};
+use crate::feeds::venue::{self, Timing};
 use crate::log::Manifest;
 use crate::sequencer::{Request, Sequencer, SequencerConfig};
 use crate::tee::{Attestor, ConfigfsTsm, EnclaveKey, MockAttestor, attest_key};
@@ -44,6 +45,7 @@ pub fn init_logging(level: &str) -> anyhow::Result<()> {
 /// Runs the node until a shutdown signal, or until the first supervised task stops.
 /// Error cases:
 /// - operator rotation is enabled, or the custody provider is not implemented
+/// - `feeds.provider = "venues"` without `[feeds.venues]`, or the TLS config cannot be built
 /// - attesting the enclave key, recovering the log, activating the protocol (including a log that
 ///   records another client auth), sequencing genesis, or binding the listener fails
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
@@ -101,13 +103,25 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     tasks.spawn(async move { ("ticker", run_ticker(ticks, tick).await) });
 
     let feeds = cfg.feeds;
-    let feed_tx = tx.clone();
-    tasks.spawn(async move {
-        match feeds.provider {
-            FeedProvider::Mock => feeds::run_mock(&feeds, feed_tx).await,
+    match feeds.provider {
+        FeedProvider::Mock => {
+            let feed_tx = tx.clone();
+            tasks.spawn(async move {
+                feeds::run_mock(&feeds, feed_tx).await;
+                ("feeds", Ok(()))
+            });
         }
-        ("feeds", Ok(()))
-    });
+        FeedProvider::Venues => {
+            let venues = feeds.venues.context("feeds.provider = \"venues\" needs [feeds.venues]")?;
+            let timing = Timing::new(feeds.interval, &venues);
+            let tls = venue::tls_config()?;
+            for conn in venues.connections {
+                let (name, tls, feed_tx) = (conn.venue.name(), tls.clone(), tx.clone());
+                info!(venue = name, url = %conn.url, symbols = conn.symbols.len(), "starting venue feed");
+                tasks.spawn(async move { (name, venue::run(conn, timing, tls, feed_tx).await) });
+            }
+        }
+    }
 
     let custody_cfg = cfg.custody;
     let dev_deposits = custody_cfg.provider == CustodyProvider::Mock;

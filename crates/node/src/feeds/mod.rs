@@ -2,8 +2,14 @@
 //! index (median, staleness, divergence), so the aggregation rules are protocol and the raw venue
 //! quotes are in the public log for anyone to check against venue history.
 //!
-//! Only a mock feed exists so far. Real adapters (crypto venue WebSockets, FX and equity data
-//! vendors) belong here, one task per venue, all sending into the sequencer.
+//! `venue` runs one supervised task per venue connection; each venue's adapter (`bitstamp`,
+//! `coinbase`, `kraken`) only builds its subscribe messages and reads its messages into books. A
+//! new source is an adapter plus a `Venue` variant. The mock feed serves local development.
+
+mod bitstamp;
+mod coinbase;
+mod kraken;
+pub mod venue;
 
 use engine_core::Fixed;
 use engine_core::command::Command;
@@ -50,3 +56,6 @@ pub async fn run_mock(cfg: &FeedsSection, tx: mpsc::Sender<Request>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
