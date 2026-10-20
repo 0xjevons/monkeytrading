@@ -2,9 +2,12 @@ use super::*;
 use std::fs;
 use std::path::PathBuf;
 
+use engine_core::command::AdminCommand;
+
 use crate::log::{Manifest, SegmentedLog, segment_seq};
 use crate::test_support::{
-    SEGMENT_COMMANDS, TRADER, TestSequencer, deposit, dev_config, log_messages, scratch_dir, sequencer_config, withdraw,
+    SEGMENT_COMMANDS, TRADER, TestSequencer, deposit, dev_config, log_messages, scratch_dir, sequencer_config,
+    trusted_now, withdraw,
 };
 
 const V1_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v1-dev.jsonl");
@@ -94,6 +97,7 @@ fn custody_gets_a_withdrawal_when_its_batch_is_flushed_not_when_it_is_signed() {
     let key = Arc::new(EnclaveKey::generate());
     let manifest = watch::channel(Manifest::default()).0;
     let mut seq = Sequencer::recover(sequencer_config(&dir, manifest), key, stream, withdrawals_tx).unwrap();
+    seq.trust(trusted_now()).unwrap();
     seq.sequence(deposit(100, "dep-1")).unwrap();
     seq.sequence(withdraw(40)).unwrap();
     assert!(withdrawals.try_recv().is_err());
@@ -256,6 +260,21 @@ fn an_existing_v1_log_activates_at_its_next_seq_and_still_verifies() {
 }
 
 #[test]
+fn protocol_activation_and_genesis_wait_for_trusted_time_then_go_in_order() {
+    let dir = scratch_dir("boot-waits");
+    let mut seq = try_recover(&dir, &signed(31_337)).0.unwrap();
+    seq.activate_protocol().unwrap();
+    seq.genesis(&dev_config().genesis).unwrap();
+    assert!(commands(&entries(&dir)).is_empty(), "nothing before the first sample");
+    seq.trust(trusted_now()).unwrap();
+    let written = commands(&entries(&dir));
+    assert!(matches!(written[0], Command::Admin(AdminCommand::SetClientAuth(_))), "{:?}", written[0]);
+    assert!(matches!(written[1], Command::Admin(AdminCommand::ActivateProtocol { .. })), "{:?}", written[1]);
+    assert!(matches!(written.last(), Some(Command::HouseCapital { .. })), "{written:?}");
+    assert!(!seq.needs_genesis());
+}
+
+#[test]
 fn a_restart_with_the_recorded_client_auth_sequences_nothing() {
     let dir = scratch_dir("activation-restart");
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
@@ -278,7 +297,7 @@ fn a_genesis_cut_short_runs_again_on_restart() {
             let dir = scratch_dir(&format!("genesis-{name}"));
             let mut seq = recover(&dir, &signed(31_337));
             seq.activate_protocol().unwrap();
-            seq.sequence_required(all[..cut].to_vec()).unwrap();
+            seq.sequence_required("genesis", all[..cut].to_vec()).unwrap();
             drop(seq);
 
             let mut seq = recover(&dir, &signed(31_337));
@@ -299,7 +318,7 @@ fn a_genesis_cut_short_runs_again_on_restart() {
 fn a_log_holding_only_client_auth_activates_on_restart() {
     let dir = scratch_dir("activation-auth-only");
     let auth = Command::Admin(AdminCommand::SetClientAuth(signed(31_337)));
-    recover(&dir, &signed(31_337)).sequence_required(vec![auth.clone()]).unwrap();
+    recover(&dir, &signed(31_337)).sequence_required("client auth", vec![auth.clone()]).unwrap();
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
     let written = entries(&dir);
     assert_eq!(commands(&written).iter().filter(|cmd| **cmd == auth).count(), 1);
@@ -362,9 +381,12 @@ fn signed(chain_id: u64) -> ClientAuth {
     ClientAuth::Eip712 { chain_id, vault: AccountId([0xaa; 20]) }
 }
 
-/// A sequencer recovered from the log in `dir` under `client_auth`, with a fresh enclave key.
+/// A sequencer recovered from the log in `dir` under `client_auth`, with a fresh enclave key, and
+/// trusted time admitting stamps on the system clock.
 fn recover(dir: &Path, client_auth: &ClientAuth) -> Sequencer {
-    try_recover(dir, client_auth).0.unwrap()
+    let mut seq = try_recover(dir, client_auth).0.unwrap();
+    seq.trust(trusted_now()).unwrap();
+    seq
 }
 
 /// `recover`'s result, and what custody would receive from it.

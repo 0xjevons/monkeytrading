@@ -77,6 +77,76 @@ fn genesis_values_the_engine_would_refuse_fail_the_boot() {
 }
 
 #[test]
+fn the_dev_config_checks_time_against_three_roughtime_servers() {
+    let cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+    let keys: Vec<String> = cfg.time.servers.iter().map(|s| STANDARD.encode(s.public_key.as_bytes())).collect();
+    assert_eq!(
+        keys,
+        [
+            "AW5uAoTSTDfG5NfY1bTh08GUnOqlRb+HVhbJ3ODJvsE=",
+            "v2CievhgKsxzlWPwIkYFUXeA51Akhkv5uhJCj1/kbiY=",
+            "iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=",
+        ]
+    );
+    assert_eq!(cfg.time.max_drift, Duration::from_secs(15));
+}
+
+#[test]
+fn a_public_key_that_is_not_32_bytes_of_base64_fails_the_boot() {
+    let key = "AW5uAoTSTDfG5NfY1bTh08GUnOqlRb+HVhbJ3ODJvsE=";
+    for bad in
+        ["not base64!", "AW5uAoTSTDfG5NfY1bTh08GUnOqlRb+HVhbJ3ODJvg==", "AW5uAoTSTDfG5NfY1bTh08GUnOqlRb+HVhbJ3ODJvsEA"]
+    {
+        let text = std::fs::read_to_string(DEV).unwrap().replace(key, bad);
+        assert!(toml::from_str::<NodeConfig>(&text).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn fewer_than_two_servers_or_a_key_listed_twice_is_refused() {
+    let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+    cfg.time.servers.truncate(1);
+    assert!(format!("{:#}", cfg.validate().unwrap_err()).contains("at least two servers"));
+
+    let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+    cfg.time.servers[2].public_key = cfg.time.servers[0].public_key;
+    assert!(format!("{:#}", cfg.validate().unwrap_err()).contains("same public key twice"));
+}
+
+#[test]
+fn a_zero_drift_bound_or_sampling_interval_is_refused() {
+    for (from, to) in [("max_drift = \"15s\"", "max_drift = \"0s\""), ("interval = \"10s\"", "interval = \"0s\"")] {
+        let text = std::fs::read_to_string(DEV).unwrap().replace(from, to);
+        let cfg: NodeConfig = toml::from_str(&text).unwrap();
+        assert!(format!("{:#}", cfg.validate().unwrap_err()).contains("time.max_drift and time.interval"), "{to}");
+    }
+}
+
+#[test]
+fn a_round_that_could_outlast_the_grace_is_refused() {
+    let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+    cfg.time.max_drift = Duration::from_millis(24_999);
+    assert!(cfg.validate().is_ok());
+    cfg.time.max_drift = Duration::from_secs(25);
+    assert!(format!("{:#}", cfg.validate().unwrap_err()).contains("twice time.max_drift"));
+}
+
+#[test]
+fn a_server_address_must_be_host_and_port() {
+    for (address, ok) in [
+        ("rough.time.nl:2002", true),
+        ("[::1]:5319", true),
+        ("rough.time.nl", false),
+        (":2002", false),
+        ("a:99999", false),
+    ] {
+        let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+        cfg.time.servers[0].address = address.into();
+        assert_eq!(cfg.validate().is_ok(), ok, "{address}");
+    }
+}
+
+#[test]
 fn a_zero_tick_is_refused() {
     let text = std::fs::read_to_string(DEV).unwrap().replace("tick = \"250ms\"", "tick = \"0s\"");
     let cfg: NodeConfig = toml::from_str(&text).unwrap();

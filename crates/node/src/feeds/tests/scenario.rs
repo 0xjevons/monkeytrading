@@ -27,7 +27,7 @@ use crate::feeds::venue::Timing;
 use crate::log::Manifest;
 use crate::sequencer::{Request, Sequencer, SequencerConfig, StreamBody, StreamMsg};
 use crate::tee::EnclaveKey;
-use crate::test_support::{dev_config, scratch_dir, sequencer_config};
+use crate::test_support::{dev_config, scratch_dir, sequencer_config, trusted_now};
 
 /// Each fake venue's book: BTC-USD 81250 / 81251 and ETH-USD 2377 / 2377.1.
 const BTC: (&str, &str, &str) = ("81250", "81251", "81250.5");
@@ -137,6 +137,8 @@ impl Node {
         let mut seq = Sequencer::recover(seq_cfg, Arc::new(EnclaveKey::generate()), stream_tx, withdrawals_tx)
             .expect("fresh sequencer");
         seq.genesis(&cfg.genesis).expect("genesis");
+        // Trusted time admits stamps on the system clock, so the queued genesis goes in now.
+        seq.trust(trusted_now()).expect("genesis");
         let (tx, rx) = mpsc::channel(65_536);
         tokio::spawn(seq.run(rx));
         let account = "0x00000000000000000000000000000000000000a1".parse().expect("account");

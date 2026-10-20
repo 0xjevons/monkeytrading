@@ -68,6 +68,37 @@ venue = "bitstamp"
 url = "wss://ws.bitstamp.net"
 symbols = [{ market = 1, symbol = "btcusd" }, { market = 2, symbol = "ethusd" }]
 
+# Trusted time. The sequencer checks every stamp against signed Roughtime readings
+# (RFC 10049), and stamps nothing, genesis included, before its first sample. It
+# halts when the host clock is not within `max_drift` of them, or when no sample
+# has arrived for 60 seconds, and resumes once a sample is within the bound
+# again. Readings carry whole seconds and a radius of a few seconds, so the
+# bound is coarse.
+[time]
+max_drift = "15s"
+interval = "10s"
+
+# Each address and key is from the operator's own published page, cited above
+# the entry, and matches the key the operator publishes in DNS TXT.
+#
+# int08h, https://int08h.com/post/public-roughtime-server/ (speaks 0x8000000c)
+[[time.servers]]
+name = "int08h"
+address = "roughtime.int08h.com:2002"
+public_key = "AW5uAoTSTDfG5NfY1bTh08GUnOqlRb+HVhbJ3ODJvsE="
+
+# TimeNL, run by SIDN Labs, https://time.nl/index_en.html (speaks 0x8000000c)
+[[time.servers]]
+name = "TimeNL"
+address = "rough.time.nl:2002"
+public_key = "v2CievhgKsxzlWPwIkYFUXeA51Akhkv5uhJCj1/kbiY="
+
+# time.txryan.com, https://time.txryan.com/ (the RFC 10049 port, speaks version 1)
+[[time.servers]]
+name = "txryan"
+address = "time.txryan.com:5319"
+public_key = "iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA="
+
 [genesis]
 house_capital = "10000000"
 benchmarks = [

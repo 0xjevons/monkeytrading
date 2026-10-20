@@ -188,7 +188,7 @@ impl ApiState {
 
     /// Sequences a command and waits for its events.
     /// Error cases:
-    /// - the sequencer has stopped
+    /// - the sequencer has stopped, or refused the command because sequencing is halted
     async fn submit(&self, cmd: Command) -> Result<Vec<Event>, ApiError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -317,7 +317,7 @@ async fn nonce(State(s): State<ApiState>, Path(address): Path<String>) -> ApiRes
 /// Places an order and returns the events it produced.
 /// Error cases:
 /// - the request is not authorised for its account
-/// - the sequencer has stopped
+/// - the sequencer has stopped, or sequencing is halted
 async fn place_order(State(s): State<ApiState>, Json(mut req): Json<OrderRequest>) -> ApiResult<Vec<Event>> {
     let auth = req.auth.take();
     req.auth =
@@ -328,7 +328,7 @@ async fn place_order(State(s): State<ApiState>, Json(mut req): Json<OrderRequest
 /// Cancels a resting order.
 /// Error cases:
 /// - the request is not authorised for its account
-/// - the sequencer has stopped
+/// - the sequencer has stopped, or sequencing is halted
 async fn cancel_order(State(s): State<ApiState>, Json(b): Json<CancelRequest>) -> ApiResult<Vec<Event>> {
     let auth = s
         .authorise(b.account, b.auth, |domain, auth| {
@@ -341,7 +341,7 @@ async fn cancel_order(State(s): State<ApiState>, Json(b): Json<CancelRequest>) -
 /// Requests a withdrawal; an approval is signed and streamed.
 /// Error cases:
 /// - the request is not authorised for its account
-/// - the sequencer has stopped
+/// - the sequencer has stopped, or sequencing is halted
 async fn withdraw(State(s): State<ApiState>, Json(b): Json<WithdrawalRequest>) -> ApiResult<Vec<Event>> {
     let auth = s
         .authorise(b.account, b.auth, |domain, auth| {
@@ -354,7 +354,7 @@ async fn withdraw(State(s): State<ApiState>, Json(b): Json<WithdrawalRequest>) -
 /// Mock custody only: credits an account without a chain deposit, under a fresh reference.
 /// Error cases:
 /// - custody is not the mock provider
-/// - the sequencer has stopped
+/// - the sequencer has stopped, or sequencing is halted
 async fn dev_deposit(State(s): State<ApiState>, Json(b): Json<AmountBody>) -> ApiResult<Vec<Event>> {
     if !s.dev_deposits {
         return Err(ApiError::NotFound);

@@ -16,10 +16,13 @@ alloy-primitives = { version = "1.7.3", default-features = false, features = ["s
 alloy-sol-types = { version = "1.7.3", default-features = false, features = ["std"] }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
+# Without `simd-unsafe`, its only source of `unsafe` code.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 crc32fast = "1"
+ed25519-dalek = "3"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hex = "0.4"
 humantime-serde = "1"
@@ -30,7 +33,7 @@ rand = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 sha3 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal", "fs"] }

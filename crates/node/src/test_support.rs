@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use engine_core::auth::ClientAuth;
 use engine_core::command::Command;
@@ -12,11 +13,12 @@ use engine_core::{Engine, Fixed};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::clock::now_ms;
+use crate::clock::{Clock, SystemClock};
 use crate::config::NodeConfig;
 use crate::log::{LogReader, Manifest, Offset};
 use crate::sequencer::{Request, Sequencer, SequencerConfig, SignedWithdrawal, StreamMsg};
 use crate::tee::EnclaveKey;
+use crate::trusted_time::Sample;
 
 pub const DEV_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/dev.toml");
 /// Small, so a short test crosses several segment boundaries.
@@ -47,6 +49,8 @@ impl TestSequencer {
         if seq.needs_genesis() {
             seq.genesis(&dev_config().genesis).expect("dev genesis");
         }
+        // Trusted time admits stamps on the system clock, so the queued genesis goes in now.
+        seq.trust(trusted_now()).expect("dev genesis");
         let (tx, rx) = mpsc::channel(64);
         let task = tokio::spawn(seq.run(rx));
         Self { tx, stream, manifest, withdrawals, task }
@@ -109,9 +113,21 @@ pub fn sequencer_config(dir: &Path, manifest: watch::Sender<Manifest>) -> Sequen
         checkpoint_every: CHECKPOINT_EVERY,
         chain_id: 31337,
         vault: AccountId([0; 20]),
-        clock: now_ms,
+        clock: Arc::new(SystemClock),
+        max_drift: Duration::from_secs(10),
         client_auth: ClientAuth::Unsigned,
     }
+}
+
+/// A trusted time sample putting true time within a second of `clock`'s wall clock, now.
+pub fn sample_around(clock: &dyn Clock) -> Sample {
+    let now = clock.now_ms();
+    Sample { at: clock.instant(), earliest_ms: now - 1_000, latest_ms: now + 1_000 }
+}
+
+/// `sample_around` the system clock.
+pub fn trusted_now() -> Sample {
+    sample_around(&SystemClock)
 }
 
 /// A deposit to `TRADER` of `amount` whole units under `chain_ref`.

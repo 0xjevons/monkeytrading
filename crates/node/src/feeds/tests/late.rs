@@ -99,6 +99,7 @@ fn late_sequencer(delay: Duration) -> (mpsc::Sender<Request>, mpsc::UnboundedRec
                     sleep(delay).await;
                     engine.answer(query);
                 }
+                Request::TimeSample(_) => unreachable!("a feed sends no time samples"),
             }
         }
     });

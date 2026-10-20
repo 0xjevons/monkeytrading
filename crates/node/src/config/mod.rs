@@ -10,14 +10,20 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use ed25519_dalek::VerifyingKey;
 use engine_core::Fixed;
 use engine_core::auth::ClientAuth;
 use engine_core::market::MarketSpec;
 use engine_core::params::{MAX_BENCHMARK_BPS, ProtocolParams};
 use engine_core::types::{AccountId, MarketId};
-use serde::Deserialize;
+use serde::de::Error;
+use serde::{Deserialize, Deserializer};
 use tokio_tungstenite::tungstenite::http::Uri;
 use tracing_subscriber::EnvFilter;
+
+use crate::trusted_time::NO_SAMPLE_GRACE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +81,7 @@ pub struct NodeConfig {
     pub operator: OperatorSection,
     pub custody: CustodySection,
     pub feeds: FeedsSection,
+    pub time: TimeSection,
     /// Sequenced as admin commands after protocol activation, and again on each boot until its
     /// house capital credit is in the log, so the rules every fill ran under are part of the public
     /// record.
@@ -193,6 +200,35 @@ pub struct MockMid {
     pub mid: Fixed,
 }
 
+/// Trusted time: the Roughtime servers the host clock is checked against.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeSection {
+    /// The most a sequenced timestamp may differ from Roughtime-verified time. A reply slower than
+    /// this cannot place the clock within it, so it is also how long each query waits.
+    #[serde(with = "humantime_serde")]
+    pub max_drift: Duration,
+    /// How often to query the servers.
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+    /// Servers run by independent operators; a sample needs replies from a strict majority.
+    ///
+    /// TODO: this file sits on host storage, so these keys are trusted only once the attestation
+    /// binds the config's hash (#26).
+    pub servers: Vec<RoughtimeServer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoughtimeServer {
+    pub name: String,
+    /// `host:port`, queried over UDP.
+    pub address: String,
+    /// The server's long-term Ed25519 public key, in base64 as its operator publishes it.
+    #[serde(deserialize_with = "public_key")]
+    pub public_key: VerifyingKey,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Genesis {
@@ -242,10 +278,14 @@ impl NodeConfig {
     /// Error cases:
     /// - the file cannot be read, or is not valid TOML for this schema (unknown keys included)
     /// - `logging.level` is not a valid filter directive
-    /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, or `feeds.interval` is zero
+    /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, `feeds.interval`,
+    ///   `time.max_drift`, or `time.interval` is zero, or `time.interval` plus twice
+    ///   `time.max_drift` is not under 60s
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
     /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
     ///   no longer than `feeds.interval`
+    /// - `time.servers` has fewer than two servers, lists a public key twice, or has an address
+    ///   that is not `host:port`
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
     ///   engine would refuse, or genesis lists a market id twice
@@ -273,10 +313,14 @@ impl NodeConfig {
     /// Checks values that parse but would fail silently or at the wrong moment.
     /// Error cases:
     /// - `logging.level` is not a valid filter directive
-    /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, or `feeds.interval` is zero
+    /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, `feeds.interval`,
+    ///   `time.max_drift`, or `time.interval` is zero, or `time.interval` plus twice
+    ///   `time.max_drift` is not under 60s
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
     /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
     ///   no longer than `feeds.interval`
+    /// - `time.servers` has fewer than two servers, lists a public key twice, or has an address
+    ///   that is not `host:port`
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
     ///   engine would refuse, or genesis lists a market id twice
@@ -309,6 +353,27 @@ impl NodeConfig {
             && (self.tee.provider != TeeProvider::Mock || self.custody.provider != CustodyProvider::Mock)
         {
             anyhow::bail!("node.auth = \"none\" needs tee.provider and custody.provider both \"mock\"");
+        }
+        if self.time.max_drift.is_zero() || self.time.interval.is_zero() {
+            anyhow::bail!("time.max_drift and time.interval must be non-zero");
+        }
+        // A round waits up to `max_drift` for a silent server, so a sample may be that old when it
+        // arrives, and the next may come `interval` plus `max_drift` later. All of it must fit in
+        // the grace, or a node with one silent server halts while the others agree.
+        let round = self.time.interval.saturating_add(self.time.max_drift.saturating_mul(2));
+        if round >= NO_SAMPLE_GRACE {
+            anyhow::bail!("time.interval plus twice time.max_drift must be under {NO_SAMPLE_GRACE:?}");
+        }
+        // One server, or one key listed twice, would let a single operator set the time.
+        let servers = &self.time.servers;
+        if servers.len() < 2 {
+            anyhow::bail!("time.servers needs at least two servers, so that more than one must agree");
+        }
+        if servers.iter().enumerate().any(|(i, a)| servers[..i].iter().any(|b| a.public_key == b.public_key)) {
+            anyhow::bail!("time.servers lists the same public key twice");
+        }
+        if let Some(s) = servers.iter().find(|s| !is_host_port(&s.address)) {
+            anyhow::bail!("time.servers address {:?} is not host:port", s.address);
         }
         self.genesis.params.validate().map_err(anyhow::Error::msg).context("genesis.params")?;
         // Genesis reruns on every boot until it completes, so a command the engine would refuse
@@ -369,6 +434,20 @@ impl VenuesSection {
         }
         Ok(())
     }
+}
+
+/// Whether `address` is a non-empty host, a colon, and a port number.
+fn is_host_port(address: &str) -> bool {
+    address.rsplit_once(':').is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+}
+
+/// Decodes a base64 Ed25519 public key.
+/// Error cases:
+/// - the text is not base64, does not decode to 32 bytes, or is not a valid Ed25519 key
+fn public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<VerifyingKey, D::Error> {
+    let bytes = STANDARD.decode(String::deserialize(deserializer)?).map_err(D::Error::custom)?;
+    let bytes: [u8; 32] = bytes.try_into().map_err(|_| D::Error::custom("an Ed25519 public key is 32 bytes"))?;
+    VerifyingKey::from_bytes(&bytes).map_err(D::Error::custom)
 }
 
 #[cfg(test)]
