@@ -49,7 +49,8 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/api/tests.rs` — API tests, including the resumable stream and archive dev scenario
 - `src/test_support.rs` — the shared test harness
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
-- `src/config.rs` — the node config schema and validation
+- `src/config/mod.rs` — the node config schema and validation
+- `src/config/tests.rs` — config loading and validation tests
 - `src/custody.rs` — the custody adapter (mock only so far)
 - `src/feeds/mod.rs` — the feed index and the mock feed
 - `src/feeds/venue/mod.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect
