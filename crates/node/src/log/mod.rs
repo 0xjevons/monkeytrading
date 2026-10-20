@@ -35,7 +35,7 @@ pub struct CommandEntry {
     #[serde(flatten)]
     pub sequenced: Sequenced,
     /// `None` only in entries written before events were logged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub events: Option<Vec<Event>>,
 }
 

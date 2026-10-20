@@ -160,7 +160,10 @@ fn read_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use engine_core::command::Command;
+    use tokio::time::timeout;
 
     use crate::test_support::{TestSequencer, deposit, log_messages, scratch_dir, withdraw};
 
@@ -203,7 +206,7 @@ mod tests {
         let node = TestSequencer::start(&dir, 2);
         let mut feed = Feed::new(node.stream.subscribe(), dir.clone(), None);
         node.submit(deposit(100, "dep-1")).await;
-        let first = feed.next().await.unwrap().unwrap();
+        let first = next_msg(&mut feed).await;
         for n in 0..20 {
             node.submit(deposit(1, &format!("dep-{n}"))).await;
         }
@@ -224,19 +227,24 @@ mod tests {
         for n in 0..10 {
             node.submit(deposit(1, &format!("dep-{n}"))).await;
         }
-        let first = feed.next().await.unwrap().unwrap();
+        let first = next_msg(&mut feed).await;
         let expected = log_messages(&dir, first.offset.next());
         assert_eq!(take(&mut feed, expected.len()).await, expected);
     }
 
     // ── Helpers ──
 
+    /// The feed's next message, failing the test if none comes within ten seconds.
+    async fn next_msg(feed: &mut Feed) -> Arc<StreamMsg> {
+        let next = timeout(Duration::from_secs(10), feed.next()).await.expect("a message in time");
+        next.unwrap().expect("sequencer running")
+    }
+
     /// The next `n` messages, as the stream encodes them.
     async fn take(feed: &mut Feed, n: usize) -> Vec<String> {
         let mut got = Vec::with_capacity(n);
         while got.len() < n {
-            let msg = feed.next().await.unwrap().expect("sequencer running");
-            got.push(serde_json::to_string(&*msg).unwrap());
+            got.push(serde_json::to_string(&*next_msg(feed).await).unwrap());
         }
         got
     }
@@ -245,6 +253,6 @@ mod tests {
     async fn assert_next_is_the_next_command(node: &TestSequencer, feed: &mut Feed) {
         let seq = node.next_seq().await;
         node.submit(Command::Tick).await;
-        assert_eq!(feed.next().await.unwrap().unwrap().offset, Offset::start_of(seq));
+        assert_eq!(next_msg(feed).await.offset, Offset::start_of(seq));
     }
 }
