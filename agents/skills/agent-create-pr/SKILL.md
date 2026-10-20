@@ -5,9 +5,10 @@ description: >
   this work" — or when the owner says a PR may merge. Covers opening every PR as a draft, the
   preconditions for marking it ready (including a multi-agent agent-code-review at medium or
   higher), the issue blocker check, the `[scopes] Title` and the body in squashed-commit format
-  ending with `Closes #12`, which every feature PR uses, or `Part of #12` for a supporting PR that
-  does not finish its issue, watching the checks after it opens, and, on the owner's go-ahead in
-  chat, posting `merge-approved` and merging the PR. Does not review or approve.
+  ending with `Closes #12` or `Part of #12`, watching the checks after it opens, and, on the
+  owner's go-ahead in chat, posting `merge-approved` and merging the PR. Every feature PR ends
+  `Closes #12`; `Part of #12` is only for a supporting PR that does not finish its issue. Does not
+  review or approve.
 ---
 
 # agent-create-pr
@@ -40,8 +41,9 @@ marked ready, may not.
 
 - **Work finished.** No "fix it in review" leftovers.
 - **Feature complete.** A feature PR delivers its issue's whole acceptance list, its dev scenario
-  is on the issue and has passed in dev on the branch rebased onto `main`, and the scenario's
-  scripted check passes in CI ([agent-build-feature](../agent-build-feature/SKILL.md)).
+  is on the issue and has passed in dev on the branch rebased onto `main` and on each later head
+  that changes the feature's behaviour, and the scenario's scripted check passes in CI
+  ([agent-build-feature](../agent-build-feature/SKILL.md)).
 - **Self-reviewed.** The change was built to
   [development-checklist](../../rules/development-checklist.md); walk every applicable section
   against the final diff once more and fix what it finds.

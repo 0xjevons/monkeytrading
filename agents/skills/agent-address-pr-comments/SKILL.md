@@ -237,7 +237,9 @@ and report the failure.
 4. **Print the triage — outcome, planned change, and draft reply per item — and wait.** A request
    to fix without review skips this wait.
 5. Make the approved fixes; ask before anything that widens scope.
-6. Verify the fixes and run the local checks.
+6. Verify the fixes and run the local checks. On a feature PR, a fix that changes the feature's
+   behaviour also runs its dev scenario again
+   ([agent-build-feature](../agent-build-feature/SKILL.md#pr-and-merge)).
 7. **Print the approval report and wait. Post nothing yet.**
 8. Re-read the PR head, its description, and every thread you will answer; if anything changed,
    re-triage and print a refreshed report.

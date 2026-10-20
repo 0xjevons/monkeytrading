@@ -75,6 +75,8 @@ a bug fix or a refactor that is not a feature goes straight through
   check is green in CI, so the merge finishes the feature and GitHub closes the issue.
 - Answer review with [agent-address-pr-comments](../agent-address-pr-comments/SKILL.md), aiming for
   one round.
+- A later push that changes the feature's behaviour, from a review fix or a rebase, runs the dev
+  scenario again on the new head and shows the user the result before the PR merges.
 - Promotion to prod needs its own approval.
 
 ## Rules
