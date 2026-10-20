@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
 use crate::clock::now_ms;
 use crate::config::Venue;
@@ -244,6 +244,38 @@ async fn a_symbol_that_goes_quiet_again_alerts_again() {
     timeout(WAIT, eth_sequenced).await.expect("ETH quoted in time");
     eth_quoting.store(false, Ordering::Relaxed);
     assert!(silent_eth(&next_alert(&mut alerts).await));
+    streaming.abort();
+}
+
+#[tokio::test]
+async fn a_recovered_venue_gets_a_full_silence_window_per_symbol() {
+    let (_guard, mut alerts) = capture_alerts();
+    let (listener, url) = listen().await;
+    let silence = Duration::from_millis(300);
+    let (mut rx, _feed) = spawn_feed(Venue::Kraken, &url, &MARKETS, fast(silence));
+    // Down for longer than the silence bound, then back quoting BTC only.
+    let outage = Instant::now();
+    while outage.elapsed() < silence * 2 {
+        drop(timeout(WAIT, listener.accept()).await.expect("no attempt in time"));
+    }
+    assert_eq!(next_alert(&mut alerts).await["alert"], "venue_feed_down");
+    let (mut ws, _) = accept(&listener).await;
+    let streaming = tokio::spawn(async move {
+        for _ in 0..1_000 {
+            send(&mut ws, &[kraken_ticker("BTC/USD", "100", "101", now_ms())]).await;
+            sleep(Duration::from_millis(20)).await;
+        }
+    });
+    next_prices(&mut rx).await;
+    let recovered = Instant::now();
+    let alert = next_alert(&mut alerts).await;
+    assert_eq!((alert["alert"].as_str(), alert["symbol"].as_str()), ("venue_symbol_silent", "ETH/USD"));
+    // ETH's silence counts from the recovery, not from before the outage.
+    assert!(
+        recovered.elapsed() >= silence - Duration::from_millis(50),
+        "alerted {:?} after recovery",
+        recovered.elapsed()
+    );
     streaming.abort();
 }
 
