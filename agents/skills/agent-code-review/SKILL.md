@@ -191,13 +191,19 @@ this skill in multi-agent mode at `medium` or higher over the PR's full diff
 ([agent-create-pr](../agent-create-pr/SKILL.md#before-a-pr-is-ready-for-review)), and every
 accepted Critical, High, and Medium finding is fixed by class before the next round.
 
+- **The round log is the count.** The branch's fix notes
+  ([Fixing an accepted finding](#fixing-an-accepted-finding)) open with a round log: one line per
+  round with its number, the commit it reviewed, and its accepted counts by severity. A session
+  reads it before anything else on the branch, numbers the next round from it, and counts the
+  Medium cap from it.
 - **A clean round ends the loop.** A round that accepts no Critical, High, or Medium finding ends
   it. After it, change no code, fix no Lows or Nits, and run no further rounds. Mark the PR ready
   on exactly the commit that round reviewed, once `ci-passed` is green on it; the remaining Lows
-  and Nits go in the report to the owner, not into new commits. A mechanical rebase onto `main`
-  after it needs no new round, and the rebased commit stands in for the reviewed one; a rebase that
-  changes behaviour needs a new round. If `ci-passed` or a feature's dev scenario fails on that
-  commit, its fix is a new commit and the loop goes on.
+  and Nits go in the report to the owner, not into new commits.
+- **A later code change reopens the loop.** Any code change after the clean round — a fix for a
+  failed check or dev scenario, a fix for a review comment on a ready PR, a change the user asks
+  for, or a rebase that changes behaviour — moves the PR back to draft and reopens the loop. A
+  mechanical rebase onto `main` does not; the rebased commit stands in for the reviewed one.
 - **Critical and High have no round cap.** Keep fixing and re-reviewing until a round accepts none.
 - **Mediums get at most five rounds.** If round 5, or any later round run to clear Critical and
   High, ends with no Critical or High but with Mediums remaining, stop. Report the remaining
