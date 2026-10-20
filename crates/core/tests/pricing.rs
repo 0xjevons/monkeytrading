@@ -107,13 +107,26 @@ fn stale_or_divergent_feeds_mean_no_fill() {
 fn malformed_quotes_are_refused_without_affecting_good_ones() {
     let mut h = Harness::new();
     let ts = h.ts;
-    let quote = |source: &str, mid: &str, ts| SourceQuote { source: source.into(), mid: f(mid), ts };
     let quotes = vec![quote("venue0", "100000", ts), quote("venue1", "100000", ts), quote("bad", "-1", i64::MIN)];
     let ev = h.cmd(Command::Prices { market: BTC, quotes });
     // The bad quote is reported, and the two good ones still price the market.
     assert!(ev.iter().any(|e| matches!(e, Event::PricesRejected { market: BTC, .. })));
     assert_eq!(h.engine.markets()[&BTC].mark, Some(f("100000")));
     assert!(!h.engine.markets()[&BTC].quotes.contains_key("bad"));
+}
+
+#[test]
+fn an_older_quote_does_not_replace_the_venues_stored_one() {
+    let mut h = Harness::new();
+    h.price(BTC, "100000");
+
+    // In the same sequenced millisecond, a delayed venue0 quote stamped 100ms earlier arrives. The
+    // stored one, stamped exactly at the sequenced time, counts and is kept.
+    let ev = h.cmd(Command::Prices { market: BTC, quotes: vec![quote("venue0", "100100", h.ts - 100)] });
+    assert!(!ev.iter().any(|e| matches!(e, Event::PricesRejected { .. })), "{ev:?}");
+    let stored = &h.engine.markets()[&BTC].quotes["venue0"];
+    assert_eq!((stored.mid, stored.ts), (f("100000"), h.ts));
+    assert_eq!(h.engine.markets()[&BTC].mark, Some(f("100000")));
 }
 
 #[test]
