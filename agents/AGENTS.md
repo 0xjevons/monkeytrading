@@ -12,18 +12,26 @@ an index: load only the rule whose hint matches the current action.
 - **crates/core/** — `engine-core`: the protocol state machine. Covers pricing against the index,
   size and stress spreads, margin and close-out, the profit fee, overnight financing, trading
   sessions, house exposure caps, and toxicity scoring. It does no IO and uses no clocks,
-  randomness, or floats. Unit tests sit inline; protocol tests are in `tests/engine.rs`.
-- **crates/node/** — `engine-node`, binary `engine`. Contains the sequencer, the public log with
-  signed checkpoints, `engine replay`, the REST and WebSocket API, TEE attestation
-  (configfs-tsm for TDX and SEV-SNP), and the custody and price-feed adapters (mock only so far).
+  randomness, or floats. `impl Engine` is split by area (`engine.rs`, `execution.rs`,
+  `closeout.rs`, `funds.rs`, `admin.rs`). Unit tests sit inline; protocol tests are in `tests/`
+  by area, with the shared harness in `tests/common/`. Its `README.md` lists every file.
+- **crates/node/** — `engine-node`, binary `engine` (`main.rs` over `lib.rs`). Contains the
+  sequencer, the public log with signed checkpoints, `engine replay`, the REST and WebSocket API,
+  TEE attestation (configfs-tsm for TDX and SEV-SNP), and the custody and price-feed adapters
+  (mock only so far). Its `README.md` lists every file.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine.
   Its `[genesis]` section is protocol: it is sequenced into the log as admin commands on first
-  boot.
+  boot. Every section rejects unknown keys.
+- **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate.
+- **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, and `cargo-deny`, on
+  every push to `main` and every PR. Actions are pinned by commit SHA.
 - **agents/** — this index, `rules/`, and `skills/` (incl. `skills/vendor/` pull-on-demand
   packs); root `AGENTS.md` / `CLAUDE.md` symlink to `agents/AGENTS.md`.
-- **Cargo.toml** — workspace manifest, shared dependencies, and the release profile (overflow
-  checks stay on).
+- **Cargo.toml** — workspace manifest, shared dependencies, and the Cargo profiles (release keeps
+  overflow checks on).
+- **deny.toml** — `cargo-deny` policy: advisories, allowed licenses, bans, and sources.
 - **rustfmt.toml** — `max_width = 120`.
+- **LICENSE** — Apache License 2.0.
 
 ## Commands
 
@@ -33,8 +41,11 @@ Run from the repo root:
 - Test one crate: `cargo test -p engine-core` or `cargo test -p engine-node`
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Format check: `cargo fmt --all -- --check`
-- Run a local node: `cargo run -p engine-node -- run --config config/dev.toml`; the API listens
-  on `127.0.0.1:8080` and the log goes to `data/dev/log.jsonl` (gitignored)
+- File line cap: `./scripts/check-file-loc.sh`
+- Supply chain: `cargo deny check` (CI runs it; install `cargo-deny` to run it locally)
+- Run a local node: `cargo run -p engine-node -- run --config config/dev.toml` (or set
+  `CONFIG_PATH`); the API listens on `127.0.0.1:8080`, the log goes to `data/dev/log.jsonl`
+  (gitignored), and the log level comes from `[logging].level`
 - Verify a published log: `cargo run -p engine-node -- replay --log <path>`
 
 ## Repo facts

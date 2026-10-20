@@ -51,9 +51,11 @@ CI on the PR.
 
 - Take the validation commands of the `.github/workflows/` jobs the changed paths trigger — format
   check, build or lint, and the tests covering the change — and run them scoped to the affected
-  crates, each exiting zero. Run formatters as checkers, never as writers. Until CI exists, the
-  checks are `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-  and `cargo test -p <crate>` for each affected crate.
+  crates, each exiting zero. Run formatters as checkers, never as writers. In
+  [ci.yaml](../../.github/workflows/ci.yaml) those are `cargo fmt --all -- --check`,
+  `./scripts/check-file-loc.sh`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test -p <crate>` for each affected crate, and `cargo deny check` when dependencies
+  change.
 - A push to a draft PR may carry failing or skipped checks when the PR says which; every check
   passes before the PR is marked ready.
 - When the change touches a shared or public surface, add its direct consumers, since a check

@@ -45,9 +45,11 @@ The engine consumes commands from clients, price feeds, custody, and the operato
 failed check on such input:
 
 - **Detected error or inconsistent/confusing state in input data → never act on it.**
-  Reject, log, and return without mutating state — leave everything as-is. Do not "recover" by
-  guessing a price, a balance, or an intent from data just proven untrustworthy. A stale or
-  divergent feed means no price, not the last price.
+  Fire an alert, log, and return without mutating state or emitting actions — leave everything
+  as-is for human intervention. Do not "recover" by guessing a price, a balance, or an intent from
+  data just proven untrustworthy. A stale or divergent feed means no price, not the last price.
+  In `engine-core`, which does not log, the rejection event is the record and the node alerts on
+  it.
 - **Internal invariants — states our own code cannot produce without a bug → hard
   `assert!` / `expect` and crash.** Add a terse comment on why the state is
   (almost) impossible. Never `debug_assert!`.
@@ -55,8 +57,13 @@ failed check on such input:
   delivery/replay effects, are real; content the sequencer cannot produce is not.
 - The same check applied to multiple inputs lives in one shared helper, not copies.
 - An inconsistent log found at recovery or replay (a gap, a reversed timestamp, a root mismatch)
-  is input, not an internal invariant: refuse to serve and report it for an operator, without
-  writing anything — the sequencer must never append to a log it cannot verify.
+  is input, not an internal invariant: Critical alert and refuse to serve, without writing
+  anything — the sequencer must never append to a log it cannot verify, and a hard panic would
+  crash-loop across restarts and block operator repair.
+- Alert severity for rejected input: **Warning** when a Critical escalation backstop exists;
+  **Critical** only when nothing re-examines the state — no self-healing or escalation path.
+- Until a paging integration exists, an alert is a log line at `error` (Critical) or `warn`
+  (Warning) carrying an `alert = "<snake_case_name>"` field, emitted inside the unit of work's span.
 - Ledger integrity beats uptime: anything that would let trading continue on possibly-diverged
   books — cash not conserved between accounts and the house, positions not matching the per-market
   aggregates — fails closed (crash).
@@ -87,6 +94,11 @@ the same state root on every machine and build.
   acceptable only outside the determinism boundary for display or mock data, converted to `Fixed`
   before it becomes a command.
 - Basis points are `i64` applied with `Fixed::mul_bps` / `Fixed::from_bps`.
+- Arithmetic on any value derived from external input must not be able to overflow: check the
+  input where it enters the engine (`Fixed::is_valid_input`, bounded by `Fixed::MAX_INPUT`) and
+  reject it as input, before any arithmetic. Admin-supplied rates are range-checked by `validate`
+  for the same reason. An overflow panic in `engine-core` is in the public log, so it recurs on
+  every replay.
 - On-chain amounts stay integer base units (`U256` or `u128`) until the custody boundary, where
   they convert to `Fixed` with the token's decimals; that conversion is checked and rejects
   precision loss.
@@ -98,7 +110,7 @@ the same state root on every machine and build.
 - Prefer channel-based communication (`tokio::sync::mpsc` or similar) over shared state unless asked otherwise or clearly justified. The sequencer owns the engine; readers send it a query.
 - Keep cancellation, polling, and timeout behavior explicit; a wait must never hang forever. Remote, process, and network calls carry explicit timeouts / deadlines, with timeout errors propagated with enough context to identify the target and operation.
 - Long-running work must respect cancellation: dropping the parent future stops child work, spawned processes are killed or joined, and background tasks have an explicit shutdown path.
-- A spawned task that the node cannot run without (sequencer, API server) is awaited by `main`, so its exit stops the process.
+- Every long-running spawned task is supervised by `main`: if any one exits or panics, the node shuts down, so it never runs on without a loop while looking healthy.
 - Parallelize expensive independent work when safe (e.g. read-only ops across targets), preserving deterministic output ordering; keep ordered mutation paths sequential when state-transition safety depends on one-at-a-time behavior.
 
 ## Process-global state
@@ -119,34 +131,44 @@ a dependency that no constructor shows and limits the process to one instance.
 
 ## Configuration
 
-The node takes one root `NodeConfig` from a TOML file, loaded and validated once at startup by
-`NodeConfig::load`. The file path is the only CLI surface (`--config`); everything else is a
-config key.
+Typed-TOML services take one root config from a TOML file, loaded and validated once at startup
+(`NodeConfig::load`). The file path is the only CLI surface (`--config` / `CONFIG_PATH`);
+everything else is a config key.
 
 - **Optionality belongs to the section, not the field.** An optional process or feature is
   `Option<Section>`, and every field inside it is plain and required — presence of the section
   means it is configured. Never make each field `Option` and then hand-write a list of missing
   config paths: serde already names the missing field.
-- **`#[serde(deny_unknown_fields)]` on node config section structs**, so a typo fails the boot
-  instead of silently keeping a default. Protocol types in `engine-core` (`MarketSpec`,
-  `ProtocolParams`) also travel in the log; whether they reject unknown fields is a log
-  compatibility decision, made explicitly.
+- **`#[serde(deny_unknown_fields)]` on every section struct**, so a typo fails the boot instead of
+  silently keeping a default. This includes the `engine-core` protocol types the genesis section
+  deserializes (`ProtocolParams`, `MarketSpec`, and the structs inside them); the same check then
+  refuses a log written with fields this build does not know, which is what replay needs. Neither
+  side of a `#[serde(flatten)]` can carry the attribute: make the field that turns the feature on
+  **required** there, so a typo surfaces as a missing field rather than a silent default.
 - **Nothing credential-bearing is a plain `String`.** Wrap secrets and credential-bearing URLs in
   a redacting newtype whose `Debug` and `Display` hide the value, and read it only at the point of
   use. Add the type with the first secret the node needs.
-- **Keep validation structural.** Ranges, non-empty tables, and parseability belong in the type's
-  `validate`; assume an operator-supplied config is intentional. Guard a value whose wrong setting
-  fails **silently** — a zero window that can never trip, a tier table out of order.
+- **Keep validation structural.** Ranges, lengths, non-empty tables, and parseability belong in
+  the type's `validate`; per-value policy checks (placeholder detection, "looks unset") do not.
+  Assume an operator-supplied config is intentional. The exception worth making is a value whose
+  wrong setting fails **silently** — a zero window that can never trip, a tier table out of order:
+  guard those, since every other wrong value already fails loudly.
 - **Classify every new constant.** Before adding one, decide whether it is a true invariant or an
   operational preference. Keep invariants in code; put adjustable protocol values in
   `ProtocolParams` or `MarketSpec` (so changes are sequenced and logged), and node-only
   preferences in `NodeConfig`.
+- Durations in service config are `humantime_serde` strings (`"250ms"`, `"30s"`). Protocol types
+  in `engine-core` keep integer `_ms` fields: they are part of the logged, hashed state.
 - **Tests must not mutate the process environment.** `set_var`/`remove_var` are `unsafe` in Rust
-  2024 and race every concurrently running test in the binary. Take configuration as an explicit
-  value instead, and assert on a committed example file.
+  2024 and race every concurrently running test in the binary, which `#[serial]` does not prevent.
+  Take the environment as an explicit source instead, and assert on a committed example file with
+  a loader that ignores the ambient environment.
 - Build shared clients once — RPC provider, HTTP client — in `main`, and pass them to the
   components that need them rather than letting each build its own.
-- CLI flags have both a short and long form where clap allows.
+- CLI flags override env vars and have both a short and long form.
+- **`.env` is optional.** Use `dotenvy`, `.env`, and `.env.example` only when a crate exposes a
+  local environment-file surface; typed TOML configuration does not require them. Document the
+  active configuration, log-level, and credential-override variables in the crate's `README.md`.
 - For conditional compilation, use the attribute macro rather than the declarative one unless not viable.
 
 ## Serialization
@@ -157,12 +179,17 @@ config key.
 
 ## Logging
 
-- Use `tracing` with the `env-filter` feature on `tracing-subscriber`; the node reads the level
-  from `RUST_LOG`, defaulting to `info`.
+- Use `tracing` with the `env-filter` feature on `tracing-subscriber`. The level comes from
+  `[logging].level` in the service's own config, installed after the config load — never from
+  `RUST_LOG`, which no service reads directly. A subcommand that loads no config uses `info`.
 - `engine-core` does not log: its events are its output. The node logs around them.
-- One log-visible correlation span per unit of work, carrying its id; long-running loops get none.
+- One log-visible correlation span per call stack, carrying the unit of work's `id`; long-running
+  loops get none, and two nested log-visible spans need a reason approved in review.
+- HTTP: one middleware layer, registered outermost, owns the request span; a handler records the
+  entity id (`Span::current().record("id", …)`) as soon as the entity is known.
 - A spawned future does not inherit the current span: spawn `fut.instrument(span)` or `fut.instrument(Span::current())`, or its lines lose the id. Never hold a `span.enter()` guard across an `.await`.
-- Ids go in their own fields: `info!(account = %w.account, nonce = w.nonce, "…")`, never only inside the message string.
+- Ids go in their own fields: `info!(id = %order_id, "…")` for the subject, role names for other entities (`account = %w.account`). Never re-emit the span's id as an event field.
+- Fire alerts inside the correlation span, so they carry its fields.
 - Never log secrets, keys, or raw request bodies that may carry signatures.
 
 ## Dependencies
@@ -171,11 +198,13 @@ config key.
 - Prefer logic from the workspace's own crates and follow DRY: protocol types and maths live in `engine-core`, and the node reuses them.
 - May add smaller utility crates freely; ask before adding a major crate, weighing maintenance and popularity.
 - A new dependency of `engine-core` must be deterministic and must not pull in IO or a runtime.
+- A new crate must pass `cargo-deny` against `deny.toml` (advisories, licenses, bans, sources), which CI runs.
 - Permitted by default (non-exhaustive): `anyhow`, `axum`, `base64`, `bytes`, `chrono`, `chrono-tz`, `clap`, `futures`, `hex`, `http`, `itertools`, `k256`, `rand` (node only, careful outside tests), `regex`, `reqwest`, `serde` (and ecosystem), `sha2`, `sha3`, `smallvec`, `thiserror`, `tokio` (and ecosystem), `toml`, `tracing`, `tracing-subscriber` (with `env-filter`).
 
 ## Workspace
 
 - Add dependencies to the workspace `Cargo.toml`, then reference them per package with `{ workspace = true }`.
+- Every executable uses both `lib.rs` (the core) and `main.rs` (the entry point).
 - Protocol logic lives in library crates (`engine-core`); a binary crate wires IO, tasks, and
   configuration around them.
 
@@ -195,16 +224,21 @@ Each source file is laid out in this order:
 10. Functions
 11. Unit tests
 
-Import sections appear in this order, separated by a blank line. In `lib.rs` / `main.rs`, list module declarations first, then imports.
+Import sections appear in this order, separated by a blank line. In `lib.rs` / `mod.rs`, place each module declaration right before its corresponding `use`.
 
-- Import only what you need, using absolute paths (`use crate::module::function`, not `use super::function`). Same for usage: `use tracing::info;` then `info!(...)`, unless one or two calls read better qualified.
+- Import only what you need, using absolute paths (`use crate::module::function`, not `use super::function`). Same for usage: `use tracing::info;` then `info!(...)`, not `tracing::info!(...)`.
 - Test-only imports belong inside the `#[cfg(test)] mod tests { … }` block, not at module top level as `#[cfg(test)] use …;`. Inside test modules and test files, `use super::*` is fine.
 - Organize source logically: a small module is a single file in `src`; a larger one gets its own subdirectory with a `mod.rs`.
 - `impl Engine` may span several files (`engine.rs` for dispatch, time, funds, and admin; `execution.rs` for orders, pricing, and risk) when each holds one cohesive area.
 
 ## File line cap and module splits
 
-Rust source files are capped at 500 lines. Split before a file crosses the cap rather than exempting it.
+Rust source files are capped at 500 lines, enforced per package by
+`scripts/check-file-loc.sh` in CI. A package opts in with a
+`check_pkg crates/<pkg> 500` line; adding that line means every `.rs` file in
+the package, `tests/` included, must already be under the cap (the script takes
+optional exempt paths, but prefer splitting over exempting). New packages opt in
+from the start.
 
 ### How to split
 
@@ -213,6 +247,7 @@ sibling submodules — never arbitrary halves. Established extractions:
 
 - `tests.rs` — the inline `#[cfg(test)] mod tests { … }` body, always the first
   choice when tests dominate the count.
+- `defaults.rs` — serde `default = "…"` functions of a config module.
 - `validation.rs` — `validate` functions of a config or spec type.
 - `setup.rs` — construction and wiring pulled out of a process/loop module.
 
@@ -236,33 +271,38 @@ import grouping.
 - `tests.rs` starts with `use super::*;` plus what it needs; helpers go below the tests under a
   `// ── Helpers ──` divider.
 - Protocol behaviour tests go through `Engine::apply` in `crates/core/tests/`, driven by
-  sequenced commands as a client and the feeds would send them.
+  sequenced commands as a client and the feeds would send them. An integration-test file over the
+  cap splits by behaviour area, with the shared harness in `tests/common/mod.rs`.
 
 ### Docs and verification
 
 - Sync [agents/AGENTS.md](../../AGENTS.md) structure bullets and any crate `README.md` to the new
   paths; describe each file exactly once.
-- Before pushing, verify the split was pure motion — diff the removed vs re-added lines;
-  residuals must be only rewrapping, visibility, and imports.
+- Before pushing: run `scripts/check-file-loc.sh` (all files under cap), and verify the split was
+  pure motion — diff the removed vs re-added lines; residuals must be only rewrapping, visibility,
+  and imports.
 
 ## Crate README
 
-When a crate gets a `README.md`, it has these sections, in order: H1 title (crate name), `## Overview`, `## Features` (bullets, no trailing period per item), `## Repository Structure`, `## Usage`, `## Configuration` (config keys and env vars; omit the section if none), `## Testing`, `## License` (single line: Apache-2.0). Deviate only when asked or clearly justified — ask first.
+Every crate has a `README.md` with these sections, in order: H1 title (crate name), `## Overview`, `## Features` (bullets, no trailing period per item), `## Repository Structure`, `## Usage`, `## Configuration` (env vars only, `` `ENV_VAR_NAME` ``: {description}; no CLI flags; omit the section if none), `## Testing`, `## Authors` (single line: The monkeytrading contributors), `## License` (single line: Licensed under the Apache License, Version 2.0; see `LICENSE`.). Deviate only when asked or clearly justified — ask first.
 
 ## Cargo profiles
 
-- Release (workspace `Cargo.toml`): `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, and
-  `overflow-checks = true`. Never turn overflow checks off: money arithmetic must halt on
-  overflow, never wrap.
-- Dev: the Cargo defaults; add `opt-level` overrides only for a measured need.
+- Release: `opt-level = 3` and `lto = true`.
+- Debug: `opt-level = 2` and `lto = "thin"` to speed up compilation.
+- Release also keeps `overflow-checks = true`: money arithmetic must halt on overflow, never wrap.
+  Input that could overflow is rejected at the boundary first (see Numeric types).
 
 ## Comments and rustdoc
 
-- Each module opens with a `//!` comment that says what it owns and the protocol rule it
-  implements, in a few sentences.
-- Rustdoc every public item whose behaviour its name and signature do not already make clear;
-  say what it guarantees, not how it works line by line.
-- For a fallible function, name the error cases when the error type does not already enumerate
-  them; a `Reject` variant documents its own case.
+- Use rustdoc on all functions and modules; tests need less function-level doc but more line-by-line commentary.
+- Document every public and private function at the function level. For fallible functions, describe error cases in this exact form:
+
+  ```text
+  /// {brief description of function}
+  /// Error cases:
+  /// - foo
+  /// - bar
+  ```
 
 General comment terseness applies too — see [../../rules/code-comments.md](../../rules/code-comments.md).
