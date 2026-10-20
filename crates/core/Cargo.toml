@@ -1,0 +1,18 @@
+[package]
+name = "engine-core"
+description = "Deterministic trading state machine: pricing, margin, fees, financing and house risk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate must stay deterministic: no clocks, no randomness, no floats, no
+# HashMap iteration. Anyone replaying the public event log against this code
+# must reproduce the same state roots bit for bit.
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha3.workspace = true
+thiserror.workspace = true

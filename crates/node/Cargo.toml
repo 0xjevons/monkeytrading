@@ -1,0 +1,29 @@
+[package]
+name = "engine-node"
+description = "TEE-hosted node: sequencer, public event log, API, attestation and custody"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "engine"
+path = "src/main.rs"
+
+[dependencies]
+engine-core.workspace = true
+
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures.workspace = true
+hex.workspace = true
+k256.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha3.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
