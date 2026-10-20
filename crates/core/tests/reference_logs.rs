@@ -56,6 +56,15 @@ fn a_panicking_command_is_reported_at_its_seq() {
 }
 
 #[test]
+fn a_refused_sequence_is_reported_at_its_seq() {
+    let mut entries = fresh_log();
+    // Dropping seq 3 leaves a gap: the engine expects 3 and is handed 4.
+    entries.remove(3);
+    let err = verify_roots(&entries).unwrap_err();
+    assert!(err.starts_with("seq 4 refused: expected seq 3, got 4"), "{err}");
+}
+
+#[test]
 fn an_empty_log_does_not_verify() {
     assert_eq!(verify_roots(&[]), Err("empty log".to_owned()));
 }

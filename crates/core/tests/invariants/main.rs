@@ -151,6 +151,8 @@ fn path(event: &Event) -> &'static str {
         Event::PricesRejected { reason, .. } if reason.starts_with("malformed") => "malformed quote",
         Event::AdminApplied => "admin applied",
         Event::AdminRejected { reason } if reason.ends_with("amount out of range") => "house capital out of range",
+        // House capital refusals come back as admin rejections; keep them apart from operator ones.
+        Event::AdminRejected { reason } if reason.starts_with("house capital") => "house capital rejected",
         Event::AdminRejected { .. } => "admin rejected",
         _ => "other",
     }

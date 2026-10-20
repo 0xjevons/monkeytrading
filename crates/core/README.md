@@ -83,7 +83,8 @@ Two suites guard replay and accounting:
 A change to engine state, its serialization, or what a command does changes the roots that existing
 logs replay to. It ships as a new protocol version, and the committed logs of earlier versions must
 keep passing unchanged. The engine has one protocol version today, `v1.jsonl`; versions that
-activate at a recorded seq arrive with signed client requests (#18). For each later version:
+activate at a recorded seq arrive with signed client requests
+([#18](https://github.com/0xjevons/monkeytrading/issues/18)). For each later version:
 
 1. Extend the session in `examples/reference_log.rs` so it activates the new version and exercises
    the new rules.
