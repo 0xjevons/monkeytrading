@@ -54,8 +54,8 @@ CI on the PR.
   crates, each exiting zero. Run formatters as checkers, never as writers. In
   [ci.yaml](../../.github/workflows/ci.yaml) those are `cargo fmt --all -- --check`,
   `./scripts/check-file-loc.sh`, `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test -p <crate>` for each affected crate, and `cargo deny check` when dependencies
-  change.
+  `cargo test -p <crate>` for each affected crate, `./scripts/check-reference-logs.sh` when
+  `crates/core/tests/reference/` changes, and `cargo deny check` when dependencies change.
 - A push to a draft PR may carry failing or skipped checks when the PR says which; every check
   passes before the PR is marked ready.
 - When the change touches a shared or public surface, add its direct consumers, since a check

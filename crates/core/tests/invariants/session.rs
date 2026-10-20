@@ -210,7 +210,7 @@ fn action() -> impl Strategy<Value = Action> {
 }
 
 /// An order of any kind: a market order quoted near the mark, a limit or stop up to 5% away, or an
-/// exact, possibly invalid, price; sized as a notional or an exact qty.
+/// exact, possibly invalid, price; sized as a leverage on equity, a notional, or an exact qty.
 fn order() -> impl Strategy<Value = Order> {
     let exact = || amount().prop_map(Price::Exact);
     let quoted = prop_oneof![8 => (-40i64..=40).prop_map(Price::Bps), 1 => exact()];

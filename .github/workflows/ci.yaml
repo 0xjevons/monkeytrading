@@ -97,7 +97,13 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Check committed reference logs are unchanged
-        run: ./scripts/check-reference-logs.sh origin/main
+        env:
+          # A PR against its base, a push against the commit it replaced, a manual run against main.
+          BASE: >-
+            ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha
+            || github.event_name == 'push' && github.event.before
+            || 'origin/main' }}
+        run: ./scripts/check-reference-logs.sh "$BASE"
 
   cargo-deny:
     runs-on: ubuntu-24.04

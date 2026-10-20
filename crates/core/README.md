@@ -82,10 +82,11 @@ Two suites guard replay and accounting:
 
 A change to engine state, its serialization, or what a command does changes the roots that existing
 logs replay to. It ships as a new protocol version, and the committed logs of earlier versions must
-keep passing unchanged:
+keep passing unchanged. The engine has one protocol version today, `v1.jsonl`; versions that
+activate at a recorded seq arrive with signed client requests (#18). For each later version:
 
-1. Extend the session in `examples/reference_log.rs` so it activates the new version where the log
-   records it and exercises the new rules.
+1. Extend the session in `examples/reference_log.rs` so it activates the new version and exercises
+   the new rules.
 2. Write the version's log, which the generator refuses to do over an existing file:
    `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`
 3. Commit the file. The replay test and CI pick it up with no other change.
