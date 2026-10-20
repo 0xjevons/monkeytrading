@@ -15,18 +15,16 @@ use std::path::PathBuf;
 use anyhow::anyhow;
 use chrono::NaiveDate;
 use common::reference::{ReferenceEntry, root_hex};
-use common::{AAPL, BTC, ETH, Harness, acct, f, market, ny, params, us_equities};
+use common::{AAPL, BTC, ETH, Harness, UNLISTED, acct, f, market, ny, params, us_equities};
 use engine_core::Engine;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::Event;
 use engine_core::market::Tier;
-use engine_core::params::ProtocolParams;
+use engine_core::params::{ProtocolParams, ToxicityParams};
 use engine_core::price::SourceQuote;
 use engine_core::session::Schedule;
 use engine_core::types::{AccountId, AssetClass, MarketId, OrderId, Side};
 
-/// A market id nothing lists.
-const UNLISTED: MarketId = 99;
 /// A market the session lists with two margin bands.
 const SOL: MarketId = 10;
 
@@ -197,6 +195,8 @@ fn session() -> Vec<Sequenced> {
     // Admin: new parameters and listings, and refusals of each kind.
     h.admin(AdminCommand::SetParams(ProtocolParams { profit_fee_bps: 1_500, ..params() }));
     h.cmd(Command::Admin(AdminCommand::SetParams(ProtocolParams { closeout_level_bps: 0, ..params() })));
+    let toxicity = ToxicityParams { horizon_ms: 3_600_001, ..params().toxicity };
+    h.cmd(Command::Admin(AdminCommand::SetParams(ProtocolParams { toxicity, ..params() })));
     let mut eth = market(ETH, "ETH-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000);
     eth.min_order_notional = f("100");
     h.admin(AdminCommand::UpsertMarket(eth));

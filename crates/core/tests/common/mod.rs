@@ -19,6 +19,8 @@ use engine_core::{Engine, Fixed};
 pub const BTC: MarketId = 1;
 pub const ETH: MarketId = 2;
 pub const AAPL: MarketId = 3;
+/// A market id nothing lists.
+pub const UNLISTED: MarketId = 99;
 pub const HOUSE_CAPITAL: i64 = 100_000_000;
 
 /// A sequenced engine with three markets and 100m of house capital, plus a record of the log and

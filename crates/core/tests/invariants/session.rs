@@ -16,10 +16,8 @@ use proptest::prop_oneof;
 use proptest::sample::select;
 use proptest::strategy::{Just, Strategy};
 
-use crate::common::{AAPL, BTC, ETH, acct, market, params, us_equities};
+use crate::common::{AAPL, BTC, ETH, UNLISTED, acct, market, params, us_equities};
 
-/// A market id the harness does not list.
-const UNLISTED: MarketId = 99;
 /// A market id only generated listings use.
 const NEW_MARKET: MarketId = 10;
 const DAY_MS: Millis = 86_400_000;

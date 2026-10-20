@@ -239,13 +239,13 @@ mod tests {
     #[test]
     fn markout_horizon_is_positive_and_at_most_an_hour() {
         let mut p = params();
-        // One hour, to the millisecond.
+        // The bounds: 1 ms and one hour.
         for horizon_ms in [1, 3_600_000] {
             p.toxicity.horizon_ms = horizon_ms;
             assert!(p.validate().is_ok(), "{horizon_ms}");
         }
-        // Past the cap a markout could hold back every later one for longer; near `i64::MAX` its
-        // due time would overflow.
+        // A markout needs a positive horizon. Past the cap one could hold back every later markout
+        // for longer, and near `i64::MAX` its due time would overflow.
         for horizon_ms in [i64::MIN, -1, 0, 3_600_001, i64::MAX] {
             p.toxicity.horizon_ms = horizon_ms;
             assert!(p.validate().is_err(), "{horizon_ms}");

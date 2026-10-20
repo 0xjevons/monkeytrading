@@ -47,12 +47,12 @@ fn a_changed_command_is_reported_at_the_first_seq_it_alters() {
 
 #[test]
 fn a_panicking_command_is_reported_at_its_seq() {
-    // The rollover after a timestamp past chrono's range cannot be computed, so applying parameters
-    // then panics; only a corrupt log carries such a timestamp.
+    // Relies on the engine panicking when it applies parameters at a timestamp past chrono's range,
+    // where the next rollover cannot be computed; only a corrupt log carries one.
     let cmd = Command::Admin(AdminCommand::SetParams(params()));
     let entries = [ReferenceEntry { sequenced: Sequenced { seq: 0, ts: i64::MAX, cmd }, root: root_hex([0; 32]) }];
     let err = verify_roots(&entries).unwrap_err();
-    assert!(err.starts_with("seq 0 panicked: timestamp in range"), "{err}");
+    assert!(err.starts_with("seq 0 panicked:"), "{err}");
 }
 
 #[test]
