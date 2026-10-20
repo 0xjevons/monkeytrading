@@ -1,6 +1,6 @@
 ---
 name: agent-code-review
-description: Review a branch or GitHub PR against the team development checklist, with the current agent by default, or with independent Claude and Codex reviewers for each requested low, medium, or high review level. Writes local Markdown only; to post the findings on a GitHub PR, use agent-review-pr.
+description: Review a branch or GitHub PR against the team development checklist, with the current agent by default, or with independent Claude and Codex reviewers for each requested low, medium, or high review level. Writes local Markdown only; to post the findings on a GitHub PR, use agent-review-pr. Also says how any skill fixes an accepted finding — by class, not by instance.
 ---
 
 # agent-code-review
@@ -16,7 +16,7 @@ Load in this order:
 
 | File | When | Holds |
 | --- | --- | --- |
-| this file | every run | scope, current-agent review, final report, completion report |
+| this file | every run | scope, current-agent review, final report, completion report, fixing an accepted finding |
 | [development-checklist](../../rules/development-checklist.md) | every run | everything a change must not miss |
 | [references/severity.md](references/severity.md) | every run | how to grade a finding |
 | [references/multi-agent.md](references/multi-agent.md) | multi-agent mode only | reviewer dispatch, cross-validation, consolidation |
@@ -87,6 +87,11 @@ diff. Walk every applicable section of the development checklist in order, desig
 each finding with the severity guide. In current-agent mode, re-check each accepted finding against
 its source before writing the final report.
 
+On a later round over the same branch or PR, the current agent also reads the `fixes.md`
+([Fixing an accepted finding](#fixing-an-accepted-finding)) of every earlier run whose `scope.md`
+names that branch or PR, and checks that each recorded invariant holds across the new diff; a site
+where one fails is a finding.
+
 ## Final report
 
 Write `code-review-final.md` with accepted findings only, grouped under `## Critical`, `## High`,
@@ -144,6 +149,32 @@ rules:
 - **Final review:** the absolute path to `code-review-final.md`.
 
 A calling skill that prints its own report built from these fields skips this one.
+
+## Fixing an accepted finding
+
+This skill never fixes code. Whoever fixes an accepted finding — in a self-review, in the review
+loop before a PR is marked ready
+([agent-create-pr](../agent-create-pr/SKILL.md#before-a-pr-is-ready-for-review)), or when
+addressing PR comments ([agent-address-pr-comments](../agent-address-pr-comments/SKILL.md)) —
+fixes its class, not only the cited instance:
+
+1. **Name the invariant** the finding breaks, in one checkable sentence: "a refused signed request
+   burns its nonce", "rounding favours the house", "every `select!` arm stays live".
+2. **Fix every site.** Find every place in the PR's code, and in the code it touches, where that
+   invariant can fail, and fix them all, not only the cited line. Check both directions and both
+   sides wherever they apply: long and short, read and write, success and error, startup and steady
+   state.
+3. **Test the class.** Add a test that covers the class, as a property or table test where one
+   fits, not only the cited scenario, and mutation-check it as
+   [development-checklist](../../rules/development-checklist.md#13-tests) requires.
+4. **Re-read the fix diff** before the next review round, against the finding's scenario and its
+   neighbours, to check that the fix creates no mirror-image defect.
+5. **Record the invariant and the sites fixed** in the round's notes, so the next round checks the
+   class instead of rediscovering it: `fixes.md` in the run directory of the review that accepted
+   the finding, or, when addressing PR comments, the item's `Changes` and its reply.
+
+The next round still reviews the full diff; the recorded invariants add to what it checks and
+never narrow it.
 
 ## Non-negotiable rules
 

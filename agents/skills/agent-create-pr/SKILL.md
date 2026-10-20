@@ -46,11 +46,12 @@ marked ready, may not.
   ([agent-build-feature](../agent-build-feature/SKILL.md)).
 - **Self-reviewed.** The change was built to
   [development-checklist](../../rules/development-checklist.md); walk every applicable section
-  against the final diff once more and fix what it finds.
+  against the final diff once more and fix what it finds by class
+  ([Fixing an accepted finding](../agent-code-review/SKILL.md#fixing-an-accepted-finding)).
 - **Multi-agent reviewed.** [agent-code-review](../agent-code-review/SKILL.md) ran in multi-agent
   mode at level `medium` or higher on the final diff, so Claude and Codex reviewers cross-validated
-  each other. Fix every accepted Critical, High, and Medium finding and run it again until a run
-  accepts none; Low and Nit findings may remain.
+  each other. Fix every accepted Critical, High, and Medium finding by class and run it again until
+  a run accepts none; Low and Nit findings may remain.
 - **Local checks** for the affected crates passed, per git-workflow; the full CI runs
   on the PR.
 
