@@ -362,6 +362,17 @@ mod tests {
     }
 
     #[test]
+    fn has_exceptions_sees_either_kind() {
+        let early_close = vec![period("2026-11-27 13:00", "2026-11-27 16:00")];
+        let special = vec![period("2026-10-24 10:00", "2026-10-24 12:00")];
+        assert!(!Schedule::AlwaysOpen.has_exceptions());
+        assert!(!us_equities().has_exceptions());
+        assert!(us_equities_with(early_close.clone(), vec![]).has_exceptions());
+        assert!(us_equities_with(vec![], special.clone()).has_exceptions());
+        assert!(us_equities_with(early_close, special).has_exceptions());
+    }
+
+    #[test]
     fn a_schedule_without_exceptions_encodes_as_before_they_existed() {
         // Exactly the keys of the encoding the committed reference logs carry.
         let json = serde_json::to_value(us_equities()).unwrap();

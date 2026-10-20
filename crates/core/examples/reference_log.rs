@@ -70,9 +70,9 @@ fn main() -> anyhow::Result<()> {
 /// (one held back by its spread), cancels, reduce-only (one clipped to the position), stress,
 /// toxicity, a position flip, house capital, withdrawals, a session close and gapped open, financing
 /// rollovers over longs and a short, a two-position close-out with bad debt, two-band margin, an
-/// exchange holiday, an early close and a special session, admin changes, and venue quotes stamped
-/// ahead of the sequenced time, with a rejection of each kind along the way. Every client request is
-/// signed by its account's key unless the comment says otherwise.
+/// exchange holiday, a zero house capital move, an early close and a special session, admin changes,
+/// and venue quotes stamped ahead of the sequenced time, with a rejection of each kind along the way.
+/// Every client request is signed by its account's key unless the comment says otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -254,10 +254,11 @@ fn session() -> Vec<Sequenced> {
     h.advance(100);
     h.quotes(BTC, &["80000", "80010"]);
 
-    // V4 activates at this seq, then a calendar update: Friday closes at 13:00 and Saturday trades a
-    // special session. An order fills before the early close, is refused after it, and fills again in
-    // the special session.
+    // V4 activates at this seq. A zero house capital move then records its reference, and a calendar
+    // update follows: Friday closes at 13:00 and Saturday trades a special session. An order fills
+    // before the early close, is refused after it, and fills again in the special session.
     h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V4 });
+    h.cmd(Command::HouseCapital { amount: f("0"), chain_ref: "house-zero".into() });
     let at = |local: &str| local.parse().expect("a local date and time");
     let schedule = Schedule::Weekly {
         tz,

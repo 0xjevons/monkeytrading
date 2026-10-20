@@ -44,9 +44,8 @@ impl TestSequencer {
         let key = Arc::new(EnclaveKey::generate());
         let mut seq = Sequencer::recover(sequencer_config(dir, manifest_tx), key, stream.clone(), withdrawals_tx)
             .expect("sequencer recovers");
-        let genesis = dev_config().genesis;
-        if seq.needs_genesis(&genesis) {
-            seq.genesis(&genesis).expect("dev genesis");
+        if seq.needs_genesis() {
+            seq.genesis(&dev_config().genesis).expect("dev genesis");
         }
         let (tx, rx) = mpsc::channel(64);
         let task = tokio::spawn(seq.run(rx));

@@ -4,9 +4,11 @@
 mod common;
 
 use common::{BTC, Harness, acct, f, market, rejection};
+use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::{Event, Reject};
 use engine_core::market::MarketSpec;
+use engine_core::protocol::ProtocolVersion;
 use engine_core::session::Schedule;
 use engine_core::types::{AssetClass, Side};
 use engine_core::{Engine, Fixed, SequenceError};
@@ -76,6 +78,34 @@ fn house_capital_is_applied_once_and_never_drains_nav() {
     let ev = h.cmd(Command::HouseCapital { amount: f("-100000000"), chain_ref: "0xout".into() });
     assert!(matches!(&ev[..], [Event::AdminRejected { .. }]));
     assert_eq!(h.engine.house_cash(), cash);
+}
+
+#[test]
+fn a_zero_house_capital_move_records_its_reference_only_from_v4() {
+    let cases = [
+        (ProtocolVersion::V2, Harness::new()),
+        (ProtocolVersion::V3, Harness::v3(ClientAuth::Unsigned)),
+        (ProtocolVersion::V4, Harness::v4(ClientAuth::Unsigned)),
+    ];
+    for (version, mut h) in cases {
+        let cash = h.engine.house_cash();
+        let zero = || Command::HouseCapital { amount: Fixed::ZERO, chain_ref: "zero".into() };
+        let events = h.cmd(zero());
+        if version >= ProtocolVersion::V4 {
+            assert_eq!(events, [Event::HouseCapitalMoved { amount: Fixed::ZERO, nav: h.engine.house_nav() }]);
+            assert!(h.engine.is_credited("zero"));
+            let again = h.cmd(zero());
+            assert!(matches!(&again[..], [Event::AdminRejected { reason }] if reason.contains("already applied")));
+        } else {
+            let refused = matches!(&events[..], [Event::AdminRejected { reason }] if reason.contains("out of range"));
+            assert!(refused, "{version:?}: {events:?}");
+            assert!(!h.engine.is_credited("zero"), "{version:?}");
+        }
+        assert_eq!(h.engine.house_cash(), cash, "{version:?}");
+        // Moves of any other amount behave the same under every version.
+        let one = h.cmd(Command::HouseCapital { amount: f("1"), chain_ref: "one".into() });
+        assert!(matches!(&one[..], [Event::HouseCapitalMoved { .. }]), "{version:?}: {one:?}");
+    }
 }
 
 #[test]

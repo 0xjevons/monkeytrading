@@ -61,6 +61,13 @@ impl Harness {
         h
     }
 
+    /// `v3`, then `V4`, which allows dated schedule exceptions and zero house capital moves.
+    pub fn v4(auth: ClientAuth) -> Self {
+        let mut h = Harness::v3(auth);
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V4 });
+        h
+    }
+
     /// No commands yet, at the harness start time.
     fn empty() -> Self {
         Harness { engine: Engine::new(), log: vec![], ts: start(), deposits: Fixed::ZERO, signers: BTreeMap::new() }

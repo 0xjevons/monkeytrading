@@ -171,16 +171,10 @@ impl Sequencer {
         Ok(sequencer)
     }
 
-    /// Whether `genesis` has yet to finish: its last command is not in the log. That is the house
-    /// capital credit, or, for a house that starts with no capital, the last market listing.
-    /// Genesis commands are safe to repeat, so a genesis cut short runs again in full.
-    pub fn needs_genesis(&self, genesis: &Genesis) -> bool {
-        match genesis_commands(genesis).last() {
-            Some(Command::HouseCapital { .. }) => !self.engine.is_credited(GENESIS_REF),
-            Some(Command::Admin(AdminCommand::UpsertMarket(spec))) => !self.engine.markets().contains_key(&spec.id),
-            // `NodeConfig::validate` refuses a genesis without markets; parameters come first.
-            _ => self.engine.params().is_none(),
-        }
+    /// Whether genesis has yet to finish: its last command, the house capital credit, is not in
+    /// the log. Genesis commands are safe to repeat, so a genesis cut short runs again in full.
+    pub fn needs_genesis(&self) -> bool {
+        !self.engine.is_credited(GENESIS_REF)
     }
 
     /// Records the config's client auth and activates the latest protocol version, whichever the
@@ -445,17 +439,15 @@ fn ensure_signed(
     }
 }
 
-/// The commands that sequence `genesis` into an empty log, in order. A house that starts with no
-/// capital gets no `HouseCapital` command, as the engine refuses a zero amount.
+/// The commands that sequence `genesis` into an empty log, in order. The last is the house capital
+/// credit under `GENESIS_REF`, a zero one included, which marks genesis done.
 pub fn genesis_commands(genesis: &Genesis) -> Vec<Command> {
     let mut cmds = vec![Command::Admin(AdminCommand::SetParams(genesis.params.clone()))];
     cmds.extend(genesis.benchmarks.iter().map(|b| {
         Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: b.name.clone(), annual_bps: b.annual_bps })
     }));
     cmds.extend(genesis.markets.iter().map(|m| Command::Admin(AdminCommand::UpsertMarket(m.clone()))));
-    if genesis.house_capital != Fixed::ZERO {
-        cmds.push(Command::HouseCapital { amount: genesis.house_capital, chain_ref: GENESIS_REF.into() });
-    }
+    cmds.push(Command::HouseCapital { amount: genesis.house_capital, chain_ref: GENESIS_REF.into() });
     cmds
 }
 

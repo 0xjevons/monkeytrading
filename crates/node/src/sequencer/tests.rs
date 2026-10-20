@@ -267,11 +267,12 @@ fn a_restart_with_the_recorded_client_auth_sequences_nothing() {
 #[test]
 fn a_genesis_cut_short_runs_again_on_restart() {
     // With house capital and without it, a genesis cut short at any command runs again in full, and
-    // a complete one is not run again.
+    // a finished one is not run again.
     for capital in [dev_config().genesis.house_capital, Fixed::ZERO] {
         let mut genesis = dev_config().genesis;
         genesis.house_capital = capital;
         let all = genesis_commands(&genesis);
+        assert!(matches!(all.last(), Some(Command::HouseCapital { .. })), "genesis ends with its credit");
         for cut in [0, 1, all.len() / 2, all.len() - 1] {
             let name = format!("capital-{capital}-cut-{cut}");
             let dir = scratch_dir(&format!("genesis-{name}"));
@@ -281,14 +282,15 @@ fn a_genesis_cut_short_runs_again_on_restart() {
             drop(seq);
 
             let mut seq = recover(&dir, &signed(31_337));
-            assert!(seq.needs_genesis(&genesis), "{name}");
+            assert!(seq.needs_genesis(), "{name}");
             seq.activate_protocol().unwrap();
             seq.genesis(&genesis).unwrap();
             drop(seq);
             let replayed = replay(&entries(&dir)).unwrap();
             assert_eq!(replayed.engine.markets().len(), genesis.markets.len(), "{name}");
             assert_eq!(replayed.engine.house_cash(), genesis.house_capital, "{name}");
-            assert!(!recover(&dir, &signed(31_337)).needs_genesis(&genesis), "{name}");
+            // The credit is in the log now, so no later edit to the config's genesis reopens it.
+            assert!(!recover(&dir, &signed(31_337)).needs_genesis(), "{name}");
         }
     }
 }
@@ -340,23 +342,6 @@ fn a_restart_under_other_client_auth_signs_no_withdrawal_the_log_ends_before() {
     assert!(format!("{err:#}").contains("the log records client auth"), "{err:#}");
     assert!(withdrawals.try_recv().is_err(), "a withdrawal was signed under the other chain and vault");
     assert_eq!(fs::read_to_string(&segment).unwrap(), cut);
-}
-
-#[test]
-fn genesis_credits_house_capital_only_when_there_is_some() {
-    let mut genesis = crate::test_support::dev_config().genesis;
-    let credit = |genesis: &Genesis| {
-        genesis_commands(genesis).into_iter().filter(|cmd| matches!(cmd, Command::HouseCapital { .. })).count()
-    };
-    assert_eq!(credit(&genesis), 1);
-    genesis.house_capital = Fixed::ZERO;
-    assert_eq!(credit(&genesis), 0);
-    // Every market is still listed.
-    let listings = genesis_commands(&genesis)
-        .iter()
-        .filter(|cmd| matches!(cmd, Command::Admin(AdminCommand::UpsertMarket(_))))
-        .count();
-    assert_eq!(listings, genesis.markets.len());
 }
 
 // ── Helpers ──

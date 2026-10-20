@@ -145,42 +145,56 @@ fn a_log_with_a_calendar_update_replays_to_the_roots_it_recorded() {
 #[test]
 fn dated_exceptions_are_accepted_only_from_v4() {
     // Under each version, a weekly schedule without exceptions is accepted, and one with an early
-    // close is accepted from V4 on.
-    let cases = [
-        (ProtocolVersion::V2, Harness::new()),
-        (ProtocolVersion::V3, Harness::v3(ClientAuth::Unsigned)),
-        (ProtocolVersion::V4, v4()),
-    ];
-    for (version, mut h) in cases {
-        assert_eq!(h.engine.protocol_version(), version);
-        let plain =
-            Command::Admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, us_equities(), 2_000)));
-        assert_eq!(h.cmd(plain), [Event::AdminApplied], "{version:?}");
-        let events = h.cmd(calendar_update(&["2026-10-22"]));
-        if version >= ProtocolVersion::V4 {
-            assert!(events.contains(&Event::AdminApplied), "{version:?}: {events:?}");
-            assert!(h.engine.markets()[&AAPL].spec.schedule.has_exceptions());
-        } else {
-            let refused =
-                matches!(&events[..], [Event::AdminRejected { reason }] if reason.contains("need protocol V4"));
-            assert!(refused, "{version:?}: {events:?}");
-            assert_eq!(h.engine.markets()[&AAPL].spec.schedule, us_equities());
+    // close, or with a special session only, is accepted from V4 on.
+    let updates = [("early close", calendar_update(&["2026-10-22"])), ("special session", special_session_update())];
+    for (kind, update) in updates {
+        let cases = [
+            (ProtocolVersion::V2, Harness::new()),
+            (ProtocolVersion::V3, Harness::v3(ClientAuth::Unsigned)),
+            (ProtocolVersion::V4, v4()),
+        ];
+        for (version, mut h) in cases {
+            assert_eq!(h.engine.protocol_version(), version);
+            let plain = Command::Admin(AdminCommand::UpsertMarket(market(
+                AAPL,
+                "AAPL",
+                AssetClass::Equity,
+                us_equities(),
+                2_000,
+            )));
+            assert_eq!(h.cmd(plain), [Event::AdminApplied], "{kind} {version:?}");
+            let events = h.cmd(update.clone());
+            if version >= ProtocolVersion::V4 {
+                assert!(events.contains(&Event::AdminApplied), "{kind} {version:?}: {events:?}");
+                assert!(h.engine.markets()[&AAPL].spec.schedule.has_exceptions(), "{kind}");
+            } else {
+                let refused =
+                    matches!(&events[..], [Event::AdminRejected { reason }] if reason.contains("need protocol V4"));
+                assert!(refused, "{kind} {version:?}: {events:?}");
+                assert_eq!(h.engine.markets()[&AAPL].spec.schedule, us_equities(), "{kind}");
+            }
         }
     }
 }
 
 // ── Helpers ──
 
-/// `Harness::v3` with unsigned client requests, moved on to `V4`, which allows dated exceptions.
+/// `Harness::v4` with unsigned client requests.
 fn v4() -> Harness {
-    let mut h = Harness::v3(ClientAuth::Unsigned);
-    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V4 });
-    h
+    Harness::v4(ClientAuth::Unsigned)
 }
 
 /// An admin command re-listing AAPL with a 13:00 New York close on each date.
 fn calendar_update(dates: &[&str]) -> Command {
     let spec = market(AAPL, "AAPL", AssetClass::Equity, early_closes(dates), 2_000);
+    Command::Admin(AdminCommand::UpsertMarket(spec))
+}
+
+/// An admin command re-listing AAPL with a Saturday 24 Oct 2026 10:00-12:00 special session only.
+fn special_session_update() -> Command {
+    let mut schedule = serde_json::to_value(us_equities()).unwrap();
+    schedule["special_sessions"] = serde_json::json!([{ "from": "2026-10-24T10:00:00", "to": "2026-10-24T12:00:00" }]);
+    let spec = market(AAPL, "AAPL", AssetClass::Equity, serde_json::from_value(schedule).unwrap(), 2_000);
     Command::Admin(AdminCommand::UpsertMarket(spec))
 }
 

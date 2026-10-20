@@ -1,7 +1,7 @@
 //! The production genesis: it loads as a dev node's genesis, every market validates and carries the
-//! launch decisions, markets on one venue share one calendar, and sequenced the way the node
-//! sequences it, a week with a holiday and early closes opens and closes each market on its venue's
-//! hours.
+//! launch decisions, and markets on one venue share one calendar. Sequenced as the node sequences
+//! it, each market opens and closes on its venue's hours through weeks with holidays and early
+//! closes.
 
 use std::collections::BTreeMap;
 use std::fs;

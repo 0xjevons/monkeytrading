@@ -31,7 +31,8 @@ pub enum ProtocolVersion {
     /// Orders, cancels, and withdrawals are authorised as the log's `ClientAuth` records: by the
     /// account's EIP-712 signature, next nonce, and expiry, or unsigned in dev logs.
     V3,
-    /// Schedules may carry dated closures and special sessions.
+    /// Schedules may carry dated closures and special sessions, and a house capital move of zero
+    /// records its reference without moving cash.
     V4,
 }
 

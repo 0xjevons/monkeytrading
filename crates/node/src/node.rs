@@ -88,7 +88,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
     seq.activate_protocol()
         .inspect_err(|e| error!(alert = "protocol_activation_failed", "refusing to serve: {e:#}"))?;
-    if seq.needs_genesis(&cfg.genesis) {
+    if seq.needs_genesis() {
         info!(markets = cfg.genesis.markets.len(), "sequencing genesis");
         seq.genesis(&cfg.genesis)?;
     }
