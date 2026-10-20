@@ -69,9 +69,9 @@ cargo test -p engine-core
 Two suites guard replay and accounting:
 
 - `cargo test -p engine-core --test reference_logs` replays every log in `tests/reference/` and fails
-  at the first seq whose state root differs from the committed one. CI runs it on x86_64 Linux,
-  aarch64 Linux, and macOS, and `scripts/check-reference-logs.sh` fails a branch that changes,
-  renames, or deletes a committed log.
+  at the first seq whose state root differs from the committed one. CI runs it on x86_64 and
+  aarch64 Linux, plus macOS on pushes to `main`, and `scripts/check-reference-logs.sh` fails a
+  branch that changes, renames, or deletes a committed log.
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed. Each
   mixes client, feed, custody, and operator commands, with values inside and outside the input
   bounds, and checks after every command that nothing panicked, cash is conserved, and every
