@@ -11,10 +11,10 @@ use crate::types::Millis;
 const MAX_RATE_BPS: i64 = 10_000;
 /// The most a multiplier or house cap may be: ten times.
 const MAX_MULTIPLE_BPS: i64 = 100_000;
-/// The longest markout horizon: one day. A longer one can overflow a markout's due time, and
-/// markouts are marked in fill order, so one queued under a long horizon holds back every later one
-/// once the horizon is lowered.
-const MAX_HORIZON_MS: i64 = 86_400_000;
+/// The longest markout horizon: one hour. A horizon near `i64::MAX` overflows a markout's due time,
+/// and markouts are marked in fill order, so one queued under a long horizon holds back every later
+/// one once the horizon is lowered; the cap bounds that wait.
+const MAX_HORIZON_MS: i64 = 3_600_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,7 +98,7 @@ impl ProtocolParams {
     /// - no stress levels, a trigger on level 0, a multiplier outside 0..=100000 bps, a minimum
     ///   spread outside 0..=10000 bps, or a negative trigger threshold
     /// - a non-positive move window, or a negative cooldown
-    /// - a toxicity horizon outside 1..=86400000 ms, an EWMA weight outside 1..=10000 bps, tiers
+    /// - a toxicity horizon outside 1..=3600000 ms, an EWMA weight outside 1..=10000 bps, tiers
     ///   not strictly ascending, or an extra spread outside 0..=10000 bps
     /// - a rollover time that does not exist (hour above 23 or minute above 59)
     pub fn validate(&self) -> Result<(), String> {
@@ -133,7 +133,7 @@ impl ProtocolParams {
         }
         let tox = &self.toxicity;
         if !(1..=MAX_HORIZON_MS).contains(&tox.horizon_ms) || !(1..=MAX_RATE_BPS).contains(&tox.ewma_weight_bps) {
-            return Err("toxicity needs horizon_ms in 1..=86400000 and ewma_weight_bps in 1..=10000".into());
+            return Err("toxicity needs horizon_ms in 1..=3600000 and ewma_weight_bps in 1..=10000".into());
         }
         if tox.tiers.windows(2).any(|w| w[0].min_score_bps >= w[1].min_score_bps)
             || tox.tiers.iter().any(|t| !rate.contains(&t.extra_spread_bps))
@@ -237,14 +237,16 @@ mod tests {
     }
 
     #[test]
-    fn markout_horizon_is_positive_and_at_most_a_day() {
+    fn markout_horizon_is_positive_and_at_most_an_hour() {
         let mut p = params();
-        for horizon_ms in [1, MAX_HORIZON_MS] {
+        // One hour, to the millisecond.
+        for horizon_ms in [1, 3_600_000] {
             p.toxicity.horizon_ms = horizon_ms;
             assert!(p.validate().is_ok(), "{horizon_ms}");
         }
-        // A longer horizon would overflow the markout's due time, or hold back every later markout.
-        for horizon_ms in [i64::MIN, -1, 0, MAX_HORIZON_MS + 1, i64::MAX] {
+        // Past the cap a markout could hold back every later one for longer; near `i64::MAX` its
+        // due time would overflow.
+        for horizon_ms in [i64::MIN, -1, 0, 3_600_001, i64::MAX] {
             p.toxicity.horizon_ms = horizon_ms;
             assert!(p.validate().is_err(), "{horizon_ms}");
         }
