@@ -10,7 +10,8 @@ explains how to reach us, what we commit to in return, and what it covers.
 
 Email reports to william.jevons@proton.me. Please do not describe a vulnerability in a public
 issue, pull request, or discussion, even in outline. Mail sent from a Proton account is end-to-end
-encrypted; a PGP key for senders on other providers will be published in this file.
+encrypted; a PGP key for senders on other providers will be published in this file. Either way,
+please keep the details out of the subject line.
 
 A report is easiest to act on when it names the affected component and the commit of `main` you
 tested, says what an attacker can achieve and what access they need first, and shows how to
@@ -22,9 +23,9 @@ a fix in mind, whether anyone else knows of the issue, and how you would like to
 
 We aim to acknowledge a report within three business days. Within ten business days of receiving
 it, we will tell you whether we can reproduce the issue, how severe we judge it, and what we plan to
-do. We aim to fix a vulnerability that can take funds, expose signing keys, corrupt the published
-log, or halt the engine within 30 days of your report, and any other within 90 days of it, and we
-will keep you informed until it is resolved. If we conclude that a report does not describe a
+do. We aim to fix a vulnerability of a kind that the Scope section below lists as mattering most
+within 30 days of your report, and any other within 90 days of it, and we will keep you informed
+until it is resolved. If we conclude that a report does not describe a
 vulnerability, we will explain why.
 
 ## Coordinated disclosure
@@ -43,11 +44,12 @@ you so.
 We will not take or support legal action against anyone who researches and reports a vulnerability
 in good faith under this policy, and if a third party does, we will make it known that the research
 was authorised. Good faith means demonstrating a vulnerability on a node you run yourself rather
-than on a live deployment; if you notice one while using a live deployment, stopping there, trading
-only from your own accounts, and never withdrawing or keeping funds it gained you; never accessing,
-changing, or destroying anyone else's data; not degrading the service for other users; and keeping
-the details private as this policy asks. If you are unsure whether something you plan to do is
-covered, ask us before you do it.
+than on a live deployment; never accessing anyone else's data beyond what the engine publishes
+through its log and public API, and never changing or destroying it; not degrading the service for
+other users; and keeping the details private as this policy asks. If you come across a
+vulnerability while using a live deployment, trade only from your own accounts, stop as soon as you
+have seen the problem, report it, and never withdraw or keep funds it gained you. If you are unsure
+whether something you plan to do is covered, ask us before you do it.
 
 ## Scope
 
@@ -67,8 +69,9 @@ The node's development settings, which are the mock enclave, mock custody, simul
 unsigned requests, exist for local testing and make no security claims, so a weakness in them is in
 scope only if a production configuration can reach it. The same holds for development-only
 endpoints such as `POST /v1/dev/deposit`, which the node serves only with mock custody. A production
-configuration uses hardware attestation, on-chain custody, live prices, and signed requests; all but
-hardware attestation are still being built.
+configuration uses hardware attestation, on-chain custody, live prices, and signed requests, and
+none of these is finished: the node can request an attestation report through configfs-tsm, but
+attestation on SEV-SNP hardware and a verifier for it are still being built, as are the other three.
 
 Out of scope are volumetric denial of service, meaning attacks that work only by flooding the API or
 the network with traffic; social engineering of anyone involved with the project; and

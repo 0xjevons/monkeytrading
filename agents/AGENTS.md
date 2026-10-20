@@ -43,7 +43,8 @@ an index: load only the rule whose hint matches the current action.
   and run it, and how to contribute. Keep its status and quick start in step with the code.
 - **SECURITY.md** — the security policy: the private reporting address, response times,
   coordinated disclosure, safe harbour, scope, and supported versions; the README's Security
-  section points to it. Keep its scope in step with the components the repository ships.
+  section points to it. Keep its scope, the parts it marks as still being built, and its known gaps
+  in step with the code.
 - **LICENSE** — Apache License 2.0.
 
 ## Commands
