@@ -31,7 +31,10 @@ an index: load only the rule whose hint matches the current action.
   others unpriced. Its `[genesis]` section is protocol: it is sequenced into the log as admin
   commands on first boot. `node.auth`, with `custody.chain_id` and `custody.vault` under `eip712`,
   is recorded in the log when it first activates protocol versions, so changing it needs a fresh
-  log. Every section rejects unknown keys.
+  log. `production-genesis.toml` is the production `[genesis]` section alone: the launch markets
+  with their venue calendars, each calendar's sources and unpublished gaps, and the launch margins
+  and fees; a deployment's node sections complete it into a config. Every section rejects unknown
+  keys.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate, and
   `check-reference-logs.sh`, which fails a branch that changes a committed reference log.
 - **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, the reference-log
@@ -67,6 +70,7 @@ Run from the repo root:
   `./scripts/check-reference-logs.sh [base]` checks none changed since `base` (default
   `origin/main`)
 - Property tests: `cargo test -p engine-core --test invariants`
+- Production genesis and its calendars: `cargo test -p engine-node --test production_genesis`
 - New protocol version's reference log:
   `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`, then
   the node's from it: `cargo run -p engine-node --example reference_log --

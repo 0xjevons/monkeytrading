@@ -23,7 +23,7 @@ use engine_core::event::Event;
 use engine_core::market::Tier;
 use engine_core::params::{ProtocolParams, ToxicityParams};
 use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
-use engine_core::session::Schedule;
+use engine_core::session::{Period, Schedule};
 use engine_core::types::{AccountId, AssetClass, MarketId, OrderId, Side};
 
 /// A market the session lists with two margin bands.
@@ -69,9 +69,9 @@ fn main() -> anyhow::Result<()> {
 /// (one held back by its spread), cancels, reduce-only (one clipped to the position), stress,
 /// toxicity, a position flip, house capital, withdrawals, a session close and gapped open, financing
 /// rollovers over longs and a short, a two-position close-out with bad debt, two-band margin, an
-/// exchange holiday, admin changes, and venue quotes stamped ahead of the sequenced time, with a
-/// rejection of each kind along the way. Every client request is signed by its account's key unless
-/// the comment says otherwise.
+/// exchange holiday, an early close and a special session, admin changes, and venue quotes stamped
+/// ahead of the sequenced time, with a rejection of each kind along the way. Every client request is
+/// signed by its account's key unless the comment says otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -230,7 +230,13 @@ fn session() -> Vec<Sequenced> {
     // An exchange holiday on Thursday keeps AAPL shut through its session hours.
     let Schedule::Weekly { tz, windows, .. } = us_equities() else { unreachable!("US equities keep weekly hours") };
     let holiday = NaiveDate::from_ymd_opt(2026, 10, 22).expect("a real date");
-    let schedule = Schedule::Weekly { tz, windows, closed_dates: vec![holiday] };
+    let schedule = Schedule::Weekly {
+        tz,
+        windows: windows.clone(),
+        closed_dates: vec![holiday],
+        closures: vec![],
+        special_sessions: vec![],
+    };
     h.admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, schedule, 2_000)));
     h.advance_to(ny(2026, 10, 22, 10, 0));
     h.cmd(Command::Tick);
@@ -246,6 +252,29 @@ fn session() -> Vec<Sequenced> {
     });
     h.advance(100);
     h.quotes(BTC, &["80000", "80010"]);
+
+    // A calendar update: Friday closes at 13:00 and Saturday trades a special session. An order fills
+    // before the early close, is refused after it, and fills again in the special session.
+    let at = |local: &str| local.parse().expect("a local date and time");
+    let schedule = Schedule::Weekly {
+        tz,
+        windows,
+        closed_dates: vec![holiday],
+        closures: vec![Period { from: at("2026-10-23T13:00:00"), to: at("2026-10-23T16:00:00") }],
+        special_sessions: vec![Period { from: at("2026-10-24T10:00:00"), to: at("2026-10-24T12:00:00") }],
+    };
+    h.admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, schedule, 2_000)));
+    h.advance_to(ny(2026, 10, 23, 12, 59));
+    h.price(AAPL, "201");
+    h.market_order(a, AAPL, Side::Buy, "1", "201");
+    h.advance_to(ny(2026, 10, 23, 13, 0));
+    h.cmd(Command::Tick);
+    h.market_order(a, AAPL, Side::Buy, "1", "201");
+    h.advance_to(ny(2026, 10, 24, 10, 0));
+    h.price(AAPL, "199");
+    h.market_order(a, AAPL, Side::Sell, "1", "199");
+    h.advance_to(ny(2026, 10, 24, 12, 0));
+    h.cmd(Command::Tick);
     h.log
 }
 

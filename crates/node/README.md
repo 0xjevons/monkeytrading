@@ -78,6 +78,8 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `tests/reference/` — one node-format reference log per protocol version, never regenerated
 - `tests/replay.rs` — replays a log the node wrote before protocol versions, kept in
   `tests/fixtures/`
+- `tests/production_genesis.rs` — loads `config/production-genesis.toml` as a dev node's genesis,
+  checks the launch values, and steps it through weeks with holidays and early closes
 
 ## Usage
 

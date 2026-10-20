@@ -336,6 +336,23 @@ fn a_restart_under_other_client_auth_signs_no_withdrawal_the_log_ends_before() {
     assert_eq!(fs::read_to_string(&segment).unwrap(), cut);
 }
 
+#[test]
+fn genesis_credits_house_capital_only_when_there_is_some() {
+    let mut genesis = crate::test_support::dev_config().genesis;
+    let credit = |genesis: &Genesis| {
+        genesis_commands(genesis).into_iter().filter(|cmd| matches!(cmd, Command::HouseCapital { .. })).count()
+    };
+    assert_eq!(credit(&genesis), 1);
+    genesis.house_capital = Fixed::ZERO;
+    assert_eq!(credit(&genesis), 0);
+    // Every market is still listed.
+    let listings = genesis_commands(&genesis)
+        .iter()
+        .filter(|cmd| matches!(cmd, Command::Admin(AdminCommand::UpsertMarket(_))))
+        .count();
+    assert_eq!(listings, genesis.markets.len());
+}
+
 // ── Helpers ──
 
 /// The segment file the log appends to.

@@ -196,6 +196,8 @@ pub struct MockMid {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Genesis {
+    /// House capital credited at genesis. Zero credits none.
+    /// TODO: nothing checks this against the house's vault deposit; bound it once custody reads it.
     pub house_capital: Fixed,
     pub params: ProtocolParams,
     #[serde(default)]
