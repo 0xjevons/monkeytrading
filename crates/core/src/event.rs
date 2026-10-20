@@ -78,7 +78,8 @@ pub enum Event {
         market: MarketId,
         level: usize,
     },
-    /// A price update the engine ignored: an unknown market, or a malformed venue quote.
+    /// A price update the engine ignored: an unknown market, a malformed venue quote, or a quote
+    /// stamped more than `MAX_QUOTE_LEAD_MS` after the sequenced time.
     PricesRejected {
         market: MarketId,
         reason: String,

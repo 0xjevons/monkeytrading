@@ -11,6 +11,10 @@ use crate::Fixed;
 use crate::market::PriceRules;
 use crate::types::Millis;
 
+/// How far after the sequenced time a venue may stamp a quote: the disagreement between a venue's
+/// clock and the sequencer's that the engine tolerates. A quote stamped further ahead is refused.
+pub const MAX_QUOTE_LEAD_MS: Millis = 1_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PriceError {

@@ -15,7 +15,7 @@ use crate::command::{Command, Sequenced};
 use crate::event::Event;
 use crate::market::MarketSpec;
 use crate::params::ProtocolParams;
-use crate::price::{SourceQuote, compute_index};
+use crate::price::{MAX_QUOTE_LEAD_MS, SourceQuote, compute_index};
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
 
 /// Clamp on a single markout, so one wild print cannot dominate an account's toxicity score.
@@ -237,8 +237,10 @@ impl Engine {
     }
 
     /// Stores venue quotes, then, if the market is open and priced, marks it, updates stress,
-    /// triggers resting orders, and checks close-outs. Malformed quotes are refused one by one.
+    /// triggers resting orders, and checks close-outs. Malformed quotes, and quotes stamped more than
+    /// `MAX_QUOTE_LEAD_MS` after the sequenced time, are refused one by one.
     fn on_prices(&mut self, market_id: MarketId, quotes: &[SourceQuote], events: &mut Vec<Event>) {
+        let now = self.now;
         let Some(market) = self.markets.get_mut(&market_id) else {
             events.push(Event::PricesRejected { market: market_id, reason: "unknown market".into() });
             return;
@@ -249,7 +251,18 @@ impl Engine {
                 events.push(Event::PricesRejected { market: market_id, reason });
                 continue;
             }
-            if market.quotes.get(&quote.source).is_none_or(|old| quote.ts >= old.ts) {
+            let lead_ms = quote.ts.saturating_sub(now);
+            if lead_ms > MAX_QUOTE_LEAD_MS {
+                // The venue's clock disagrees with the sequencer's, so its stored quote's age is
+                // unknown too: the venue has no price until it sends a quote within the limit.
+                market.quotes.remove(&quote.source);
+                let reason = format!("quote from {} stamped {lead_ms}ms ahead of the sequenced time", quote.source);
+                events.push(Event::PricesRejected { market: market_id, reason });
+                continue;
+            }
+            // A stored quote stamped after the sequenced time does not count yet, so it never holds
+            // back a replacement.
+            if market.quotes.get(&quote.source).is_none_or(|old| quote.ts >= old.ts || old.ts > now) {
                 market.quotes.insert(quote.source.clone(), quote.clone());
             }
         }

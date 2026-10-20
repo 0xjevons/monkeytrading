@@ -7,8 +7,8 @@ use common::{BTC, Harness, acct, f, fills, rejection};
 use engine_core::Fixed;
 use engine_core::command::{AdminCommand, Command, OrderKind};
 use engine_core::event::{Event, Reject};
-use engine_core::price::SourceQuote;
-use engine_core::types::Side;
+use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
+use engine_core::types::{Millis, Side};
 
 #[test]
 fn normal_size_fills_at_mid_and_only_winners_pay() {
@@ -117,6 +117,77 @@ fn malformed_quotes_are_refused_without_affecting_good_ones() {
 }
 
 #[test]
+fn a_quote_stamped_an_hour_ahead_is_refused_and_the_venue_counts_again_on_its_next_quote() {
+    let mut h = Harness::new();
+    let a = acct(1);
+    h.deposit(a, "100000");
+    h.price(BTC, "100000");
+
+    // venue0's clock jumps an hour ahead for one quote.
+    h.advance(100);
+    let ev = h.cmd(Command::Prices { market: BTC, quotes: vec![quote("venue0", "100000", h.ts + 3_600_000)] });
+    assert!(
+        ev.iter().any(|e| matches!(e, Event::PricesRejected { market: BTC, reason } if reason.contains("venue0"))),
+        "{ev:?}"
+    );
+
+    // Correctly stamped quotes follow. Two venues are needed, so the mark at their mean shows venue0
+    // counts, and orders fill again.
+    h.advance(100);
+    h.quotes(BTC, &["100000", "100100"]);
+    assert_eq!(h.engine.markets()[&BTC].mark, Some(f("100050")));
+    let ev = h.market_order(a, BTC, Side::Buy, "0.1", "100050");
+    assert_eq!(fills(&ev)[0].price, f("100050"));
+}
+
+#[test]
+fn a_quote_is_kept_at_the_lead_limit_and_refused_one_millisecond_past_it() {
+    let mut h = Harness::new();
+    let limit = h.ts + MAX_QUOTE_LEAD_MS;
+    let quotes = vec![quote("venue0", "100000", limit), quote("venue1", "100000", limit + 1)];
+    let ev = h.cmd(Command::Prices { market: BTC, quotes });
+    let refused: Vec<&str> = ev
+        .iter()
+        .filter_map(|e| match e {
+            Event::PricesRejected { reason, .. } => Some(reason.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refused, [format!("quote from venue1 stamped {}ms ahead of the sequenced time", MAX_QUOTE_LEAD_MS + 1)]);
+    let stored: Vec<(&String, Millis)> = h.engine.markets()[&BTC].quotes.iter().map(|(s, q)| (s, q.ts)).collect();
+    assert_eq!(stored, [(&"venue0".to_owned(), limit)]);
+}
+
+#[test]
+fn a_kept_quote_stamped_ahead_does_not_hold_back_the_venues_next_quote() {
+    let mut h = Harness::new();
+    // Kept, but it does not count until the sequenced time reaches it.
+    let ahead = h.ts + MAX_QUOTE_LEAD_MS;
+    h.cmd(Command::Prices { market: BTC, quotes: vec![quote("venue0", "100000", ahead)] });
+
+    // venue0's next quote is stamped earlier than the kept one, yet replaces it and prices the market
+    // with venue1's.
+    h.advance(100);
+    h.quotes(BTC, &["100000", "100100"]);
+    assert_eq!(h.engine.markets()[&BTC].mark, Some(f("100050")));
+}
+
+#[test]
+fn a_refused_quote_also_drops_the_venues_older_quote() {
+    let mut h = Harness::new();
+    let a = acct(1);
+    h.deposit(a, "100000");
+    h.price(BTC, "100000");
+
+    // venue0's quote from 100ms ago is still fresh, but after venue0 sends one stamped past the lead
+    // limit it no longer counts, which leaves one venue of the two needed.
+    h.advance(100);
+    h.cmd(Command::Prices { market: BTC, quotes: vec![quote("venue0", "100000", h.ts + MAX_QUOTE_LEAD_MS + 1)] });
+    let ev = h.market_order(a, BTC, Side::Buy, "0.1", "100000");
+    assert!(matches!(rejection(&ev), Reject::NoPrice(_)));
+}
+
+#[test]
 fn out_of_range_order_numbers_are_rejected_not_panicked_on() {
     let mut h = Harness::new();
     let a = acct(1);
@@ -188,4 +259,11 @@ fn limit_orders_never_fill_worse_than_the_limit() {
     assert!(fills(&ev).is_empty());
     let ev = h.price(BTC, "98500");
     assert_eq!(fills(&ev)[0].price, f("98500"));
+}
+
+// ── Helpers ──
+
+/// A venue quote.
+fn quote(source: &str, mid: &str, ts: Millis) -> SourceQuote {
+    SourceQuote { source: source.into(), mid: f(mid), ts }
 }
