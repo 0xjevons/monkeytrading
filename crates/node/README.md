@@ -54,11 +54,14 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/feeds/mod.rs` — the feed index and the mock feed
 - `src/feeds/venue/mod.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect
 - `src/feeds/venue/validation.rs` — the checks every venue's books pass before they are sequenced
+- `src/feeds/venue/confirm.rs` — confirming with the engine which markets the venue is quoting,
+  holding back markets it does not list, and settling a dropped connection's last quotes
 - `src/feeds/venue/quotes.rs` — the quotes held between ticks until the host clock reaches them,
   and the rule that decides whether the quote the engine holds counts as the venue quoting
 - `src/feeds/venue/setup.rs` — the TLS client config and reconnect backoff every connection shares
 - `src/feeds/venue/tests.rs` — venue task unit tests: alert throttling and silence windows on
-  paused time, held quotes, the freshness rule, and backoff
+  paused time, held quotes against the engine's rule, kept books for unsubscribed symbols, the
+  freshness rule, and backoff
 - `src/feeds/coinbase.rs`, `src/feeds/bitstamp.rs` — venue adapters
 - `src/feeds/kraken/mod.rs` — the Kraken adapter: a kept order book verified against Kraken's
   checksum; `src/feeds/kraken/tests.rs` replays recorded book messages against it

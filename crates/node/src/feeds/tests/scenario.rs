@@ -7,14 +7,15 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engine_core::command::{Command, OrderKind, OrderRequest};
+use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest};
 use engine_core::event::{Event, Reject};
 use engine_core::price::PriceError;
 use engine_core::types::{AccountId, MarketId, Millis, Side};
 use tokio::net::TcpListener;
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep, timeout};
+use tokio::time::{Instant, interval, sleep, timeout, timeout_at};
 
 use crate::clock::now_ms;
 use crate::config::Venue;
@@ -76,12 +77,31 @@ async fn venues_going_down_age_out_and_the_index_runs_on_the_rest() {
 }
 
 #[tokio::test]
-async fn quotes_for_a_market_the_engine_does_not_list_do_not_count_as_quoting() {
+async fn a_market_the_engine_does_not_list_is_alerted_once_and_held_back_until_it_is_listed() {
     let (_guard, mut alerts) = capture_alerts();
-    let node = Node::start("unlisted").await;
-    // ETH/USD is mapped to a market the engine does not list, so it refuses every quote for it.
+    let mut node = Node::start("unlisted").await;
+    // ETH/USD is mapped to a market the engine does not list.
     start_kraken(&node, &[(1, "BTC/USD"), (99, "ETH/USD")], now_ms).await;
-    assert_first_silent(&mut alerts, "ETH/USD").await;
+    let unlisted = loop {
+        let alert = next_alert(&mut alerts).await;
+        if alert["alert"] == "venue_market_unlisted" {
+            break alert;
+        }
+    };
+    assert_eq!((unlisted["market"].as_str(), unlisted["symbol"].as_str()), ("99", "ETH/USD"));
+
+    // From then on, over several silence windows, no ETH quote reaches the engine to be refused,
+    // and ETH is alerted neither again nor as silent.
+    assert_eq!(node.prices_within(99, Duration::from_secs(1)).await, 0);
+    while let Ok(alert) = alerts.try_recv() {
+        assert!(!["venue_market_unlisted", "venue_symbol_silent"].contains(&alert["alert"].as_str()), "{alert:?}");
+    }
+
+    // Once the engine lists the market, its quotes go again.
+    let mut spec = dev_config().genesis.markets.into_iter().find(|market| market.id == 2).expect("ETH-USD");
+    (spec.id, spec.symbol) = (99, "ETH-USD-B".into());
+    node.submit(Command::Admin(AdminCommand::UpsertMarket(spec))).await;
+    node.wait_for_quotes(&[(99, "kraken")]).await;
 }
 
 #[tokio::test]
@@ -174,6 +194,23 @@ impl Node {
             reduce_only: false,
         };
         self.submit(Command::PlaceOrder(order)).await
+    }
+
+    /// Counts the price commands for `market` the engine applies over `window`, after letting
+    /// those already sent drain through.
+    async fn prices_within(&mut self, market: MarketId, window: Duration) -> usize {
+        sleep(Duration::from_millis(100)).await;
+        while !matches!(self.stream.try_recv(), Err(TryRecvError::Empty | TryRecvError::Closed)) {}
+        let deadline = Instant::now() + window;
+        let mut count = 0;
+        while let Ok(Ok(message)) = timeout_at(deadline, self.stream.recv()).await {
+            if let StreamBody::Command(entry) = &message.body
+                && matches!(entry.sequenced.cmd, Command::Prices { market: priced, .. } if priced == market)
+            {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Sequences `cmd` and returns its events.

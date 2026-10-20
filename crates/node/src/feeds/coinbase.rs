@@ -21,8 +21,10 @@ use crate::feeds::venue::{Book, Frame, Refusal, check_time};
 const MAX_LEVELS: usize = 200_000;
 
 /// The price levels of every product on one connection, rebuilt from `level2` messages.
-#[derive(Default)]
 pub(super) struct Books {
+    /// The products the connection subscribed to; a change for any other is refused before it is
+    /// kept, so the venue cannot grow books the feed never reads.
+    products: BTreeSet<String>,
     /// The `sequence_num` of the last message read.
     sequence: Option<u64>,
     depths: BTreeMap<String, Depth>,
@@ -64,6 +66,12 @@ struct Update<'a> {
 }
 
 impl Books {
+    /// Empty books for a connection subscribed to `products`.
+    pub(super) fn new(products: &[&str]) -> Self {
+        let products = products.iter().map(|product| (*product).to_owned()).collect();
+        Books { products, sequence: None, depths: BTreeMap::new() }
+    }
+
     /// Reads one message at host time `now`, applying any book changes in it. Any change it cannot apply ends the
     /// connection, and with it this book.
     /// Error cases:
@@ -101,7 +109,8 @@ impl Books {
     ///   valid input range, or a quantity is negative
     /// - an event time is implausible at `now` (see `check_time`), whether or not the change
     ///   leaves a top of book
-    /// - an update arrives for a product with no snapshot, or an event has no updates
+    /// - an event is for a product the connection did not subscribe to, an update arrives for a
+    ///   product with no snapshot, or an event has no updates
     fn apply(&mut self, events: &str, now: Millis) -> Result<Vec<Book>, String> {
         let events: Vec<Event> = serde_json::from_str(events).map_err(|e| format!("bad level2 events: {e}"))?;
         let tops: Vec<Option<Book>> =
@@ -114,6 +123,9 @@ impl Books {
     /// - as for `apply`
     fn apply_event(&mut self, event: Event, now: Millis) -> Result<Option<Book>, String> {
         let Event { kind, product_id, updates } = event;
+        if !self.products.contains(&product_id) {
+            return Err(format!("{product_id} not subscribed"));
+        }
         let depth = match kind {
             "snapshot" => {
                 let depth = self.depths.entry(product_id.clone()).or_default();
@@ -193,12 +205,12 @@ mod tests {
     #[test]
     fn a_snapshot_gives_the_top_of_book_at_the_venue_event_time() {
         // 2026-10-20T09:51:15.714274Z, truncated to the millisecond.
-        assert_eq!(Books::default().read(SNAPSHOT, NOW), Ok(top("2376.8", "2376.81", 1_792_489_875_714)));
+        assert_eq!(Books::new(&["ETH-USD"]).read(SNAPSHOT, NOW), Ok(top("2376.8", "2376.81", 1_792_489_875_714)));
     }
 
     #[test]
     fn updates_move_the_top_and_carry_their_latest_event_time() {
-        let mut books = Books::default();
+        let mut books = Books::new(&["ETH-USD"]);
         books.read(SNAPSHOT, NOW).unwrap();
         // Levels below the top change: the top is unchanged but now current at the update's time.
         assert_eq!(books.read(UPDATE, NOW), Ok(top("2376.8", "2376.81", 1_792_489_875_761)));
@@ -215,7 +227,7 @@ mod tests {
 
     #[test]
     fn a_new_snapshot_replaces_the_product_book() {
-        let mut books = Books::default();
+        let mut books = Books::new(&["ETH-USD"]);
         books.read(SNAPSHOT, NOW).unwrap();
         let resent = SNAPSHOT
             .replace(r#""sequence_num":11"#, r#""sequence_num":12"#)
@@ -227,7 +239,7 @@ mod tests {
 
     #[test]
     fn a_book_with_an_empty_side_has_no_top() {
-        let mut books = Books::default();
+        let mut books = Books::new(&["ETH-USD"]);
         books.read(SNAPSHOT, NOW).unwrap();
         let emptied = update(
             12,
@@ -241,7 +253,7 @@ mod tests {
 
     #[test]
     fn a_sequenced_message_on_an_unknown_channel_resyncs() {
-        let mut books = Books::default();
+        let mut books = Books::new(&["ETH-USD"]);
         books.read(SNAPSHOT, NOW).unwrap();
         let unknown = UPDATE.replace(r#""channel":"l2_data""#, r#""channel":"l2_delta""#);
         assert!(matches!(books.read(&unknown, NOW), Err(Refusal::Connection(reason)) if reason.contains("l2_delta")));
@@ -249,7 +261,7 @@ mod tests {
 
     #[test]
     fn acknowledgements_carry_no_price_and_venue_errors_are_refused() {
-        let mut books = Books::default();
+        let mut books = Books::new(&["ETH-USD"]);
         assert_eq!(books.read(SUBSCRIPTIONS, NOW), Ok(Frame::Control));
         assert_eq!(books.read(ERROR, NOW), Err(Refusal::Message("venue error: authentication failure".into())));
         assert!(matches!(books.read(r#"{"channel":"l2_data"}"#, NOW), Err(Refusal::Message(_))));
@@ -258,7 +270,7 @@ mod tests {
 
     #[test]
     fn a_sequence_gap_resyncs_the_connection() {
-        let mut books = Books::default();
+        let mut books = Books::new(&["ETH-USD"]);
         books.read(SNAPSHOT, NOW).unwrap();
         let skipped = UPDATE.replace(r#""sequence_num":12"#, r#""sequence_num":14"#);
         assert_eq!(books.read(&skipped, NOW), Err(Refusal::Connection("sequence gap: 11 then 14".into())));
@@ -284,7 +296,7 @@ mod tests {
             UPDATE.replace(r#""product_id":"ETH-USD""#, r#""product_id":"BTC-USD""#),
         ];
         for case in cases {
-            let mut books = Books::default();
+            let mut books = Books::new(&["ETH-USD"]);
             books.read(SNAPSHOT, NOW).unwrap();
             assert!(matches!(books.read(&case, NOW), Err(Refusal::Connection(_))), "applied {case}");
         }
@@ -304,7 +316,7 @@ mod tests {
                 r#"{{"channel":"l2_data","timestamp":"2026-10-20T09:51:15.9Z","sequence_num":{sequence},"events":{events}}}"#
             )
         };
-        let mut books = Books::default();
+        let mut books = Books::new(&["ETH-USD"]);
         books.read(SNAPSHOT, NOW).unwrap();
         // The snapshot holds two bids, so this fills the side to the cap, which is still a book.
         assert!(books.read(&bids(12, 0..MAX_LEVELS - 2), NOW).is_ok());

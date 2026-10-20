@@ -2,7 +2,9 @@ use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 
 use super::*;
 use crate::config::VenueSymbol;
-use crate::feeds::tests::fake::{WAIT, capture_alerts, fast, next_alert};
+use crate::feeds::kraken;
+use crate::feeds::tests::fake::{WAIT, capture_alerts, coinbase_levels, fast, kraken_book, next_alert};
+use crate::feeds::venue::quotes::counts;
 use crate::feeds::venue::setup::next_backoff;
 
 #[test]
@@ -77,6 +79,82 @@ fn the_newest_quote_the_host_clock_has_reached_is_taken_and_those_ahead_wait() {
     pending.add(at(NOW + 70), NOW).unwrap();
     pending.add(at(NOW + 80), NOW + 90).unwrap();
     assert_eq!(pending.take(NOW + 90), Some(at(NOW + 80)));
+}
+
+#[test]
+fn the_engine_holds_what_it_would_if_every_quote_went_once_its_time_came() {
+    // The engine stores a quote in place of the one it holds unless that one is newer and its time
+    // already reached.
+    let stores = |held: &Option<SourceQuote>, quote: &SourceQuote, now: Millis| {
+        held.as_ref().is_none_or(|held| quote.ts >= held.ts || held.ts > now)
+    };
+    let quote = |id: i64, ts: Millis| SourceQuote { source: "kraken".into(), mid: Fixed::from_int(id), ts };
+    // Every way three quotes can arrive at 0, 10, 20 or 30 ms dated 0 to 40 ms, with the engine
+    // first holding nothing, a reached quote, or one still ahead, and a tick every 10 ms from 5 ms.
+    // The reference sends, at each tick, every quote whose time has come, in arrival order, and
+    // withdraws a quote still ahead of the host clock when a later one is dated before it, as when
+    // the venue's clock steps back. After every tick the engine holds the same quote either way.
+    let times: Vec<(Millis, Millis)> = (0..4).flat_map(|at| (0..5).map(move |ts| (at * 10, ts * 10))).collect();
+    let grid = times.as_slice();
+    for start in [None, Some(quote(0, -10)), Some(quote(0, 50))] {
+        for (first, second, third) in
+            grid.iter().flat_map(move |a| grid.iter().flat_map(move |b| grid.iter().map(move |c| (a, b, c))))
+        {
+            let mut arrivals =
+                [(first.0, quote(1, first.1)), (second.0, quote(2, second.1)), (third.0, quote(3, third.1))];
+            // Stable, so quotes arriving together keep their order.
+            arrivals.sort_by_key(|(at, _)| *at);
+            let case = format!("{start:?} then {arrivals:?}");
+            let (mut reference, mut held, mut pending) = (start.clone(), start.clone(), Pending::default());
+            let mut waiting: Vec<SourceQuote> = Vec::new();
+            let mut arrivals = arrivals.into_iter().peekable();
+            for tick in (5..=55).step_by(10) {
+                while let Some((at, arrived)) = arrivals.next_if(|(at, _)| *at < tick) {
+                    waiting.retain(|quote| quote.ts <= at || quote.ts <= arrived.ts);
+                    waiting.push(arrived.clone());
+                    pending.add(arrived, at).unwrap();
+                }
+                let (due, ahead): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|quote| quote.ts <= tick);
+                waiting = ahead;
+                for quote in due {
+                    if stores(&reference, &quote, tick) {
+                        reference = Some(quote);
+                    }
+                }
+                if let Some(taken) = pending.take(tick)
+                    && stores(&held, &taken, tick)
+                {
+                    held = Some(taken);
+                }
+                assert_eq!(held, reference, "at {tick}: {case}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_kept_book_for_a_symbol_not_subscribed_is_refused_before_it_is_kept() {
+    const NOW: Millis = 1_792_489_875_714;
+    // Two-sided books and one-sided ones, which have no top for the subscription check to catch.
+    let one_sided_coinbase = r#"{"channel":"l2_data","timestamp":"2026-10-20T09:51:15.9Z","sequence_num":1,"events":[{"type":"snapshot","product_id":"SOL-USD","updates":[{"side":"bid","event_time":"2026-10-20T09:51:15.714274Z","price_level":"100","new_quantity":"1"}]}]}"#;
+    let checksum = kraken::checksum([("100", "1.5")].into_iter());
+    let one_sided_kraken = format!(
+        r#"{{"channel":"book","type":"snapshot","data":[{{"symbol":"SOL/USD","bids":[{{"price":100,"qty":1.5}}],"asks":[],"checksum":{checksum},"timestamp":"2026-10-20T12:34:44.332552Z"}}]}}"#
+    );
+    let cases = [
+        (Venue::Coinbase, ["BTC-USD", "ETH-USD"], coinbase_levels(1, true, "SOL-USD", "100", "101", NOW)),
+        (Venue::Coinbase, ["BTC-USD", "ETH-USD"], one_sided_coinbase.to_owned()),
+        (Venue::Kraken, ["BTC/USD", "ETH/USD"], kraken_book("SOL/USD", "100", "101", NOW)),
+        (Venue::Kraken, ["BTC/USD", "ETH/USD"], one_sided_kraken),
+    ];
+    for (venue, symbols, message) in cases {
+        let refused = Adapter::new(venue, &symbols).read(&message, NOW);
+        assert!(
+            matches!(&refused, Err(Refusal::Connection(reason)) if reason.contains("SOL") && reason.contains("not subscribed")),
+            "{}: {refused:?}",
+            venue.name()
+        );
+    }
 }
 
 #[test]

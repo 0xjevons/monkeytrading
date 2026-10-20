@@ -3,8 +3,10 @@
 //! sequencer has gone away: a failed connection is retried inside the task with backoff, and while
 //! it is down the venue's last quotes age out in the engine, which prices from the other venues.
 
+mod confirm;
+use confirm::Confirmation;
 mod quotes;
-use quotes::{Pending, counts};
+use quotes::Pending;
 mod setup;
 use setup::next_attempt;
 pub use setup::tls_config;
@@ -33,7 +35,7 @@ use tracing::{debug, info, warn};
 use crate::clock::now_ms;
 use crate::config::{Venue, VenueConnection, VenuesSection};
 use crate::feeds::{bitstamp, coinbase, kraken};
-use crate::sequencer::{Query, Request};
+use crate::sequencer::Request;
 
 /// After a refused-message or clock alert, the same alert from the same venue waits this long, so
 /// a venue that changes its format raises one alert a minute, not one per message.
@@ -110,7 +112,10 @@ struct VenueFeed {
     /// Markets the current connection has sequenced quotes for that no confirmation covers yet.
     unconfirmed: BTreeSet<MarketId>,
     /// The one confirmation awaited, and the markets it covers (see `confirm`).
-    confirming: Option<(oneshot::Receiver<Vec<MarketId>>, BTreeSet<MarketId>)>,
+    confirming: Option<(oneshot::Receiver<Confirmation>, BTreeSet<MarketId>)>,
+    /// Markets the engine did not list at the last confirmation: their quotes are held back, not
+    /// sequenced for the engine to refuse, and they are not counted as silent.
+    unlisted: BTreeSet<MarketId>,
     refusals: Throttle,
     clock_alerts: Throttle,
 }
@@ -148,12 +153,12 @@ impl Timing {
 }
 
 impl Adapter {
-    /// A fresh adapter for a new connection to `venue`.
-    fn new(venue: Venue) -> Self {
+    /// A fresh adapter for a new connection to `venue`, subscribed to `symbols`.
+    fn new(venue: Venue, symbols: &[&str]) -> Self {
         match venue {
             Venue::Bitstamp => Adapter::Bitstamp,
-            Venue::Coinbase => Adapter::Coinbase(coinbase::Books::default()),
-            Venue::Kraken => Adapter::Kraken(kraken::Books::default()),
+            Venue::Coinbase => Adapter::Coinbase(coinbase::Books::new(symbols)),
+            Venue::Kraken => Adapter::Kraken(kraken::Books::new(symbols)),
         }
     }
 
@@ -205,6 +210,7 @@ impl VenueFeed {
             silent: BTreeSet::new(),
             unconfirmed: BTreeSet::new(),
             confirming: None,
+            unlisted: BTreeSet::new(),
             refusals: Throttle::default(),
             clock_alerts: Throttle::default(),
         }
@@ -246,8 +252,8 @@ impl VenueFeed {
         let connect = connect_async_tls_with_config(self.conn.url.as_str(), None, false, connector);
         let (ws, _) = timeout(self.timing.timeout, connect).await.context("connect timed out")?.context("connect")?;
         let (mut sink, mut stream) = ws.split();
-        let mut adapter = Adapter::new(self.conn.venue);
         let symbols: Vec<&str> = self.markets.keys().map(String::as_str).collect();
+        let mut adapter = Adapter::new(self.conn.venue, &symbols);
         let subscribe = async {
             for text in adapter.subscriptions(&symbols) {
                 sink.send(Message::text(text)).await?;
@@ -271,19 +277,22 @@ impl VenueFeed {
                         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                     }
                 }
-                fresh = async {
+                answer = async {
                     match &mut self.confirming {
                         Some((reply, _)) => reply.await,
                         None => pending().await,
                     }
                 } => {
                     self.confirming = None;
-                    fresh.map_err(|_| anyhow!("sequencer gone"))?.into_iter().for_each(|market| self.delivered(market));
+                    self.confirmed(answer.map_err(|_| anyhow!("sequencer gone"))?);
                 }
                 _ = flush.tick() => {
                     let now = now_ms();
                     for (market, quotes) in &mut buffered {
                         let Some(quote) = quotes.take(now) else { continue };
+                        if self.unlisted.contains(market) {
+                            continue;
+                        }
                         self.unconfirmed.insert(*market);
                         let cmd = Command::Prices { market: *market, quotes: vec![quote] };
                         let request = Request::Submit { cmd, reply: None };
@@ -303,45 +312,6 @@ impl VenueFeed {
                     }
                 }
             }
-        }
-    }
-
-    /// Asks the sequencer, behind the quotes already sent, for the `markets` where the venue
-    /// counts as quoting once they are applied: the engine lists the market, and the quote it holds
-    /// from this venue passes `counts` at the time the sequencer would stamp next. Judging what the
-    /// engine holds, not what was sent, means a market it does not list never counts, and a quote
-    /// a lagging sequencer applies late counts as stale.
-    /// Error cases:
-    /// - the sequencer has gone away
-    async fn confirm(&self, markets: BTreeSet<MarketId>) -> anyhow::Result<oneshot::Receiver<Vec<MarketId>>> {
-        let (reply, fresh) = oneshot::channel();
-        let source = self.conn.venue.name();
-        let stale_after = Millis::try_from(self.timing.stale_after.as_millis()).unwrap_or(Millis::MAX);
-        let query: Query = Box::new(move |engine| {
-            let at = now_ms().max(engine.now());
-            let quoting = |market: &MarketId| {
-                let Some(state) = engine.markets().get(market) else { return false };
-                let max_age_ms = state.spec.price_rules.max_age_ms;
-                state.quotes.get(source).is_some_and(|held| counts(held.ts, at, stale_after, max_age_ms))
-            };
-            let _ = reply.send(markets.into_iter().filter(quoting).collect());
-        });
-        self.tx.send(Request::Query(query)).await.map_err(|_| anyhow!("sequencer gone"))?;
-        Ok(fresh)
-    }
-
-    /// Settles what the ended connection sequenced, so one that quoted just before it ended is not
-    /// taken for a failed attempt: one last confirmation covers every market not yet confirmed,
-    /// waiting at most `timing.timeout` for the answer.
-    async fn settle(&mut self) {
-        let mut markets = take(&mut self.unconfirmed);
-        markets.extend(self.confirming.take().into_iter().flat_map(|(_, covered)| covered));
-        if markets.is_empty() {
-            return;
-        }
-        let confirmed = async { anyhow::Ok(self.confirm(markets).await?.await?) };
-        if let Ok(Ok(fresh)) = timeout(self.timing.timeout, confirmed).await {
-            fresh.into_iter().for_each(|market| self.delivered(market));
         }
     }
 
@@ -416,7 +386,7 @@ impl VenueFeed {
         let venue = self.conn.venue.name();
         let now = Instant::now();
         let mut newly_silent = false;
-        for (symbol, market) in &self.markets {
+        for (symbol, market) in self.markets.iter().filter(|(_, market)| !self.unlisted.contains(market)) {
             let quiet = self.last_quote.get(market).is_some_and(|at| now.duration_since(*at) >= self.timing.timeout);
             if quiet && self.silent.insert(*market) {
                 warn!(

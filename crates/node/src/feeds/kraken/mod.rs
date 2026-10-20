@@ -9,7 +9,7 @@
 //! Prices and sizes arrive as JSON numbers written at the pair's precision. They are read from
 //! the raw number text, never through a float, and that text is what the checksum covers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::DateTime;
 use crc32fast::Hasher;
@@ -25,8 +25,10 @@ use crate::feeds::venue::{Book, Frame, Refusal, check_time};
 const DEPTH: usize = 10;
 
 /// The verified top levels of every symbol on one connection.
-#[derive(Default)]
 pub(super) struct Books {
+    /// The symbols the connection subscribed to; a book for any other is refused before it is
+    /// kept, so the venue cannot grow books the feed never reads.
+    symbols: BTreeSet<String>,
     depths: BTreeMap<String, Depth>,
 }
 
@@ -78,6 +80,12 @@ struct RawLevel<'a> {
 }
 
 impl Books {
+    /// Empty books for a connection subscribed to `symbols`.
+    pub(super) fn new(symbols: &[&str]) -> Self {
+        let symbols = symbols.iter().map(|symbol| (*symbol).to_owned()).collect();
+        Books { symbols, depths: BTreeMap::new() }
+    }
+
     /// Reads one Kraken message at host time `now`, applying and verifying any book change in it.
     /// Error cases:
     /// - an unknown channel or method, or a failed subscription (the connection carries on)
@@ -113,12 +121,16 @@ impl Books {
 
     /// Applies one symbol's snapshot or update, then checks the result against its checksum.
     /// Error cases:
-    /// - the message type is unknown, or an update arrives for a symbol with no snapshot
+    /// - the symbol is not one the connection subscribed to, the message type is unknown, or an
+    ///   update arrives for a symbol with no snapshot
     /// - a price or size is not a plain decimal, a price is out of range, or a size is negative
     /// - the kept book's checksum differs from the venue's
     /// - the timestamp is not RFC 3339, or is implausible at `now` (see `check_time`)
     fn apply_book(&mut self, kind: Option<&str>, book: BookData, now: Millis) -> Result<Option<Book>, String> {
         let BookData { symbol, bids, asks, checksum, timestamp } = book;
+        if !self.symbols.contains(&symbol) {
+            return Err(format!("{symbol} not subscribed"));
+        }
         let depth = match kind {
             Some("snapshot") => {
                 let depth = self.depths.entry(symbol.clone()).or_default();
