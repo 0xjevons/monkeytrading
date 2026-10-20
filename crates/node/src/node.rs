@@ -69,7 +69,8 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     let (stream_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
     let (withdrawals_tx, withdrawals_rx) = mpsc::unbounded_channel();
     let seq_cfg = SequencerConfig {
-        log_path: &cfg.node.log_path,
+        log_dir: &cfg.node.log_dir,
+        segment_commands: cfg.node.segment_commands,
         checkpoint_every: cfg.node.checkpoint_every,
         chain_id: cfg.custody.chain_id,
         vault,
@@ -104,7 +105,14 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     tasks.spawn(async move { ("custody", custody::run(&custody_cfg, withdrawals_rx).await) });
 
     let listener = TcpListener::bind(cfg.node.listen).await.with_context(|| format!("binding {}", cfg.node.listen))?;
-    let app = router(ApiState { tx, stream: stream_tx, attestation, auth: cfg.node.auth, dev_deposits });
+    let app = router(ApiState {
+        tx,
+        stream: stream_tx,
+        attestation,
+        auth: cfg.node.auth,
+        dev_deposits,
+        log_dir: cfg.node.log_dir.clone(),
+    });
     info!(listen = %cfg.node.listen, "api up");
     tasks.spawn(async move { ("api", axum::serve(listener, app).await.context("api server")) });
 

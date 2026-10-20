@@ -19,9 +19,10 @@ an index: load only the rule whose hint matches the current action.
   `tests/reference_logs.rs`; `tests/invariants/` holds the property tests. Its `README.md` lists
   every file.
 - **crates/node/** — `engine-node`, binary `engine` (`main.rs` over `lib.rs`). Contains the
-  sequencer, the public log with signed checkpoints, `engine replay`, the REST and WebSocket API,
-  TEE attestation (configfs-tsm for TDX and SEV-SNP), and the custody and price-feed adapters
-  (mock only so far). Its `README.md` lists every file.
+  sequencer, the public log with signed checkpoints (segmented, with a public archive), `engine
+  replay`, the REST API and the resumable WebSocket stream, TEE attestation (configfs-tsm for TDX
+  and SEV-SNP), and the custody and price-feed adapters (mock only so far). Its `README.md` lists
+  every file.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine.
   Its `[genesis]` section is protocol: it is sequenced into the log as admin commands on first
   boot. Every section rejects unknown keys.
@@ -60,9 +61,10 @@ Run from the repo root:
   `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`
 - Supply chain: `cargo deny check` (CI runs it; install `cargo-deny` to run it locally)
 - Run a local node: `cargo run -p engine-node -- run --config config/dev.toml` (or set
-  `CONFIG_PATH`); the API listens on `127.0.0.1:8080`, the log goes to `data/dev/log.jsonl`
-  (gitignored), and the log level comes from `[logging].level`
-- Verify a published log: `cargo run -p engine-node -- replay --log <path>`
+  `CONFIG_PATH`); the API listens on `127.0.0.1:8080`, the log goes to segment files and a
+  manifest in `data/dev/log/` (gitignored), and the log level comes from `[logging].level`
+- Verify a published log: `cargo run -p engine-node -- replay --log <path>`, where `<path>` is a
+  log directory, a downloaded archive, or a single log file
 
 ## Repo facts
 
