@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 use serde_json::value::RawValue;
 
-use crate::feeds::venue::{Book, Frame, Refusal};
+use crate::feeds::venue::{Book, Frame, Refusal, check_time};
 
 /// The price levels of every product on one connection, rebuilt from `level2` messages.
 #[derive(Default)]
@@ -59,13 +59,14 @@ struct Update<'a> {
 }
 
 impl Books {
-    /// Reads one message, applying any book changes in it.
+    /// Reads one message at host time `now`, applying any book changes in it. Any change it cannot
+    /// apply ends the connection, and with it this book.
     /// Error cases:
     /// - an error message from the venue, or a message that is neither an error nor a channel
     ///   message (the connection carries on)
     /// - a sequence gap, or a `level2` message that does not parse or apply (the connection
     ///   resyncs)
-    pub(super) fn read(&mut self, text: &str) -> Result<Frame, Refusal> {
+    pub(super) fn read(&mut self, text: &str, now: Millis) -> Result<Frame, Refusal> {
         let message: Message =
             serde_json::from_str(text).map_err(|e| Refusal::Message(format!("unparseable message: {e}")))?;
         let (Some(channel), Some(sequence)) = (message.channel, message.sequence_num) else {
@@ -81,7 +82,7 @@ impl Books {
             "subscriptions" => Ok(Frame::Control),
             "l2_data" => {
                 let events = message.events.ok_or_else(|| Refusal::Connection("l2_data without events".into()))?;
-                self.apply(events.get()).map(Frame::Books).map_err(Refusal::Connection)
+                self.apply(events.get(), now).map(Frame::Books).map_err(Refusal::Connection)
             }
             other => Err(Refusal::Message(format!("unexpected channel {other}"))),
         }
@@ -92,18 +93,20 @@ impl Books {
     /// Error cases:
     /// - the events do not parse, an event type or side is unknown, a price level is outside the
     ///   valid input range, or a quantity is negative
+    /// - an event time is implausible at host time `now` (see `check_time`), whether or not the
+    ///   change leaves a top of book
     /// - an update arrives for a product with no snapshot, or an event has no updates
-    fn apply(&mut self, events: &str) -> Result<Vec<Book>, String> {
+    fn apply(&mut self, events: &str, now: Millis) -> Result<Vec<Book>, String> {
         let events: Vec<Event> = serde_json::from_str(events).map_err(|e| format!("bad level2 events: {e}"))?;
         let tops: Vec<Option<Book>> =
-            events.into_iter().map(|event| self.apply_event(event)).collect::<Result<_, _>>()?;
+            events.into_iter().map(|event| self.apply_event(event, now)).collect::<Result<_, _>>()?;
         Ok(tops.into_iter().flatten().collect())
     }
 
     /// Applies one product's snapshot or update.
     /// Error cases:
     /// - as for `apply`
-    fn apply_event(&mut self, event: Event) -> Result<Option<Book>, String> {
+    fn apply_event(&mut self, event: Event, now: Millis) -> Result<Option<Book>, String> {
         let Event { kind, product_id, updates } = event;
         let depth = match kind {
             "snapshot" => {
@@ -137,6 +140,7 @@ impl Books {
             let event_time = DateTime::parse_from_rfc3339(update.event_time)
                 .map_err(|e| format!("bad event_time {}: {e}", update.event_time))?
                 .timestamp_millis();
+            check_time(&product_id, event_time, now)?;
             ts = ts.max(Some(event_time));
         }
         let ts = ts.ok_or_else(|| format!("{product_id} event without updates"))?;
@@ -160,6 +164,8 @@ mod tests {
     const UPDATE: &str = r#"{"channel":"l2_data","timestamp":"2026-10-20T09:51:15.877258658Z","sequence_num":12,"events":[{"type":"update","product_id":"ETH-USD","updates":[{"side":"bid","event_time":"2026-10-20T09:51:15.761244Z","price_level":"2341.14","new_quantity":"0.001"},{"side":"bid","event_time":"2026-10-20T09:51:15.761244Z","price_level":"2306.03","new_quantity":"0.001"}]}]}"#;
     const SUBSCRIPTIONS: &str = r#"{"channel":"subscriptions","timestamp":"2026-10-20T09:51:15.877783282Z","sequence_num":13,"events":[{"subscriptions":{"level2":["BTC-USD","ETH-USD"]}}]}"#;
     const ERROR: &str = r#"{"type":"error","message":"authentication failure"}"#;
+    /// The host time each message is read at: just after the recorded messages.
+    const NOW: Millis = 1_792_489_876_000;
 
     /// An ETH-USD top of book.
     fn top(bid: &str, ask: &str, ts: Millis) -> Frame {
@@ -181,15 +187,15 @@ mod tests {
     #[test]
     fn a_snapshot_gives_the_top_of_book_at_the_venue_event_time() {
         // 2026-10-20T09:51:15.714274Z, truncated to the millisecond.
-        assert_eq!(Books::default().read(SNAPSHOT), Ok(top("2376.8", "2376.81", 1_792_489_875_714)));
+        assert_eq!(Books::default().read(SNAPSHOT, NOW), Ok(top("2376.8", "2376.81", 1_792_489_875_714)));
     }
 
     #[test]
     fn updates_move_the_top_and_carry_their_latest_event_time() {
         let mut books = Books::default();
-        books.read(SNAPSHOT).unwrap();
+        books.read(SNAPSHOT, NOW).unwrap();
         // Levels below the top change: the top is unchanged but now current at the update's time.
-        assert_eq!(books.read(UPDATE), Ok(top("2376.8", "2376.81", 1_792_489_875_761)));
+        assert_eq!(books.read(UPDATE, NOW), Ok(top("2376.8", "2376.81", 1_792_489_875_761)));
         // The best bid is pulled and a better offer arrives; the later of the two times stamps it.
         let moved = update(
             13,
@@ -198,25 +204,25 @@ mod tests {
                 ("offer", "2026-10-20T09:51:15.940000Z", "2376.79", "0.5"),
             ],
         );
-        assert_eq!(books.read(&moved), Ok(top("2376.76", "2376.79", 1_792_489_875_950)));
+        assert_eq!(books.read(&moved, NOW), Ok(top("2376.76", "2376.79", 1_792_489_875_950)));
     }
 
     #[test]
     fn a_new_snapshot_replaces_the_product_book() {
         let mut books = Books::default();
-        books.read(SNAPSHOT).unwrap();
+        books.read(SNAPSHOT, NOW).unwrap();
         let resent = SNAPSHOT
             .replace(r#""sequence_num":11"#, r#""sequence_num":12"#)
             .replace(r#""price_level":"2376.8""#, r#""price_level":"2376.7""#)
             .replace(r#""price_level":"2376.76""#, r#""price_level":"2376.69""#);
         // The earlier snapshot's better bid at 2376.8 is gone.
-        assert_eq!(books.read(&resent), Ok(top("2376.7", "2376.81", 1_792_489_875_714)));
+        assert_eq!(books.read(&resent, NOW), Ok(top("2376.7", "2376.81", 1_792_489_875_714)));
     }
 
     #[test]
     fn a_book_with_an_empty_side_has_no_top() {
         let mut books = Books::default();
-        books.read(SNAPSHOT).unwrap();
+        books.read(SNAPSHOT, NOW).unwrap();
         let emptied = update(
             12,
             &[
@@ -224,24 +230,39 @@ mod tests {
                 ("offer", "2026-10-20T09:51:15.950000Z", "2376.82", "0"),
             ],
         );
-        assert_eq!(books.read(&emptied), Ok(Frame::Books(vec![])));
+        assert_eq!(books.read(&emptied, NOW), Ok(Frame::Books(vec![])));
+    }
+
+    #[test]
+    fn a_change_dated_ahead_of_the_host_clock_resyncs_even_without_a_top() {
+        let mut books = Books::default();
+        books.read(SNAPSHOT, NOW).unwrap();
+        // A minute ahead, it empties the offers and moves the bid: no top, but the book is suspect.
+        let ahead = "2026-10-20T09:52:16.000000Z";
+        let emptied = update(
+            12,
+            &[("offer", ahead, "2376.81", "0"), ("offer", ahead, "2376.82", "0"), ("bid", ahead, "2376.9", "1")],
+        );
+        assert!(
+            matches!(books.read(&emptied, NOW), Err(Refusal::Connection(reason)) if reason.contains("ahead of the host clock"))
+        );
     }
 
     #[test]
     fn acknowledgements_carry_no_price_and_venue_errors_are_refused() {
         let mut books = Books::default();
-        assert_eq!(books.read(SUBSCRIPTIONS), Ok(Frame::Control));
-        assert_eq!(books.read(ERROR), Err(Refusal::Message("venue error: authentication failure".into())));
-        assert!(matches!(books.read(r#"{"channel":"l2_data"}"#), Err(Refusal::Message(_))));
-        assert!(matches!(books.read("{"), Err(Refusal::Message(_))));
+        assert_eq!(books.read(SUBSCRIPTIONS, NOW), Ok(Frame::Control));
+        assert_eq!(books.read(ERROR, NOW), Err(Refusal::Message("venue error: authentication failure".into())));
+        assert!(matches!(books.read(r#"{"channel":"l2_data"}"#, NOW), Err(Refusal::Message(_))));
+        assert!(matches!(books.read("{", NOW), Err(Refusal::Message(_))));
     }
 
     #[test]
     fn a_sequence_gap_resyncs_the_connection() {
         let mut books = Books::default();
-        books.read(SNAPSHOT).unwrap();
+        books.read(SNAPSHOT, NOW).unwrap();
         let skipped = UPDATE.replace(r#""sequence_num":12"#, r#""sequence_num":14"#);
-        assert_eq!(books.read(&skipped), Err(Refusal::Connection("sequence gap: 11 then 14".into())));
+        assert_eq!(books.read(&skipped, NOW), Err(Refusal::Connection("sequence gap: 11 then 14".into())));
     }
 
     #[test]
@@ -262,8 +283,8 @@ mod tests {
         ];
         for case in cases {
             let mut books = Books::default();
-            books.read(SNAPSHOT).unwrap();
-            assert!(matches!(books.read(&case), Err(Refusal::Connection(_))), "applied {case}");
+            books.read(SNAPSHOT, NOW).unwrap();
+            assert!(matches!(books.read(&case, NOW), Err(Refusal::Connection(_))), "applied {case}");
         }
     }
 

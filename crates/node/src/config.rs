@@ -285,7 +285,10 @@ impl NodeConfig {
             bail!("node.tick, node.checkpoint_every, node.segment_commands, and feeds.interval must be non-zero");
         }
         match &self.feeds.venues {
-            Some(venues) => venues.validate().context("feeds.venues")?,
+            Some(venues) => {
+                venues.validate().context("feeds.venues")?;
+                self.check_stale_after(venues)?;
+            }
             None if self.feeds.provider == FeedProvider::Venues => {
                 bail!("feeds.provider = \"venues\" needs [feeds.venues]")
             }
@@ -311,6 +314,26 @@ impl NodeConfig {
         }
         for m in &self.genesis.markets {
             m.validate().map_err(anyhow::Error::msg).with_context(|| format!("market {}", m.symbol))?;
+        }
+        Ok(())
+    }
+}
+
+impl NodeConfig {
+    /// Checks `feeds.venues.stale_after` against the genesis market each venue symbol prices: a
+    /// longer bound would count quotes the engine already drops as stale as the venue quoting.
+    /// Error cases:
+    /// - `stale_after` exceeds a priced market's `price_rules.max_age_ms`
+    fn check_stale_after(&self, venues: &VenuesSection) -> anyhow::Result<()> {
+        let priced: BTreeSet<MarketId> =
+            venues.connections.iter().flat_map(|conn| conn.symbols.iter().map(|s| s.market)).collect();
+        for market in self.genesis.markets.iter().filter(|market| priced.contains(&market.id)) {
+            let max_age = u128::try_from(market.price_rules.max_age_ms).unwrap_or(0);
+            ensure!(
+                venues.stale_after.as_millis() <= max_age,
+                "feeds.venues.stale_after exceeds market {} max_age_ms ({max_age})",
+                market.symbol
+            );
         }
         Ok(())
     }
@@ -445,6 +468,14 @@ mod tests {
             let markets: Vec<MarketId> = conn.symbols.iter().map(|s| s.market).collect();
             assert_eq!(markets, [1, 2], "{}", conn.venue.name());
         }
+    }
+
+    #[test]
+    fn a_stale_after_beyond_a_priced_market_max_age_is_refused() {
+        let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+        cfg.feeds.venues.as_mut().unwrap().stale_after = Duration::from_millis(1_001);
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("exceeds market BTC-USD max_age_ms (1000)"), "{err}");
     }
 
     #[test]
