@@ -67,7 +67,7 @@ fn generated_sessions_reach_every_checked_path() {
         "bad debt",
         "financing",
         "order out of bounds",
-        "prices rejected",
+        "malformed quote",
         "admin applied",
         "admin rejected",
     ];
@@ -148,8 +148,10 @@ fn path(event: &Event) -> &'static str {
         Event::Fill(_) => "fill",
         Event::BadDebt { .. } => "bad debt",
         Event::Financing { .. } => "financing",
-        Event::OrderRejected { reason: Reject::InvalidOrder { .. }, .. } => "order out of bounds",
-        Event::PricesRejected { .. } => "prices rejected",
+        Event::OrderRejected { reason: Reject::InvalidOrder { reason }, .. } if reason.ends_with("out of range") => {
+            "order out of bounds"
+        }
+        Event::PricesRejected { reason, .. } if reason.starts_with("malformed") => "malformed quote",
         Event::AdminApplied => "admin applied",
         Event::AdminRejected { .. } => "admin rejected",
         _ => "other",

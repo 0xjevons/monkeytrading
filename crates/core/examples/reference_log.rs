@@ -8,16 +8,17 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+use anyhow::{Context, anyhow};
 use common::reference::{ReferenceEntry, root_hex};
 use common::{AAPL, BTC, ETH, Harness, acct, f, market, ny, params};
 use engine_core::Engine;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::Event;
+use engine_core::market::Tier;
 use engine_core::params::ProtocolParams;
 use engine_core::price::SourceQuote;
 use engine_core::session::Schedule;
@@ -25,14 +26,17 @@ use engine_core::types::{AccountId, AssetClass, MarketId, OrderId, Side};
 
 /// A market id nothing lists.
 const UNLISTED: MarketId = 99;
+/// A market the session lists with two margin bands.
+const SOL: MarketId = 10;
 
 /// Writes the session to the path given as the only argument, then prints how often each event
 /// kind occurred, so the author can check the session still reaches every path.
 /// Error cases:
 /// - no output path, or a file already at it
-/// - the engine refuses the session's sequence, or the file cannot be written
-fn main() -> Result<(), Box<dyn Error>> {
-    let path: PathBuf = std::env::args_os().nth(1).ok_or("usage: reference_log <output.jsonl>")?.into();
+/// - the file cannot be written
+fn main() -> anyhow::Result<()> {
+    let path: PathBuf =
+        std::env::args_os().nth(1).ok_or_else(|| anyhow!("usage: reference_log <output.jsonl>"))?.into();
     let mut engine = Engine::new();
     let mut tally: BTreeMap<String, usize> = BTreeMap::new();
     let mut entries = Vec::new();
@@ -47,7 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .write(true)
         .create_new(true)
         .open(&path)
-        .map_err(|e| format!("{}: {e}; a committed reference log is never regenerated", path.display()))?;
+        .with_context(|| format!("{}: a committed reference log is never regenerated", path.display()))?;
     let mut out = BufWriter::new(file);
     for entry in &entries {
         serde_json::to_writer(&mut out, entry)?;
@@ -130,6 +134,8 @@ fn session() -> Vec<Sequenced> {
     h.advance(1_000);
     h.price(ETH, "3075");
     h.market_order(t, ETH, Side::Buy, "1", "3075");
+    // A buy through a short: the 1.8 short closes at a loss and a 1.2 long opens at the fill price.
+    h.market_order(b, ETH, Side::Buy, "3", "3075");
 
     // Size spread on a large fill, then the house cap refusing a larger one.
     h.price(BTC, "101000");
@@ -183,8 +189,13 @@ fn session() -> Vec<Sequenced> {
     eth.min_order_notional = f("100");
     h.admin(AdminCommand::UpsertMarket(eth));
     h.price(ETH, "3075");
-    h.market_order(b, ETH, Side::Sell, "0.01", "3075");
-    h.admin(AdminCommand::UpsertMarket(market(10, "SOL-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 2_000)));
+    h.market_order(b, ETH, Side::Buy, "0.01", "3075");
+    // Margin of 10% up to 10,000 notional and 20% above: a 15,000 position needs 2,000.
+    let mut sol = market(SOL, "SOL-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000);
+    sol.margin_tiers = vec![Tier { up_to: Some(f("10000")), bps: 1_000 }, Tier { up_to: None, bps: 2_000 }];
+    h.admin(AdminCommand::UpsertMarket(sol));
+    h.price(SOL, "150");
+    h.market_order(a, SOL, Side::Buy, "100", "150");
     h.cmd(Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 10_001 }));
     h.cmd(Command::Admin(AdminCommand::SetReduceOnly { market: UNLISTED, reduce_only: true }));
     h.advance(60_000);

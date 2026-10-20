@@ -329,9 +329,7 @@ impl Engine {
     fn book(&mut self, exec: &Exec, priced: Priced) -> Fill {
         let params = self.params.as_ref().expect("callers check params are set");
         let fee_bps = params.profit_fee_bps;
-        // `validate` accepts any positive horizon, and rejecting large ones would change what logged
-        // `SetParams` commands do. One that runs past the end of time saturates and never comes due.
-        let markout_due = self.now.saturating_add(params.toxicity.horizon_ms);
+        let markout_due = self.now + params.toxicity.horizon_ms;
         let market = self.markets.get_mut(&exec.market).expect("priced against this market");
         let acct = self.accounts.get_mut(&exec.account).expect("priced for this account");
 

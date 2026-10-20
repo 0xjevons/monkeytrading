@@ -316,10 +316,12 @@ fn listing() -> impl Strategy<Value = MarketSpec> {
                 ..listed(id)
             }
         ),
-        (id(), bps(), any::<i64>()).prop_map(move |(id, markup_bps, day_basis)| MarketSpec {
-            financing: FinancingSpec { benchmark: "SOFR".into(), markup_bps, day_basis },
-            ..listed(id)
-        }),
+        (id(), bps(), prop_oneof![4 => select(vec![360, 365]), 1 => any::<i64>()]).prop_map(
+            move |(id, markup_bps, day_basis)| MarketSpec {
+                financing: FinancingSpec { benchmark: "SOFR".into(), markup_bps, day_basis },
+                ..listed(id)
+            }
+        ),
     ]
 }
 
