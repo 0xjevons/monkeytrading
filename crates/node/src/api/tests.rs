@@ -250,6 +250,35 @@ fn retry_after_is_the_wait_in_whole_seconds_rounded_up() {
     }
 }
 
+#[tokio::test]
+async fn withdrawals_are_refused_while_custody_cannot_pay_them_out() {
+    let (state, mut rx) = api_state(false);
+    let request = WithdrawalRequest { account: AccountId([0xaa; 20]), amount: Fixed::from_int(5), auth: None };
+    let answer = timeout(Duration::from_secs(5), super::withdraw(State(state), Json(request)));
+    let res = answer.await.expect("the endpoint answers without waiting on the sequencer");
+    assert!(matches!(res, Err(ApiError::NotImplemented(_))));
+    assert!(rx.try_recv().is_err(), "nothing may reach the sequencer");
+}
+
+#[tokio::test]
+async fn the_dev_deposit_endpoint_exists_only_under_mock_custody() {
+    let (state, mut rx) = api_state(false);
+    let answer = timeout(Duration::from_secs(5), dev_deposit(State(state), Json(body())));
+    let res = answer.await.expect("the endpoint answers without waiting on the sequencer");
+    assert!(matches!(res, Err(ApiError::NotFound)));
+    assert!(rx.try_recv().is_err(), "nothing may reach the sequencer");
+
+    let (state, mut rx) = api_state(true);
+    let handler = tokio::spawn(dev_deposit(State(state), Json(body())));
+    let Some(sequencer::Request::Submit { cmd: Command::Deposit { amount, .. }, reply: Some(reply) }) = rx.recv().await
+    else {
+        panic!("mock custody must sequence the deposit");
+    };
+    assert_eq!(amount, Fixed::from_int(5));
+    reply.send(vec![]).unwrap();
+    assert!(handler.await.unwrap().is_ok());
+}
+
 // ── Helpers ──
 
 /// Serves the API for `node`, with `dir` as its log directory, on a free local port.
@@ -264,7 +293,7 @@ async fn serve_with(node: &TestSequencer, dir: &Path, manifest: watch::Receiver<
         stream: node.stream.clone(),
         attestation: Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate(), &[0; 32]).unwrap()),
         auth: ClientAuth::Unsigned,
-        dev_deposits: true,
+        mock_custody: true,
         clock: now_ms,
         log_dir: dir.to_owned(),
         manifest,
@@ -286,7 +315,7 @@ async fn serve_history(history: Reader) -> SocketAddr {
         stream: broadcast::channel(1).0,
         attestation: Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate(), &[0; 32]).unwrap()),
         auth: ClientAuth::Unsigned,
-        dev_deposits: false,
+        mock_custody: false,
         clock: now_ms,
         log_dir: PathBuf::new(),
         manifest: watch::channel(Manifest::default()).1,
@@ -375,4 +404,30 @@ async fn get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
     assert!(!head.contains("transfer-encoding: chunked"), "{head}");
     let status = head.split(' ').nth(1).unwrap().parse().unwrap();
     (status, response[split + 4..].to_vec())
+}
+
+/// API state over a channel no sequencer reads, so a test sees each request the API sends.
+fn api_state(mock_custody: bool) -> (ApiState, mpsc::Receiver<sequencer::Request>) {
+    let (tx, rx) = mpsc::channel(1);
+    let attestation = Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate(), &[0; 32]).unwrap());
+    let (stream, _) = broadcast::channel(1);
+    let (_, manifest) = watch::channel(Manifest::default());
+    let state = ApiState {
+        tx,
+        stream,
+        attestation,
+        auth: ClientAuth::Unsigned,
+        mock_custody,
+        clock: now_ms,
+        log_dir: scratch_dir("api-state"),
+        manifest,
+        backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
+        limits: Arc::new(ApiLimits::new(&dev_config().api)),
+        history: Reader::new(PathBuf::new(), watch::channel(true).1),
+    };
+    (state, rx)
+}
+
+fn body() -> AmountBody {
+    AmountBody { account: AccountId([0xaa; 20]), amount: Fixed::from_int(5) }
 }

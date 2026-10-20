@@ -26,6 +26,7 @@ impl NodeConfig {
     /// - `time.servers` has fewer than two servers, lists a public key twice, or has an address
     ///   that is not `host:port`
     /// - `history.retention` is zero, or too long to count in milliseconds
+    /// - the custody section does not match its provider (see `validate_custody`)
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
     ///   engine would refuse, or genesis lists a market id twice
@@ -84,6 +85,7 @@ impl NodeConfig {
             anyhow::bail!("time.servers address {:?} is not host:port", s.address);
         }
         self.history.retention_ms().context("history.retention")?;
+        self.validate_custody()?;
         self.genesis.params.validate().map_err(anyhow::Error::msg).context("genesis.params")?;
         // Genesis reruns on every boot until it completes, so a command the engine would refuse
         // fails here, before anything reaches the log.

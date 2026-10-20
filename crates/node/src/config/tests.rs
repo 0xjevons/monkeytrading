@@ -2,6 +2,8 @@ use super::*;
 
 use crate::test_support::DEV_CONFIG as DEV;
 
+const ANVIL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/anvil.toml");
+
 #[test]
 fn the_committed_dev_config_loads() {
     let cfg = NodeConfig::load(Path::new(DEV)).unwrap();
@@ -30,9 +32,10 @@ fn a_zero_segment_size_is_refused() {
 fn unsigned_requests_need_the_mock_tee_and_mock_custody() {
     let dev = std::fs::read_to_string(DEV).unwrap();
     let tee = dev.replace("provider = \"mock\" # \"configfs_tsm\"", "provider = \"configfs_tsm\" #");
-    let custody = dev.replace("[custody]\nprovider = \"mock\"", "[custody]\nprovider = \"evm\"");
-    for text in [&tee, &custody] {
-        assert_ne!(text, &dev, "the replacement must change the config");
+    let anvil = std::fs::read_to_string(ANVIL).unwrap();
+    let custody = anvil.replace("auth = \"eip712\"", "auth = \"none\"");
+    for (text, source) in [(&tee, &dev), (&custody, &anvil)] {
+        assert_ne!(text, source, "the replacement must change the config");
         let cfg: NodeConfig = toml::from_str(text).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("node.auth = \"none\""), "{err:#}");
@@ -184,6 +187,72 @@ fn a_zero_tick_is_refused() {
 }
 
 #[test]
+fn the_committed_anvil_config_loads_with_evm_custody_and_no_genesis_capital() {
+    let cfg = NodeConfig::load(Path::new(ANVIL)).unwrap();
+    assert_eq!(cfg.custody.provider, CustodyProvider::Evm);
+    assert_eq!(cfg.custody.evm.unwrap().finality_tag, FinalityTag::Safe);
+    assert_eq!(cfg.genesis.house_capital, Fixed::ZERO);
+}
+
+#[test]
+fn the_custody_section_must_match_its_provider() {
+    let dev = std::fs::read_to_string(DEV).unwrap();
+    let evm_without_section = dev
+        .replace("provider = \"mock\"\nchain_id", "provider = \"evm\"\nchain_id")
+        .replace("auth = \"none\"", "auth = \"eip712\"");
+    assert_validation_fails(&evm_without_section, "needs a [custody.evm] section");
+    let anvil = std::fs::read_to_string(ANVIL).unwrap();
+    let mock_with_section = anvil.replace("provider = \"evm\"", "provider = \"mock\"");
+    assert_validation_fails(&mock_with_section, "[custody.evm] is set");
+    assert_validation_fails(&anvil.replace("max_block_range = 1000", "max_block_range = 0"), "must be non-zero");
+    assert_validation_fails(&anvil.replace("http://127.0.0.1:8545", "not a url"), "custody.evm.rpc_url");
+}
+
+#[test]
+fn genesis_house_capital_is_refused_with_evm_custody() {
+    let anvil = std::fs::read_to_string(ANVIL).unwrap();
+    let text = anvil.replace("house_capital = \"0\"", "house_capital = \"1000\"");
+    assert_ne!(text, anvil, "the replacement must change the config");
+    assert_validation_fails(&text, "genesis.house_capital must be zero with EVM custody");
+}
+
+#[test]
+fn the_rpc_url_is_redacted_from_debug_output() {
+    let text = std::fs::read_to_string(ANVIL).unwrap().replace("127.0.0.1:8545", "rpc.example/v2/secret-key");
+    let cfg: NodeConfig = toml::from_str(&text).unwrap();
+    let printed = format!("{cfg:?}");
+    assert!(printed.contains("SecretUrl(<redacted>)"), "{printed}");
+    assert!(!printed.contains("secret-key"), "{printed}");
+}
+
+#[test]
+fn a_plain_http_rpc_url_is_refused_unless_it_is_a_literal_loopback_address() {
+    let anvil = std::fs::read_to_string(ANVIL).unwrap();
+    let remote = anvil.replace("http://127.0.0.1:8545", "http://rpc.example/v2/key");
+    assert_validation_fails(&remote, "must use https");
+    // `localhost` resolves through the host's `/etc/hosts`, so only literal loopback passes.
+    assert_validation_fails(&anvil.replace("127.0.0.1:8545", "localhost:8545"), "must use https");
+    let cfg: NodeConfig = toml::from_str(&remote.replace("http://rpc.example", "https://rpc.example")).unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn a_malformed_config_line_is_named_but_never_quoted() {
+    let anvil = std::fs::read_to_string(ANVIL).unwrap();
+    let line = anvil.lines().position(|l| l.starts_with("rpc_url")).unwrap() + 1;
+    let text =
+        anvil.replace("rpc_url = \"http://127.0.0.1:8545\"", "rpc_url = [\"https://rpc.example/v2/secret-key\"]");
+    let path = std::env::temp_dir().join(format!("engine-config-test-{}.toml", std::process::id()));
+    std::fs::write(&path, text).unwrap();
+
+    let err = format!("{:#}", NodeConfig::load(&path).unwrap_err());
+    assert!(err.contains(&format!("line {line}:")), "{err}");
+    assert!(!err.contains("secret-key"), "{err}");
+}
+
+// ── Helpers ──
+
+#[test]
 fn the_committed_venue_feeds_price_both_crypto_markets_from_three_venues() {
     let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
     cfg.feeds.provider = FeedProvider::Venues;
@@ -265,4 +334,10 @@ fn a_zero_api_rate_or_cap_fails_the_boot() {
         assert_eq!(dev.matches(from).count(), 1, "{from}");
         assert!(toml::from_str::<NodeConfig>(&dev.replace(from, to)).is_err(), "{to}");
     }
+}
+
+fn assert_validation_fails(text: &str, expected: &str) {
+    let cfg: NodeConfig = toml::from_str(text).unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains(expected), "{err}");
 }

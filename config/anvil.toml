@@ -1,0 +1,177 @@
+# Local EVM custody against Anvil: mock TEE and feeds, with the vault and a mock USDC on a local
+# chain. `scripts/dev-vault-deposits.sh` starts Anvil, deploys both contracts from Anvil's first
+# account (so they land at the addresses below), and runs the deposit scenario against this node.
+#
+# Genesis credits no house capital: it enters through vault deposits to the house.
+
+[node]
+listen = "127.0.0.1:8080"
+log_dir = "data/anvil/log"
+segment_commands = 1000
+checkpoint_every = 1000
+tick = "250ms"
+# Signed requests: unsigned ones need mock custody. Recorded in the log on first start, with the
+# custody chain id and vault under "eip712"; changing it needs a fresh log.
+auth = "eip712"
+
+# Limits on the public API, served over TLS with a key generated in the enclave. A client is its
+# socket peer IP (an IPv6 client by its /64); forwarding headers are ignored.
+[api]
+# Keep max_connections below the process's open-file limit (`ulimit -n`).
+max_connections = 512
+max_connections_per_ip = 32
+handshake_timeout = "10s"
+read_timeout = "30s"
+# Largest request body (413 when larger) and largest message a stream subscriber may send.
+max_body_bytes = 65536
+# A token bucket: `burst` requests at once, refilled at `per_second`. Excess requests get 429.
+per_ip = { per_second = 50, burst = 100 }
+# Requests that act for one account: orders, cancels, and withdrawals.
+per_account = { per_second = 10, burst = 20 }
+# New connections from one client, closed before the TLS handshake when over. Keep it above per_ip.
+per_ip_connections = { per_second = 100, burst = 200 }
+max_subscribers = 256
+# A client that takes longer than this to take a response, or a subscriber a message, is dropped.
+send_timeout = "30s"
+
+[history]
+# The account history index, derived from the log; removing the directory while
+# the node is stopped rebuilds it from the log.
+dir = "data/anvil/history"
+# Events older than this, counted back from the newest command, leave the index; the log keeps them.
+retention = "365d"
+
+[logging]
+level = "info"
+
+[tee]
+provider = "mock"
+
+[operator]
+rotation_enabled = false
+
+[custody]
+provider = "evm"
+chain_id = 31337
+vault = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+
+[custody.evm]
+rpc_url = "http://127.0.0.1:8545"
+usdc = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+# Anvil started with `--slots-in-an-epoch 1` marks the block below the head safe, so a deposit is
+# final three blocks after it is mined. On Arbitrum One: "safe" and no confirmations.
+finality_tag = "safe"
+confirmations = 2
+start_block = 0
+max_block_range = 1000
+poll_interval = "200ms"
+rpc_timeout = "5s"
+stall_critical_after = "5m"
+cursor_path = "data/anvil/custody-cursor.json"
+
+[feeds]
+provider = "mock"
+interval = "200ms"
+mock_mids = [
+  { market = 1, mid = "100000" },
+  { market = 2, mid = "4000" },
+]
+
+# Trusted time. The sequencer checks every stamp against signed Roughtime readings
+# (RFC 10049), and stamps nothing, genesis included, before its first sample. It
+# halts when the host clock is not within `max_drift` of them, or when no sample
+# has arrived for 60 seconds, and resumes once a sample is within the bound
+# again. Readings carry whole seconds and a radius of a few seconds, so the
+# bound is coarse.
+[time]
+max_drift = "15s"
+interval = "10s"
+
+# Each address and key is from the operator's own published page, cited above
+# the entry, and matches the key the operator publishes in DNS TXT.
+#
+# int08h, https://int08h.com/post/public-roughtime-server/ (speaks 0x8000000c)
+[[time.servers]]
+name = "int08h"
+address = "roughtime.int08h.com:2002"
+public_key = "AW5uAoTSTDfG5NfY1bTh08GUnOqlRb+HVhbJ3ODJvsE="
+
+# TimeNL, run by SIDN Labs, https://time.nl/index_en.html (speaks 0x8000000c)
+[[time.servers]]
+name = "TimeNL"
+address = "rough.time.nl:2002"
+public_key = "v2CievhgKsxzlWPwIkYFUXeA51Akhkv5uhJCj1/kbiY="
+
+# time.txryan.com, https://time.txryan.com/ (the RFC 10049 port, speaks version 1)
+[[time.servers]]
+name = "txryan"
+address = "time.txryan.com:5319"
+public_key = "iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA="
+
+[genesis]
+house_capital = "0"
+benchmarks = [
+  { name = "SOFR", annual_bps = 400 },
+]
+
+[genesis.params]
+profit_fee_bps = 1000
+closeout_level_bps = 5000
+house_total_cap_bps = 20000
+stress_move_window_ms = 60000
+stress_cooldown_ms = 300000
+
+[genesis.params.rollover]
+tz = "Europe/London"
+hour = 22
+minute = 0
+
+[genesis.params.toxicity]
+horizon_ms = 2000
+ewma_weight_bps = 1000
+tiers = [
+  { min_score_bps = 5, extra_spread_bps = 1 },
+  { min_score_bps = 15, extra_spread_bps = 3 },
+]
+
+# Level 0 is normal. Higher levels widen spreads, either automatically on
+# any trigger or when the operator raises the floor.
+[[genesis.params.stress_levels]]
+size_spread_multiplier_bps = 10000
+min_spread_bps = 0
+
+[[genesis.params.stress_levels]]
+size_spread_multiplier_bps = 20000
+min_spread_bps = 2
+trigger = { divergence_bps = 15, move_bps = 150, utilisation_bps = 8000 }
+
+[[genesis.params.stress_levels]]
+size_spread_multiplier_bps = 40000
+min_spread_bps = 10
+trigger = { divergence_bps = 20, move_bps = 300, utilisation_bps = 9500 }
+
+# --- Crypto: 24/7 ---------------------------------------------------------
+
+[[genesis.markets]]
+id = 1
+symbol = "BTC-USD"
+asset_class = "crypto"
+max_slippage_bps = 25
+house_cap_bps = 3000
+margin_tiers = [{ up_to = "1000000", bps = 1000 }, { bps = 2000 }]
+spread_tiers = [{ up_to = "2000000", bps = 0 }, { up_to = "10000000", bps = 3 }, { bps = 8 }]
+schedule = { kind = "always_open" }
+price_rules = { max_age_ms = 1000, max_divergence_bps = 25, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 500, day_basis = 365 }
+
+[[genesis.markets]]
+id = 2
+symbol = "ETH-USD"
+asset_class = "crypto"
+max_slippage_bps = 25
+house_cap_bps = 2000
+margin_tiers = [{ up_to = "1000000", bps = 1000 }, { bps = 2000 }]
+spread_tiers = [{ up_to = "1000000", bps = 0 }, { up_to = "5000000", bps = 3 }, { bps = 8 }]
+schedule = { kind = "always_open" }
+price_rules = { max_age_ms = 1000, max_divergence_bps = 25, min_sources = 2 }
+financing = { benchmark = "SOFR", markup_bps = 500, day_basis = 365 }

@@ -21,6 +21,9 @@ use engine_core::types::{AccountId, MarketId, Millis};
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
 
+mod custody;
+pub use custody::{EvmCustodySection, FinalityTag, SecretUrl};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
@@ -46,7 +49,8 @@ pub enum TeeProvider {
 pub enum CustodyProvider {
     /// No chain. Exposes a dev deposit endpoint and logs withdrawals.
     Mock,
-    /// Watches vault deposits on an EVM chain and submits signed withdrawals.
+    /// Credits final vault deposits from an EVM chain. Withdrawals are refused until they are
+    /// paid on-chain.
     Evm,
 }
 
@@ -172,8 +176,10 @@ pub struct OperatorSection {
 pub struct CustodySection {
     pub provider: CustodyProvider,
     pub chain_id: u64,
-    /// The vault contract that holds collateral and honours enclave-signed withdrawals.
+    /// The vault contract that holds collateral.
     pub vault: String,
+    /// The chain connection; present exactly when `provider = "evm"`.
+    pub evm: Option<EvmCustodySection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,8 +290,8 @@ pub struct HistorySection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Genesis {
-    /// House capital credited at genesis. Zero credits none.
-    /// TODO: nothing checks this against the house's vault deposit; bound it once custody reads it.
+    /// House capital credited at genesis. Zero credits none; with EVM custody it must be zero,
+    /// since house capital then enters only through vault deposits to the house.
     pub house_capital: Fixed,
     pub params: ProtocolParams,
     #[serde(default)]
@@ -328,7 +334,8 @@ impl Venue {
 impl NodeConfig {
     /// Reads and validates the config file at `path`.
     /// Error cases:
-    /// - the file cannot be read, or is not valid TOML for this schema (unknown keys included)
+    /// - the file cannot be read, or is not valid TOML for this schema (unknown keys included);
+    ///   the error names the line but never quotes it, since a line may hold a credential
     /// - `logging.level` is not a valid filter directive
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, `feeds.interval`,
     ///   `time.max_drift`, `time.interval`, or an `api` timeout is zero, or `time.interval` plus
@@ -339,12 +346,15 @@ impl NodeConfig {
     /// - `time.servers` has fewer than two servers, lists a public key twice, or has an address
     ///   that is not `host:port`
     /// - `history.retention` is zero, or too long to count in milliseconds
+    /// - the custody section does not match its provider (see `validate_custody`)
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
     ///   engine would refuse, or genesis lists a market id twice
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg: NodeConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let cfg: NodeConfig = toml::from_str(&text)
+            .map_err(|e| parse_error(&e, &text))
+            .with_context(|| format!("parsing {}", path.display()))?;
         cfg.validate().with_context(|| format!("validating {}", path.display()))?;
         Ok(cfg)
     }
@@ -372,6 +382,16 @@ impl HistorySection {
     pub fn retention_ms(&self) -> anyhow::Result<Millis> {
         ensure!(!self.retention.is_zero(), "must be non-zero");
         Millis::try_from(self.retention.as_millis()).context("too long")
+    }
+}
+
+/// A TOML error reduced to its message and line. The error's own text quotes the offending
+/// source line, which may hold a credential such as `custody.evm.rpc_url`.
+fn parse_error(e: &toml::de::Error, text: &str) -> anyhow::Error {
+    let line = e.span().map(|span| text[..span.start].matches('\n').count() + 1);
+    match line {
+        Some(line) => anyhow::anyhow!("line {line}: {}", e.message()),
+        None => anyhow::anyhow!("{}", e.message()),
     }
 }
 

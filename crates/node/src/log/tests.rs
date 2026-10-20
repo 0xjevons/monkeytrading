@@ -77,6 +77,17 @@ fn offsets_number_each_seqs_entries_from_its_command() {
 }
 
 #[test]
+fn sync_writes_buffered_entries_to_the_segment() {
+    let dir = scratch_dir("sync");
+    let manifest = watch::channel(Manifest::default()).0;
+    let mut writer = SegmentedLog::open(&dir).unwrap().into_writer(100, manifest).unwrap();
+    writer.append(&cmd(0)).unwrap();
+    assert!(read_all(&dir.join(SEG_0)).unwrap().is_empty(), "appends stay buffered");
+    writer.sync().unwrap();
+    assert_eq!(read_all(&dir.join(SEG_0)).unwrap(), [cmd(0)]);
+}
+
+#[test]
 fn a_missing_log_is_empty_and_a_corrupt_line_is_an_error() {
     let path = scratch_dir("corrupt").join("log.jsonl");
     assert!(read_all(&path).unwrap().is_empty());

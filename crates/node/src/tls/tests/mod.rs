@@ -333,7 +333,7 @@ impl TestNode {
             attestation: Arc::new(attestation.clone()),
             auth: ClientAuth::Unsigned,
             clock: now_ms,
-            dev_deposits: false,
+            mock_custody: true,
             log_dir: PathBuf::new(),
             manifest: watch::channel(Manifest::default()).1,
             backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),

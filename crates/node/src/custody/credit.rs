@@ -1,0 +1,109 @@
+//! Sequencing vault deposits: crediting one deposit once, and the round trips to the sequencer
+//! it needs.
+
+use std::collections::BTreeSet;
+
+use anyhow::anyhow;
+use engine_core::Engine;
+use engine_core::command::Command;
+use engine_core::event::Event;
+use tokio::sync::{mpsc, oneshot};
+use tracing::{Instrument, debug, error, info, info_span};
+
+use crate::custody::evm::{Beneficiary, VaultDeposit};
+use crate::custody::usdc_to_fixed;
+use crate::sequencer::Request;
+
+/// Sequences one final deposit, unless its reference is already credited. Its span carries the
+/// reference as `id`.
+/// Error cases:
+/// - the sequencer has stopped
+pub(super) async fn credit(tx: &mpsc::Sender<Request>, deposit: &VaultDeposit) -> anyhow::Result<()> {
+    let chain_ref = deposit.chain_ref();
+    let span = info_span!("deposit", id = %chain_ref, block = deposit.block, deposit_id = deposit.id);
+    async move {
+        let Some(amount) = usdc_to_fixed(deposit.units) else {
+            // Nothing re-examines it, and the USDC stays in the vault uncredited.
+            error!(alert = "deposit_unrepresentable", units = %deposit.units, "deposit too large to credit");
+            return Ok(());
+        };
+        let credited_ref = chain_ref.clone();
+        if query(tx, move |engine| engine.is_credited(&credited_ref)).await? {
+            debug!("deposit already credited");
+            return Ok(());
+        }
+        let cmd = match deposit.beneficiary {
+            Beneficiary::Trader(account) => Command::Deposit { account, amount, chain_ref },
+            Beneficiary::House => Command::HouseCapital { amount, chain_ref },
+        };
+        for event in submit(tx, cmd).await? {
+            match event {
+                Event::Deposited { account, amount } => info!(%account, %amount, "deposit credited"),
+                Event::HouseCapitalMoved { amount, nav } => info!(%amount, %nav, "house deposit credited"),
+                // The sequencer alerts a refused trader deposit as `deposit_rejected`; a refused
+                // house deposit is an admin rejection, which it does not alert.
+                Event::AdminRejected { reason } => {
+                    error!(alert = "house_deposit_rejected", %amount, reason, "house deposit not credited");
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    .instrument(span)
+    .await
+}
+
+/// References already credited for the transactions in `deposits` at log indices those
+/// deposits no longer carry: a transaction the chain moved after it was credited.
+/// Error cases:
+/// - the sequencer has stopped
+pub(super) async fn moved_credits(
+    tx: &mpsc::Sender<Request>,
+    deposits: &[VaultDeposit],
+) -> anyhow::Result<Vec<String>> {
+    let current: BTreeSet<String> = deposits.iter().map(VaultDeposit::chain_ref).collect();
+    let prefixes: BTreeSet<String> = deposits.iter().map(|d| format!("{}:", d.tx_hash)).collect();
+    query(tx, move |engine| {
+        prefixes
+            .iter()
+            .flat_map(|prefix| engine.credited_refs_with_prefix(prefix))
+            .filter(|chain_ref| !current.contains(*chain_ref))
+            .map(str::to_owned)
+            .collect()
+    })
+    .await
+}
+
+/// Sequences `cmd` and returns its events once they are durable.
+/// Error cases:
+/// - the sequencer has stopped
+async fn submit(tx: &mpsc::Sender<Request>, cmd: Command) -> anyhow::Result<Vec<Event>> {
+    let (reply, rx) = oneshot::channel();
+    tx.send(Request::Submit { cmd, reply: Some(reply) }).await.map_err(|_| anyhow!("sequencer stopped"))?;
+    rx.await.map_err(|_| anyhow!("sequencer stopped"))
+}
+
+/// Waits until every command sequenced so far is synced to storage, and returns the last seq.
+/// Error cases:
+/// - the sequencer has stopped
+pub(super) async fn sync(tx: &mpsc::Sender<Request>) -> anyhow::Result<Option<u64>> {
+    let (reply, rx) = oneshot::channel();
+    tx.send(Request::Sync(reply)).await.map_err(|_| anyhow!("sequencer stopped"))?;
+    rx.await.map_err(|_| anyhow!("sequencer stopped"))
+}
+
+/// Reads the engine between sequencer batches.
+/// Error cases:
+/// - the sequencer has stopped
+async fn query<T: Send + 'static>(
+    tx: &mpsc::Sender<Request>,
+    read: impl FnOnce(&Engine) -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    let (reply, rx) = oneshot::channel();
+    let q = Box::new(move |engine: &Engine| {
+        let _ = reply.send(read(engine));
+    });
+    tx.send(Request::Query(q)).await.map_err(|_| anyhow!("sequencer stopped"))?;
+    rx.await.map_err(|_| anyhow!("sequencer stopped"))
+}

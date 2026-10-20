@@ -6,3 +6,9 @@
 
 # Agent process artifacts: code-review runs and similar (do not commit)
 agents/.processes/
+
+# Foundry build output and Soldeer-installed dependencies
+/contracts/out
+/contracts/cache
+/contracts/dependencies
+/contracts/broadcast

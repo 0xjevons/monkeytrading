@@ -1,0 +1,111 @@
+//! The `[custody.evm]` section, the RPC URL that may carry a credential, and the checks that tie
+//! the custody section to its provider.
+
+use std::fmt;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use alloy::primitives::Address;
+use alloy::transports::http::reqwest::Url;
+use anyhow::bail;
+use engine_core::Fixed;
+use serde::Deserialize;
+
+use crate::config::{CustodyProvider, NodeConfig};
+
+/// The block tag whose number marks finality on the custody chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalityTag {
+    Latest,
+    /// On Arbitrum One, the newest block whose L2 batch is posted to Ethereum.
+    Safe,
+    Finalized,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvmCustodySection {
+    /// HTTPS unless it is on this machine (`127.0.0.1` or `[::1]`). It must serve state at past
+    /// blocks back to `start_block` (an archive node), which catch-up after downtime and rescans
+    /// read.
+    pub rpc_url: SecretUrl,
+    /// The USDC contract the vault must hold; the watcher checks it on its first poll.
+    pub usdc: Address,
+    /// A deposit is final once its block is at least `confirmations` below the block this tag
+    /// names: `safe` with no confirmations on Arbitrum One.
+    pub finality_tag: FinalityTag,
+    pub confirmations: u64,
+    /// The vault's deployment block, where scanning starts when there is no cursor.
+    pub start_block: u64,
+    /// Most blocks asked for in one `eth_getLogs` request, and most headers in one JSON-RPC
+    /// batch; set it within both of the provider's limits. The watcher also keeps one proven
+    /// block hash per this many blocks of backlog.
+    pub max_block_range: u64,
+    #[serde(with = "humantime_serde")]
+    pub poll_interval: Duration,
+    /// Deadline for each RPC request.
+    #[serde(with = "humantime_serde")]
+    pub rpc_timeout: Duration,
+    /// A deposit stall, a final block that stays put while the head moves, or an endpoint head
+    /// that stops advancing, that lasts this long raises a Critical alert. On Arbitrum One, set it
+    /// above the longest gap between L1 batch posts.
+    #[serde(with = "humantime_serde")]
+    pub stall_critical_after: Duration,
+    /// Where the deposit cursor is kept between restarts.
+    pub cursor_path: PathBuf,
+}
+
+/// A URL that may carry credentials. `Debug` hides it; read it with `expose` where it is used.
+#[derive(Deserialize)]
+#[serde(transparent)]
+pub struct SecretUrl(String);
+
+impl fmt::Debug for SecretUrl {
+    /// Never prints the URL.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretUrl(<redacted>)")
+    }
+}
+
+impl SecretUrl {
+    /// The URL, for the one place that connects with it.
+    /// Error cases:
+    /// - the value is not a valid URL
+    pub fn expose(&self) -> anyhow::Result<Url> {
+        // `url::ParseError` names the problem, never the input, so nothing secret reaches a log.
+        Url::parse(&self.0).map_err(|e| anyhow::anyhow!("custody.evm.rpc_url: {e}"))
+    }
+}
+
+impl NodeConfig {
+    /// Checks the custody section against its provider, and that genesis credits house capital
+    /// only under mock custody.
+    /// Error cases:
+    /// - `provider = "evm"` without `[custody.evm]`, or `provider = "mock"` with it
+    /// - `custody.evm.rpc_url` is not a URL, or is plain HTTP to another machine, where the host
+    ///   could rewrite every answer
+    /// - a range, interval, or timeout in `[custody.evm]` is zero
+    /// - `genesis.house_capital` is not zero with EVM custody
+    pub(super) fn validate_custody(&self) -> anyhow::Result<()> {
+        let evm = match (self.custody.provider, &self.custody.evm) {
+            (CustodyProvider::Mock, None) => return Ok(()),
+            (CustodyProvider::Mock, Some(_)) => bail!("[custody.evm] is set but custody.provider is \"mock\""),
+            (CustodyProvider::Evm, None) => bail!("custody.provider = \"evm\" needs a [custody.evm] section"),
+            (CustodyProvider::Evm, Some(evm)) => evm,
+        };
+        let url = evm.rpc_url.expose()?;
+        // Literal addresses only: `localhost` resolves through the host-controlled `/etc/hosts`.
+        let on_this_machine = matches!(url.host_str(), Some("127.0.0.1" | "[::1]"));
+        if url.scheme() != "https" && !on_this_machine {
+            bail!("custody.evm.rpc_url must use https unless it is on this machine");
+        }
+        if evm.max_block_range == 0 || evm.poll_interval.is_zero() || evm.rpc_timeout.is_zero() {
+            bail!("custody.evm.max_block_range, poll_interval, and rpc_timeout must be non-zero");
+        }
+        if self.genesis.house_capital != Fixed::ZERO {
+            bail!("genesis.house_capital must be zero with EVM custody; deposit to the house instead");
+        }
+        Ok(())
+    }
+}

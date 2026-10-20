@@ -9,7 +9,7 @@ use engine_core::types::Millis;
 use tracing::info;
 
 use crate::config::Genesis;
-use crate::sequencer::{GENESIS_REF, Sequencer, genesis_commands};
+use crate::sequencer::{GENESIS_REF, Sequencer};
 
 impl Sequencer {
     /// The seq of the last command in the log, if any.
@@ -99,4 +99,16 @@ impl Sequencer {
         }
         Ok(())
     }
+}
+
+/// The commands that sequence `genesis` into an empty log, in order. The last is the house capital
+/// credit under `GENESIS_REF`, a zero one included, which marks genesis done.
+pub fn genesis_commands(genesis: &Genesis) -> Vec<Command> {
+    let mut cmds = vec![Command::Admin(AdminCommand::SetParams(genesis.params.clone()))];
+    cmds.extend(genesis.benchmarks.iter().map(|b| {
+        Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: b.name.clone(), annual_bps: b.annual_bps })
+    }));
+    cmds.extend(genesis.markets.iter().map(|m| Command::Admin(AdminCommand::UpsertMarket(m.clone()))));
+    cmds.push(Command::HouseCapital { amount: genesis.house_capital, chain_ref: GENESIS_REF.into() });
+    cmds
 }

@@ -14,6 +14,7 @@ engine-core = { path = "crates/core", version = "0.1.0" }
 alloy-dyn-abi = { version = "1.7.3", default-features = false, features = ["std", "eip712"] }
 alloy-primitives = { version = "1.7.3", default-features = false, features = ["std", "serde"] }
 alloy-sol-types = { version = "1.7.3", default-features = false, features = ["std"] }
+alloy = { version = "2.5", default-features = false, features = ["std", "provider-http", "reqwest-rustls-tls", "rpc-types", "sol-types"] }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 # Without `simd-unsafe`, its only source of `unsafe` code.
@@ -54,6 +55,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+webpki-root-certs = "1"
 webpki-roots = "1"
 
 [profile.release]

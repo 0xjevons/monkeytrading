@@ -4,6 +4,7 @@
 //! On SIGTERM or ctrl-c, every task but the sequencer is stopped; the sequencer then drains what is
 //! queued and writes a final checkpoint.
 
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +23,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 use crate::api::{ApiState, Feed, MAX_BACKFILLS, router};
 use crate::clock::{Clock, SystemClock, now_ms};
 use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProvider};
+use crate::custody::Custody;
+use crate::feeds;
 use crate::feeds::venue::{self, Timing};
 use crate::history::History;
 use crate::limits::{ApiLimits, run_retain};
@@ -29,7 +32,7 @@ use crate::log::{Manifest, SegmentedLog};
 use crate::sequencer::{Request, Sequencer, SequencerConfig};
 use crate::tee::{Attestor, ConfigfsTsm, EnclaveKey, MockAttestor, attest_key};
 use crate::tls::{TlsIdentity, serve};
-use crate::{custody, feeds, trusted_time};
+use crate::trusted_time;
 
 /// How long the sequencer gets to drain and checkpoint after a shutdown signal.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -37,22 +40,23 @@ const CHANNEL_CAPACITY: usize = 65_536;
 
 type TaskResult = (&'static str, anyhow::Result<()>);
 
-/// Installs the global log subscriber at `level`, a `tracing` filter directive.
+/// Installs the global log subscriber at `level`, a `tracing` filter directive. Colour codes
+/// go only to a terminal, so a log file or collector gets plain `field=value` text.
 /// Error cases:
 /// - `level` is not a valid filter directive
 pub fn init_logging(level: &str) -> anyhow::Result<()> {
     let filter = EnvFilter::try_new(level).context("log level")?;
-    fmt().with_env_filter(filter).init();
+    fmt().with_env_filter(filter).with_ansi(std::io::stdout().is_terminal()).init();
     Ok(())
 }
 
 /// Runs the node until a shutdown signal, or until the first supervised task stops.
 /// Error cases:
-/// - operator rotation is enabled, or the custody provider is not implemented
+/// - operator rotation is enabled
 /// - `feeds.provider = "venues"` without `[feeds.venues]`, or the TLS config cannot be built
 /// - generating the TLS key, attesting the keys, opening the history index (including one the log
-///   does not match), recovering the log (including a log that records another client auth), or
-///   binding the listener fails
+///   does not match), recovering the log (including a log that records another client auth),
+///   connecting custody, or binding the listener fails
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
 pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.operator.rotation_enabled {
@@ -61,7 +65,6 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.node.auth == AuthMode::None {
         warn!("API authentication is OFF: development only");
     }
-    custody::check(&cfg.custody)?;
 
     let attestor: Box<dyn Attestor> = match cfg.tee.provider {
         TeeProvider::Mock => {
@@ -109,6 +112,8 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     };
     let mut seq = Sequencer::recover_from(log, seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
+    let custody = Custody::connect(&cfg.custody, seq.last_seq())
+        .inspect_err(|e| error!(alert = "custody_connect_failed", "refusing to serve: {e:#}"))?;
     // Protocol activation and genesis wait, like any command, for a stamp trusted time admits;
     // with no sample yet, they are queued.
     seq.activate_protocol()
@@ -153,9 +158,9 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     let time_tx = tx.clone();
     tasks.spawn(async move { ("trusted_time", trusted_time::run(time_cfg, clock, time_tx).await) });
 
-    let custody_cfg = cfg.custody;
-    let dev_deposits = custody_cfg.provider == CustodyProvider::Mock;
-    tasks.spawn(async move { ("custody", custody::run(&custody_cfg, withdrawals_rx).await) });
+    let mock_custody = cfg.custody.provider == CustodyProvider::Mock;
+    let custody_tx = tx.clone();
+    tasks.spawn(async move { ("custody", custody.run(withdrawals_rx, custody_tx).await) });
 
     let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
     let history_reader = history.reader();
@@ -175,7 +180,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         stream: stream_tx,
         attestation,
         auth: client_auth,
-        dev_deposits,
+        mock_custody,
         clock: now_ms,
         log_dir: cfg.node.log_dir.clone(),
         manifest: manifest_rx,

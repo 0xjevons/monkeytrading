@@ -239,6 +239,18 @@ impl LogWriter {
         }
     }
 
+    /// Flushes, then forces the open segment's data and the directory entry naming it to
+    /// storage, so its entries survive a host kill or a power loss as well as a process crash.
+    /// Error cases:
+    /// - the write or either sync fails
+    pub fn sync(&mut self) -> anyhow::Result<()> {
+        self.flush()?;
+        if let Some((_, out)) = &self.open {
+            out.get_ref().sync_data().context("syncing log")?;
+        }
+        self.dir_handle.sync_all().with_context(|| format!("syncing {}", self.dir.display()))
+    }
+
     /// Starts the segment for `first_seq`, first syncing and listing the current one, if any. The
     /// new file takes its segment name only once the old one is listed, which `LogReader` relies on.
     /// Creating it is the only step that needs a new file descriptor, so it runs first: if it fails
