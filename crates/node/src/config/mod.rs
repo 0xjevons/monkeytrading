@@ -18,7 +18,7 @@ use engine_core::Fixed;
 use engine_core::auth::ClientAuth;
 use engine_core::market::MarketSpec;
 use engine_core::params::{MAX_BENCHMARK_BPS, ProtocolParams};
-use engine_core::types::{AccountId, MarketId};
+use engine_core::types::{AccountId, MarketId, Millis};
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
 use tokio_tungstenite::tungstenite::http::Uri;
@@ -84,6 +84,7 @@ pub struct NodeConfig {
     pub custody: CustodySection,
     pub feeds: FeedsSection,
     pub time: TimeSection,
+    pub history: HistorySection,
     /// Sequenced as admin commands after protocol activation, and again on each boot until its
     /// house capital credit is in the log, so the rules every fill ran under are part of the public
     /// record.
@@ -274,6 +275,18 @@ pub struct RoughtimeServer {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct HistorySection {
+    /// Where the node keeps the account history index, which it derives from the log alone:
+    /// removing the directory rebuilds the index from the log.
+    pub dir: PathBuf,
+    /// How long an event stays in the index, counted back from the sequenced time of the newest
+    /// command it holds. The log keeps every event regardless.
+    #[serde(with = "humantime_serde")]
+    pub retention: Duration,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Genesis {
     /// House capital credited at genesis. Zero credits none.
     /// TODO: nothing checks this against the house's vault deposit; bound it once custody reads it.
@@ -329,6 +342,7 @@ impl NodeConfig {
     ///   no longer than `feeds.interval`
     /// - `time.servers` has fewer than two servers, lists a public key twice, or has an address
     ///   that is not `host:port`
+    /// - `history.retention` is zero, or too long to count in milliseconds
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
     ///   engine would refuse, or genesis lists a market id twice
@@ -364,6 +378,7 @@ impl NodeConfig {
     ///   no longer than `feeds.interval`
     /// - `time.servers` has fewer than two servers, lists a public key twice, or has an address
     ///   that is not `host:port`
+    /// - `history.retention` is zero, or too long to count in milliseconds
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
     ///   engine would refuse, or genesis lists a market id twice
@@ -421,6 +436,7 @@ impl NodeConfig {
         if let Some(s) = servers.iter().find(|s| !is_host_port(&s.address)) {
             anyhow::bail!("time.servers address {:?} is not host:port", s.address);
         }
+        self.history.retention_ms().context("history.retention")?;
         self.genesis.params.validate().map_err(anyhow::Error::msg).context("genesis.params")?;
         // Genesis reruns on every boot until it completes, so a command the engine would refuse
         // fails here, before anything reaches the log.
@@ -494,6 +510,17 @@ fn public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<VerifyingKey
     let bytes = STANDARD.decode(String::deserialize(deserializer)?).map_err(D::Error::custom)?;
     let bytes: [u8; 32] = bytes.try_into().map_err(|_| D::Error::custom("an Ed25519 public key is 32 bytes"))?;
     VerifyingKey::from_bytes(&bytes).map_err(D::Error::custom)
+}
+
+impl HistorySection {
+    /// The retention in milliseconds, the unit of sequenced time.
+    /// Error cases:
+    /// - the retention is zero, which would empty the index at every write
+    /// - it is too long to count in milliseconds
+    pub fn retention_ms(&self) -> anyhow::Result<Millis> {
+        anyhow::ensure!(!self.retention.is_zero(), "must be non-zero");
+        Millis::try_from(self.retention.as_millis()).context("too long")
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -11,12 +12,19 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
-use crate::log::{MANIFEST, Manifest, Offset, SegmentedLog, segment_seq};
+use crate::history::{HistoryEvent, INDEX_FILE, account_of};
+use crate::log::{LogEntry, MANIFEST, Manifest, Offset, SegmentedLog, read_all, segment_seq};
 use crate::sequencer::replay;
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
-use crate::test_support::{SEGMENT_COMMANDS, TestSequencer, deposit, dev_config, log_messages, scratch_dir, withdraw};
+use crate::test_support::{
+    SEGMENT_COMMANDS, TRADER, TestHistory, TestSequencer, deposit, dev_config, log_messages, logged_history,
+    scratch_dir, withdraw,
+};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// The protocol reference log: deposits, trades, rollover financing, a close-out, and withdrawals.
+const REFERENCE_LOG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference/v2.jsonl");
 
 /// The feature's dev scenario: a subscriber reads from offset zero, disconnects between two
 /// messages of one seq, resumes after the last offset it received, and sees every message once;
@@ -113,6 +121,88 @@ async fn the_archive_serves_only_what_the_enclave_manifest_lists() {
     assert_eq!(get(addr, "/v1/archive/00000000000000000000.jsonl").await.0, 404);
 }
 
+/// The account history dev scenario. On a log that deposits, trades, crosses rollovers, closes out,
+/// and withdraws, rebuilt into an index from its completed segments, every account's history pages
+/// one event at a time. More commands then rotate the log, the node restarts, and history pages
+/// again; then again after the index is removed and rebuilt from the log. Each time, every event
+/// in the log appears once, newest first.
+#[tokio::test]
+async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart() {
+    let (dir, index) = (scratch_dir("history-dev-scenario"), scratch_dir("history-dev-index"));
+    let mut log =
+        SegmentedLog::open(&dir).unwrap().into_writer(SEGMENT_COMMANDS, watch::channel(Manifest::default()).0).unwrap();
+    let reference = read_all(Path::new(REFERENCE_LOG)).unwrap();
+    reference.iter().for_each(|entry| log.append(entry).unwrap());
+    log.flush().unwrap();
+    drop(log);
+    let mut accounts: BTreeSet<AccountId> = reference
+        .iter()
+        .filter_map(|entry| match entry {
+            LogEntry::Command(c) => c.events.clone(),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|event| account_of(&event))
+        .collect();
+    accounts.insert(TRADER);
+    let addr = serve_history(&index).await;
+
+    let node = TestSequencer::start(&dir, 1024);
+    let history = TestHistory::start(&node, &dir, &index).unwrap();
+    node.submit(deposit(100, "dep-1")).await;
+    node.submit(withdraw(40)).await;
+    node.stop().await;
+    history.finish().await.unwrap();
+    let first = every_history_page(addr, &accounts).await;
+    assert_eq!(first, expected_history(&dir, &accounts));
+    let kinds: BTreeSet<&str> = first.values().flatten().map(|e| e["type"].as_str().unwrap()).collect();
+    for kind in ["deposited", "fill", "financing", "close_out", "withdrawal_approved"] {
+        assert!(kinds.contains(kind), "{kind} is missing from {kinds:?}");
+    }
+
+    let segments = Manifest::load(&dir).unwrap().segments.len();
+    let node = TestSequencer::start(&dir, 1024);
+    let history = TestHistory::start(&node, &dir, &index).unwrap();
+    for n in 0..SEGMENT_COMMANDS {
+        node.submit(deposit(1, &format!("dep-rotate-{n}"))).await;
+    }
+    node.stop().await;
+    history.finish().await.unwrap();
+    assert!(Manifest::load(&dir).unwrap().segments.len() > segments, "the log rotated");
+    let second = every_history_page(addr, &accounts).await;
+    assert_eq!(second, expected_history(&dir, &accounts));
+    for (account, events) in &first {
+        assert!(second[account].ends_with(events), "{account}: events served before the restart changed");
+    }
+    assert_eq!(second[&TRADER].len(), first[&TRADER].len() + SEGMENT_COMMANDS as usize);
+
+    fs::remove_dir_all(&index).unwrap();
+    let node = TestSequencer::start(&dir, 1024);
+    let history = TestHistory::start(&node, &dir, &index).unwrap();
+    node.stop().await;
+    history.finish().await.unwrap();
+    assert_eq!(every_history_page(addr, &accounts).await, second);
+}
+
+#[tokio::test]
+async fn history_refuses_a_malformed_address_cursor_kind_or_limit() {
+    let (dir, index) = (scratch_dir("history-params"), scratch_dir("history-params-index"));
+    let node = TestSequencer::start(&dir, 16);
+    let history = TestHistory::start(&node, &dir, &index).unwrap();
+    node.submit(deposit(100, "dep-1")).await;
+    node.stop().await;
+    history.finish().await.unwrap();
+    let addr = serve_history(&index).await;
+    let path = format!("/v1/accounts/{TRADER}/history");
+    for query in ["limit=200", "limit=1", "kind=deposited", "before=99999:0", "after=0:0"] {
+        assert_eq!(get(addr, &format!("{path}?{query}")).await.0, 200, "{query}");
+    }
+    for query in ["limit=0", "limit=201", "kind=deposit", "before=3", "after=x:1", "since=1:0"] {
+        assert_eq!(get(addr, &format!("{path}?{query}")).await.0, 400, "{query}");
+    }
+    assert_eq!(get(addr, "/v1/accounts/0x1234/history").await.0, 400);
+}
+
 #[tokio::test]
 async fn the_stream_refuses_after_and_from_together_or_a_malformed_offset() {
     let dir = scratch_dir("stream-params");
@@ -143,11 +233,10 @@ async fn serve(node: &TestSequencer, dir: &Path) -> SocketAddr {
 
 /// Serves the API for `node`, with `dir` as its log directory and `manifest` as the writer's.
 async fn serve_with(node: &TestSequencer, dir: &Path, manifest: watch::Receiver<Manifest>) -> SocketAddr {
-    let attestation = Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate(), &[0; 32]).unwrap());
-    let app = router(ApiState {
+    serve_state(ApiState {
         tx: node.tx.clone(),
         stream: node.stream.clone(),
-        attestation,
+        attestation: Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate(), &[0; 32]).unwrap()),
         auth: ClientAuth::Unsigned,
         dev_deposits: true,
         clock: now_ms,
@@ -155,7 +244,32 @@ async fn serve_with(node: &TestSequencer, dir: &Path, manifest: watch::Receiver<
         manifest,
         backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
         limits: Arc::new(ApiLimits::new(&dev_config().api)),
-    });
+        history: Reader::new(dir.join(INDEX_FILE)),
+    })
+    .await
+}
+
+/// Serves the API with only the history index in `index` behind it, so it outlives any sequencer.
+async fn serve_history(index: &Path) -> SocketAddr {
+    serve_state(ApiState {
+        tx: mpsc::channel(1).0,
+        stream: broadcast::channel(1).0,
+        attestation: Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate(), &[0; 32]).unwrap()),
+        auth: ClientAuth::Unsigned,
+        dev_deposits: false,
+        clock: now_ms,
+        log_dir: PathBuf::new(),
+        manifest: watch::channel(Manifest::default()).1,
+        backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
+        limits: Arc::new(ApiLimits::new(&dev_config().api)),
+        history: Reader::new(index.join(INDEX_FILE)),
+    })
+    .await
+}
+
+/// Serves `state`'s API on a free local port.
+async fn serve_state(state: ApiState) -> SocketAddr {
+    let app = router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await });
@@ -174,6 +288,44 @@ async fn next_text(ws: &mut Ws) -> String {
             return text.to_string();
         }
     }
+}
+
+/// Each account's history, paged one event at a time from the newest, following `next`. Each page
+/// must hold only events older than the `before` it was asked for, so a page that does not move on
+/// fails rather than repeats.
+async fn every_history_page(
+    addr: SocketAddr,
+    accounts: &BTreeSet<AccountId>,
+) -> BTreeMap<AccountId, Vec<serde_json::Value>> {
+    let mut history = BTreeMap::new();
+    for account in accounts {
+        let (mut events, mut before): (Vec<serde_json::Value>, Option<Offset>) = (Vec::new(), None);
+        loop {
+            let query = before.map_or_else(String::new, |before| format!("&before={before}"));
+            let (status, body) = get(addr, &format!("/v1/accounts/{account}/history?limit=1{query}")).await;
+            assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+            let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let page_events = page["events"].as_array().unwrap();
+            assert!(page_events.len() <= 1, "{page}");
+            let next: Option<Offset> = page["next"].as_str().map(|next| next.parse().unwrap());
+            let cursors = page_events.iter().map(|e| e["cursor"].as_str().unwrap().parse::<Offset>().unwrap());
+            let older = |cursor: Offset| before.is_none_or(|before| cursor < before);
+            assert!(cursors.chain(next).all(older), "{page} after {before:?}");
+            events.extend(page_events.iter().cloned());
+            match next {
+                Some(next) => before = Some(next),
+                None => break,
+            }
+        }
+        history.insert(*account, events);
+    }
+    history
+}
+
+/// Each account's events in the log in `dir`, newest first, as history serves them.
+fn expected_history(dir: &Path, accounts: &BTreeSet<AccountId>) -> BTreeMap<AccountId, Vec<serde_json::Value>> {
+    let encode = |events: Vec<HistoryEvent>| events.iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+    accounts.iter().map(|a| (*a, encode(logged_history(dir, *a)))).collect()
 }
 
 fn offset(msg: &str) -> Offset {

@@ -119,6 +119,12 @@ name = "txryan"
 address = "time.txryan.com:5319"
 public_key = "iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA="
 
+[history]
+# The account history index, derived from the log; removing the directory rebuilds it from the log.
+dir = "data/dev/history"
+# Events older than this, counted back from the newest command, leave the index; the log keeps them.
+retention = "365d"
+
 [genesis]
 house_capital = "10000000"
 benchmarks = [

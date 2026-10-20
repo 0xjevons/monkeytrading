@@ -45,7 +45,7 @@ pub struct StreamParams {
 }
 
 /// One subscriber's messages, in offset order, each once.
-struct Feed {
+pub(crate) struct Feed {
     live: broadcast::Receiver<Arc<StreamMsg>>,
     log_dir: PathBuf,
     manifest: watch::Receiver<Manifest>,
@@ -64,7 +64,7 @@ impl Feed {
     /// A feed that starts at `start`, or with the next live message if `None`. `live` must be
     /// subscribed before the feed first reads the disk, so that every message is either on disk by
     /// then or still to come live.
-    fn new(
+    pub(crate) fn new(
         live: broadcast::Receiver<Arc<StreamMsg>>,
         log_dir: PathBuf,
         manifest: watch::Receiver<Manifest>,
@@ -80,7 +80,7 @@ impl Feed {
     /// - the log on disk cannot be read (see `LogReader`)
     /// - the next live message does not follow the last one yielded, so history is missing from
     ///   the log on disk
-    async fn next(&mut self) -> anyhow::Result<Option<Arc<StreamMsg>>> {
+    pub(crate) async fn next(&mut self) -> anyhow::Result<Option<Arc<StreamMsg>>> {
         loop {
             if let Some(msg) = self.backlog.pop_front() {
                 self.next = Some(msg.offset.next());

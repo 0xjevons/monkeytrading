@@ -21,6 +21,7 @@ use tower::ServiceExt;
 
 use crate::clock::test_clock::TestClock;
 use crate::config::RateLimit;
+use crate::history::INDEX_FILE;
 use crate::log::{LogEntry, SegmentedLog};
 use crate::sequencer::{Sequencer, SequencerConfig, SignedWithdrawal, replay};
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
@@ -322,6 +323,7 @@ impl Node {
             manifest,
             backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
             limits: Arc::new(ApiLimits::with_quota(&dev_config().api, hourly, DefaultClock::default())),
+            history: Reader::new(dir.join(INDEX_FILE)),
         };
         let app = router(state.clone()).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))));
         Node { app, state, dir, withdrawals }

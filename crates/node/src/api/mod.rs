@@ -1,10 +1,11 @@
 //! Client API: REST for actions and reads, a WebSocket that streams the public log (every
-//! sequenced command with its events, every signed checkpoint, every signed withdrawal), and the
-//! log archive. Every request passes the limits in `limits`.
+//! sequenced command with its events, every signed checkpoint, every signed withdrawal), the log
+//! archive, and account history. Every request passes the limits in `limits`.
 
 mod archive;
+mod history;
 mod stream;
-pub(crate) use stream::MAX_BACKFILLS;
+pub(crate) use stream::{Feed, MAX_BACKFILLS};
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -33,6 +34,7 @@ use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, debug, info_span};
 
 use crate::clock::now_ms;
+use crate::history::Reader;
 use crate::limits::{ApiLimits, limit_client, read_body};
 use crate::log::Manifest;
 use crate::sequencer::{self, StreamMsg};
@@ -78,6 +80,7 @@ pub struct ApiState {
     /// Permits for stream subscribers reading from disk.
     pub backfills: Arc<Semaphore>,
     pub limits: Arc<ApiLimits>,
+    pub history: Reader,
 }
 
 #[derive(Serialize)]
@@ -249,6 +252,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/house", get(house))
         .route("/v1/accounts/{address}", get(account))
         .route("/v1/accounts/{address}/nonce", get(nonce))
+        .route("/v1/accounts/{address}/history", get(history::history))
         .route("/v1/orders", post(place_order))
         .route("/v1/orders/cancel", post(cancel_order))
         .route("/v1/withdrawals", post(withdraw))

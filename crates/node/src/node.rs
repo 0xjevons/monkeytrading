@@ -1,7 +1,8 @@
-//! Node wiring: attest the enclave key and the API's TLS key, recover the engine from its log, then
-//! run the sequencer, ticker, price feeds, custody, trusted time check, API, and rate-limit upkeep
-//! as supervised tasks. Any task stopping stops the node. On SIGTERM or ctrl-c, every task but the
-//! sequencer is stopped; the sequencer then drains what is queued and writes a final checkpoint.
+//! Node wiring: attest the enclave key and the API's TLS key, recover the engine from its log and
+//! the history index, then run the sequencer, ticker, price feeds, custody, trusted time check,
+//! history index, API, and rate-limit upkeep as supervised tasks. Any task stopping stops the node.
+//! On SIGTERM or ctrl-c, every task but the sequencer is stopped; the sequencer then drains what is
+//! queued and writes a final checkpoint.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,10 +19,11 @@ use tokio::time::{interval, timeout};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use crate::api::{ApiState, MAX_BACKFILLS, router};
+use crate::api::{ApiState, Feed, MAX_BACKFILLS, router};
 use crate::clock::{Clock, SystemClock, now_ms};
 use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProvider};
 use crate::feeds::venue::{self, Timing};
+use crate::history::History;
 use crate::limits::{ApiLimits, run_retain};
 use crate::log::Manifest;
 use crate::sequencer::{Request, Sequencer, SequencerConfig};
@@ -49,7 +51,7 @@ pub fn init_logging(level: &str) -> anyhow::Result<()> {
 /// - operator rotation is enabled, or the custody provider is not implemented
 /// - `feeds.provider = "venues"` without `[feeds.venues]`, or the TLS config cannot be built
 /// - generating the TLS key, attesting the keys, recovering the log (including a log that records
-///   another client auth), or binding the listener fails
+///   another client auth), opening the history index, or binding the listener fails
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
 pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.operator.rotation_enabled {
@@ -106,6 +108,8 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         info!(markets = cfg.genesis.markets.len(), "genesis queued for the first trusted time sample");
         seq.genesis(&cfg.genesis)?;
     }
+    let history = History::open(&cfg.history, &cfg.node.log_dir, manifest_rx.clone())
+        .inspect_err(|e| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}"))?;
 
     let (tx, rx) = mpsc::channel::<Request>(CHANNEL_CAPACITY);
     // TODO: pin the sequencer to a dedicated core once latency matters.
@@ -145,6 +149,17 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     let dev_deposits = custody_cfg.provider == CustodyProvider::Mock;
     tasks.spawn(async move { ("custody", custody::run(&custody_cfg, withdrawals_rx).await) });
 
+    let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
+    let history_reader = history.reader();
+    let history_feed = Feed::new(
+        stream_tx.subscribe(),
+        cfg.node.log_dir.clone(),
+        manifest_rx.clone(),
+        backfills.clone(),
+        Some(history.resume_at()),
+    );
+    tasks.spawn(async move { ("history", history.run(history_feed).await) });
+
     let listener = TcpListener::bind(cfg.node.listen).await.with_context(|| format!("binding {}", cfg.node.listen))?;
     let limits = Arc::new(ApiLimits::new(&cfg.api));
     let app = router(ApiState {
@@ -156,8 +171,9 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         clock: now_ms,
         log_dir: cfg.node.log_dir.clone(),
         manifest: manifest_rx,
-        backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
+        backfills,
         limits: limits.clone(),
+        history: history_reader,
     });
     info!(listen = %cfg.node.listen, "api up over TLS");
     let (api, retained) = (cfg.api, limits.clone());

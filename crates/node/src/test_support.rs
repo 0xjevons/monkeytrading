@@ -1,4 +1,5 @@
-//! Shared test harness: scratch directories, the committed dev config, and a running sequencer.
+//! Shared test harness: scratch directories, the committed dev config, a running sequencer, and a
+//! history index following it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,12 +11,15 @@ use engine_core::event::{CancelReason, Event, Fill, Reject};
 use engine_core::price::PriceError;
 use engine_core::types::{AccountId, Side};
 use engine_core::{Engine, Fixed};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
+use crate::api::{Feed, MAX_BACKFILLS};
 use crate::clock::{Clock, SystemClock};
-use crate::config::NodeConfig;
-use crate::log::{LogReader, Manifest, Offset};
+use crate::config::{HistorySection, NodeConfig};
+use crate::history::{History, HistoryEvent};
+use crate::log::{LogEntry, LogReader, Manifest, Offset, SegmentedLog};
 use crate::sequencer::{Request, Sequencer, SequencerConfig, SignedWithdrawal, StreamMsg};
 use crate::tee::EnclaveKey;
 use crate::trusted_time::Sample;
@@ -25,6 +29,8 @@ pub const DEV_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/
 pub const SEGMENT_COMMANDS: u64 = 4;
 pub const CHECKPOINT_EVERY: u64 = 3;
 pub const TRADER: AccountId = AccountId([7; 20]);
+/// Long enough that no test event leaves the history index.
+pub const RETENTION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
 /// A sequencer task running on a log directory, with the ends of its channels.
 pub struct TestSequencer {
@@ -92,6 +98,31 @@ impl TestSequencer {
     }
 }
 
+/// The task of a history index following a `TestSequencer`'s log.
+pub struct TestHistory {
+    task: JoinHandle<anyhow::Result<()>>,
+}
+
+impl TestHistory {
+    /// Opens the index in `index` against the log `node` writes in `dir`, and runs it.
+    /// Error cases:
+    /// - the index does not match the log (see `History::open`)
+    pub fn start(node: &TestSequencer, dir: &Path, index: &Path) -> anyhow::Result<Self> {
+        let cfg = HistorySection { dir: index.to_owned(), retention: RETENTION };
+        let history = History::open(&cfg, dir, node.manifest.clone())?;
+        let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
+        let (live, manifest, start) = (node.stream.subscribe(), node.manifest.clone(), Some(history.resume_at()));
+        let feed = Feed::new(live, dir.to_owned(), manifest, backfills, start);
+        Ok(Self { task: tokio::spawn(history.run(feed)) })
+    }
+
+    /// The task's result once it has taken the whole log, which it ends with after the sequencer
+    /// stops.
+    pub async fn finish(self) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(10), self.task).await.expect("the history task ends in time").expect("history task")
+    }
+}
+
 /// An empty directory for one test, named after it.
 pub fn scratch_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("engine-node-test-{}-{name}", std::process::id()));
@@ -147,6 +178,28 @@ pub fn log_messages(dir: &Path, from: Offset) -> Vec<String> {
     std::iter::from_fn(|| reader.next_entry().expect("log reads"))
         .map(|(offset, entry)| serde_json::to_string(&StreamMsg::new(offset, entry)).expect("message encodes"))
         .collect()
+}
+
+/// Every event in the log in `dir` whose JSON names `account`, newest first, as history serves it.
+pub fn logged_history(dir: &Path, account: AccountId) -> Vec<HistoryEvent> {
+    let entries = SegmentedLog::open(dir).expect("log opens").entries;
+    let mut events: Vec<HistoryEvent> = entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            LogEntry::Command(command) => Some(command),
+            _ => None,
+        })
+        .flat_map(|command| {
+            let (seq, ts) = (command.sequenced.seq, command.sequenced.ts);
+            command.events.into_iter().flatten().enumerate().map(move |(index, event)| {
+                let cursor = Offset { seq, index: u32::try_from(index).expect("few events per command") };
+                HistoryEvent { cursor, ts, event }
+            })
+        })
+        .filter(|e| serde_json::to_value(&e.event).expect("event encodes")["account"] == account.to_string())
+        .collect();
+    events.reverse();
+    events
 }
 
 /// One event of each kind, and an order rejection for each reason. The matches stop compiling when

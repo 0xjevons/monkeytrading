@@ -30,6 +30,7 @@ use webpki::EndEntityCert;
 use crate::api::{ApiState, MAX_BACKFILLS, router};
 use crate::clock::now_ms;
 use crate::config::RateLimit;
+use crate::history::Reader;
 use crate::limits::ApiLimits;
 use crate::log::Manifest;
 use crate::sequencer::{Request, StreamMsg};
@@ -337,6 +338,7 @@ impl TestNode {
             manifest: watch::channel(Manifest::default()).1,
             backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
             limits: limits.clone(),
+            history: Reader::new(PathBuf::new()),
         };
         let server = tokio::spawn(serve(listener, tls.config, router(state), limits, api));
         Self { port, attestation, stream, server, sequencer }

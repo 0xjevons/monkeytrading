@@ -95,7 +95,8 @@ cargo test --workspace
 cargo run -p engine-node -- run --config config/dev.toml
 ```
 
-In another terminal, credit a test account and buy 0.25 BTC at the live price:
+In another terminal, credit a test account, buy 0.25 BTC at the live price, and read the account
+and its history:
 
 ```bash
 API=https://localhost:8080
@@ -106,6 +107,7 @@ PRICE=$(curl -sk $API/v1/markets | jq -r '.[] | select(.symbol == "BTC-USD") | .
 curl -sk -X POST $API/v1/orders -H 'content-type: application/json' \
   -d "{\"account\":\"$ACCOUNT\",\"client_id\":1,\"market\":1,\"side\":\"buy\",\"qty\":\"0.25\",\"kind\":{\"kind\":\"market\",\"quoted\":\"$PRICE\"}}"
 curl -sk $API/v1/accounts/$ACCOUNT
+curl -sk "$API/v1/accounts/$ACCOUNT/history?limit=10"
 ```
 
 `-k` only skips the CA check that a self-signed certificate cannot pass. What makes a connection
