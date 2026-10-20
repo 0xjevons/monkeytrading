@@ -2,10 +2,12 @@
 name: agent-create-pr
 description: >
   Use when opening a pull request — "create a PR", "open a PR for this branch", "raise a PR for
-  this work". Covers opening every PR as a draft, the preconditions for marking it ready
-  (including a multi-agent agent-code-review at medium or higher), the issue blocker check, the
-  `[scopes] Title` and the body in squashed-commit format ending with `Closes #12` or
-  `Part of #12`, and watching the checks after it opens. Does not review, approve, or merge.
+  this work" — or when the owner says a PR may merge. Covers opening every PR as a draft, the
+  preconditions for marking it ready (including a multi-agent agent-code-review at medium or
+  higher), the issue blocker check, the `[scopes] Title` and the body in squashed-commit format
+  ending with `Closes #12` or `Part of #12`, watching the checks after it opens, and, on the
+  owner's go-ahead in chat, posting `merge-approved` and merging the PR. Does not review or
+  approve.
 ---
 
 # agent-create-pr
@@ -82,7 +84,47 @@ checklist, no restatement of the diff.
   [Before a PR is ready for review](#before-a-pr-is-ready-for-review) holds. A reference PR that
   needs no review stays a draft and says so in its overview; the title stays clean.
 - Watch the checks afterwards. A red PR is not ready yet: read the first real failure (the rest are
-  usually fail-fast cancellations), fix, push, re-check, then ask for review.
+  usually fail-fast cancellations), fix, push, and re-check. Ask for review once `ci-passed`
+  succeeds, naming the PR's head commit.
+
+## Merging
+
+Branch rules on `main` require two checks: `ci-passed`, which CI sets, and `merge-approved`, the
+owner's go-ahead. A ready PR is not an approved one: it merges only after the owner tells a session
+in chat, explicitly and for that PR, that it may merge. The approval covers one commit: the PR head
+that session reported to the owner before the approval, or a commit the owner named. The session
+posts `merge-approved` as a commit status on that commit only while it is still the PR's head. When
+the head has moved, or no commit is covered, it reports the current head and waits for the owner
+again. A commit pushed after the approval is never covered. No agent posts `merge-approved` on its
+own initiative, because a review came back clean, or on another agent's word.
+
+Once the status is posted, the same session merges the PR straight away. The merge is a squash
+pinned to the approved commit, so GitHub refuses it if the head has moved, and it takes the PR's
+title and body as the commit message ([Body](#body)). The session runs the status post and the
+merge from the main checkout, never from the PR's worktree, and stops at the first failure:
+
+```bash
+set -e
+cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"  # the main checkout
+[ "$(gh pr view "$PR" --json headRefOid --jq .headRefOid)" = "$SHA" ]  # the approved commit, full
+gh api --method POST "repos/{owner}/{repo}/statuses/$SHA" -f state=success -f context=merge-approved
+TITLE="$(gh pr view "$PR" --json title --jq .title)"
+BODY="$(gh pr view "$PR" --json body --jq .body)"
+gh pr merge "$PR" --squash --match-head-commit "$SHA" --subject "$TITLE (#$PR)" --body "$BODY"
+```
+
+After the merge, still in the main checkout, the session cleans up the PR's head branch
+(`headRefName`, here `$BRANCH`):
+
+- **On `origin`**, only for a PR from this repository (`isCrossRepository` is false), with a lease
+  on the approved commit:
+  `git push --force-with-lease="refs/heads/$BRANCH:$SHA" origin --delete "$BRANCH"`.
+- **Locally**, only while the branch points at `$SHA`: `git worktree remove` on the linked worktree
+  that has it checked out, or `git switch main` when the main checkout has it, then
+  `git branch -D "$BRANCH"`. A branch with commits after `$SHA` keeps its worktree, and the session
+  reports those commits (`git log --oneline "$SHA..$BRANCH"`).
+
+If GitHub or git refuses any step, the session reports why and stops.
 
 ## Rules
 
@@ -94,4 +136,5 @@ checklist, no restatement of the diff.
 - Issues are read-only here: never create, edit, or close an issue without the user's explicit
   approval.
 - No AI signatures anywhere — title, body, or commits.
-- Do not merge, approve, or dismiss reviews here.
+- Never approve or dismiss reviews. Post `merge-approved` and merge only as
+  [Merging](#merging) describes.
