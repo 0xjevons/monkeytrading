@@ -96,11 +96,11 @@ fn stale_or_divergent_feeds_mean_no_fill() {
     h.price(BTC, "100000");
     h.advance(1_500);
     let ev = h.market_order(a, BTC, Side::Buy, "0.1", "100000");
-    assert!(matches!(rejection(&ev), Reject::NoPrice(_)));
+    assert!(matches!(rejection(&ev), Reject::NoPrice { .. }));
 
     h.quotes(BTC, &["100000", "101000"]);
     let ev = h.market_order(a, BTC, Side::Buy, "0.1", "100000");
-    assert!(matches!(rejection(&ev), Reject::NoPrice(_)));
+    assert!(matches!(rejection(&ev), Reject::NoPrice { .. }));
 }
 
 #[test]
