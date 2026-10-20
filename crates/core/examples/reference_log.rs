@@ -71,7 +71,8 @@ fn main() -> anyhow::Result<()> {
 /// toxicity, a position flip, house capital, withdrawals, a session close and gapped open, financing
 /// rollovers over longs and a short, a two-position close-out with bad debt, two-band margin, an
 /// exchange holiday, a zero house capital move, an early close and a special session, admin changes,
-/// and venue quotes stamped ahead of the sequenced time, with a rejection of each kind along the way.
+/// venue quotes stamped ahead of the sequenced time, and dust adds to a long and a short held over a
+/// rollover, with a rejection of each kind along the way.
 /// Every client request is signed by its account's key unless the comment says otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
@@ -279,6 +280,32 @@ fn session() -> Vec<Sequenced> {
     h.market_order(a, AAPL, Side::Sell, "1", "199");
     h.advance_to(ny(2026, 10, 24, 12, 0));
     h.cmd(Command::Tick);
+
+    // V5 activates at this seq. Dust buys one unit of precision below the long's entry and dust sells
+    // one above the short's leave both entries at 150.5, where a truncated average would lower the
+    // long's. Both are held over the rollover, where a charge rounds up and a credit toward zero.
+    // Closing one unit above the entries realises 10 units for the long, whose 15% fee of 1.5 rounds
+    // up to 2, and loses 10.000000003 units for the short, rounded down to 11.
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V5 });
+    let (long, short) = (h.signer(10), h.signer(11));
+    h.deposit(long, "10000");
+    h.deposit(short, "10000");
+    h.price(SOL, "150.5");
+    h.market_order(long, SOL, Side::Buy, "10", "150.5");
+    h.market_order(short, SOL, Side::Sell, "10", "150.5");
+    h.price(SOL, "150.499999999");
+    (0..3).for_each(|_| {
+        h.market_order(long, SOL, Side::Buy, "0.000000001", "150.499999999");
+    });
+    h.price(SOL, "150.500000001");
+    (0..3).for_each(|_| {
+        h.market_order(short, SOL, Side::Sell, "0.000000001", "150.500000001");
+    });
+    h.advance_to(ny(2026, 10, 24, 17, 1));
+    h.cmd(Command::Tick);
+    h.price(SOL, "150.500000001");
+    h.market_order(long, SOL, Side::Sell, "10.000000003", "150.500000001");
+    h.market_order(short, SOL, Side::Buy, "10.000000003", "150.500000001");
     h.log
 }
 

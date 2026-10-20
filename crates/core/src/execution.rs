@@ -15,8 +15,10 @@ use crate::command::{OrderKind, OrderRequest};
 use crate::eip712::{cancel_hash, order_hash};
 use crate::engine::{Engine, Markout};
 use crate::event::{CancelReason, Event, Fill, Reject};
+use crate::fixed::Rounding;
 use crate::market::staircase;
 use crate::price::compute_index;
+use crate::protocol::ProtocolVersion;
 use crate::types::{AccountId, MarketId, OrderId, Side};
 
 /// What the live price is checked against before filling.
@@ -321,8 +323,9 @@ impl Engine {
         let market = &self.markets[&exec.market];
 
         let mut sim = self.accounts[&exec.account].clone();
-        let realised = sim.positions.entry(exec.market).or_default().apply(priced.delta, priced.price);
-        sim.balance += realised - profit_fee(realised, params.profit_fee_bps);
+        let version = self.protocol_version;
+        let realised = sim.positions.entry(exec.market).or_default().apply(priced.delta, priced.price, version);
+        sim.balance += realised - profit_fee(realised, params.profit_fee_bps, version);
         let (equity, required) = self.equity_and_margin(&sim, Some((exec.market, priced.mid)));
         if equity < required {
             return Err(Reject::InsufficientMargin { equity, required });
@@ -347,6 +350,7 @@ impl Engine {
     fn book(&mut self, exec: &Exec, priced: Priced) -> Fill {
         let params = self.params.as_ref().expect("callers check params are set");
         let fee_bps = params.profit_fee_bps;
+        let version = self.protocol_version;
         let markout_due = self.now + params.toxicity.horizon_ms;
         let market = self.markets.get_mut(&exec.market).expect("priced against this market");
         let acct = self.accounts.get_mut(&exec.account).expect("priced for this account");
@@ -354,14 +358,14 @@ impl Engine {
         let pos = acct.positions.entry(exec.market).or_default();
         market.client_qty -= pos.qty;
         market.client_cost -= pos.cost();
-        let realised_pnl = pos.apply(priced.delta, priced.price);
+        let realised_pnl = pos.apply(priced.delta, priced.price, version);
         market.client_qty += pos.qty;
         market.client_cost += pos.cost();
         let position = pos.qty;
         if position.is_zero() {
             acct.positions.remove(&exec.market);
         }
-        let fee = profit_fee(realised_pnl, fee_bps);
+        let fee = profit_fee(realised_pnl, fee_bps, version);
         acct.balance += realised_pnl - fee;
         self.house_cash -= realised_pnl - fee;
 
@@ -413,9 +417,16 @@ fn growth(current: Fixed, delta: Fixed) -> (Fixed, Fixed) {
     }
 }
 
-/// Losers pay nothing; winners pay `fee_bps` of realised profit.
-fn profit_fee(realised: Fixed, fee_bps: i64) -> Fixed {
-    if realised.is_positive() { realised.mul_bps(fee_bps) } else { Fixed::ZERO }
+/// Losers pay nothing; winners pay `fee_bps` of realised profit, rounded up from `V5` and truncated
+/// before it.
+fn profit_fee(realised: Fixed, fee_bps: i64, version: ProtocolVersion) -> Fixed {
+    if !realised.is_positive() {
+        Fixed::ZERO
+    } else if version >= ProtocolVersion::V5 {
+        realised.mul_bps_rounded(fee_bps, Rounding::Up)
+    } else {
+        realised.mul_bps(fee_bps)
+    }
 }
 
 #[cfg(test)]
@@ -438,8 +449,19 @@ mod tests {
 
     #[test]
     fn profit_fee_only_on_gains() {
-        assert_eq!(profit_fee(f(100), 1_000), f(10));
-        assert_eq!(profit_fee(f(-100), 1_000), f(0));
-        assert_eq!(profit_fee(f(0), 1_000), f(0));
+        for version in [ProtocolVersion::V2, ProtocolVersion::V5] {
+            assert_eq!(profit_fee(f(100), 1_000, version), f(10));
+            assert_eq!(profit_fee(f(-100), 1_000, version), f(0));
+            assert_eq!(profit_fee(f(0), 1_000, version), f(0));
+        }
+    }
+
+    #[test]
+    fn a_fractional_profit_fee_rounds_up() {
+        let realised = Fixed::from_raw(9);
+        assert_eq!(profit_fee(realised, 1_000, ProtocolVersion::V5), Fixed::from_raw(1));
+        assert_eq!(profit_fee(realised, 1_000, ProtocolVersion::V2), Fixed::ZERO);
+        // The highest fee the engine accepts, 99.99%, takes the whole profit and no more.
+        assert_eq!(profit_fee(realised, 9_999, ProtocolVersion::V5), realised);
     }
 }

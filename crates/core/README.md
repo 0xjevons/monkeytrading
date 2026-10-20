@@ -25,6 +25,10 @@ this crate and reproduce the signed state roots exactly.
 - From protocol `V3`, client auth recorded in the log: EIP-712 signatures, per-account nonces, and
   expiries on every order, cancel, and withdrawal, checked by the engine so a replay proves each
   request was its account's, or unsigned requests in dev logs
+- From protocol `V5`, position accounting rounds in the house's favour: an averaged entry is the
+  exact average rounded once, up for a long and down for a short, realised and unrealised PnL round
+  down, and the profit fee and financing charges round up, so no sequence of fills realises more
+  than its exact PnL
 
 ## Repository Structure
 
@@ -53,8 +57,8 @@ this crate and reproduce the signed state roots exactly.
   the state root after it
 - `tests/reference_logs.rs` — replays every reference log and fails at the first seq whose root
   differs
-- `tests/invariants/` — property tests over generated sessions (`main.rs`) and the session generator
-  (`session.rs`)
+- `tests/invariants/` — property tests over generated sessions (`main.rs`), the session generator
+  (`session.rs`), and fills at one price (`rounding.rs`)
 - `tests/fixtures/eip712.json` — EIP-712 test vectors: API bodies, wallet typed data, and
   signatures
 - `examples/reference_log.rs` — writes the reference log for a new protocol version
@@ -98,11 +102,12 @@ Two suites guard replay and accounting:
   at the first seq whose state root differs from the committed one. CI runs it on x86_64 and
   aarch64 Linux, and `scripts/check-reference-logs.sh` fails a branch that changes, renames, or
   deletes a committed log.
-- `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed. Each
-  mixes client, feed, custody, and operator commands, with values inside and outside the input
-  bounds, and checks after every command that nothing panicked, cash is conserved, and every
-  market's aggregates match its accounts' positions. Raise `CASES` or change `SEED` in
-  `tests/invariants/main.rs` to search further.
+- `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
+  under `V2` and again under `V5`. Each mixes client, feed, custody, and operator commands, with
+  values inside and outside the input bounds, and checks after every command that nothing panicked,
+  cash is conserved, and every market's aggregates match its accounts' positions. Raise `CASES` or
+  change `SEED` in `tests/invariants/main.rs` to search further. The same suite generates adds,
+  reductions, and flips at one price under `V5` and checks that none realises a profit.
 
 ### Adding a protocol version
 
@@ -114,8 +119,8 @@ stored one stamped after the sequenced time. Both predate activation, so every l
 their combined rules, which `src/protocol.rs` names `V2`; `v1.jsonl` still replays because none of
 its quotes is stamped ahead. `V3` adds signed client requests and activates at a recorded seq; its
 log is `v3.jsonl`. `V4` lets schedules carry dated closures and special sessions, and lets a zero
-house capital move record its reference; it activates the same way, and its log is `v4.jsonl`. For
-each later version:
+house capital move record its reference; it activates the same way, and its log is `v4.jsonl`. `V5`
+rounds position accounting in the house's favour; its log is `v5.jsonl`. For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log.rs` so it activates the new version and exercises the new rules.

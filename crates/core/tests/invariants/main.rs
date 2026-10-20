@@ -1,12 +1,13 @@
 //! Accounting invariants under generated sessions. Each case sequences random client, feed,
-//! custody, and operator commands, with values inside and outside the engine's input bounds, and
-//! checks after every command that it did not panic, that cash is conserved, and that each market's
-//! aggregates match its accounts' positions. The same sessions must reach every path that moves cash
-//! and the refusal of out-of-range amounts, order numbers, and quotes, so the checks cannot pass
-//! vacuously.
+//! custody, and operator commands, with values inside and outside the engine's input bounds, under
+//! `V2`, the rules every log starts under, and again under `V5`. It checks after every command that
+//! it did not panic, that cash is conserved, and that each market's aggregates match its accounts'
+//! positions. Under each version the same sessions must reach every path that moves cash and the
+//! refusal of out-of-range amounts, order numbers, and quotes, so the checks cannot pass vacuously.
 
 #[path = "../common/mod.rs"]
 mod common;
+mod rounding;
 mod session;
 
 use std::cell::RefCell;
@@ -14,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::{HOUSE_CAPITAL, Harness, acct};
 use engine_core::event::{Event, Reject};
+use engine_core::protocol::ProtocolVersion;
 use engine_core::types::MarketId;
 use engine_core::{Engine, Fixed};
 use proptest::test_runner::{Config, RngSeed, TestCaseError, TestRunner};
@@ -26,20 +28,25 @@ const CASES: u32 = 1_024;
 
 #[test]
 fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
-    // Coverage is recorded from the same sessions whose invariants are checked.
-    let reached = RefCell::new(BTreeSet::new());
+    // Coverage is recorded per protocol version, from the same sessions whose invariants are
+    // checked.
+    let reached: RefCell<BTreeMap<ProtocolVersion, BTreeSet<&str>>> = RefCell::default();
     let result = TestRunner::new(config()).run(&session(), |session| {
-        let mut h = funded(&session);
-        let mut inflow = h.deposits + Fixed::from_int(HOUSE_CAPITAL);
-        check(&h.engine, inflow).map_err(TestCaseError::fail)?;
-        for step in session.steps {
-            h.advance(step.advance_ms);
-            let cmd = command(&step.action, &h.engine, h.ts);
-            // `Harness::cmd` panics if the engine refuses the sequence; a panic fails the case.
-            let events = h.cmd(cmd.clone());
-            reached.borrow_mut().extend(events.iter().map(path));
-            inflow += cash_moved(&events);
-            check(&h.engine, inflow).map_err(|e| TestCaseError::fail(format!("after {cmd:?}: {e}")))?;
+        for genesis in [Harness::new(), Harness::v5()] {
+            let mut h = funded(genesis, &session);
+            let version = h.engine.protocol_version();
+            let mut inflow = h.deposits + Fixed::from_int(HOUSE_CAPITAL);
+            check(&h.engine, inflow).map_err(TestCaseError::fail)?;
+            for step in &session.steps {
+                h.advance(step.advance_ms);
+                let cmd = command(&step.action, &h.engine, h.ts);
+                // `Harness::cmd` panics if the engine refuses the sequence; a panic fails the case.
+                let events = h.cmd(cmd.clone());
+                reached.borrow_mut().entry(version).or_default().extend(events.iter().map(path));
+                inflow += cash_moved(&events);
+                check(&h.engine, inflow)
+                    .map_err(|e| TestCaseError::fail(format!("{version:?}, after {cmd:?}: {e}")))?;
+            }
         }
         Ok(())
     });
@@ -67,7 +74,11 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
         "admin rejected",
     ];
     let reached = reached.into_inner();
-    let missed: Vec<&str> = expected.into_iter().filter(|p| !reached.contains(p)).collect();
+    let missed: Vec<(ProtocolVersion, &str)> = [ProtocolVersion::V2, ProtocolVersion::V5]
+        .into_iter()
+        .flat_map(|version| expected.iter().map(move |path| (version, *path)))
+        .filter(|(version, path)| !reached.get(version).is_some_and(|paths| paths.contains(path)))
+        .collect();
     assert!(missed.is_empty(), "generated sessions never reach {missed:?}");
 }
 
@@ -78,9 +89,8 @@ fn config() -> Config {
     Config { cases: CASES, rng_seed: RngSeed::Fixed(SEED), failure_persistence: None, ..Config::default() }
 }
 
-/// Genesis, then the session's deposits for the three traders.
-fn funded(session: &Session) -> Harness {
-    let mut h = Harness::new();
+/// `h` after its genesis, with the session's deposits for the three traders.
+fn funded(mut h: Harness, session: &Session) -> Harness {
     for (n, amount) in (1..).zip(session.funding) {
         h.deposit(acct(n), &amount.to_string());
     }

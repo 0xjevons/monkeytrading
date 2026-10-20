@@ -82,7 +82,9 @@ impl Engine {
         acct.positions
             .iter()
             .filter(|(market_id, _)| self.tradeable_now(**market_id))
-            .filter_map(|(market_id, pos)| Some((pos.unrealised(self.markets[market_id].mark?), *market_id, *pos)))
+            .filter_map(|(market_id, pos)| {
+                Some((pos.unrealised(self.markets[market_id].mark?, self.protocol_version), *market_id, *pos))
+            })
             .min_by_key(|(upnl, market_id, _)| (*upnl, *market_id))
             .map(|(_, market_id, pos)| (market_id, pos, equity, margin))
     }

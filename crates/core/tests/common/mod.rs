@@ -68,6 +68,14 @@ impl Harness {
         h
     }
 
+    /// `v4` taking unsigned requests, then `V5`, which rounds position accounting in the house's
+    /// favour.
+    pub fn v5() -> Self {
+        let mut h = Harness::v4(ClientAuth::Unsigned);
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V5 });
+        h
+    }
+
     /// No commands yet, at the harness start time.
     fn empty() -> Self {
         Harness { engine: Engine::new(), log: vec![], ts: start(), deposits: Fixed::ZERO, signers: BTreeMap::new() }

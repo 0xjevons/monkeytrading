@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Fixed;
 use crate::command::OrderKind;
+use crate::fixed::Rounding;
+use crate::protocol::ProtocolVersion;
 use crate::types::{MarketId, OrderId, Side};
 
 /// One netted position per market, as on a CFD netting account. `qty` is
@@ -17,19 +19,34 @@ pub struct Position {
 }
 
 impl Position {
-    /// Applies a signed fill and returns the price PnL it realises.
-    pub fn apply(&mut self, delta: Fixed, price: Fixed) -> Fixed {
+    /// Applies a signed fill and returns the price PnL it realises. From `V5` an averaged entry
+    /// rounds against the holder and realised PnL rounds down, so no sequence of fills realises more
+    /// than its exact PnL; before `V5` both truncate toward zero.
+    pub fn apply(&mut self, delta: Fixed, price: Fixed, version: ProtocolVersion) -> Fixed {
         if delta.is_zero() {
             return Fixed::ZERO;
         }
+        let house_rounding = version >= ProtocolVersion::V5;
         if self.qty.is_zero() || self.qty.signum() == delta.signum() {
             let new_qty = self.qty + delta;
-            self.entry = (self.entry.mul(self.qty.abs()) + price.mul(delta.abs())).div(new_qty.abs());
+            self.entry = if house_rounding {
+                // The exact average is `entry + (price - entry) * delta / new_qty`: one rounding, up for
+                // a long and down for a short. Weighting the fill keeps the product in range, since a
+                // fill adds at most `Fixed::MAX_INPUT`.
+                let rounding = if new_qty.is_positive() { Rounding::Up } else { Rounding::Down };
+                self.entry + (price - self.entry).mul_div(delta.abs(), new_qty.abs(), rounding)
+            } else {
+                (self.entry.mul(self.qty.abs()) + price.mul(delta.abs())).div(new_qty.abs())
+            };
             self.qty = new_qty;
             return Fixed::ZERO;
         }
         let closing = delta.abs().min(self.qty.abs());
-        let pnl = (price - self.entry).mul(closing).mul_int(self.qty.signum());
+        let pnl = if house_rounding {
+            (price - self.entry).mul_int(self.qty.signum()).mul_rounded(closing, Rounding::Down)
+        } else {
+            (price - self.entry).mul(closing).mul_int(self.qty.signum())
+        };
         let new_qty = self.qty + delta;
         if new_qty.is_zero() {
             *self = Position::default();
@@ -41,9 +58,14 @@ impl Position {
         pnl
     }
 
-    /// Price PnL if the position were closed at `mark`.
-    pub fn unrealised(&self, mark: Fixed) -> Fixed {
-        (mark - self.entry).mul(self.qty)
+    /// Price PnL if the position were closed at `mark`: from `V5` rounded down, as closing would
+    /// realise it, and before `V5` truncated toward zero.
+    pub fn unrealised(&self, mark: Fixed, version: ProtocolVersion) -> Fixed {
+        if version >= ProtocolVersion::V5 {
+            (mark - self.entry).mul_rounded(self.qty, Rounding::Down)
+        } else {
+            (mark - self.entry).mul(self.qty)
+        }
     }
 
     /// `entry * qty`, kept per market in aggregate so house NAV is O(markets).
@@ -84,28 +106,127 @@ impl Account {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::arbitrary::any;
+    use proptest::prop_assert;
+    use proptest::prop_assert_eq;
+    use proptest::strategy::Strategy;
+    use proptest::test_runner::{Config, RngSeed, TestCaseError, TestRunner};
+
+    const V2: ProtocolVersion = ProtocolVersion::V2;
+    const V5: ProtocolVersion = ProtocolVersion::V5;
+
+    #[test]
+    fn netting_averages_entry_and_realises_on_reduce() {
+        for version in [V2, V5] {
+            let mut p = Position::default();
+            assert_eq!(p.apply(f("1"), f("100"), version), Fixed::ZERO);
+            assert_eq!(p.apply(f("1"), f("110"), version), Fixed::ZERO);
+            assert_eq!(p.entry, f("105"));
+            assert_eq!(p.apply(f("-1"), f("120"), version), f("15"));
+            assert_eq!(p, Position { qty: f("1"), entry: f("105") });
+            assert_eq!(p.unrealised(f("100"), version), f("-5"));
+        }
+    }
+
+    #[test]
+    fn flip_closes_then_opens_at_fill_price() {
+        for version in [V2, V5] {
+            let mut p = Position { qty: f("2"), entry: f("100") };
+            assert_eq!(p.apply(f("-5"), f("90"), version), f("-20"));
+            assert_eq!(p, Position { qty: f("-3"), entry: f("90") });
+            assert_eq!(p.apply(f("3"), f("80"), version), f("30"));
+            assert_eq!(p, Position::default());
+        }
+    }
+
+    #[test]
+    fn a_dust_add_at_the_entry_price_leaves_the_entry_there() {
+        let long = Position { qty: f("4500000"), entry: f("1.1") };
+        let mut p = long;
+        p.apply(f("0.000000001"), f("1.1"), V5);
+        assert_eq!(p.entry, f("1.1"));
+        // Before `V5` each truncation lowers the long's entry by one unit.
+        let mut p = long;
+        p.apply(f("0.000000001"), f("1.1"), V2);
+        assert_eq!(p.entry, f("1.099999999"));
+    }
+
+    #[test]
+    fn an_averaged_entry_rounds_up_for_a_long_and_down_for_a_short() {
+        // One at 100 and two at 101 average 100.6666…
+        let mut long = Position { qty: f("1"), entry: f("100") };
+        long.apply(f("2"), f("101"), V5);
+        assert_eq!(long.entry, f("100.666666667"));
+        let mut short = Position { qty: f("-1"), entry: f("100") };
+        short.apply(f("-2"), f("101"), V5);
+        assert_eq!(short.entry, f("100.666666666"));
+    }
+
+    #[test]
+    fn realised_and_unrealised_pnl_round_down() {
+        // Half a unit one nano-dollar against the holder is a loss of half a unit of precision.
+        let long = Position { qty: f("0.5"), entry: f("100") };
+        assert_eq!(long.unrealised(f("99.999999999"), V5), f("-0.000000001"));
+        assert_eq!(long.unrealised(f("99.999999999"), V2), Fixed::ZERO);
+        assert_eq!(close(long, f("99.999999999"), V5), f("-0.000000001"));
+        assert_eq!(close(long, f("99.999999999"), V2), Fixed::ZERO);
+        let short = Position { qty: f("-0.5"), entry: f("100") };
+        assert_eq!(short.unrealised(f("100.000000001"), V5), f("-0.000000001"));
+        assert_eq!(close(short, f("100.000000001"), V5), f("-0.000000001"));
+        assert_eq!(close(short, f("100.000000001"), V2), Fixed::ZERO);
+        // A gain of half a unit of precision rounds down to nothing.
+        assert_eq!(close(long, f("100.000000001"), V5), Fixed::ZERO);
+    }
+
+    #[test]
+    fn adding_at_a_price_never_raises_what_closing_there_realises() {
+        let raw = 1i128..=10i128.pow(15);
+        let cases = (raw.clone(), raw.clone(), raw.clone(), raw, any::<bool>());
+        check(cases, |(qty, entry, add, price, long)| {
+            let sign = if long { 1 } else { -1 };
+            let held = Position { qty: Fixed::from_raw(sign * qty), entry: Fixed::from_raw(entry) };
+            let price = Fixed::from_raw(price);
+            let mut added = held;
+            added.apply(Fixed::from_raw(sign * add), price, V5);
+            let (with_add, without) = (close(added, price, V5), close(held, price, V5));
+            prop_assert!(with_add <= without, "{held:?} + {add} at {price}: {with_add} > {without}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn unrealised_pnl_is_what_closing_at_the_mark_realises() {
+        let raw = 1i128..=10i128.pow(15);
+        check((raw.clone(), raw.clone(), raw, any::<bool>()), |(qty, entry, mark, long)| {
+            let qty = Fixed::from_raw(if long { qty } else { -qty });
+            let held = Position { qty, entry: Fixed::from_raw(entry) };
+            let mark = Fixed::from_raw(mark);
+            prop_assert_eq!(held.unrealised(mark, V5), close(held, mark, V5));
+            Ok(())
+        });
+    }
+
+    // ── Helpers ──
 
     fn f(s: &str) -> Fixed {
         s.parse().unwrap()
     }
 
-    #[test]
-    fn netting_averages_entry_and_realises_on_reduce() {
-        let mut p = Position::default();
-        assert_eq!(p.apply(f("1"), f("100")), Fixed::ZERO);
-        assert_eq!(p.apply(f("1"), f("110")), Fixed::ZERO);
-        assert_eq!(p.entry, f("105"));
-        assert_eq!(p.apply(f("-1"), f("120")), f("15"));
-        assert_eq!(p, Position { qty: f("1"), entry: f("105") });
-        assert_eq!(p.unrealised(f("100")), f("-5"));
+    /// The PnL closing `position` at `price` realises.
+    fn close(mut position: Position, price: Fixed, version: ProtocolVersion) -> Fixed {
+        position.apply(-position.qty, price, version)
     }
 
-    #[test]
-    fn flip_closes_then_opens_at_fill_price() {
-        let mut p = Position { qty: f("2"), entry: f("100") };
-        assert_eq!(p.apply(f("-5"), f("90")), f("-20"));
-        assert_eq!(p, Position { qty: f("-3"), entry: f("90") });
-        assert_eq!(p.apply(f("3"), f("80")), f("30"));
-        assert_eq!(p, Position::default());
+    /// Runs `test` over 4,096 cases from a fixed seed, so every run checks the same ones.
+    fn check<S: Strategy>(strategy: S, test: impl Fn(S::Value) -> Result<(), TestCaseError>) {
+        let config = Config {
+            cases: 4_096,
+            rng_seed: RngSeed::Fixed(0x5eed_0004),
+            failure_persistence: None,
+            ..Config::default()
+        };
+        if let Err(failure) = TestRunner::new(config).run(&strategy, test) {
+            panic!("{failure}");
+        }
     }
 }
