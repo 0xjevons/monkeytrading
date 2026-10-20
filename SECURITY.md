@@ -23,10 +23,10 @@ a fix in mind, whether anyone else knows of the issue, and how you would like to
 
 We aim to acknowledge a report within three business days, and within ten business days of
 receiving it to tell you whether we can reproduce the issue, how severe we judge it, and what we
-plan to do. We aim to fix, within 30 days of your report, a vulnerability of a kind that the Scope
-section below lists as mattering most, and any other within 90 days of it, and we will keep you
-informed until it is resolved. If we conclude that a report does not describe a vulnerability, we
-will explain why.
+plan to do. We aim to fix a vulnerability within 90 days of your report, or within 30 days if it is
+of a kind that the Scope section below lists as mattering most, and we will keep you informed until
+it is resolved. If we conclude that a report does not describe a vulnerability, we will explain
+why.
 
 ## Coordinated disclosure
 
@@ -35,9 +35,9 @@ days after you reported it, whichever comes first. A fix has shipped when it is 
 the engine is live, running in production. If a fix needs longer, we will tell you why before the
 deadline and agree a new date with you. Once the fix has shipped, we publish an advisory in this
 repository that describes the vulnerability, its impact, and the fix, and credits you by name
-unless you would rather it did not. You are free to publish your own account from the same day. If
-we conclude that a report does not describe a vulnerability, you may disclose it once we have told
-you so.
+unless you would rather it did not. You are free to publish your own account from the day the fix
+ships. If we conclude that a report does not describe a vulnerability, you may disclose it once we
+have told you so.
 
 ## Safe harbour
 
@@ -48,10 +48,11 @@ run yourself rather than on a live deployment; never accessing anyone else's dat
 engine publishes through its log and public API, and never changing or destroying it; not degrading
 the service for other users; and keeping the details private as this policy asks. If you come
 across a vulnerability while using a live deployment, trade only from your own accounts, stop as
-soon as you have seen the problem, and report it. Until we have agreed with you how to return what
-it gained you, place no further orders on the affected account unless we ask you to, and make no
-withdrawal that would leave it holding less than that gain. If you are unsure whether something you
-plan to do is covered, ask us before you do it.
+soon as you have seen the problem, and report it. To limit your risk you may then cancel the
+affected account's orders and reduce or close its positions, telling us when you do, but place no
+other orders on it. Until we have agreed with you how to return what the problem had gained you when
+you reported it, make no withdrawal that would take the account's balance below that amount. If you
+are unsure whether something you plan to do is covered, ask us before you do it.
 
 ## Scope
 
