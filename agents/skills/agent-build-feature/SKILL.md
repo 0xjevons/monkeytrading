@@ -3,9 +3,10 @@ name: agent-build-feature
 description: >
   Use when implementing a feature — "build #12", "implement this feature", "start the next
   feature". Confirms the feature is ready to build, builds all of it on one branch for one PR
-  (parallel subagents allowed), self-reviews it with agent-code-review, opens the PR through
-  agent-create-pr, and runs its dev scenario after merge. Deploys and issue writes need the
-  user's approval.
+  (parallel subagents allowed), self-reviews it with agent-code-review, runs its dev scenario on
+  the branch before the PR is marked ready, and opens the PR through agent-create-pr ending
+  `Closes #<feature>`, so the merge closes the issue. Deploys and issue writes need the user's
+  approval.
 ---
 
 # agent-build-feature
@@ -60,26 +61,28 @@ a bug fix or a refactor that is not a feature goes straight through
   before the PR is marked ready.
 - Show the user the dev scenario — steps, expected result, and the config it needs — and on their
   yes write it into the issue's dev scenario section, replacing the planned text.
+- Rebase the branch onto `main` and run the dev scenario in dev on that build: a local node built
+  from the branch, or a hosted dev environment once one exists, deployed only on the user's
+  explicit approval ([no-deploy](../../rules/no-deploy.md)). Show the user the result.
 - The scenario's scripted check passes in CI.
 - Put what promotion needs in the PR body: config, secrets, genesis or parameter changes, contract
   deployments, deploy ordering, rollback.
 
-## Merge and dev run
+## PR and merge
 
-- Open the PR with agent-create-pr, ending `Part of #<feature>`: the feature closes after its dev
-  run, not at merge.
+- Open the PR with agent-create-pr, ending `Closes #<feature>`, never `Part of #<feature>`. The PR
+  is marked ready only after the dev scenario has passed on the rebased branch and its scripted
+  check is green in CI, so the merge finishes the feature and GitHub closes the issue.
 - Answer review with [agent-address-pr-comments](../agent-address-pr-comments/SKILL.md), aiming for
   one round.
-- After merge, dev runs the `main` build: a local node built from `main`, or a hosted dev
-  environment once one exists, deployed only on the user's explicit approval
-  ([no-deploy](../../rules/no-deploy.md)). Never run the dev scenario on a branch build.
-- Run the dev scenario in dev, show the user the result, and on their yes record it on the issue
-  and close it.
+- A later push that changes the feature's behaviour, from a review fix or a rebase, runs the dev
+  scenario again on the new head and shows the user the result before the PR merges.
 - Promotion to prod needs its own approval.
 
 ## Rules
 
 - One feature never spans several pushed branches or PRs.
 - Never build part of a feature that is not ready.
-- Never write to a GitHub issue without the user's yes to the exact text.
+- Never write to a GitHub issue without the user's yes to the exact text. The one exception is the
+  merge closing the feature issue through `Closes #<feature>`.
 - Never deploy or change an environment without explicit per-action approval.

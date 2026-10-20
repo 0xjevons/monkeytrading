@@ -6,8 +6,9 @@ description: >
   preconditions for marking it ready (including a multi-agent agent-code-review at medium or
   higher), the issue blocker check, the `[scopes] Title` and the body in squashed-commit format
   ending with `Closes #12` or `Part of #12`, watching the checks after it opens, and, on the
-  owner's go-ahead in chat, posting `merge-approved` and merging the PR. Does not review or
-  approve.
+  owner's go-ahead in chat, posting `merge-approved` and merging the PR. Every feature PR ends
+  `Closes #12`; `Part of #12` is only for a supporting PR that does not finish its issue. Does not
+  review or approve.
 ---
 
 # agent-create-pr
@@ -40,7 +41,8 @@ marked ready, may not.
 
 - **Work finished.** No "fix it in review" leftovers.
 - **Feature complete.** A feature PR delivers its issue's whole acceptance list, its dev scenario
-  is on the issue, and the scenario's scripted check passes
+  is on the issue and has passed in dev on the branch rebased onto `main` and on each later head
+  that changes the feature's behaviour, and the scenario's scripted check passes in CI
   ([agent-build-feature](../agent-build-feature/SKILL.md)).
 - **Self-reviewed.** The change was built to
   [development-checklist](../../rules/development-checklist.md); walk every applicable section
@@ -71,7 +73,10 @@ checklist, no restatement of the diff.
   diff cannot show gets its own bullet: a required env or secret change, an ordering constraint
   against another PR or a deploy, a manual step.
 - **End with the issue** when the PR is tied to one, one line per issue in the branch name:
-  `Closes #12` when the merge finishes the issue, `Part of #12` when it does not.
+  `Closes #12` when the merge finishes the issue, so GitHub closes it on merge. A feature PR always
+  ends `Closes #<feature>`: it is marked ready only after its dev scenario has passed, so its merge
+  finishes the feature. `Part of #12` is only for a supporting PR — CI, docs, a fix — that touches
+  an issue without finishing it.
 - **End state only.** Describe what the branch does, never how it got there: no review history,
   alternatives considered, "X instead of Y", "no longer", or notes addressed to reviewers. Context
   a reviewer needs goes in a PR comment. The text follows
@@ -134,7 +139,8 @@ If GitHub or git refuses any step, the session reports why and stops.
 - Never open from an unpushed or stale branch.
 - Never open a PR whose issue has an open blocker without the user's explicit yes.
 - Issues are read-only here: never create, edit, or close an issue without the user's explicit
-  approval.
+  approval. The one exception is GitHub closing, on merge, each issue the body ends with
+  `Closes #<n>`.
 - No AI signatures anywhere — title, body, or commits.
 - Never approve or dismiss reviews. Post `merge-approved` and merge only as
   [Merging](#merging) describes.
