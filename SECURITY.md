@@ -21,12 +21,12 @@ a fix in mind, whether anyone else knows of the issue, and how you would like to
 
 ## What happens next
 
-We aim to acknowledge a report within three business days. Within ten business days of receiving
-it, we will tell you whether we can reproduce the issue, how severe we judge it, and what we plan to
-do. We aim to fix a vulnerability of a kind that the Scope section below lists as mattering most
-within 30 days of your report, and any other within 90 days of it, and we will keep you informed
-until it is resolved. If we conclude that a report does not describe a
-vulnerability, we will explain why.
+We aim to acknowledge a report within three business days, and within ten business days of
+receiving it to tell you whether we can reproduce the issue, how severe we judge it, and what we
+plan to do. We aim to fix a vulnerability of a kind that the Scope section below lists as mattering
+most within 30 days of your report, and any other within 90 days of it, and we will keep you
+informed until it is resolved. If we conclude that a report does not describe a vulnerability, we
+will explain why.
 
 ## Coordinated disclosure
 
@@ -48,8 +48,9 @@ than on a live deployment; never accessing anyone else's data beyond what the en
 through its log and public API, and never changing or destroying it; not degrading the service for
 other users; and keeping the details private as this policy asks. If you come across a
 vulnerability while using a live deployment, trade only from your own accounts, stop as soon as you
-have seen the problem, report it, and never withdraw or keep funds it gained you. If you are unsure
-whether something you plan to do is covered, ask us before you do it.
+have seen the problem, report it, and make no withdrawal from the affected account until we have
+agreed with you how to return what the problem gained you. If you are unsure whether something you
+plan to do is covered, ask us before you do it.
 
 ## Scope
 
@@ -85,15 +86,16 @@ unless they defeat a guarantee the engine makes. The engine is designed so that 
 controls the machine it runs on, cannot alter the published log without detection, have the enclave
 sign a state its rules do not produce, or pay out funds the engine did not approve. A finding that
 breaks one of these guarantees is in scope even when it starts from an operator's key. Some of the
-checks behind them are still being built: `engine replay` does not yet verify checkpoint
-signatures, the node does not yet detect a log its host has truncated, and the enclave's signing key
-does not yet survive a restart. A gap that an open issue or a `TODO` in the code already records is
-known; a way around a check that exists is a finding.
+checks behind them are still being built: `engine replay` does not yet verify checkpoint signatures;
+the node does not yet check the log it recovers from against anything its host cannot rewrite, so it
+accepts a truncated or rewritten one; and the enclave's signing key does not yet survive a restart.
+A gap that an open issue or a `TODO` in the code already records is known; a way around a check that
+exists is a finding.
 
 ## Supported versions
 
-monkeytrading has not launched and has no releases. Until the first release, only the latest commit
-on `main` is supported, so please check that an issue still reproduces there before reporting it.
+monkeytrading has not launched and has no releases. Until launch, only the latest commit on `main`
+is supported, so please check that an issue still reproduces there before reporting it.
 
 ## Bug bounty
 
