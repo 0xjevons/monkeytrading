@@ -59,23 +59,41 @@ fn a_missed_update_is_caught_by_the_next_checksum() {
 }
 
 #[test]
-fn malformed_books_resync() {
+fn malformed_books_resync_with_their_reason() {
     let cases = [
         // Exponent notation is not a plain decimal; reading it would mean going through a float.
-        UPDATES[0].replace(r#""price":2387.35"#, r#""price":2.38735e3"#),
-        UPDATES[0].replace(r#""price":2387.35"#, r#""price":"2387.35""#),
-        UPDATES[0].replace(r#""qty":3.07562993"#, r#""qty":-3.07562993"#),
-        UPDATES[0].replace(r#""price":2387.35"#, r#""price":0"#),
-        UPDATES[0].replace(r#""checksum":3352854302,"#, ""),
-        UPDATES[0].replace("2026-10-20T12:34:44.338822Z", "later"),
-        UPDATES[0].replace(r#""type":"update""#, r#""type":"delta""#),
-        UPDATES[0].replace("ETH/USD", "SOL/USD"),
+        ("bad price", UPDATES[0].replace(r#""price":2387.35"#, r#""price":2.38735e3"#)),
+        ("bad price", UPDATES[0].replace(r#""price":2387.35"#, r#""price":"2387.35""#)),
+        ("out of range", UPDATES[0].replace(r#""qty":3.07562993"#, r#""qty":-3.07562993"#)),
+        ("out of range", UPDATES[0].replace(r#""price":2387.35"#, r#""price":0"#)),
+        ("bad book", UPDATES[0].replace(r#""checksum":3352854302,"#, "")),
+        ("bad timestamp", UPDATES[0].replace("2026-10-20T12:34:44.338822Z", "later")),
+        ("before the epoch", UPDATES[0].replace("2026-10-20T12:34:44.338822Z", "1969-12-31T23:59:59.999Z")),
+        ("unknown book message type", UPDATES[0].replace(r#""type":"update""#, r#""type":"delta""#)),
+        ("update before snapshot", UPDATES[0].replace("ETH/USD", "SOL/USD")),
     ];
-    for case in cases {
+    for (expected, case) in cases {
         let mut books = Books::default();
         books.read(SNAPSHOT).unwrap();
-        assert!(matches!(books.read(&case), Err(Refusal::Connection(_))), "applied {case}");
+        let refused = books.read(&case);
+        assert!(
+            matches!(&refused, Err(Refusal::Connection(reason)) if reason.contains(expected)),
+            "{expected}: {refused:?}"
+        );
     }
+}
+
+#[test]
+fn a_new_snapshot_replaces_the_book() {
+    let mut books = Books::default();
+    books.read(SNAPSHOT).unwrap();
+    UPDATES.iter().for_each(|update| drop(books.read(update).unwrap()));
+    // One level a side: its checksum holds only if nothing of the earlier book is kept.
+    let checksum = checksum([("2390.00", "1.00000000"), ("2389.00", "2.00000000")].into_iter());
+    let snapshot = format!(
+        r#"{{"channel":"book","type":"snapshot","data":[{{"symbol":"ETH/USD","bids":[{{"price":2389.00,"qty":2.00000000}}],"asks":[{{"price":2390.00,"qty":1.00000000}}],"checksum":{checksum},"timestamp":"2026-10-20T12:34:45.000000Z"}}]}}"#
+    );
+    assert_eq!(books.read(&snapshot), Ok(top("2389", "2390", 1_792_499_685_000)));
 }
 
 #[test]
