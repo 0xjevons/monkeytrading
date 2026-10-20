@@ -1,3 +1,5 @@
+//! Engine outputs and the typed reasons a command is refused.
+
 use serde::{Deserialize, Serialize};
 
 use crate::Fixed;
@@ -12,6 +14,13 @@ pub enum Event {
     Deposited {
         account: AccountId,
         amount: Fixed,
+    },
+    /// A deposit the engine refused to credit: out of range, or a reference already credited.
+    DepositRejected {
+        account: AccountId,
+        amount: Fixed,
+        chain_ref: String,
+        reason: Reject,
     },
     WithdrawalApproved {
         account: AccountId,
@@ -69,29 +78,15 @@ pub enum Event {
         market: MarketId,
         level: usize,
     },
+    /// A price update the engine ignored: an unknown market, or a malformed venue quote.
+    PricesRejected {
+        market: MarketId,
+        reason: String,
+    },
     AdminApplied,
     AdminRejected {
         reason: String,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Fill {
-    pub account: AccountId,
-    pub order_id: OrderId,
-    pub market: MarketId,
-    pub side: Side,
-    pub qty: Fixed,
-    pub price: Fixed,
-    /// Reference mid at fill time. `price` minus `index` is the spread paid.
-    pub index: Fixed,
-    pub spread_bps: i64,
-    /// Price PnL realised by this fill, before the fee.
-    pub realised_pnl: Fixed,
-    pub profit_fee: Fixed,
-    /// Signed position after the fill.
-    pub position: Fixed,
-    pub liquidation: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -119,6 +114,10 @@ pub enum Reject {
         available: Fixed,
     },
     HouseCapacity,
+    /// An amount at or below zero, or above `Fixed::MAX_INPUT`.
+    InvalidAmount,
+    /// A custody reference that was already credited.
+    DuplicateReference,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,4 +127,23 @@ pub enum CancelReason {
     /// Triggered but couldn't fill (margin, house capacity, or reduce-only
     /// with no position left).
     Unfillable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Fill {
+    pub account: AccountId,
+    pub order_id: OrderId,
+    pub market: MarketId,
+    pub side: Side,
+    pub qty: Fixed,
+    pub price: Fixed,
+    /// Reference mid at fill time. `price` minus `index` is the spread paid.
+    pub index: Fixed,
+    pub spread_bps: i64,
+    /// Price PnL realised by this fill, before the fee.
+    pub realised_pnl: Fixed,
+    pub profit_fee: Fixed,
+    /// Signed position after the fill.
+    pub position: Fixed,
+    pub liquidation: bool,
 }

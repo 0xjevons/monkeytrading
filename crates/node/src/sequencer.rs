@@ -1,12 +1,10 @@
-//! The sequencer owns the engine. Commands arrive over one channel, get a
-//! seq and a timestamp, go into the log, and are applied in order. Nothing
-//! is acknowledged or published until its log entry is flushed. One thread,
-//! no locks, and no queue beyond the channel: a fill costs about one engine
-//! step plus a buffered write.
+//! The sequencer owns the engine. Commands arrive over one channel, get a seq and a timestamp, go
+//! into the log, and are applied in order. Nothing is acknowledged or published until its log
+//! entry is flushed. One task, no locks, and no queue beyond the channel: a fill costs about one
+//! engine step plus a buffered write.
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use engine_core::command::{AdminCommand, Command, Sequenced};
@@ -15,7 +13,9 @@ use engine_core::types::{AccountId, Millis};
 use engine_core::{Engine, Fixed};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tracing::{error, info, info_span, warn};
 
+use crate::clock::now_ms;
 use crate::config::Genesis;
 use crate::log::{self, Checkpoint, LogEntry, LogWriter};
 use crate::tee::EnclaveKey;
@@ -61,6 +61,7 @@ pub struct Sequencer {
     checkpoint_every: u64,
     next_seq: u64,
     last_ts: Millis,
+    last_checkpoint: Option<u64>,
     chain_id: u64,
     vault: AccountId,
     stream: broadcast::Sender<Arc<StreamMsg>>,
@@ -75,12 +76,21 @@ pub struct SequencerConfig<'a> {
     pub vault: AccountId,
 }
 
+/// The result of replaying a log.
+pub struct Replayed {
+    pub engine: Engine,
+    pub commands: u64,
+    pub checkpoints: u64,
+}
+
 impl Sequencer {
-    /// Rebuilds state by replaying the existing log, if there is one.
+    /// Rebuilds state by replaying the existing log, if there is one, and opens it for appending.
     ///
-    /// TODO: the log sits on host storage, so the host could truncate it.
-    /// Before serving, check the replayed root against the latest root
-    /// posted on-chain.
+    /// TODO: the log sits on host storage, so the host could truncate it. Before serving, check the
+    /// replayed root against the latest root posted on-chain.
+    /// Error cases:
+    /// - the log cannot be read, or fails replay (see `replay`)
+    /// - the log cannot be opened for appending
     pub fn recover(
         cfg: SequencerConfig<'_>,
         key: Arc<EnclaveKey>,
@@ -88,10 +98,11 @@ impl Sequencer {
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
         let replayed = replay(&log::read_all(cfg.log_path)?)?;
-        tracing::info!(commands = replayed.commands, checkpoints = replayed.checkpoints, "recovered from log");
+        info!(commands = replayed.commands, checkpoints = replayed.checkpoints, "recovered from log");
         Ok(Self {
             next_seq: replayed.engine.last_seq().map_or(0, |s| s + 1),
             last_ts: replayed.engine.now(),
+            last_checkpoint: replayed.engine.last_seq(),
             engine: replayed.engine,
             log: LogWriter::open(cfg.log_path)?,
             key,
@@ -104,18 +115,22 @@ impl Sequencer {
         })
     }
 
+    /// Whether the log was empty, so genesis has not been sequenced.
     pub fn is_fresh(&self) -> bool {
         self.next_seq == 0
     }
 
-    /// Sequences the genesis config as ordinary admin commands.
-    pub fn genesis(&mut self, g: &Genesis) -> anyhow::Result<()> {
-        let mut cmds = vec![Command::Admin(AdminCommand::SetParams(g.params.clone()))];
-        cmds.extend(g.benchmarks.iter().map(|b| {
+    /// Sequences the genesis config as ordinary admin commands, then checkpoints.
+    /// Error cases:
+    /// - the engine rejects any genesis command
+    /// - the log cannot be written
+    pub fn genesis(&mut self, genesis: &Genesis) -> anyhow::Result<()> {
+        let mut cmds = vec![Command::Admin(AdminCommand::SetParams(genesis.params.clone()))];
+        cmds.extend(genesis.benchmarks.iter().map(|b| {
             Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: b.name.clone(), annual_bps: b.annual_bps })
         }));
-        cmds.extend(g.markets.iter().map(|m| Command::Admin(AdminCommand::UpsertMarket(m.clone()))));
-        cmds.push(Command::HouseCapital { amount: g.house_capital, chain_ref: "genesis".into() });
+        cmds.extend(genesis.markets.iter().map(|m| Command::Admin(AdminCommand::UpsertMarket(m.clone()))));
+        cmds.push(Command::HouseCapital { amount: genesis.house_capital, chain_ref: "genesis".into() });
         for cmd in cmds {
             let events = self.sequence(cmd)?;
             if let Some(Event::AdminRejected { reason }) =
@@ -128,6 +143,10 @@ impl Sequencer {
         self.flush()
     }
 
+    /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch is
+    /// flushed before its replies, stream messages, and queries go out.
+    /// Error cases:
+    /// - the log cannot be written; the node must stop rather than acknowledge undurable commands
     pub async fn run(mut self, mut rx: mpsc::Receiver<Request>) -> anyhow::Result<()> {
         let mut replies = Vec::new();
         let mut queries: Vec<Query> = Vec::new();
@@ -148,40 +167,39 @@ impl Sequencer {
                 }
             }
             self.flush()?;
-            for (reply, events) in replies.drain(..) {
+            replies.drain(..).for_each(|(reply, events)| {
                 let _ = reply.send(events);
-            }
-            for q in queries.drain(..) {
-                q(&self.engine);
-            }
+            });
+            queries.drain(..).for_each(|q| q(&self.engine));
         }
+        if self.last_checkpoint != self.engine.last_seq() {
+            self.checkpoint()?;
+        }
+        self.flush()?;
+        info!(seq = ?self.engine.last_seq(), "sequencer drained");
         Ok(())
     }
 
+    /// Stamps, logs, and applies one command, signs any approved withdrawal, and checkpoints on
+    /// schedule. The command's span carries its seq as `id`.
+    /// Error cases:
+    /// - the log cannot be written
+    /// - the engine refuses the sequence, which means this sequencer is broken
     fn sequence(&mut self, cmd: Command) -> anyhow::Result<Vec<Event>> {
-        // The host clock is untrusted inside a TEE, but it can't move
-        // sequenced time backwards. TODO: bound drift against a trusted
-        // time source.
+        // The host clock is untrusted inside a TEE, but it can't move sequenced time backwards.
+        // TODO: bound drift against a trusted time source.
         let ts = now_ms().max(self.last_ts);
         let sequenced = Sequenced { seq: self.next_seq, ts, cmd };
+        let _span = info_span!("command", id = sequenced.seq).entered();
         self.log.append(&LogEntry::Command(sequenced.clone()))?;
         let events = self.engine.apply(&sequenced).context("sequencer produced an invalid sequence")?;
         self.next_seq += 1;
         self.last_ts = ts;
 
-        for e in &events {
-            if let Event::WithdrawalApproved { account, amount, nonce } = e {
-                let signature = self.key.sign_withdrawal(self.chain_id, &self.vault.0, *account, *amount, *nonce);
-                let w = SignedWithdrawal {
-                    account: *account,
-                    amount: *amount,
-                    nonce: *nonce,
-                    chain_id: self.chain_id,
-                    vault: self.vault,
-                    signature,
-                };
-                let _ = self.withdrawals.send(w.clone());
-                self.outbox.push(Arc::new(StreamMsg::Withdrawal(w)));
+        for event in &events {
+            alert_on(event);
+            if let Event::WithdrawalApproved { account, amount, nonce } = event {
+                self.sign_withdrawal(*account, *amount, *nonce);
             }
         }
         self.outbox.push(Arc::new(StreamMsg::Command { sequenced, events: events.clone() }));
@@ -191,22 +209,43 @@ impl Sequencer {
         Ok(events)
     }
 
-    /// TODO: hashing the whole state is O(state). Replace it with an
-    /// incremental Merkle root before accounts number in the millions.
+    /// Signs an approved withdrawal and hands it to custody and the stream.
+    fn sign_withdrawal(&mut self, account: AccountId, amount: Fixed, nonce: u64) {
+        let signature = self.key.sign_withdrawal(self.chain_id, &self.vault.0, account, amount, nonce);
+        let withdrawal =
+            SignedWithdrawal { account, amount, nonce, chain_id: self.chain_id, vault: self.vault, signature };
+        info!(%account, nonce, "withdrawal signed");
+        if self.withdrawals.send(withdrawal.clone()).is_err() {
+            error!(alert = "custody_unavailable", %account, nonce, "signed withdrawal has no custody consumer");
+        }
+        self.outbox.push(Arc::new(StreamMsg::Withdrawal(withdrawal)));
+    }
+
+    /// Logs and publishes a signed state root for the last applied seq.
+    ///
+    /// TODO: hashing the whole state is O(state). Replace it with an incremental Merkle root before
+    /// accounts number in the millions.
+    /// Error cases:
+    /// - nothing has been applied yet
+    /// - the log cannot be written
     fn checkpoint(&mut self) -> anyhow::Result<()> {
-        let seq = self.next_seq - 1;
+        let seq = self.engine.last_seq().context("checkpoint before any command")?;
         let root = self.engine.state_root();
         let cp = Checkpoint {
             seq,
             root: format!("0x{}", hex::encode(root)),
-            signature: self.key.sign_checkpoint(seq, &root),
+            signature: self.key.sign_checkpoint(self.chain_id, &self.vault.0, seq, &root),
             signer: self.key.address_hex(),
         };
         self.log.append(&LogEntry::Checkpoint(cp.clone()))?;
         self.outbox.push(Arc::new(StreamMsg::Checkpoint(cp)));
+        self.last_checkpoint = Some(seq);
         Ok(())
     }
 
+    /// Makes buffered log entries durable, then publishes what they produced.
+    /// Error cases:
+    /// - the log cannot be written
     fn flush(&mut self) -> anyhow::Result<()> {
         self.log.flush()?;
         for msg in self.outbox.drain(..) {
@@ -216,15 +255,12 @@ impl Sequencer {
     }
 }
 
-pub struct Replayed {
-    pub engine: Engine,
-    pub commands: u64,
-    pub checkpoints: u64,
-}
-
-/// Re-applies a log and checks every checkpoint root against the state the
-/// open-source engine actually produces. The same code serves crash
-/// recovery and third-party audit (`engine replay`).
+/// Re-applies a log and checks every checkpoint root against the state the open-source engine
+/// produces. The same code serves crash recovery and third-party audit (`engine replay`).
+/// Error cases:
+/// - a command out of sequence or with time running backwards
+/// - a checkpoint for a seq other than the last applied
+/// - a checkpoint root that differs from the replayed state
 pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
     let mut engine = Engine::new();
     let (mut commands, mut checkpoints) = (0, 0);
@@ -249,6 +285,56 @@ pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
     Ok(Replayed { engine, commands, checkpoints })
 }
 
-fn now_ms() -> Millis {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after epoch").as_millis() as Millis
+/// Raises an alert for an engine rejection an operator must look at.
+fn alert_on(event: &Event) {
+    match event {
+        // A finalised deposit the engine will not credit leaves user funds in the vault and
+        // nothing re-examines it.
+        Event::DepositRejected { account, amount, chain_ref, reason } => {
+            error!(alert = "deposit_rejected", %account, %amount, chain_ref, ?reason, "deposit not credited");
+        }
+        Event::PricesRejected { market, reason } => {
+            warn!(alert = "prices_rejected", market, reason, "price update refused");
+        }
+        Event::BadDebt { account, amount } => {
+            warn!(alert = "bad_debt", %account, %amount, "loss beyond balance written off against the house");
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tick(seq: u64) -> LogEntry {
+        LogEntry::Command(Sequenced { seq, ts: 0, cmd: Command::Tick })
+    }
+
+    fn checkpoint(seq: u64, root: String) -> LogEntry {
+        LogEntry::Checkpoint(Checkpoint { seq, root, signature: String::new(), signer: String::new() })
+    }
+
+    #[test]
+    fn replay_verifies_checkpoint_roots() {
+        let mut engine = Engine::new();
+        engine.apply(&Sequenced { seq: 0, ts: 0, cmd: Command::Tick }).unwrap();
+        let root = format!("0x{}", hex::encode(engine.state_root()));
+        let replayed = replay(&[tick(0), checkpoint(0, root)]).unwrap();
+        assert_eq!((replayed.commands, replayed.checkpoints), (1, 1));
+    }
+
+    #[test]
+    fn replay_refuses_a_tampered_root_or_a_misplaced_checkpoint() {
+        let err = replay(&[tick(0), checkpoint(0, "0xbad".into())]).err().unwrap();
+        assert!(format!("{err:#}").contains("state root mismatch"), "{err:#}");
+        let err = replay(&[tick(0), checkpoint(5, "0x".into())]).err().unwrap();
+        assert!(format!("{err:#}").contains("checkpoint for seq 5"), "{err:#}");
+    }
+
+    #[test]
+    fn replay_refuses_a_gap_in_the_log() {
+        let err = replay(&[tick(0), tick(2)]).err().unwrap();
+        assert!(format!("{err:#}").contains("applying seq 2"), "{err:#}");
+    }
 }

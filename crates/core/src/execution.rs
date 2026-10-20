@@ -1,11 +1,10 @@
-//! Orders, pricing, fills and close-outs.
+//! Orders, pricing, and fills.
 //!
-//! Every fill is against the house at the live index mid plus a spread made
-//! of three parts:
+//! Every fill is against the house at the live index mid plus a spread made of three parts:
 //! - the stress level's minimum spread (zero in normal conditions);
 //! - the account's toxicity add-on (zero for normal flow);
-//! - the size spread, charged only on the slice of the trade that grows the
-//!   account's absolute position through the market's size bands.
+//! - the size spread, charged only on the slice of the trade that grows the account's absolute
+//!   position through the market's size bands.
 //!
 //! Normal trades therefore fill at the mid.
 
@@ -20,10 +19,10 @@ use crate::types::{AccountId, MarketId, OrderId, Side};
 
 /// What the live price is checked against before filling.
 #[derive(Clone, Copy)]
-enum PriceGuard {
+pub(crate) enum PriceGuard {
     None,
-    /// Market order: decline if the live price is more than `max_bps`
-    /// worse than the price the client saw.
+    /// Market order: decline if the live price is more than `max_bps` worse than the price the
+    /// client saw.
     Quote {
         quoted: Fixed,
         max_bps: i64,
@@ -32,44 +31,44 @@ enum PriceGuard {
     Limit(Fixed),
 }
 
-struct Exec {
-    account: AccountId,
-    order_id: OrderId,
-    market: MarketId,
-    side: Side,
+/// One fill to price, risk-check, and book.
+pub(crate) struct Exec {
+    pub account: AccountId,
+    pub order_id: OrderId,
+    pub market: MarketId,
+    pub side: Side,
+    pub qty: Fixed,
+    pub reduce_only: bool,
+    pub guard: PriceGuard,
+    pub liquidation: bool,
+}
+
+/// A priced fill that has passed its price guard but is not yet booked.
+struct Priced {
     qty: Fixed,
-    reduce_only: bool,
-    guard: PriceGuard,
-    liquidation: bool,
+    delta: Fixed,
+    price: Fixed,
+    mid: Fixed,
+    spread_bps: i64,
+    increases: bool,
 }
 
 impl Engine {
-    pub(crate) fn place_order(&mut self, req: &OrderRequest, ev: &mut Vec<Event>) {
-        let reject = |reason, ev: &mut Vec<Event>| {
-            ev.push(Event::OrderRejected { account: req.account, client_id: req.client_id, reason })
+    /// Fills a market order now, or rests a limit or stop order, emitting acceptance or rejection.
+    pub(crate) fn place_order(&mut self, req: &OrderRequest, events: &mut Vec<Event>) {
+        let reject = |reason, events: &mut Vec<Event>| {
+            events.push(Event::OrderRejected { account: req.account, client_id: req.client_id, reason })
         };
-        if self.params.is_none() {
-            return reject(Reject::InvalidOrder { reason: "protocol params not set".into() }, ev);
+        if let Err(reason) = self.validate_order(req) {
+            return reject(reason, events);
         }
-        let Some(ms) = self.markets.get(&req.market) else {
-            return reject(Reject::UnknownMarket, ev);
-        };
-        if !req.qty.is_positive() {
-            return reject(Reject::InvalidOrder { reason: "qty must be positive".into() }, ev);
-        }
-        if !self.accounts.contains_key(&req.account) {
-            return reject(Reject::InsufficientFunds { available: Fixed::ZERO }, ev);
-        }
-        let max_slippage = ms.spec.max_slippage_bps;
-        self.refresh_session(req.market, ev);
+        self.refresh_session(req.market, events);
 
         match req.kind {
             OrderKind::Market { quoted, max_slippage_bps } => {
-                if !quoted.is_positive() {
-                    return reject(Reject::InvalidOrder { reason: "quoted price must be positive".into() }, ev);
-                }
+                let house_bound = self.markets[&req.market].spec.max_slippage_bps;
                 // The client may tighten the house bound but not widen it.
-                let max_bps = max_slippage_bps.map_or(max_slippage, |c| c.clamp(0, max_slippage));
+                let max_bps = max_slippage_bps.map_or(house_bound, |client| client.clamp(0, house_bound));
                 let order_id = self.alloc_order_id();
                 let exec = Exec {
                     account: req.account,
@@ -83,16 +82,13 @@ impl Engine {
                 };
                 match self.execute(exec) {
                     Ok(fill) => {
-                        ev.push(Event::OrderAccepted { account: req.account, client_id: req.client_id, order_id });
-                        self.after_fill(fill, ev);
+                        events.push(Event::OrderAccepted { account: req.account, client_id: req.client_id, order_id });
+                        self.after_fill(fill, events);
                     }
-                    Err(reason) => reject(reason, ev),
+                    Err(reason) => reject(reason, events),
                 }
             }
-            OrderKind::Limit { price } | OrderKind::Stop { price } => {
-                if !price.is_positive() {
-                    return reject(Reject::InvalidOrder { reason: "trigger price must be positive".into() }, ev);
-                }
+            OrderKind::Limit { .. } | OrderKind::Stop { .. } => {
                 let order_id = self.alloc_order_id();
                 let order = RestingOrder {
                     order_id,
@@ -103,294 +99,329 @@ impl Engine {
                     kind: req.kind,
                     reduce_only: req.reduce_only,
                 };
-                self.accounts.get_mut(&req.account).expect("checked").orders.insert(order_id, order);
-                self.markets.get_mut(&req.market).expect("checked").resting.insert(order_id, req.account);
-                ev.push(Event::OrderAccepted { account: req.account, client_id: req.client_id, order_id });
-                self.trigger_resting(req.market, ev);
+                self.accounts.get_mut(&req.account).expect("validated").orders.insert(order_id, order);
+                self.markets.get_mut(&req.market).expect("validated").resting.insert(order_id, req.account);
+                events.push(Event::OrderAccepted { account: req.account, client_id: req.client_id, order_id });
+                self.trigger_resting(req.market, events);
             }
         }
     }
 
-    pub(crate) fn cancel_order(&mut self, account: AccountId, order_id: OrderId, ev: &mut Vec<Event>) {
+    /// Cancels a resting order on the client's request.
+    pub(crate) fn cancel_order(&mut self, account: AccountId, order_id: OrderId, events: &mut Vec<Event>) {
         if self.remove_order(account, order_id).is_some() {
-            ev.push(Event::OrderCancelled { account, order_id, reason: CancelReason::Client });
+            events.push(Event::OrderCancelled { account, order_id, reason: CancelReason::Client });
         } else {
-            ev.push(Event::OrderRejected { account, client_id: 0, reason: Reject::UnknownOrder });
+            events.push(Event::OrderRejected { account, client_id: 0, reason: Reject::UnknownOrder });
         }
     }
 
-    /// Fills resting orders whose trigger the live price has reached. While a
-    /// market is closed nothing triggers, so the first fresh price after the
-    /// open fills everything that gapped through, at that price.
-    pub(crate) fn trigger_resting(&mut self, m: MarketId, ev: &mut Vec<Event>) {
-        let ms = &self.markets[&m];
-        if !ms.open {
+    /// Fills resting orders whose trigger the live price has reached. While a market is closed
+    /// nothing triggers, so the first fresh price after the open fills everything that gapped
+    /// through, at that price.
+    pub(crate) fn trigger_resting(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
+        let market = &self.markets[&market_id];
+        if !market.open {
             return;
         }
-        let Ok(index) = compute_index(&ms.quotes, &ms.spec.price_rules, self.now) else { return };
-        let mid = index.mid;
-        let resting: Vec<(OrderId, AccountId)> = ms.resting.iter().map(|(o, a)| (*o, *a)).collect();
-
+        let Ok(index) = compute_index(&market.quotes, &market.spec.price_rules, self.now) else { return };
+        let resting: Vec<(OrderId, AccountId)> = market.resting.iter().map(|(o, a)| (*o, *a)).collect();
         for (order_id, account) in resting {
-            let Some(order) = self.accounts.get(&account).and_then(|a| a.orders.get(&order_id)).cloned() else {
-                continue;
-            };
-            let (triggered, guard) = match (order.kind, order.side) {
-                (OrderKind::Limit { price }, Side::Buy) => (mid <= price, PriceGuard::Limit(price)),
-                (OrderKind::Limit { price }, Side::Sell) => (mid >= price, PriceGuard::Limit(price)),
-                (OrderKind::Stop { price }, Side::Buy) => (mid >= price, PriceGuard::None),
-                (OrderKind::Stop { price }, Side::Sell) => (mid <= price, PriceGuard::None),
-                (OrderKind::Market { .. }, _) => unreachable!("market orders never rest"),
-            };
-            if !triggered {
-                continue;
+            self.trigger_order(order_id, account, index.mid, events);
+        }
+    }
+
+    /// Prices and risk-checks one fill, then books it. Nothing is mutated on error.
+    /// Error cases:
+    /// - the market is closed, or has no valid index
+    /// - reduce-only with no opposite position, or new risk in a reduce-only market
+    /// - new risk below the market's minimum order notional
+    /// - a spread at this size that reaches the price itself
+    /// - a live price beyond the slippage bound or the limit
+    /// - not enough margin, or no house capacity, for the risk the fill adds
+    pub(crate) fn execute(&mut self, exec: Exec) -> Result<Fill, Reject> {
+        let priced = self.price(&exec)?;
+        if priced.increases && !exec.liquidation {
+            self.check_risk(&exec, &priced)?;
+        }
+        Ok(self.book(&exec, priced))
+    }
+
+    /// Records a fill and writes off any balance the account can no longer cover.
+    pub(crate) fn after_fill(&mut self, fill: Fill, events: &mut Vec<Event>) {
+        let account = fill.account;
+        events.push(Event::Fill(fill));
+        self.settle_bad_debt(account, events);
+    }
+
+    /// The next order id; ids are never reused.
+    pub(crate) fn alloc_order_id(&mut self) -> OrderId {
+        let id = self.next_order_id;
+        self.next_order_id += 1;
+        id
+    }
+
+    /// Checks an order can be considered at all.
+    /// Error cases:
+    /// - protocol params not set yet
+    /// - an unknown market
+    /// - a qty, quoted price, or trigger price at or below zero or above `Fixed::MAX_INPUT`
+    /// - an account that has never been credited
+    fn validate_order(&self, req: &OrderRequest) -> Result<(), Reject> {
+        let invalid = |reason: &str| Err(Reject::InvalidOrder { reason: reason.into() });
+        if self.params.is_none() {
+            return invalid("protocol params not set");
+        }
+        if !self.markets.contains_key(&req.market) {
+            return Err(Reject::UnknownMarket);
+        }
+        if !req.qty.is_valid_input() {
+            return invalid("qty out of range");
+        }
+        let price = match req.kind {
+            OrderKind::Market { quoted, .. } => quoted,
+            OrderKind::Limit { price } | OrderKind::Stop { price } => price,
+        };
+        if !price.is_valid_input() {
+            return invalid("price out of range");
+        }
+        if !self.accounts.contains_key(&req.account) {
+            return Err(Reject::InsufficientFunds { available: Fixed::ZERO });
+        }
+        Ok(())
+    }
+
+    /// Fills one resting order if `mid` has reached its trigger. A limit the spread keeps out of
+    /// reach stays resting; any other failure cancels it.
+    fn trigger_order(&mut self, order_id: OrderId, account: AccountId, mid: Fixed, events: &mut Vec<Event>) {
+        let Some(order) = self.accounts.get(&account).and_then(|acct| acct.orders.get(&order_id)).cloned() else {
+            return;
+        };
+        let (triggered, guard) = match (order.kind, order.side) {
+            (OrderKind::Limit { price }, Side::Buy) => (mid <= price, PriceGuard::Limit(price)),
+            (OrderKind::Limit { price }, Side::Sell) => (mid >= price, PriceGuard::Limit(price)),
+            (OrderKind::Stop { price }, Side::Buy) => (mid >= price, PriceGuard::None),
+            (OrderKind::Stop { price }, Side::Sell) => (mid <= price, PriceGuard::None),
+            // `place_order` fills market orders immediately; they never rest.
+            (OrderKind::Market { .. }, _) => unreachable!("market orders never rest"),
+        };
+        if !triggered {
+            return;
+        }
+        let exec = Exec {
+            account,
+            order_id,
+            market: order.market,
+            side: order.side,
+            qty: order.qty,
+            reduce_only: order.reduce_only,
+            guard,
+            liquidation: false,
+        };
+        match self.execute(exec) {
+            Ok(fill) => {
+                self.remove_order(account, order_id);
+                self.after_fill(fill, events);
             }
-            let exec = Exec {
-                account,
-                order_id,
-                market: m,
-                side: order.side,
-                qty: order.qty,
-                reduce_only: order.reduce_only,
-                guard,
-                liquidation: false,
-            };
-            match self.execute(exec) {
-                Ok(fill) => {
-                    self.remove_order(account, order_id);
-                    self.after_fill(fill, ev);
-                }
-                // Mid reached the limit but spread keeps the live price worse; keep resting.
-                Err(Reject::Slippage { .. }) => {}
-                Err(_) => {
-                    self.remove_order(account, order_id);
-                    ev.push(Event::OrderCancelled { account, order_id, reason: CancelReason::Unfillable });
-                }
+            Err(Reject::Slippage { .. }) => {}
+            Err(_) => {
+                self.remove_order(account, order_id);
+                events.push(Event::OrderCancelled { account, order_id, reason: CancelReason::Unfillable });
             }
         }
     }
 
-    /// Account close-out: while equity is below the close-out level
-    /// of the margin requirement, close the largest losing position that can
-    /// trade right now.
-    pub(crate) fn check_closeouts(&mut self, m: MarketId, ev: &mut Vec<Event>) {
-        let level_bps = self.params.as_ref().expect("checked by caller").closeout_level_bps;
-        let accounts: Vec<AccountId> =
-            self.accounts.iter().filter(|(_, a)| a.positions.contains_key(&m)).map(|(id, _)| *id).collect();
-
-        for account in accounts {
-            let mut announced = false;
-            loop {
-                let acct = &self.accounts[&account];
-                let (equity, margin) = self.equity_and_margin(acct, None);
-                if margin.is_zero() || equity >= margin.mul_bps(level_bps) {
-                    break;
-                }
-                let worst = acct
-                    .positions
-                    .iter()
-                    .filter(|(pm, _)| self.tradeable_now(**pm))
-                    .filter_map(|(pm, pos)| {
-                        let mark = self.markets[pm].mark?;
-                        Some((pos.unrealised(mark), *pm, *pos))
-                    })
-                    .min_by_key(|(upnl, pm, _)| (*upnl, *pm));
-                let Some((_, pm, pos)) = worst else { break };
-                if !announced {
-                    ev.push(Event::CloseOut { account, equity, margin });
-                    announced = true;
-                }
-                let side = if pos.qty.is_positive() { Side::Sell } else { Side::Buy };
-                let order_id = self.alloc_order_id();
-                let exec = Exec {
-                    account,
-                    order_id,
-                    market: pm,
-                    side,
-                    qty: pos.qty.abs(),
-                    reduce_only: true,
-                    guard: PriceGuard::None,
-                    liquidation: true,
-                };
-                match self.execute(exec) {
-                    Ok(fill) => self.after_fill(fill, ev),
-                    Err(_) => break,
-                }
-            }
-            self.settle_bad_debt(account, ev);
-        }
-    }
-
-    fn tradeable_now(&self, m: MarketId) -> bool {
-        let ms = &self.markets[&m];
-        ms.open && compute_index(&ms.quotes, &ms.spec.price_rules, self.now).is_ok()
-    }
-
-    /// Prices and risk-checks a fill, then books it. Nothing is mutated on error.
-    fn execute(&mut self, x: Exec) -> Result<Fill, Reject> {
-        let params = self.params.as_ref().expect("checked by caller");
-        let ms = &self.markets[&x.market];
-        if !ms.open {
+    /// The live price for a fill and the slice of it that adds risk.
+    /// Error cases:
+    /// - the market is closed, or has no valid index
+    /// - reduce-only with no opposite position, or new risk in a reduce-only market
+    /// - new risk below the market's minimum order notional
+    /// - a spread at this size that reaches the price itself
+    /// - a live price beyond the slippage bound or the limit
+    fn price(&self, exec: &Exec) -> Result<Priced, Reject> {
+        let params = self.params.as_ref().expect("callers check params are set");
+        let market = &self.markets[&exec.market];
+        if !market.open {
             return Err(Reject::MarketClosed);
         }
-        let index = compute_index(&ms.quotes, &ms.spec.price_rules, self.now).map_err(Reject::NoPrice)?;
-        let mid = index.mid;
-        let acct = &self.accounts[&x.account];
-        let pos = acct.position(x.market);
+        let mid = compute_index(&market.quotes, &market.spec.price_rules, self.now).map_err(Reject::NoPrice)?.mid;
+        let acct = &self.accounts[&exec.account];
+        let pos = acct.position(exec.market);
 
-        let mut qty = x.qty;
-        if x.reduce_only {
-            if pos.qty.is_zero() || pos.qty.signum() == x.side.sign() {
+        let qty = if exec.reduce_only {
+            if pos.qty.is_zero() || pos.qty.signum() == exec.side.sign() {
                 return Err(Reject::ReduceOnly);
             }
-            qty = qty.min(pos.qty.abs());
-        }
-        let delta = x.side.signed(qty);
-        let new_qty = pos.qty + delta;
-
-        // The slice of the trade that grows |position|.
-        let (grow_from, grow_to) = if pos.qty.is_zero() || pos.qty.signum() == delta.signum() {
-            (pos.qty.abs(), new_qty.abs())
-        } else if !new_qty.is_zero() && new_qty.signum() == delta.signum() {
-            (Fixed::ZERO, new_qty.abs())
+            exec.qty.min(pos.qty.abs())
         } else {
-            (Fixed::ZERO, Fixed::ZERO)
+            exec.qty
         };
+        let delta = exec.side.signed(qty);
+        let (grow_from, grow_to) = growth(pos.qty, delta);
         let increases = grow_to > grow_from;
-        if increases && ms.reduce_only {
+        if increases && market.reduce_only {
             return Err(Reject::ReduceOnly);
         }
-        let trade_notional = qty.mul(mid);
-        if increases && trade_notional < ms.spec.min_order_notional {
+        if increases && qty.mul(mid) < market.spec.min_order_notional {
             return Err(Reject::InvalidOrder { reason: "below minimum order notional".into() });
         }
 
-        // Price.
-        let stress = &params.stress_levels[ms.stress.level];
-        let size_cost = staircase(&ms.spec.spread_tiers, grow_from.mul(mid), grow_to.mul(mid))
+        let stress = &params.stress_levels[market.stress.level];
+        let size_cost = staircase(&market.spec.spread_tiers, grow_from.mul(mid), grow_to.mul(mid))
             .mul_bps(stress.size_spread_multiplier_bps);
-        let toxicity_bps = if x.liquidation { 0 } else { params.toxicity_spread_bps(acct.toxicity_bps) };
-        // Per-unit price adjustment; dividing the size cost by qty (not by
-        // notional) keeps full precision.
+        let toxicity_bps = if exec.liquidation { 0 } else { params.toxicity_spread_bps(acct.toxicity_bps) };
+        // Per-unit adjustment; dividing the size cost by qty (not by notional) keeps full precision.
         let adjust = mid.mul_bps(stress.min_spread_bps + toxicity_bps) + size_cost.div(qty);
-        let price = mid + adjust.mul_int(x.side.sign());
-        let spread_bps = (price - mid).abs().bps_of(mid);
+        if adjust >= mid {
+            return Err(Reject::InvalidOrder { reason: "spread at this size reaches the price".into() });
+        }
+        let price = mid + adjust.mul_int(exec.side.sign());
 
-        match x.guard {
+        match exec.guard {
             PriceGuard::None => {}
             PriceGuard::Quote { quoted, max_bps } => {
-                let adverse = (price - quoted).mul_int(x.side.sign());
+                let adverse = (price - quoted).mul_int(exec.side.sign());
                 if adverse > quoted.mul_bps(max_bps) {
                     return Err(Reject::Slippage { quoted, live: price, slippage_bps: adverse.bps_of(quoted) });
                 }
             }
             PriceGuard::Limit(limit) => {
-                if (price - limit).mul_int(x.side.sign()).is_positive() {
+                if (price - limit).mul_int(exec.side.sign()).is_positive() {
                     return Err(Reject::Slippage { quoted: limit, live: price, slippage_bps: 0 });
                 }
             }
         }
+        Ok(Priced { qty, delta, price, mid, spread_bps: adjust.bps_of(mid), increases })
+    }
 
-        // Risk: only trades that add risk are checked. Reducing is always allowed.
-        if increases && !x.liquidation {
-            let mut sim = acct.clone();
-            let realised = sim.positions.entry(x.market).or_default().apply(delta, price);
-            sim.balance += realised - profit_fee(realised, params.profit_fee_bps);
-            let (equity, required) = self.equity_and_margin(&sim, Some((x.market, mid)));
-            if equity < required {
-                return Err(Reject::InsufficientMargin { equity, required });
-            }
+    /// Checks a fill that adds risk against the account's margin and the house's exposure caps.
+    /// Error cases:
+    /// - the account's equity after the fill would be below its margin requirement
+    /// - the fill would push the house's net exposure past the market cap or the total cap
+    fn check_risk(&self, exec: &Exec, priced: &Priced) -> Result<(), Reject> {
+        let params = self.params.as_ref().expect("callers check params are set");
+        let market = &self.markets[&exec.market];
 
-            let nav = self.house_nav();
-            let before = ms.client_qty.abs().mul(mid);
-            let after = (ms.client_qty + delta).abs().mul(mid);
-            if after > before {
-                let total_after = self.house_gross_exposure() - before + after;
-                if after > nav.mul_bps(ms.spec.house_cap_bps) || total_after > nav.mul_bps(params.house_total_cap_bps) {
-                    return Err(Reject::HouseCapacity);
-                }
-            }
+        let mut sim = self.accounts[&exec.account].clone();
+        let realised = sim.positions.entry(exec.market).or_default().apply(priced.delta, priced.price);
+        sim.balance += realised - profit_fee(realised, params.profit_fee_bps);
+        let (equity, required) = self.equity_and_margin(&sim, Some((exec.market, priced.mid)));
+        if equity < required {
+            return Err(Reject::InsufficientMargin { equity, required });
         }
 
-        // Book it.
+        let nav = self.house_nav();
+        let before = market.client_qty.abs().mul(priced.mid);
+        let after = (market.client_qty + priced.delta).abs().mul(priced.mid);
+        if after > before {
+            // `house_gross_exposure` values this market at its mark; swap that term for `after`.
+            let at_mark = market.mark.map_or(Fixed::ZERO, |mark| market.client_qty.abs().mul(mark));
+            let total_after = self.house_gross_exposure() - at_mark + after;
+            if after > nav.mul_bps(market.spec.house_cap_bps) || total_after > nav.mul_bps(params.house_total_cap_bps) {
+                return Err(Reject::HouseCapacity);
+            }
+        }
+        Ok(())
+    }
+
+    /// Books a priced fill: the position, the market aggregates, realised PnL and the profit fee
+    /// against house cash, and a markout to score the flow later.
+    fn book(&mut self, exec: &Exec, priced: Priced) -> Fill {
+        let params = self.params.as_ref().expect("callers check params are set");
         let fee_bps = params.profit_fee_bps;
-        let toxicity_horizon = params.toxicity.horizon_ms;
-        let ms = self.markets.get_mut(&x.market).expect("checked");
-        let acct = self.accounts.get_mut(&x.account).expect("checked");
-        let pos = acct.positions.entry(x.market).or_default();
-        ms.client_qty -= pos.qty;
-        ms.client_cost -= pos.cost();
-        let realised_pnl = pos.apply(delta, price);
-        ms.client_qty += pos.qty;
-        ms.client_cost += pos.cost();
+        let markout_due = self.now + params.toxicity.horizon_ms;
+        let market = self.markets.get_mut(&exec.market).expect("priced against this market");
+        let acct = self.accounts.get_mut(&exec.account).expect("priced for this account");
+
+        let pos = acct.positions.entry(exec.market).or_default();
+        market.client_qty -= pos.qty;
+        market.client_cost -= pos.cost();
+        let realised_pnl = pos.apply(priced.delta, priced.price);
+        market.client_qty += pos.qty;
+        market.client_cost += pos.cost();
         let position = pos.qty;
         if position.is_zero() {
-            acct.positions.remove(&x.market);
+            acct.positions.remove(&exec.market);
         }
         let fee = profit_fee(realised_pnl, fee_bps);
         acct.balance += realised_pnl - fee;
         self.house_cash -= realised_pnl - fee;
 
-        if !x.liquidation {
+        if !exec.liquidation {
             self.markouts.push_back(Markout {
-                due: self.now + toxicity_horizon,
-                account: x.account,
-                market: x.market,
-                side: x.side,
-                price,
+                due: markout_due,
+                account: exec.account,
+                market: exec.market,
+                side: exec.side,
+                price: priced.price,
             });
         }
-
-        Ok(Fill {
-            account: x.account,
-            order_id: x.order_id,
-            market: x.market,
-            side: x.side,
-            qty,
-            price,
-            index: mid,
-            spread_bps,
+        Fill {
+            account: exec.account,
+            order_id: exec.order_id,
+            market: exec.market,
+            side: exec.side,
+            qty: priced.qty,
+            price: priced.price,
+            index: priced.mid,
+            spread_bps: priced.spread_bps,
             realised_pnl,
             profit_fee: fee,
             position,
-            liquidation: x.liquidation,
-        })
-    }
-
-    fn after_fill(&mut self, fill: Fill, ev: &mut Vec<Event>) {
-        let account = fill.account;
-        ev.push(Event::Fill(fill));
-        self.settle_bad_debt(account, ev);
-    }
-
-    /// Negative balance protection: once an account is flat, any negative
-    /// balance is written off against the house.
-    fn settle_bad_debt(&mut self, account: AccountId, ev: &mut Vec<Event>) {
-        let Some(acct) = self.accounts.get_mut(&account) else { return };
-        if acct.positions.is_empty() && acct.balance.is_negative() {
-            let amount = -acct.balance;
-            acct.balance = Fixed::ZERO;
-            self.house_cash -= amount;
-            ev.push(Event::BadDebt { account, amount });
+            liquidation: exec.liquidation,
         }
     }
 
+    /// Removes a resting order from its account and its market's book.
     fn remove_order(&mut self, account: AccountId, order_id: OrderId) -> Option<RestingOrder> {
         let order = self.accounts.get_mut(&account)?.orders.remove(&order_id)?;
-        if let Some(ms) = self.markets.get_mut(&order.market) {
-            ms.resting.remove(&order_id);
+        if let Some(market) = self.markets.get_mut(&order.market) {
+            market.resting.remove(&order_id);
         }
         Some(order)
     }
+}
 
-    fn alloc_order_id(&mut self) -> OrderId {
-        let id = self.next_order_id;
-        self.next_order_id += 1;
-        id
+/// The slice of a trade that grows |position|, as `(from, to)` absolute quantities: the whole of
+/// an increase, the new side of a flip, and nothing for a pure reduction.
+fn growth(current: Fixed, delta: Fixed) -> (Fixed, Fixed) {
+    let new = current + delta;
+    if current.is_zero() || current.signum() == delta.signum() {
+        (current.abs(), new.abs())
+    } else if !new.is_zero() && new.signum() == delta.signum() {
+        (Fixed::ZERO, new.abs())
+    } else {
+        (Fixed::ZERO, Fixed::ZERO)
     }
 }
 
 /// Losers pay nothing; winners pay `fee_bps` of realised profit.
 fn profit_fee(realised: Fixed, fee_bps: i64) -> Fixed {
     if realised.is_positive() { realised.mul_bps(fee_bps) } else { Fixed::ZERO }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f(n: i64) -> Fixed {
+        Fixed::from_int(n)
+    }
+
+    #[test]
+    fn growth_covers_increase_flip_and_reduce() {
+        assert_eq!(growth(f(0), f(3)), (f(0), f(3)));
+        assert_eq!(growth(f(2), f(3)), (f(2), f(5)));
+        // Long 2, sell 5: the 3 short is new risk.
+        assert_eq!(growth(f(2), f(-5)), (f(0), f(3)));
+        assert_eq!(growth(f(5), f(-2)), (f(0), f(0)));
+        assert_eq!(growth(f(5), f(-5)), (f(0), f(0)));
+    }
+
+    #[test]
+    fn profit_fee_only_on_gains() {
+        assert_eq!(profit_fee(f(100), 1_000), f(10));
+        assert_eq!(profit_fee(f(-100), 1_000), f(0));
+        assert_eq!(profit_fee(f(0), 1_000), f(0));
+    }
 }

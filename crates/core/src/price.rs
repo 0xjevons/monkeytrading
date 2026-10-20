@@ -1,9 +1,7 @@
-//! Reference index. The house quotes around the median of several
-//! independent venues. Quotes too old relative to the sequenced time are
-//! dropped, and if too few venues remain, or the fresh ones disagree too
-//! much, the market has no price and nothing fills. This staleness guard
-//! replaces queue-plus-jitter: a fast feed means there is no stale price to
-//! pick off.
+//! Reference index. The house quotes around the median of several independent venues. Quotes too
+//! old relative to the sequenced time are dropped, and if too few venues remain, or the fresh ones
+//! disagree too much, the market has no price and nothing fills. This staleness guard replaces
+//! queue-plus-jitter: a fast feed means there is no stale price to pick off.
 
 use std::collections::BTreeMap;
 
@@ -12,6 +10,15 @@ use serde::{Deserialize, Serialize};
 use crate::Fixed;
 use crate::market::PriceRules;
 use crate::types::Millis;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PriceError {
+    #[error("only {fresh} fresh sources, need {needed}")]
+    Stale { fresh: usize, needed: usize },
+    #[error("sources diverge by {divergence_bps}bps")]
+    Divergent { divergence_bps: i64 },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceQuote {
@@ -28,15 +35,18 @@ pub struct Index {
     pub sources: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PriceError {
-    #[error("only {fresh} fresh sources, need {needed}")]
-    Stale { fresh: usize, needed: usize },
-    #[error("sources diverge by {divergence_bps}bps")]
-    Divergent { divergence_bps: i64 },
+impl SourceQuote {
+    /// Whether the quote could have come from a working venue feed: a mid in the valid input range
+    /// and a timestamp at or after the epoch.
+    pub fn is_well_formed(&self) -> bool {
+        self.mid.is_valid_input() && self.ts >= 0
+    }
 }
 
+/// The index at `now`: the median of quotes no older than `rules.max_age_ms`.
+/// Error cases:
+/// - fewer fresh quotes than `rules.min_sources`
+/// - fresh quotes spread wider than `rules.max_divergence_bps` around the median
 pub fn compute_index(
     quotes: &BTreeMap<String, SourceQuote>,
     rules: &PriceRules,
@@ -44,7 +54,7 @@ pub fn compute_index(
 ) -> Result<Index, PriceError> {
     let mut mids: Vec<Fixed> = quotes
         .values()
-        .filter(|q| q.mid.is_positive() && q.ts <= now && now - q.ts <= rules.max_age_ms)
+        .filter(|q| q.is_well_formed() && q.ts <= now && now.saturating_sub(q.ts) <= rules.max_age_ms)
         .map(|q| q.mid)
         .collect();
     if mids.len() < rules.min_sources {
@@ -78,12 +88,25 @@ mod tests {
         let idx = compute_index(&q, &RULES, 1_200).unwrap();
         assert_eq!(idx.mid, "100.05".parse().unwrap());
         assert_eq!(idx.sources, 3);
+        // (100.1 - 100) / 100.05 = 9.99bps, truncated.
         assert_eq!(idx.divergence_bps, 9);
+    }
+
+    #[test]
+    fn even_source_counts_average_the_middle_pair() {
+        let q = quotes(&[("a", "100", 1_000), ("b", "100.1", 1_000)]);
+        assert_eq!(compute_index(&q, &RULES, 1_000).unwrap().mid, "100.05".parse().unwrap());
     }
 
     #[test]
     fn stale_sources_are_dropped() {
         let q = quotes(&[("a", "100", 1_000), ("b", "100.1", 100)]);
+        assert_eq!(compute_index(&q, &RULES, 1_000), Err(PriceError::Stale { fresh: 1, needed: 2 }));
+    }
+
+    #[test]
+    fn quotes_from_the_future_or_malformed_are_ignored() {
+        let q = quotes(&[("a", "100", 2_000), ("b", "100", i64::MIN), ("c", "0", 1_000), ("d", "100", 1_000)]);
         assert_eq!(compute_index(&q, &RULES, 1_000), Err(PriceError::Stale { fresh: 1, needed: 2 }));
     }
 

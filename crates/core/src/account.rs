@@ -1,3 +1,5 @@
+//! Trader accounts: cash, netted positions, and resting orders.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +41,7 @@ impl Position {
         pnl
     }
 
+    /// Price PnL if the position were closed at `mark`.
     pub fn unrealised(&self, mark: Fixed) -> Fixed {
         (mark - self.entry).mul(self.qty)
     }
@@ -72,6 +75,7 @@ pub struct Account {
 }
 
 impl Account {
+    /// The account's position in `market`, flat if it has none.
     pub fn position(&self, market: MarketId) -> Position {
         self.positions.get(&market).copied().unwrap_or_default()
     }

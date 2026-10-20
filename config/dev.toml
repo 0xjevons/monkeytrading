@@ -11,8 +11,11 @@
 listen = "127.0.0.1:8080"
 log_path = "data/dev/log.jsonl"
 checkpoint_every = 1000
-tick_ms = 250
+tick = "250ms"
 auth = "none"
+
+[logging]
+level = "info"
 
 [tee]
 provider = "mock" # "configfs_tsm" on a TDX / SEV-SNP confidential VM
@@ -27,7 +30,7 @@ vault = "0x0000000000000000000000000000000000000000"
 
 [feeds]
 provider = "mock"
-interval_ms = 200
+interval = "200ms"
 mock_mids = [
   { market = 1, mid = "100000" },
   { market = 2, mid = "4000" },

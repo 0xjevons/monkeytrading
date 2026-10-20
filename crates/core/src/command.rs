@@ -12,13 +12,6 @@ use crate::price::SourceQuote;
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Sequenced {
-    pub seq: u64,
-    pub ts: Millis,
-    pub cmd: Command,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     /// Venue quotes from the feed handlers.
@@ -29,7 +22,8 @@ pub enum Command {
     /// Advances time when nothing else is happening, so session changes and
     /// rollovers fire on schedule.
     Tick,
-    /// Credited once the custody chain finalises a vault deposit.
+    /// Credited once the custody chain finalises a vault deposit. `chain_ref` identifies the
+    /// deposit on-chain (transaction hash and log index) and is credited at most once.
     Deposit {
         account: AccountId,
         amount: Fixed,
@@ -41,8 +35,8 @@ pub enum Command {
         account: AccountId,
         amount: Fixed,
     },
-    /// House capital in or out. Equity issuance against it is not designed
-    /// yet; for now this only moves house NAV.
+    /// House capital in or out, applied at most once per `chain_ref`. Equity issuance against it
+    /// is not designed yet; for now this only moves house NAV.
     HouseCapital {
         amount: Fixed,
         chain_ref: String,
@@ -53,20 +47,6 @@ pub enum Command {
         order_id: OrderId,
     },
     Admin(AdminCommand),
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OrderRequest {
-    pub account: AccountId,
-    /// Client-chosen id, echoed back so clients can match responses.
-    pub client_id: u64,
-    pub market: MarketId,
-    pub side: Side,
-    pub qty: Fixed,
-    pub kind: OrderKind,
-    /// Only reduce an existing position, never open or flip it.
-    #[serde(default)]
-    pub reduce_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,4 +91,25 @@ pub enum AdminCommand {
         market: MarketId,
         reduce_only: bool,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Sequenced {
+    pub seq: u64,
+    pub ts: Millis,
+    pub cmd: Command,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OrderRequest {
+    pub account: AccountId,
+    /// Client-chosen id, echoed back so clients can match responses.
+    pub client_id: u64,
+    pub market: MarketId,
+    pub side: Side,
+    pub qty: Fixed,
+    pub kind: OrderKind,
+    /// Only reduce an existing position, never open or flip it.
+    #[serde(default)]
+    pub reduce_only: bool,
 }
