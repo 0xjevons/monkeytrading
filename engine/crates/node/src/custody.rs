@@ -13,7 +13,10 @@ use tokio::sync::mpsc;
 use crate::config::{CustodyProvider, CustodySection};
 use crate::sequencer::SignedWithdrawal;
 
-pub async fn run(cfg: &CustodySection, mut withdrawals: mpsc::UnboundedReceiver<SignedWithdrawal>) -> anyhow::Result<()> {
+pub async fn run(
+    cfg: &CustodySection,
+    mut withdrawals: mpsc::UnboundedReceiver<SignedWithdrawal>,
+) -> anyhow::Result<()> {
     match cfg.provider {
         CustodyProvider::Mock => {
             while let Some(w) = withdrawals.recv().await {

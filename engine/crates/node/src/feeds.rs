@@ -13,7 +13,7 @@ use engine_core::price::SourceQuote;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 
 use crate::config::FeedsSection;
 use crate::sequencer::Request;
@@ -27,10 +27,9 @@ pub async fn run_mock(cfg: &FeedsSection, tx: mpsc::Sender<Request>) {
     let mut every = interval(Duration::from_millis(cfg.interval_ms));
     loop {
         every.tick().await;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_millis() as i64;
+        let ts =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock after epoch").as_millis()
+                as i64;
         for (market, mid) in &mut mids {
             *mid += mid.mul_bps(rng.gen_range(-2..=2));
             let quotes = MOCK_VENUES

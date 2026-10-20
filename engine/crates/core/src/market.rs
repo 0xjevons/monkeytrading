@@ -4,9 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::Fixed;
 use crate::session::Schedule;
 use crate::types::{AssetClass, MarketId};
-use crate::Fixed;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MarketSpec {
@@ -172,11 +172,8 @@ mod tests {
         assert!(validate_tiers("t", &tiers()).is_ok());
         assert!(validate_tiers("t", &[]).is_err());
         assert!(validate_tiers("t", &[Tier { up_to: Some(f(1)), bps: 1 }]).is_err());
-        let backwards = vec![
-            Tier { up_to: Some(f(5)), bps: 1 },
-            Tier { up_to: Some(f(2)), bps: 1 },
-            Tier { up_to: None, bps: 1 },
-        ];
+        let backwards =
+            vec![Tier { up_to: Some(f(5)), bps: 1 }, Tier { up_to: Some(f(2)), bps: 1 }, Tier { up_to: None, bps: 1 }];
         assert!(validate_tiers("t", &backwards).is_err());
     }
 }

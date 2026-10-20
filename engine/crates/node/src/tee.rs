@@ -48,7 +48,14 @@ impl EnclaveKey {
     }
 
     /// TODO: move to EIP-712 typed data once the vault contract is written.
-    pub fn sign_withdrawal(&self, chain_id: u64, vault: &[u8; 20], account: AccountId, amount: Fixed, nonce: u64) -> String {
+    pub fn sign_withdrawal(
+        &self,
+        chain_id: u64,
+        vault: &[u8; 20],
+        account: AccountId,
+        amount: Fixed,
+        nonce: u64,
+    ) -> String {
         let mut h = Keccak256::new();
         h.update(b"engine.withdrawal.v1");
         h.update(chain_id.to_be_bytes());
@@ -120,7 +127,8 @@ impl Default for ConfigfsTsm {
 impl Attestor for ConfigfsTsm {
     fn attest(&self, report_data: [u8; 64]) -> anyhow::Result<(String, Vec<u8>)> {
         let dir = self.root.join(format!("engine-{}", std::process::id()));
-        std::fs::create_dir(&dir).with_context(|| format!("creating {} (is this a TDX/SEV-SNP guest?)", dir.display()))?;
+        std::fs::create_dir(&dir)
+            .with_context(|| format!("creating {} (is this a TDX/SEV-SNP guest?)", dir.display()))?;
         let result = (|| {
             std::fs::write(dir.join("inblob"), report_data).context("writing inblob")?;
             let quote = std::fs::read(dir.join("outblob")).context("reading outblob")?;

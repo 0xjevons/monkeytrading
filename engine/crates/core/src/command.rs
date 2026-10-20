@@ -5,11 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::Fixed;
 use crate::market::MarketSpec;
 use crate::params::ProtocolParams;
 use crate::price::SourceQuote;
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
-use crate::Fixed;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sequenced {
@@ -22,20 +22,36 @@ pub struct Sequenced {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     /// Venue quotes from the feed handlers.
-    Prices { market: MarketId, quotes: Vec<SourceQuote> },
+    Prices {
+        market: MarketId,
+        quotes: Vec<SourceQuote>,
+    },
     /// Advances time when nothing else is happening, so session changes and
     /// rollovers fire on schedule.
     Tick,
     /// Credited once the custody chain finalises a vault deposit.
-    Deposit { account: AccountId, amount: Fixed, chain_ref: String },
+    Deposit {
+        account: AccountId,
+        amount: Fixed,
+        chain_ref: String,
+    },
     /// A trader asks to withdraw. If approved, the enclave signs a
     /// withdrawal the vault contract will honour.
-    Withdraw { account: AccountId, amount: Fixed },
+    Withdraw {
+        account: AccountId,
+        amount: Fixed,
+    },
     /// House capital in or out. Equity issuance against it is not designed
     /// yet; for now this only moves house NAV.
-    HouseCapital { amount: Fixed, chain_ref: String },
+    HouseCapital {
+        amount: Fixed,
+        chain_ref: String,
+    },
     PlaceOrder(OrderRequest),
-    CancelOrder { account: AccountId, order_id: OrderId },
+    CancelOrder {
+        account: AccountId,
+        order_id: OrderId,
+    },
     Admin(AdminCommand),
 }
 
@@ -79,11 +95,20 @@ pub enum AdminCommand {
     SetParams(ProtocolParams),
     /// Lists a new market or replaces an existing market's spec.
     UpsertMarket(MarketSpec),
-    SetBenchmarkRate { benchmark: String, annual_bps: i64 },
+    SetBenchmarkRate {
+        benchmark: String,
+        annual_bps: i64,
+    },
     /// The operator's stress floor for one market, or every market if
     /// `market` is `None`. The effective level is the higher of this and the
     /// automatic level, so the operator can raise stress but never suppress it.
-    SetStressFloor { market: Option<MarketId>, level: usize },
+    SetStressFloor {
+        market: Option<MarketId>,
+        level: usize,
+    },
     /// Stops new risk in a market. Reducing trades stay allowed.
-    SetReduceOnly { market: MarketId, reduce_only: bool },
+    SetReduceOnly {
+        market: MarketId,
+        reduce_only: bool,
+    },
 }

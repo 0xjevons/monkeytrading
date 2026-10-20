@@ -153,7 +153,14 @@ impl Harness {
         }))
     }
 
-    fn market_order(&mut self, account: AccountId, market: MarketId, side: Side, qty: &str, quoted: &str) -> Vec<Event> {
+    fn market_order(
+        &mut self,
+        account: AccountId,
+        market: MarketId,
+        side: Side,
+        qty: &str,
+        quoted: &str,
+    ) -> Vec<Event> {
         self.order(account, market, side, qty, OrderKind::Market { quoted: f(quoted), max_slippage_bps: None })
     }
 
@@ -359,7 +366,9 @@ fn withdrawals_are_limited_to_free_cash() {
     h.market_order(a, BTC, Side::Buy, "0.09", "100000");
 
     let ev = h.cmd(Command::Withdraw { account: a, amount: f("200") });
-    assert!(matches!(&ev[0], Event::WithdrawalRejected { reason: Reject::InsufficientFunds { available }, .. } if *available == f("100")));
+    assert!(
+        matches!(&ev[0], Event::WithdrawalRejected { reason: Reject::InsufficientFunds { available }, .. } if *available == f("100"))
+    );
     let ev = h.cmd(Command::Withdraw { account: a, amount: f("100") });
     assert_eq!(ev[0], Event::WithdrawalApproved { account: a, amount: f("100"), nonce: 1 });
     h.assert_conserved(f("100"));

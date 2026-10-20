@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::Fixed;
 use crate::command::OrderKind;
 use crate::types::{MarketId, OrderId, Side};
-use crate::Fixed;
 
 /// One netted position per market, as on a CFD netting account. `qty` is
 /// signed: long > 0, short < 0.

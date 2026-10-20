@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use engine_core::command::Command;
 use engine_core::types::AccountId;
@@ -133,13 +133,7 @@ async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         }
     });
 
-    let app = api::router(api::ApiState {
-        tx,
-        stream: stream_tx,
-        attestation,
-        auth: cfg.node.auth,
-        dev_deposits,
-    });
+    let app = api::router(api::ApiState { tx, stream: stream_tx, attestation, auth: cfg.node.auth, dev_deposits });
     let listener = tokio::net::TcpListener::bind(cfg.node.listen).await?;
     tracing::info!(listen = %cfg.node.listen, "api up");
     let mut server = tokio::spawn(async move { axum::serve(listener, app).await });

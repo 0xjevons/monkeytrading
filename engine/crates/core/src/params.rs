@@ -80,9 +80,7 @@ pub struct Rollover {
 impl Rollover {
     /// The first rollover strictly after `ts`.
     pub fn next_after(&self, ts: Millis) -> Millis {
-        let local = DateTime::<Utc>::from_timestamp_millis(ts)
-            .expect("timestamp in range")
-            .with_timezone(&self.tz);
+        let local = DateTime::<Utc>::from_timestamp_millis(ts).expect("timestamp in range").with_timezone(&self.tz);
         let mut date = local.date_naive();
         loop {
             let naive = date.and_hms_opt(self.hour, self.minute, 0).expect("validated time");
@@ -127,11 +125,6 @@ impl ProtocolParams {
     }
 
     pub fn toxicity_spread_bps(&self, score_bps: i64) -> i64 {
-        self.toxicity
-            .tiers
-            .iter()
-            .rev()
-            .find(|t| score_bps >= t.min_score_bps)
-            .map_or(0, |t| t.extra_spread_bps)
+        self.toxicity.tiers.iter().rev().find(|t| score_bps >= t.min_score_bps).map_or(0, |t| t.extra_spread_bps)
     }
 }

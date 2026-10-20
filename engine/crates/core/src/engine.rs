@@ -9,14 +9,14 @@ use std::collections::{BTreeMap, VecDeque};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
+use crate::Fixed;
 use crate::account::Account;
 use crate::command::{AdminCommand, Command, Sequenced};
 use crate::event::{Event, Reject};
 use crate::market::MarketSpec;
 use crate::params::ProtocolParams;
-use crate::price::{compute_index, SourceQuote};
+use crate::price::{SourceQuote, compute_index};
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
-use crate::Fixed;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Engine {
@@ -154,20 +154,14 @@ impl Engine {
 
     /// House cash minus clients' unrealised PnL at current marks.
     pub fn house_nav(&self) -> Fixed {
-        let client_upnl: Fixed = self
-            .markets
-            .values()
-            .filter_map(|ms| ms.mark.map(|mark| mark.mul(ms.client_qty) - ms.client_cost))
-            .sum();
+        let client_upnl: Fixed =
+            self.markets.values().filter_map(|ms| ms.mark.map(|mark| mark.mul(ms.client_qty) - ms.client_cost)).sum();
         self.house_cash - client_upnl
     }
 
     /// Sum over markets of the house's absolute net notional.
     pub fn house_gross_exposure(&self) -> Fixed {
-        self.markets
-            .values()
-            .filter_map(|ms| ms.mark.map(|mark| ms.client_qty.abs().mul(mark)))
-            .sum()
+        self.markets.values().filter_map(|ms| ms.mark.map(|mark| ms.client_qty.abs().mul(mark))).sum()
     }
 
     /// (equity, margin requirement) at current marks, optionally overriding
@@ -238,8 +232,7 @@ impl Engine {
             }
         };
         let cap = nav.mul_bps(ms.spec.house_cap_bps);
-        let util_bps =
-            if cap.is_positive() { ms.client_qty.abs().mul(mid).bps_of(cap) } else { i64::MAX };
+        let util_bps = if cap.is_positive() { ms.client_qty.abs().mul(mid).bps_of(cap) } else { i64::MAX };
 
         let target = params
             .stress_levels
@@ -296,11 +289,8 @@ impl Engine {
                 let Some(mark) = ms.mark else { continue };
                 let fin = &ms.spec.financing;
                 let benchmark = self.benchmarks.get(&fin.benchmark).copied().unwrap_or(0);
-                let annual_bps = if pos.qty.is_positive() {
-                    benchmark + fin.markup_bps
-                } else {
-                    fin.markup_bps - benchmark
-                };
+                let annual_bps =
+                    if pos.qty.is_positive() { benchmark + fin.markup_bps } else { fin.markup_bps - benchmark };
                 let amount = pos.qty.abs().mul(mark).mul_bps(annual_bps).div_int(fin.day_basis);
                 if amount.is_zero() {
                     continue;

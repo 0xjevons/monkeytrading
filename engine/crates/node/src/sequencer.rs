@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::event::Event;
 use engine_core::types::{AccountId, Millis};
@@ -24,6 +24,8 @@ const MAX_BATCH: usize = 1024;
 
 pub type Query = Box<dyn FnOnce(&Engine) + Send>;
 
+// Unboxed on purpose: boxing every command would add an allocation to the hot path.
+#[allow(clippy::large_enum_variant)]
 pub enum Request {
     Submit { cmd: Command, reply: Option<oneshot::Sender<Vec<Event>>> },
     Query(Query),
@@ -116,7 +118,9 @@ impl Sequencer {
         cmds.push(Command::HouseCapital { amount: g.house_capital, chain_ref: "genesis".into() });
         for cmd in cmds {
             let events = self.sequence(cmd)?;
-            if let Some(Event::AdminRejected { reason }) = events.iter().find(|e| matches!(e, Event::AdminRejected { .. })) {
+            if let Some(Event::AdminRejected { reason }) =
+                events.iter().find(|e| matches!(e, Event::AdminRejected { .. }))
+            {
                 bail!("genesis rejected: {reason}");
             }
         }
@@ -181,7 +185,7 @@ impl Sequencer {
             }
         }
         self.outbox.push(Arc::new(StreamMsg::Command { sequenced, events: events.clone() }));
-        if self.next_seq % self.checkpoint_every == 0 {
+        if self.next_seq.is_multiple_of(self.checkpoint_every) {
             self.checkpoint()?;
         }
         Ok(events)

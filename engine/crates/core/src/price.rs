@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::Fixed;
 use crate::market::PriceRules;
 use crate::types::Millis;
-use crate::Fixed;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceQuote {
@@ -68,9 +68,7 @@ mod tests {
 
     fn quotes(qs: &[(&str, &str, Millis)]) -> BTreeMap<String, SourceQuote> {
         qs.iter()
-            .map(|(s, m, ts)| {
-                (s.to_string(), SourceQuote { source: s.to_string(), mid: m.parse().unwrap(), ts: *ts })
-            })
+            .map(|(s, m, ts)| (s.to_string(), SourceQuote { source: s.to_string(), mid: m.parse().unwrap(), ts: *ts }))
             .collect()
     }
 
@@ -86,10 +84,7 @@ mod tests {
     #[test]
     fn stale_sources_are_dropped() {
         let q = quotes(&[("a", "100", 1_000), ("b", "100.1", 100)]);
-        assert_eq!(
-            compute_index(&q, &RULES, 1_000),
-            Err(PriceError::Stale { fresh: 1, needed: 2 })
-        );
+        assert_eq!(compute_index(&q, &RULES, 1_000), Err(PriceError::Stale { fresh: 1, needed: 2 }));
     }
 
     #[test]

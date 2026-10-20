@@ -1,32 +1,78 @@
 use serde::{Deserialize, Serialize};
 
+use crate::Fixed;
 use crate::price::PriceError;
 use crate::types::{AccountId, MarketId, OrderId, Side};
-use crate::Fixed;
 
 /// Engine outputs. Clients and the custody layer act on events; they never
 /// read state directly.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    Deposited { account: AccountId, amount: Fixed },
-    WithdrawalApproved { account: AccountId, amount: Fixed, nonce: u64 },
-    WithdrawalRejected { account: AccountId, amount: Fixed, reason: Reject },
-    HouseCapitalMoved { amount: Fixed, nav: Fixed },
-    OrderAccepted { account: AccountId, client_id: u64, order_id: OrderId },
-    OrderRejected { account: AccountId, client_id: u64, reason: Reject },
-    OrderCancelled { account: AccountId, order_id: OrderId, reason: CancelReason },
+    Deposited {
+        account: AccountId,
+        amount: Fixed,
+    },
+    WithdrawalApproved {
+        account: AccountId,
+        amount: Fixed,
+        nonce: u64,
+    },
+    WithdrawalRejected {
+        account: AccountId,
+        amount: Fixed,
+        reason: Reject,
+    },
+    HouseCapitalMoved {
+        amount: Fixed,
+        nav: Fixed,
+    },
+    OrderAccepted {
+        account: AccountId,
+        client_id: u64,
+        order_id: OrderId,
+    },
+    OrderRejected {
+        account: AccountId,
+        client_id: u64,
+        reason: Reject,
+    },
+    OrderCancelled {
+        account: AccountId,
+        order_id: OrderId,
+        reason: CancelReason,
+    },
     Fill(Fill),
-    CloseOut { account: AccountId, equity: Fixed, margin: Fixed },
+    CloseOut {
+        account: AccountId,
+        equity: Fixed,
+        margin: Fixed,
+    },
     /// Loss beyond the account's balance, absorbed by the house
     /// (negative balance protection).
-    BadDebt { account: AccountId, amount: Fixed },
-    Financing { account: AccountId, market: MarketId, amount: Fixed },
-    MarketOpened { market: MarketId },
-    MarketClosed { market: MarketId },
-    StressChanged { market: MarketId, level: usize },
+    BadDebt {
+        account: AccountId,
+        amount: Fixed,
+    },
+    Financing {
+        account: AccountId,
+        market: MarketId,
+        amount: Fixed,
+    },
+    MarketOpened {
+        market: MarketId,
+    },
+    MarketClosed {
+        market: MarketId,
+    },
+    StressChanged {
+        market: MarketId,
+        level: usize,
+    },
     AdminApplied,
-    AdminRejected { reason: String },
+    AdminRejected {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -53,14 +99,25 @@ pub struct Fill {
 pub enum Reject {
     UnknownMarket,
     UnknownOrder,
-    InvalidOrder { reason: String },
+    InvalidOrder {
+        reason: String,
+    },
     MarketClosed,
     ReduceOnly,
     NoPrice(PriceError),
     /// The live price is further from the client's quote than allowed.
-    Slippage { quoted: Fixed, live: Fixed, slippage_bps: i64 },
-    InsufficientMargin { equity: Fixed, required: Fixed },
-    InsufficientFunds { available: Fixed },
+    Slippage {
+        quoted: Fixed,
+        live: Fixed,
+        slippage_bps: i64,
+    },
+    InsufficientMargin {
+        equity: Fixed,
+        required: Fixed,
+    },
+    InsufficientFunds {
+        available: Fixed,
+    },
     HouseCapacity,
 }
 

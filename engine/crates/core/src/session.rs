@@ -42,9 +42,7 @@ impl Schedule {
                     return false;
                 }
                 let t = WeekTime(
-                    local.weekday().num_days_from_monday() * MINUTES_PER_DAY
-                        + local.hour() * 60
-                        + local.minute(),
+                    local.weekday().num_days_from_monday() * MINUTES_PER_DAY + local.hour() * 60 + local.minute(),
                 );
                 windows.iter().any(|w| w.contains(t))
             }
@@ -54,9 +52,7 @@ impl Schedule {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Schedule::AlwaysOpen => Ok(()),
-            Schedule::Weekly { windows, .. } if windows.is_empty() => {
-                Err("weekly schedule has no windows".into())
-            }
+            Schedule::Weekly { windows, .. } if windows.is_empty() => Err("weekly schedule has no windows".into()),
             Schedule::Weekly { windows, .. } => match windows.iter().find(|w| w.open == w.close) {
                 Some(w) => Err(format!("empty window {}-{}", w.open, w.close)),
                 None => Ok(()),
@@ -138,10 +134,7 @@ mod tests {
     }
 
     fn ny_ms(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> Millis {
-        chrono_tz::America::New_York
-            .with_ymd_and_hms(y, mo, d, h, mi, 0)
-            .unwrap()
-            .timestamp_millis()
+        chrono_tz::America::New_York.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().timestamp_millis()
     }
 
     fn us_equities() -> Schedule {

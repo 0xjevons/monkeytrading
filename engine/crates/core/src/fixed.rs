@@ -42,10 +42,14 @@ impl Fixed {
         Fixed(bps as i128 * SCALE / BPS)
     }
 
+    // Named methods rather than `Mul`/`Div` impls, so truncation is visible
+    // at every call site.
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, rhs: Fixed) -> Fixed {
         Fixed(self.0 * rhs.0 / SCALE)
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn div(self, rhs: Fixed) -> Fixed {
         assert!(rhs.0 != 0, "fixed-point division by zero");
         Fixed(self.0 * SCALE / rhs.0)

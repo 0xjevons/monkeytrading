@@ -9,6 +9,7 @@
 //!
 //! Normal trades therefore fill at the mid.
 
+use crate::Fixed;
 use crate::account::RestingOrder;
 use crate::command::{OrderKind, OrderRequest};
 use crate::engine::{Engine, Markout};
@@ -16,7 +17,6 @@ use crate::event::{CancelReason, Event, Fill, Reject};
 use crate::market::staircase;
 use crate::price::compute_index;
 use crate::types::{AccountId, MarketId, OrderId, Side};
-use crate::Fixed;
 
 /// What the live price is checked against before filling.
 #[derive(Clone, Copy)]
@@ -24,7 +24,10 @@ enum PriceGuard {
     None,
     /// Market order: decline if the live price is more than `max_bps`
     /// worse than the price the client saw.
-    Quote { quoted: Fixed, max_bps: i64 },
+    Quote {
+        quoted: Fixed,
+        max_bps: i64,
+    },
     /// Triggered limit: never fill worse than the limit.
     Limit(Fixed),
 }
@@ -172,12 +175,8 @@ impl Engine {
     /// trade right now.
     pub(crate) fn check_closeouts(&mut self, m: MarketId, ev: &mut Vec<Event>) {
         let level_bps = self.params.as_ref().expect("checked by caller").closeout_level_bps;
-        let accounts: Vec<AccountId> = self
-            .accounts
-            .iter()
-            .filter(|(_, a)| a.positions.contains_key(&m))
-            .map(|(id, _)| *id)
-            .collect();
+        let accounts: Vec<AccountId> =
+            self.accounts.iter().filter(|(_, a)| a.positions.contains_key(&m)).map(|(id, _)| *id).collect();
 
         for account in accounts {
             let mut announced = false;
