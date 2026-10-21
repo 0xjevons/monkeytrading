@@ -2,17 +2,14 @@
 
 use super::*;
 
-use std::path::{Path, PathBuf};
-
-use engine_core::Engine;
-use engine_core::command::Sequenced;
 use tokio::sync::mpsc;
 
-use crate::custody::cursor::{Cursor, temp_path};
+use crate::custody::cursor::Cursor;
 use crate::custody::evm::{Beneficiary, VaultDeposit, VaultIdentity, check_complete};
 use crate::custody::sizing::AdaptiveSize;
 use crate::custody::stall::{PollError, Polled, Stall};
 mod alerts;
+mod cursor;
 mod fakes;
 mod reorg;
 use crate::custody::tests::fakes::*;
@@ -108,23 +105,6 @@ async fn a_deposit_read_again_after_a_restart_is_credited_once() {
 }
 
 #[tokio::test]
-async fn the_cursor_survives_a_restart() {
-    let dir = scratch("cursor");
-    let (chain, node) = (FakeChain::default(), Node::start(&dir));
-    chain.add(deposit(0, 2, Beneficiary::Trader(TRADER), USDC));
-    chain.set_final(Some(9));
-    assert!(matches!(watcher(&chain, &dir, 1_000, None).poll(&node.tx).await.map(Polled::caught_up), Ok(true)));
-    chain.add(deposit(1, 12, Beneficiary::Trader(TRADER), USDC));
-    chain.set_final(Some(12));
-
-    let mut restarted = watcher(&chain, &dir, 1_000, node.last_seq().await);
-    assert!(matches!(restarted.poll(&node.tx).await.map(Polled::caught_up), Ok(true)));
-
-    assert_eq!(chain.reads(), vec![(0, 9), (10, 12)]);
-    assert_eq!(node.balance(TRADER).await, Some(usdc("2")));
-}
-
-#[tokio::test]
 async fn a_missing_log_pauses_crediting_instead_of_skipping_the_deposit() {
     let dir = scratch("missing");
     let (chain, node) = (FakeChain::default(), Node::start(&dir));
@@ -163,46 +143,6 @@ async fn a_vault_count_below_the_deposits_already_read_pauses_crediting() {
 
     assert!(matches!(watcher.poll(&node.tx).await, Err(PollError::Stalled(Stall::Inconsistent(_)))));
     assert_eq!(stored_cursor(&dir), stale);
-}
-
-#[tokio::test]
-async fn the_cursor_moves_only_after_the_log_is_synced_past_the_credits() {
-    let dir = scratch("sync");
-    let cursor_path = dir.join("cursor.json");
-    // A sequencer that records, at each sync request, the block the stored cursor has reached.
-    let (tx, mut rx) = mpsc::channel::<Request>(64);
-    let sequencer = tokio::spawn(async move {
-        let (mut engine, mut seq, mut cursor_at_sync) = (Engine::new(), 0, Vec::new());
-        while let Some(request) = rx.recv().await {
-            match request {
-                Request::Submit { cmd, reply } => {
-                    let events = engine.apply(&Sequenced { seq, ts: 0, cmd }).unwrap();
-                    seq += 1;
-                    if let Some(reply) = reply {
-                        let _ = reply.send(events);
-                    }
-                }
-                Request::Query(query) => query(&engine),
-                Request::Sync(reply) => {
-                    let stored: Cursor = serde_json::from_str(&std::fs::read_to_string(&cursor_path).unwrap()).unwrap();
-                    cursor_at_sync.push((stored.next_block, stored.crediting.is_some()));
-                    let _ = reply.send(engine.last_seq());
-                }
-                Request::TimeSample(_) => unreachable!("custody sends no time samples"),
-            }
-        }
-        cursor_at_sync
-    });
-    let chain = FakeChain::default();
-    chain.add(deposit(0, 1, Beneficiary::Trader(TRADER), USDC));
-    chain.set_final(Some(1));
-
-    assert!(matches!(watcher(&chain, &dir, 1_000, None).poll(&tx).await.map(Polled::caught_up), Ok(true)));
-    drop(tx);
-    // At the sync the cursor still stands before the range, marked as crediting it.
-    assert_eq!(sequencer.await.unwrap(), vec![(0, true)]);
-    let stored = stored_cursor(&dir);
-    assert_eq!((stored.next_block, stored.log_seq, stored.crediting), (2, Some(0), None));
 }
 
 #[tokio::test]
@@ -281,33 +221,6 @@ async fn a_capped_log_read_settles_below_the_cap_while_the_tag_moves() {
     assert_eq!(node.balance(TRADER).await, Some(usdc("1")));
     // 1000 and 500 fail; 250 works and is kept, so no read fails again.
     assert_eq!(failures, 2);
-}
-
-#[tokio::test]
-async fn a_sequencer_that_cannot_sync_leaves_the_cursor_where_it_was() {
-    let dir = scratch("sync-fails");
-    let tx = engine_sequencer(false);
-    let chain = FakeChain::default();
-    chain.add(deposit(0, 1, Beneficiary::Trader(TRADER), USDC));
-    chain.set_final(Some(1));
-
-    let result = watcher(&chain, &dir, 1_000, None).poll(&tx).await;
-    assert!(matches!(&result, Err(PollError::Fatal(e)) if format!("{e:#}").contains("sequencer stopped")));
-    let stored = stored_cursor(&dir);
-    assert_eq!((stored.next_block, stored.crediting), (0, Some((1, canonical_hash(1)))));
-}
-
-#[tokio::test]
-async fn a_cursor_that_cannot_be_stored_stops_the_watcher() {
-    let dir = scratch("store-fails");
-    let (chain, node) = (FakeChain::default(), Node::start(&dir));
-    chain.set_final(Some(3));
-    let mut watcher = watcher(&chain, &dir, 1_000, None);
-    // A directory where the cursor file belongs: the rename over it fails.
-    let blocker: PathBuf = dir.join("cursor.json");
-    std::fs::create_dir_all(blocker.join("occupied")).unwrap();
-
-    assert!(matches!(watcher.poll(&node.tx).await, Err(PollError::Fatal(_))));
 }
 
 #[tokio::test]
@@ -439,12 +352,6 @@ async fn the_watcher_stops_when_the_sequencer_has_gone() {
 }
 
 #[test]
-fn a_cursor_is_written_beside_itself_whatever_its_name() {
-    assert_eq!(temp_path(Path::new("data/custody.tmp")), Path::new("data/custody.tmp.tmp"));
-    assert_eq!(temp_path(Path::new("data/cursor.json")), Path::new("data/cursor.json.tmp"));
-}
-
-#[test]
 fn a_read_size_halves_on_failure_holds_and_recovers_after_good_reads() {
     let mut size = AdaptiveSize::new(1_000);
     size.failed();
@@ -473,23 +380,4 @@ async fn a_lower_tag_from_a_lagging_backend_is_checked_without_proving_again() {
     chain.set_final(Some(25));
     assert!(matches!(watcher.poll(&node.tx).await.map(Polled::caught_up), Ok(false)));
     assert_eq!(chain.0.lock().unwrap().header_reads[proof..], [(25, 29), (10, 19)]);
-}
-
-#[test]
-fn a_cursor_is_refused_when_it_belongs_elsewhere_or_is_ahead_of_its_log() {
-    let path = scratch("cursor-load").join("cursor.json");
-    let fresh = Cursor::load(&path, CHAIN_ID, VAULT, 77, None).unwrap();
-    assert_eq!((fresh.next_block, fresh.next_deposit_id, fresh.log_seq), (77, 0, None));
-    Cursor { next_block: 100, next_deposit_id: 4, log_seq: Some(9), ..fresh }.store(&path).unwrap();
-
-    assert_eq!(Cursor::load(&path, CHAIN_ID, VAULT, 77, Some(9)).unwrap().next_block, 100);
-    assert!(Cursor::load(&path, 1, VAULT, 77, Some(9)).is_err());
-    assert!(Cursor::load(&path, CHAIN_ID, Address::repeat_byte(1), 77, Some(9)).is_err());
-    let err = Cursor::load(&path, CHAIN_ID, VAULT, 77, None).unwrap_err();
-    assert!(format!("{err:#}").contains("the log is new"), "{err:#}");
-    // A log restored or truncated to before the cursor's last credit.
-    let err = Cursor::load(&path, CHAIN_ID, VAULT, 77, Some(8)).unwrap_err();
-    assert!(format!("{err:#}").contains("the log ends at seq Some(8)"), "{err:#}");
-    std::fs::write(&path, "{not json").unwrap();
-    assert!(Cursor::load(&path, CHAIN_ID, VAULT, 77, Some(9)).is_err());
 }

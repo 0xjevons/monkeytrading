@@ -43,11 +43,14 @@ pub struct Cursor {
 
 impl Cursor {
     /// The cursor stored at `path`, or one at `start_block` when there is none. `log_seq` is the
-    /// last seq of the recovered log, `None` when the log is empty.
+    /// last seq of the recovered log, `None` when the log is empty. A cursor that records no log
+    /// seq has passed only blocks with no deposit to credit, so it fits any log, an empty one
+    /// included, as when it was stored before trusted time let the log's first command in.
     /// Error cases:
     /// - the file exists but cannot be read or parsed
     /// - it belongs to another chain or vault
-    /// - it exists although the log is fresh, or it has read past deposits the log does not hold
+    /// - it has read past deposits the log does not hold: its log seq is above the log's, or the
+    ///   log is empty
     pub fn load(
         path: &Path,
         chain_id: u64,
@@ -70,9 +73,6 @@ impl Cursor {
             }
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        if log_seq.is_none() {
-            bail!("{} exists but the log is new; remove it to rescan the vault from the start", path.display());
-        }
         let cursor: Cursor = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         if cursor.chain_id != chain_id || cursor.vault != vault {
             bail!(

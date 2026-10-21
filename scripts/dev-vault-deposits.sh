@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Dev scenario for vault deposits, on a local Anvil chain with a node on config/anvil.toml:
 #   1. start Anvil and deploy a mock USDC and the vault;
-#   2. run a node with custody.provider = "evm" against them;
+#   2. run a node with custody.provider = "evm" against them, after a first boot that never gets
+#      trusted time stored the deposit cursor before the log's first command;
 #   3. deposit as a trader, for the trader from another account, and as the house, restart the
 #      node mid-way (once with its cursor lost), and deposit again;
 #   4. reorg a deposit away before it is final, then include the same transaction again.
@@ -66,12 +67,21 @@ stays() {
 trader_balance() { curl -sk "$api/v1/accounts/$trader" | jq -r '.balance // "none"'; }
 house_nav() { curl -sk "$api/v1/house" | jq -r '.nav'; }
 rescanned_deposits() { jq -r '.next_deposit_id' "$work/custody-cursor.json" 2>/dev/null || echo none; }
+cursor_stored() { [[ -f "$work/custody-cursor.json" ]] && echo yes || echo no; }
+log_commands() {
+  local n=0 f
+  for f in "$work"/log/[0-9]*.jsonl; do
+    [[ -f "$f" ]] && n=$((n + $(jq -c 'select(.entry == "command")' "$f" | wc -l)))
+  done
+  echo "$n"
+}
 mine() { cast rpc anvil_mine "$(printf '0x%x' "$1")" --rpc-url "$rpc" >/dev/null; }
 send() { cast send "$@" --rpc-url "$rpc" >/dev/null; }
 
+# Starts the node on config `$1` (default the scenario's), logging to `$2` (default node.log).
 start_node() {
   curl -sk "$api/v1/health" >/dev/null 2>&1 && fail "port $api_port already serves an API"
-  "$engine" run --config "$work/anvil.toml" >>"$work/node.log" 2>&1 &
+  "$engine" run --config "${1:-$work/anvil.toml}" >>"${2:-$work/node.log}" 2>&1 &
   node_pid=$!
   for _ in $(seq 1 100); do
     kill -0 "$node_pid" 2>/dev/null || fail "node exited at startup"
@@ -120,9 +130,19 @@ for funder_key in "$trader_key" "$house_key"; do
   send "$usdc" "approve(address,uint256)" "$vault" $((10000000 * usdc_units)) --private-key "$funder_key"
 done
 
-step "Start the node with EVM custody"
+step "A first boot without trusted time stores the deposit cursor while the log is empty"
 sed -e "s#data/anvil#$work#g" -e "s#127.0.0.1:8545#127.0.0.1:$anvil_port#" -e "s#127.0.0.1:8080#127.0.0.1:$api_port#" \
   config/anvil.toml >"$work/anvil.toml"
+# Every Roughtime server points at a closed local port, so no sample arrives and nothing is
+# sequenced, while the watcher reads the blocks so far and stores its cursor. That boot's time
+# alerts are expected, so it logs apart from node.log.
+sed -E 's#^address = ".*"#address = "127.0.0.1:9"#' "$work/anvil.toml" >"$work/anvil-no-time.toml"
+start_node "$work/anvil-no-time.toml" "$work/node-no-time.log"
+wait_for cursor_stored yes
+[[ "$(log_commands)" == "0" ]] || fail "a command was sequenced without trusted time"
+stop_node
+
+step "Start the node with EVM custody; it resumes from that cursor"
 start_node
 [[ "$(house_nav)" == "0" ]] || fail "genesis credited house capital under EVM custody"
 code="$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$api/v1/dev/deposit" \

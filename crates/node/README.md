@@ -118,6 +118,8 @@ verifies its checkpoints.
 - `src/custody/cursor.rs` — the deposit cursor kept between restarts
 - `src/custody/tests/mod.rs` — deposit watcher tests against a fake chain and a real sequencer
 - `src/custody/tests/alerts.rs` — the watcher's alerts over time, in paused time
+- `src/custody/tests/cursor.rs` — the deposit cursor across restarts, and which cursors a log
+  refuses
 - `src/custody/tests/fakes.rs` — the fake chain, test sequencer, log capture, and fixtures
 - `src/custody/tests/rpc.rs` — the RPC adapter's log decoding, deadlines, and URL scrubbing
 - `src/custody/tests/reorg.rs` — reorgs and forked answers against the proven chain
