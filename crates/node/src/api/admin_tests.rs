@@ -27,10 +27,10 @@ use crate::clock::test_clock::TestClock;
 use crate::config::RateLimit;
 use crate::history::Reader;
 use crate::limits::ApiLimits;
-use crate::log::{LogEntry, SegmentedLog};
+use crate::log::LogEntry;
 use crate::sequencer::{Sequencer, SequencerConfig, replay};
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
-use crate::test_support::{DEV_CONFIG, dev_config, sample_around, scratch_dir, sequencer_config};
+use crate::test_support::{DEV_CONFIG, dev_config, log_entries, sample_around, scratch_dir, sequencer_config};
 use crate::tls::{TlsIdentity, serve};
 
 /// The dev operator key, whose public key `config/dev.toml` names.
@@ -318,7 +318,7 @@ impl Node {
 
     /// Every entry of the node's log, as flushed so far.
     fn entries(&self) -> Vec<LogEntry> {
-        SegmentedLog::open(&self.dir).unwrap().entries
+        log_entries(&self.dir)
     }
 
     /// The status and JSON body of a POST of `body` to `path`.
