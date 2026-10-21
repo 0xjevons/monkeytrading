@@ -16,11 +16,11 @@ use tokio::time::timeout;
 
 use crate::api::MAX_BACKFILLS;
 use crate::config::HistorySection;
-use crate::log::{MANIFEST, Manifest, SegmentedLog};
+use crate::log::{CommandEntry, MANIFEST, Manifest, SegmentedLog};
 use crate::sequencer::StreamMsg;
 use crate::test_support::{
     RETENTION, SEGMENT_COMMANDS, TRADER, TestHistory, TestSequencer, assert_a_dropped_read_keeps_its_permit, deposit,
-    every_event, logged_history, scratch_dir, withdraw,
+    every_event, log_entries, logged_history, open_history, published_manifest, scratch_dir, withdraw,
 };
 
 mod rebuild;
@@ -213,7 +213,7 @@ fn ready() -> watch::Receiver<bool> {
 /// Runs an index in `index` under `retention` over the whole log in `dir`, with no live messages
 /// after it, and returns where it resumed.
 async fn index_to_end(dir: &Path, index: &Path, retention: Duration) -> Offset {
-    let mut history = History::open(&HistorySection { dir: index.to_owned(), retention }, &entries(dir)).unwrap();
+    let mut history = open_history(&HistorySection { dir: index.to_owned(), retention }, dir).unwrap();
     history.catch_up_to(None);
     let resume_at = history.resume_at();
     follow_to_end(history, dir).await;
@@ -225,8 +225,7 @@ async fn index_to_end(dir: &Path, index: &Path, retention: Duration) -> Offset {
 async fn follow_to_end(history: History, dir: &Path) {
     let (live, subscriber) = broadcast::channel(1);
     drop(live);
-    let (manifest, backfills) =
-        (watch::channel(Manifest::load(dir).unwrap()).1, Arc::new(Semaphore::new(MAX_BACKFILLS)));
+    let (manifest, backfills) = (published_manifest(dir), Arc::new(Semaphore::new(MAX_BACKFILLS)));
     let feed = Feed::new(subscriber, dir.to_owned(), manifest, backfills, Some(history.resume_at()));
     timeout(Duration::from_secs(10), history.run(feed)).await.unwrap().unwrap();
 }
@@ -250,9 +249,13 @@ fn deposit_log(dir: &Path, count: u64) -> Vec<LogEntry> {
             LogEntry::Command(CommandEntry { sequenced, events: events() })
         })
         .collect();
-    let mut log =
-        SegmentedLog::open(dir).unwrap().into_writer(SEGMENT_COMMANDS, watch::channel(Manifest::default()).0).unwrap();
-    entries.iter().for_each(|entry| log.append(entry).unwrap());
+    let mut log = SegmentedLog::open(dir, |_| Ok(()))
+        .unwrap()
+        .into_writer(SEGMENT_COMMANDS, watch::channel(Manifest::default()).0)
+        .unwrap();
+    for entry in &entries {
+        log.append(entry).unwrap();
+    }
     log.flush().unwrap();
     entries
 }
@@ -260,8 +263,12 @@ fn deposit_log(dir: &Path, count: u64) -> Vec<LogEntry> {
 /// Appends `count` commands to the log in `dir`, or starts one there, each depositing `amount` to `A`
 /// and stamped half a second after `deposit_log` stamps its seq, so none matches a command it wrote.
 fn append_deposits(dir: &Path, amount: i64, count: u64) {
-    let log = SegmentedLog::open(dir).unwrap();
-    let next = log.entries.iter().rev().find_map(command_seq).map_or(0, |seq| seq + 1);
+    let mut next = 0;
+    let log = SegmentedLog::open(dir, |entry| {
+        next = command_seq(&entry).map_or(next, |seq| seq + 1);
+        Ok(())
+    })
+    .unwrap();
     let mut writer = log.into_writer(SEGMENT_COMMANDS, watch::channel(Manifest::default()).0).unwrap();
     for seq in next..next + count {
         let ts = Millis::try_from(seq).unwrap() * 1_000 + 500;
@@ -272,15 +279,9 @@ fn append_deposits(dir: &Path, amount: i64, count: u64) {
     writer.flush().unwrap();
 }
 
-/// Every entry of the log in `dir`.
-fn entries(dir: &Path) -> Vec<LogEntry> {
-    SegmentedLog::open(dir).unwrap().entries
-}
-
 /// The seq of the last command in the log in `dir`.
 fn last_command_seq(dir: &Path) -> u64 {
-    let entries = SegmentedLog::open(dir).unwrap().entries;
-    entries.iter().rev().find_map(command_seq).expect("the log holds a command")
+    log_entries(dir).iter().rev().find_map(command_seq).expect("the log holds a command")
 }
 
 /// The seq of `entry`, if it is a command.

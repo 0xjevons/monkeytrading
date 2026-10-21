@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use engine_core::auth::{ClientAuth, Operator};
 use engine_node::admin::{self, AdminArgs, HexKey, KeyEnv};
-use engine_node::{NodeConfig, init_logging, log, replay, run};
+use engine_node::{NodeConfig, init_logging, replay_path, run};
 
 #[derive(Subcommand)]
 enum Cmd {
@@ -16,7 +16,8 @@ enum Cmd {
         config: PathBuf,
     },
     /// Replay a published log and verify every checkpoint root. `--log` is a single log file, or a
-    /// directory of segments with their manifest: a node's log directory or a downloaded archive.
+    /// directory of segments with their manifest: a node's log directory or a downloaded archive. A
+    /// missing log, or one with no command or no checkpoint, fails.
     Replay {
         #[arg(short, long)]
         log: PathBuf,
@@ -37,7 +38,8 @@ struct Cli {
 /// Dispatches the subcommand.
 /// Error cases:
 /// - the config cannot be loaded, or the node stops with an error
-/// - the log cannot be read, or fails its manifest check or verification
+/// - the log is missing or cannot be read, fails its manifest check or verification, or holds no
+///   command or no checkpoint
 /// - an admin command cannot be signed or submitted, or the engine rejects it
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,8 +51,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Replay { log: path } => {
             init_logging("info")?;
-            let entries = if path.is_dir() { log::SegmentedLog::open(&path)?.entries } else { log::read_all(&path)? };
-            let mut replayed = replay(&entries)?;
+            let mut replayed = replay_path(&path)?;
             let activations: Vec<String> =
                 replayed.activations.iter().map(|(version, seq)| format!("{version:?} from seq {seq}")).collect();
             println!(

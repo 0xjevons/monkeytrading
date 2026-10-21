@@ -4,7 +4,7 @@
 //! beyond the channel: a fill costs about one engine step plus a buffered write.
 
 mod replay;
-pub use replay::{Replayed, replay};
+pub use replay::{Replayed, replay, replay_path};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,11 +21,13 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::clock::Clock;
-use crate::log::{self, Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
+use crate::log::{Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
 use crate::sequencer::alerts::{DeficitAlert, alert_on};
+use crate::sequencer::replay::Replay;
 use crate::tee::EnclaveKey;
 use crate::trusted_time::{Sample, TimeGate};
 
+/// Most requests of any kind taken into one batch before it is flushed and answered.
 const MAX_BATCH: usize = 1024;
 /// The custody reference genesis credits house capital under, as its last command.
 const GENESIS_REF: &str = "genesis";
@@ -82,7 +84,6 @@ pub struct Sequencer {
     next_seq: u64,
     last_ts: Millis,
     last_checkpoint: Option<u64>,
-    last_offset: Option<Offset>,
     chain_id: u64,
     vault: AccountId,
     stream: broadcast::Sender<Arc<StreamMsg>>,
@@ -117,6 +118,12 @@ pub struct SequencerConfig<'a> {
     pub operator: Operator,
 }
 
+/// A log read from disk and replayed, before anything is written to it.
+pub struct ReplayedLog {
+    log: SegmentedLog,
+    replayed: Replayed,
+}
+
 impl StreamMsg {
     /// The stream form of the log entry at `offset`.
     pub fn new(offset: Offset, entry: LogEntry) -> Self {
@@ -136,8 +143,7 @@ impl Sequencer {
     /// TODO: the log sits on host storage, so the host could truncate it. Before serving, check the
     /// replayed root against the latest root posted on-chain.
     /// Error cases:
-    /// - the log cannot be read, or fails its manifest check (see `SegmentedLog::open`) or replay
-    ///   (see `replay`)
+    /// - the log cannot be read or replayed (see `read_log`)
     /// - the log records a client auth or an operator other than the config's
     /// - the log cannot be opened for appending, or written
     pub fn recover(
@@ -146,23 +152,36 @@ impl Sequencer {
         stream: broadcast::Sender<Arc<StreamMsg>>,
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
-        let log = SegmentedLog::open(cfg.log_dir)?;
+        let log = Self::read_log(cfg.log_dir, |_| {})?;
         Self::recover_from(log, cfg, key, stream, withdrawals)
     }
 
-    /// As `recover`, from `log`, the log already read, so that a check of it before recovery sees
-    /// exactly what recovery replays.
+    /// Reads the log in `dir` a segment at a time and replays it as it goes, handing each entry to
+    /// `observe` as well, so that a check of the log before recovery sees exactly what it replays.
     /// Error cases:
-    /// - the log fails replay (see `replay`), or records a client auth other than the config's
+    /// - the log cannot be read, or fails its manifest check (see `SegmentedLog::open`) or replay
+    ///   (see `Replay`)
+    pub fn read_log(dir: &Path, mut observe: impl FnMut(&LogEntry)) -> anyhow::Result<ReplayedLog> {
+        let mut replay = Replay::default();
+        let log = SegmentedLog::open(dir, |entry| {
+            observe(&entry);
+            replay.apply(&entry)
+        })?;
+        Ok(ReplayedLog { log, replayed: replay.finish() })
+    }
+
+    /// As `recover`, from `log`, which `read_log` read and replayed.
+    /// Error cases:
+    /// - the log records a client auth other than the config's
     /// - the log cannot be opened for appending, or written
     pub fn recover_from(
-        log: SegmentedLog,
+        log: ReplayedLog,
         cfg: SequencerConfig<'_>,
         key: Arc<EnclaveKey>,
         stream: broadcast::Sender<Arc<StreamMsg>>,
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
-        let Replayed { engine, commands, checkpoints, unsigned, .. } = replay(&log.entries)?;
+        let ReplayedLog { log, replayed: Replayed { engine, commands, checkpoints, unsigned, .. } } = log;
         // A config naming another client auth or operator, and so another chain, vault, or admin key,
         // is the wrong one for this log: refuse before anything is written or signed under it.
         if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
@@ -171,13 +190,11 @@ impl Sequencer {
         if let Some(recorded) = engine.operator().filter(|recorded| **recorded != cfg.operator) {
             bail!("the log records operator {recorded:?}, but the config gives {:?}", cfg.operator);
         }
-        let last_offset = log::last_offset(&log.entries)?;
         info!(commands, checkpoints, "recovered from log");
         let mut sequencer = Self {
             next_seq: engine.last_seq().map_or(0, |s| s + 1),
             last_ts: engine.now(),
             last_checkpoint: engine.last_seq(),
-            last_offset,
             engine,
             log: log.into_writer(cfg.segment_commands.max(1), cfg.manifest)?,
             key,
@@ -207,10 +224,10 @@ impl Sequencer {
         Ok(sequencer)
     }
 
-    /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch is
-    /// flushed before its replies, stream messages, and queries go out, and synced to storage first
-    /// when it carries a sync request. A command trusted time refuses is dropped with its reply,
-    /// which the API answers as unavailable.
+    /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch,
+    /// of at most `MAX_BATCH` requests, is flushed before its replies, stream messages, and queries
+    /// go out, and synced to storage first when it carries a sync request. A command trusted time
+    /// refuses is dropped with its reply, which the API answers as unavailable.
     /// Error cases:
     /// - the log cannot be written or synced; the node must stop rather than acknowledge
     ///   undurable commands
@@ -220,8 +237,9 @@ impl Sequencer {
         let mut queries: Vec<Query> = Vec::new();
         let mut syncs = Vec::new();
         while let Some(first) = rx.recv().await {
-            let mut next = Some(first);
+            let (mut next, mut taken) = (Some(first), 0);
             while let Some(req) = next.take() {
+                taken += 1;
                 match req {
                     Request::Submit { cmd, reply } => {
                         if let Some(events) = self.sequence(cmd)?
@@ -234,7 +252,7 @@ impl Sequencer {
                     Request::TimeSample(sample) => self.take_sample(sample)?,
                     Request::Sync(reply) => syncs.push(reply),
                 }
-                if replies.len() + queries.len() + syncs.len() < MAX_BATCH {
+                if taken < MAX_BATCH {
                     next = rx.try_recv().ok();
                 }
             }
@@ -332,9 +350,7 @@ impl Sequencer {
     /// Error cases:
     /// - the log cannot be written
     fn record(&mut self, entry: LogEntry) -> anyhow::Result<()> {
-        let offset = log::offset_of(self.last_offset, &entry)?;
-        self.log.append(&entry)?;
-        self.last_offset = Some(offset);
+        let offset = self.log.append(&entry)?;
         self.outbox.push(Arc::new(StreamMsg::new(offset, entry)));
         Ok(())
     }

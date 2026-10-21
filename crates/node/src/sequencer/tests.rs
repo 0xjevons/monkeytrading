@@ -6,10 +6,10 @@ use engine_core::command::AdminCommand;
 use engine_core::protocol::ProtocolVersion;
 
 use crate::clock::test_clock::TestClock;
-use crate::log::{Manifest, SegmentedLog, segment_seq};
+use crate::log::{Manifest, segment_seq};
 use crate::test_support::{
-    SEGMENT_COMMANDS, TRADER, TestSequencer, deposit, dev_config, log_messages, sample_around, scratch_dir,
-    sequencer_config, trusted_now, withdraw,
+    SEGMENT_COMMANDS, TRADER, TestSequencer, deposit, dev_config, log_entries, log_messages, sample_around,
+    scratch_dir, sequencer_config, trusted_now, withdraw,
 };
 
 const V1_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v1-dev.jsonl");
@@ -115,7 +115,7 @@ async fn replay_refuses_logged_events_or_withdrawals_that_replay_does_not_produc
     node.submit(deposit(100, "dep-1")).await;
     node.submit(withdraw(40)).await;
     node.stop().await;
-    let entries = SegmentedLog::open(&dir).unwrap().entries;
+    let entries = log_entries(&dir);
     replay(&entries).unwrap();
 
     let mut altered = entries.clone();
@@ -149,7 +149,7 @@ async fn a_restarted_sequencer_continues_the_log_offsets_and_segments() {
     let node = TestSequencer::start(&dir, 16);
     node.submit(deposit(100, "dep-1")).await;
     node.stop().await;
-    let before = replay(&SegmentedLog::open(&dir).unwrap().entries).unwrap().engine.last_seq().unwrap();
+    let before = replay(&log_entries(&dir)).unwrap().engine.last_seq().unwrap();
 
     let node = TestSequencer::start(&dir, 16);
     let mut live = node.stream.subscribe();
@@ -159,8 +159,7 @@ async fn a_restarted_sequencer_continues_the_log_offsets_and_segments() {
     assert_eq!(live.try_recv().unwrap().offset, Offset::start_of(before + 1));
     node.stop().await;
 
-    let log = SegmentedLog::open(&dir).unwrap();
-    let replayed = replay(&log.entries).unwrap();
+    let replayed = replay(&log_entries(&dir)).unwrap();
     assert_eq!(replayed.engine.last_seq(), Some(before + SEGMENT_COMMANDS));
     assert!(Manifest::load(&dir).unwrap().segments.len() >= 2);
 }
@@ -173,7 +172,7 @@ async fn replay_refuses_an_approved_withdrawal_whose_signed_entry_is_missing() {
     node.submit(withdraw(40)).await;
     node.submit(Command::Tick).await;
     node.stop().await;
-    let mut entries = SegmentedLog::open(&dir).unwrap().entries;
+    let mut entries = log_entries(&dir);
     let at = entries.iter().position(|e| matches!(e, LogEntry::Withdrawal(_))).unwrap();
     entries.remove(at);
     let err = replay(&entries).err().unwrap();
@@ -194,13 +193,13 @@ async fn a_restart_signs_a_withdrawal_the_log_ends_before_and_hands_it_to_custod
     let command = text.find(r#""cmd":{"type":"withdraw""#).unwrap();
     fs::write(&segment, &text[..command + text[command..].find('\n').unwrap() + 1]).unwrap();
     let approved = (TRADER, Fixed::from_int(40), 1);
-    assert_eq!(replay(&SegmentedLog::open(&dir).unwrap().entries).unwrap().unsigned, [approved]);
+    assert_eq!(replay(&log_entries(&dir)).unwrap().unsigned, [approved]);
 
     let mut node = TestSequencer::start(&dir, 16);
     let signed = node.withdrawals.try_recv().unwrap();
     assert_eq!((signed.account, signed.amount, signed.nonce), approved);
     node.stop().await;
-    assert!(replay(&SegmentedLog::open(&dir).unwrap().entries).unwrap().unsigned.is_empty());
+    assert!(replay(&log_entries(&dir)).unwrap().unsigned.is_empty());
 }
 
 #[tokio::test]
@@ -209,7 +208,7 @@ async fn replay_refuses_a_command_without_logged_events_after_ones_with_them() {
     let node = TestSequencer::start(&dir, 16);
     node.submit(deposit(100, "dep-1")).await;
     node.stop().await;
-    let mut entries = SegmentedLog::open(&dir).unwrap().entries;
+    let mut entries = log_entries(&dir);
     let last_command = entries.iter().rposition(|e| matches!(e, LogEntry::Command(_))).unwrap();
     if let LogEntry::Command(c) = &mut entries[last_command] {
         c.events = None;
@@ -226,7 +225,7 @@ async fn replay_refuses_a_checkpoint_after_an_approval_whose_signed_entry_is_mis
     node.tick_to_checkpoint().await;
     node.submit(withdraw(40)).await;
     node.stop().await;
-    let mut entries = SegmentedLog::open(&dir).unwrap().entries;
+    let mut entries = log_entries(&dir);
     assert!(matches!(entries.last(), Some(LogEntry::Checkpoint(_))));
     let at = entries.iter().position(|e| matches!(e, LogEntry::Withdrawal(_))).unwrap();
     entries.remove(at);
@@ -240,7 +239,7 @@ fn a_fresh_log_records_client_auth_and_the_operator_and_activates_the_latest_ver
     let mut seq = recover(&dir, &signed(31_337));
     seq.activate_protocol().unwrap();
     seq.genesis(&dev_config().genesis).unwrap();
-    let entries = entries(&dir);
+    let entries = log_entries(&dir);
     let cmds = commands(&entries);
     let operator = dev_config().operator().unwrap();
     assert_eq!(cmds[0], Command::Admin(AdminCommand::SetClientAuth(signed(31_337))));
@@ -261,7 +260,7 @@ fn an_existing_v1_log_activates_at_its_next_seq_and_still_verifies() {
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
     // The original 63 commands and 3 checkpoints, then client auth, the operator, and the
     // activation, with the scheduled checkpoint after the third and the activation's own.
-    let replayed = replay(&entries(&dir)).unwrap();
+    let replayed = replay(&log_entries(&dir)).unwrap();
     assert_eq!((replayed.commands, replayed.checkpoints), (66, 5));
     assert_eq!(replayed.activations, [(ProtocolVersion::LATEST, 65)]);
 }
@@ -272,9 +271,9 @@ fn protocol_activation_and_genesis_wait_for_trusted_time_then_go_in_order() {
     let mut seq = try_recover(&dir, &signed(31_337)).0.unwrap();
     seq.activate_protocol().unwrap();
     seq.genesis(&dev_config().genesis).unwrap();
-    assert!(commands(&entries(&dir)).is_empty(), "nothing before the first sample");
+    assert!(commands(&log_entries(&dir)).is_empty(), "nothing before the first sample");
     seq.trust(trusted_now()).unwrap();
-    let written = commands(&entries(&dir));
+    let written = commands(&log_entries(&dir));
     assert!(matches!(written[0], Command::Admin(AdminCommand::SetClientAuth(_))), "{:?}", written[0]);
     assert!(matches!(written[1], Command::Admin(AdminCommand::SetOperator(_))), "{:?}", written[1]);
     assert!(matches!(written[2], Command::Admin(AdminCommand::ActivateProtocol { .. })), "{:?}", written[2]);
@@ -287,7 +286,7 @@ fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
     let dir = scratch_dir("activation-v3");
     fs::create_dir_all(&dir).unwrap();
     fs::copy(V3_REFERENCE, dir.join("00000000000000000000.jsonl")).unwrap();
-    let before = replay(&entries(&dir)).unwrap();
+    let before = replay(&log_entries(&dir)).unwrap();
     // The node records the operator at the log's next seq and activates the latest version after it.
     let activated = before.engine.last_seq().unwrap() + 2;
     // The log is stamped ahead of the system clock, so the host clock and trusted time agree on a
@@ -303,7 +302,7 @@ fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
     seq.activate_protocol().unwrap();
     // The V3 checkpoints still verify under the hash of the state encoding, and the activation's
     // checkpoint under the state tree, whose proofs hold against it.
-    let written = entries(&dir);
+    let written = log_entries(&dir);
     let replayed = replay(&written).unwrap();
     assert_eq!(replayed.activations, [(ProtocolVersion::V3, 1), (ProtocolVersion::LATEST, activated)]);
     assert!(replayed.checkpoints > before.checkpoints);
@@ -317,9 +316,9 @@ fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
 fn a_restart_with_the_recorded_client_auth_sequences_nothing() {
     let dir = scratch_dir("activation-restart");
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
-    let written = entries(&dir).len();
+    let written = log_entries(&dir).len();
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
-    assert_eq!(entries(&dir).len(), written);
+    assert_eq!(log_entries(&dir).len(), written);
 }
 
 #[test]
@@ -344,7 +343,7 @@ fn a_genesis_cut_short_runs_again_on_restart() {
             seq.activate_protocol().unwrap();
             seq.genesis(&genesis).unwrap();
             drop(seq);
-            let replayed = replay(&entries(&dir)).unwrap();
+            let replayed = replay(&log_entries(&dir)).unwrap();
             assert_eq!(replayed.engine.markets().len(), genesis.markets.len(), "{name}");
             assert_eq!(replayed.engine.house_cash(), genesis.house_capital, "{name}");
             // The credit is in the log now, so no later edit to the config's genesis reopens it.
@@ -359,23 +358,23 @@ fn a_log_holding_only_client_auth_activates_on_restart() {
     let auth = Command::Admin(AdminCommand::SetClientAuth(signed(31_337)));
     recover(&dir, &signed(31_337)).sequence_required("client auth", vec![auth.clone()]).unwrap();
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
-    let written = entries(&dir);
+    let written = log_entries(&dir);
     assert_eq!(commands(&written).iter().filter(|cmd| **cmd == auth).count(), 1);
     assert_eq!(replay(&written).unwrap().engine.protocol_version(), ProtocolVersion::LATEST);
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
-    assert_eq!(entries(&dir).len(), written.len());
+    assert_eq!(log_entries(&dir).len(), written.len());
 }
 
 #[test]
 fn a_log_recording_other_client_auth_refuses_to_start_and_writes_nothing() {
     let dir = scratch_dir("activation-mismatch");
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
-    let written = entries(&dir).len();
+    let written = log_entries(&dir).len();
     for other in [ClientAuth::Unsigned, signed(1)] {
         let err = try_recover(&dir, &other).0.err().unwrap();
         assert!(format!("{err:#}").contains("the log records client auth"), "{err:#}");
     }
-    assert_eq!(entries(&dir).len(), written);
+    assert_eq!(log_entries(&dir).len(), written);
 }
 
 #[test]
@@ -417,6 +416,85 @@ async fn a_sync_request_is_answered_after_the_commands_before_it_are_written() {
     node.stop().await;
 }
 
+#[tokio::test]
+async fn recovery_replays_the_log_a_segment_at_a_time() {
+    let dir = scratch_dir("seq-recover-streams");
+    let node = TestSequencer::start(&dir, 16);
+    for n in 0..2 * SEGMENT_COMMANDS {
+        node.submit(deposit(1, &format!("dep-{n}"))).await;
+    }
+    node.stop().await;
+    let (newest, logged) = (last_segment(&dir), log_entries(&dir));
+    // Removing the newest segment once the first entry is read fails recovery only if it reads that
+    // segment after replaying the ones before it.
+    let mut seen = Vec::new();
+    let err = Sequencer::read_log(&dir, |entry| {
+        if seen.is_empty() {
+            fs::remove_file(&newest).unwrap();
+        }
+        seen.push(entry.clone());
+    })
+    .err()
+    .unwrap();
+    assert!(format!("{err:#}").contains(&format!("opening {}", newest.display())), "{err:#}");
+    assert!(!seen.is_empty() && logged.starts_with(&seen) && seen.len() < logged.len(), "{} read", seen.len());
+}
+
+/// Reply-less commands keep the channel full, and a client's reply still goes out with the first
+/// `MAX_BATCH` requests, while the rest wait for later batches.
+#[tokio::test]
+async fn a_reply_goes_out_at_the_batch_limit_while_reply_less_commands_keep_coming() {
+    let seq = recover(&scratch_dir("seq-batch-flood"), &ClientAuth::Unsigned);
+    let first = seq.next_seq;
+    let (tx, rx) = mpsc::channel(3 * MAX_BATCH);
+    let (reply, replied) = oneshot::channel();
+    tx.try_send(Request::Submit { cmd: Command::Tick, reply: Some(reply) }).unwrap();
+    let (at_end, seen) = oneshot::channel();
+    tx.try_send(Request::Query(Box::new(move |e: &Engine| {
+        let _ = at_end.send(e.last_seq());
+    })))
+    .unwrap();
+    for _ in 0..2 * MAX_BATCH {
+        tx.try_send(Request::Submit { cmd: Command::Tick, reply: None }).unwrap();
+    }
+    let task = tokio::spawn(seq.run(rx));
+    replied.await.unwrap();
+    // The query, in the reply's batch, sees it end after `MAX_BATCH` requests.
+    assert_eq!(seen.await.unwrap(), Some(first + MAX_BATCH as u64 - 2));
+    drop(tx);
+    task.await.unwrap().unwrap();
+}
+
+/// A batch ends after `MAX_BATCH` requests whatever their kind: a query that is a batch's last
+/// request runs before the command after it is applied.
+#[tokio::test]
+async fn a_batch_ends_after_max_batch_requests_of_any_kind() {
+    for kind in ["submit without reply", "submit with reply", "time sample", "query"] {
+        let dir = scratch_dir(&format!("seq-batch-{}", kind.replace(' ', "-")));
+        let seq = recover(&dir, &ClientAuth::Unsigned);
+        let (tx, rx) = mpsc::channel(MAX_BATCH + 1);
+        for _ in 0..MAX_BATCH - 1 {
+            let request = match kind {
+                "submit without reply" => Request::Submit { cmd: Command::Tick, reply: None },
+                "submit with reply" => Request::Submit { cmd: Command::Tick, reply: Some(oneshot::channel().0) },
+                "time sample" => Request::TimeSample(trusted_now()),
+                _ => Request::Query(Box::new(|_: &Engine| {})),
+            };
+            tx.try_send(request).unwrap();
+        }
+        let (at_end, seen) = oneshot::channel();
+        tx.try_send(Request::Query(Box::new(move |e: &Engine| {
+            let _ = at_end.send(e.last_seq());
+        })))
+        .unwrap();
+        tx.try_send(Request::Submit { cmd: Command::Tick, reply: None }).unwrap();
+        drop(tx);
+        seq.run(rx).await.unwrap();
+        let after = seen.await.unwrap().map_or(0, |s| s + 1);
+        assert_eq!(replay(&log_entries(&dir)).unwrap().engine.last_seq(), Some(after), "{kind}");
+    }
+}
+
 // ── Helpers ──
 
 /// The segment file the log appends to.
@@ -453,11 +531,6 @@ fn try_recover(
     let (manifest, _) = watch::channel(Manifest::default());
     let cfg = SequencerConfig { client_auth: client_auth.clone(), ..sequencer_config(dir, manifest) };
     (Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, withdrawals_tx), withdrawals)
-}
-
-/// Every entry of the log in `dir`.
-fn entries(dir: &Path) -> Vec<LogEntry> {
-    SegmentedLog::open(dir).unwrap().entries
 }
 
 /// The commands among `entries`, in order.

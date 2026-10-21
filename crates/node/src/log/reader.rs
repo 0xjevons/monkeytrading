@@ -1,5 +1,6 @@
 //! Reads the log from any offset, across segments, while the sequencer appends to it. Only whole
-//! lines are read: a line still being written is left for a later call.
+//! lines are read, and only entries the writer has flushed are yielded: anything later is left for
+//! a later call.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -23,6 +24,8 @@ pub struct LogReader {
     /// The segment being read, by index into `segments`.
     segment: Option<(usize, OpenSegment)>,
     last: Option<Offset>,
+    /// An entry read past the writer's last flush, yielded once the writer has flushed it.
+    held: Option<(Offset, LogEntry)>,
 }
 
 struct OpenSegment {
@@ -50,7 +53,8 @@ impl LogReader {
     /// - the directory cannot be listed, or segments exist but none holds `from.seq`
     pub fn open(dir: &Path, from: Offset, manifest: watch::Receiver<Manifest>) -> anyhow::Result<Self> {
         let segments = list_segments(dir)?;
-        let mut reader = Self { dir: dir.to_owned(), from, manifest, segments, segment: None, last: None };
+        let (segment, last, held) = (None, None, None);
+        let mut reader = Self { dir: dir.to_owned(), from, manifest, segments, segment, last, held };
         reader.open_start()?;
         Ok(reader)
     }
@@ -64,13 +68,33 @@ impl LogReader {
         }
     }
 
-    /// The next entry at or after `from`, with its offset, or `None` once every whole line on disk
-    /// has been read. A later call picks up whatever has been written since.
+    /// The next entry at or after `from`, with its offset, or `None` once every entry the writer
+    /// has flushed has been read: a line on disk may belong to a batch that is not yet durable. A
+    /// later call picks up whatever has been flushed since.
+    /// Error cases:
+    /// - as `read_next`
+    pub fn next_entry(&mut self) -> anyhow::Result<Option<(Offset, LogEntry)>> {
+        let next = match self.held.take() {
+            Some(held) => held,
+            None => match self.read_next()? {
+                Some(next) => next,
+                None => return Ok(None),
+            },
+        };
+        if self.manifest.borrow().flushed.is_some_and(|flushed| next.0 <= flushed) {
+            return Ok(Some(next));
+        }
+        self.held = Some(next);
+        Ok(None)
+    }
+
+    /// The next entry at or after `from` on disk, with its offset, or `None` once every whole line
+    /// on disk has been read.
     /// Error cases:
     /// - a segment cannot be listed, opened, or read, or holds a line that is not a valid entry
     /// - a completed segment differs from its listing, or ends mid-line
     /// - a segment does not start with a command
-    pub fn next_entry(&mut self) -> anyhow::Result<Option<(Offset, LogEntry)>> {
+    fn read_next(&mut self) -> anyhow::Result<Option<(Offset, LogEntry)>> {
         loop {
             let Some((i, segment)) = self.segment.as_mut() else {
                 // The log was empty when last listed.

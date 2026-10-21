@@ -18,9 +18,9 @@
 mod store;
 pub use store::Reader;
 
-use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, anyhow, bail};
 use engine_core::event::Event;
 use engine_core::types::{AccountId, Millis};
 use serde::Serialize;
@@ -94,42 +94,20 @@ pub struct History {
     resume_at: Offset,
 }
 
-impl History {
-    /// Opens the index in `cfg.dir`, creating it if missing, and checks it against `entries`, the log
-    /// recovery replays next, so that it resumes after the last command it took. An index whose
-    /// file is damaged or holds another schema, whose rows were pruned under another retention than
-    /// `cfg` gives, or whose last command `entries` do not hold unchanged is discarded with a
-    /// Warning alert and rebuilt from the start of the log. A power loss can leave the index ahead
-    /// of the log, and a log rolled back, truncated, or replaced does the same; a log forged to end
-    /// with that same command passes (see the module's TODO).
-    /// Error cases:
-    /// - the retention is invalid
-    /// - no index was on disk and a new one cannot be opened, or a discarded one cannot be removed or
-    ///   replaced (see `Writer::open`)
-    pub fn open(cfg: &HistorySection, entries: &[LogEntry]) -> anyhow::Result<Self> {
-        let path = cfg.dir.join(INDEX_FILE);
-        let retention_ms = cfg.retention_ms().context("history.retention")?;
-        let found = path.exists();
-        let (writer, resume_at) = match resume(&path, retention_ms, entries) {
-            Ok(resumed) => resumed,
-            Err(reason) if found => {
-                warn!(
-                    alert = "history_index_discarded",
-                    dir = %cfg.dir.display(),
-                    "rebuilding the history index from the log: {reason:#}"
-                );
-                discard(&path)?;
-                (Writer::open(&path, retention_ms)?.0, Offset::start_of(0))
-            }
-            Err(e) => return Err(e),
-        };
-        info!(dir = %cfg.dir.display(), from = %resume_at, "history index opened");
-        let (ready, ready_rx) = watch::channel(false);
-        Ok(Self { writer, reader: Reader::new(path, ready_rx), ready, ready_at: None, resume_at })
-    }
+/// The index, opened but not yet checked against the log recovery is about to replay: that read
+/// hands `observe` each entry as it goes, and `finish` then resumes the index or rebuilds it.
+pub struct HistoryCheck {
+    dir: PathBuf,
+    retention_ms: Millis,
+    /// The index and the last command it took, or why it must be rebuilt.
+    opened: anyhow::Result<(Writer, Option<CommandEntry>)>,
+    /// Whether the log held the last command the index took, unchanged, once its seq was read.
+    found: Option<bool>,
+}
 
-    /// Records `tip`, the last command in the log recovery replayed, the same read `open` checked:
-    /// readers are let in once the index has taken it, or now when it already has.
+impl History {
+    /// Records `tip`, the last command in the log recovery replayed, the same read `HistoryCheck`
+    /// saw: readers are let in once the index has taken it, or now when it already has.
     pub fn catch_up_to(&mut self, tip: Option<u64>) {
         self.ready_at = tip.filter(|tip| *tip >= self.resume_at.seq);
         if self.ready_at.is_none() {
@@ -179,6 +157,82 @@ impl History {
     }
 }
 
+impl HistoryCheck {
+    /// Opens the index in `cfg.dir`, creating it if missing, to be checked against the log recovery
+    /// replays next (see `finish`). An index whose file is damaged or holds another schema, or
+    /// whose rows were pruned under another retention than `cfg` gives, is left for `finish` to
+    /// discard. Finish the check before recovery writes to the log.
+    /// Error cases:
+    /// - the retention is invalid
+    /// - no index was on disk and a new one cannot be opened (see `Writer::open`)
+    pub fn open(cfg: &HistorySection) -> anyhow::Result<Self> {
+        let path = cfg.dir.join(INDEX_FILE);
+        let retention_ms = cfg.retention_ms().context("history.retention")?;
+        let found_file = path.exists();
+        let opened = Writer::open(&path, retention_ms).and_then(|(writer, progress)| match progress {
+            Some(progress) if progress.retention_ms != retention_ms => Err(anyhow!(
+                "its events were pruned under a retention of {} ms, not the {retention_ms} ms history.retention gives",
+                progress.retention_ms
+            )),
+            progress => Ok((writer, progress.map(|progress| progress.command))),
+        });
+        // With no index on disk there is nothing to discard: a new one that cannot be opened fails.
+        let opened = match opened {
+            Err(e) if !found_file => return Err(e),
+            opened => opened,
+        };
+        Ok(Self { dir: cfg.dir.clone(), retention_ms, opened, found: None })
+    }
+
+    /// Notes the next entry of the log recovery reads.
+    pub fn observe(&mut self, entry: &LogEntry) {
+        if let (LogEntry::Command(command), Ok((_, Some(last)))) = (entry, &self.opened)
+            && command.sequenced.seq == last.sequenced.seq
+        {
+            self.found = Some(command == last);
+        }
+    }
+
+    /// The index, resumed after the last command it took when the log observed holds that command
+    /// unchanged. An index `open` found damaged, of another schema, or pruned under another
+    /// retention, or whose last command the log does not hold unchanged, is discarded with a
+    /// Warning alert and rebuilt from the start of the log. A power loss can leave the index ahead
+    /// of the log, and a log rolled back, truncated, or replaced does the same; a log forged to end
+    /// with that same command passes (see the module's TODO).
+    /// Error cases:
+    /// - a discarded index cannot be removed or replaced (see `Writer::open`)
+    pub fn finish(self) -> anyhow::Result<History> {
+        let path = self.dir.join(INDEX_FILE);
+        let found = self.found;
+        let resumed = self.opened.and_then(|(writer, last)| {
+            let Some(last) = last else {
+                return Ok((writer, Offset::start_of(0)));
+            };
+            let seq = last.sequenced.seq;
+            match found {
+                None => bail!("the log ends before seq {seq}, the last command the index took"),
+                Some(false) => bail!("the log holds another command at seq {seq}, the last command the index took"),
+                Some(true) => Ok((writer, Offset::start_of(seq + 1))),
+            }
+        });
+        let (writer, resume_at) = match resumed {
+            Ok(resumed) => resumed,
+            Err(reason) => {
+                warn!(
+                    alert = "history_index_discarded",
+                    dir = %self.dir.display(),
+                    "rebuilding the history index from the log: {reason:#}"
+                );
+                discard(&path)?;
+                (Writer::open(&path, self.retention_ms)?.0, Offset::start_of(0))
+            }
+        };
+        info!(dir = %self.dir.display(), from = %resume_at, "history index opened");
+        let (ready, ready_rx) = watch::channel(false);
+        Ok(History { writer, reader: Reader::new(path, ready_rx), ready, ready_at: None, resume_at })
+    }
+}
+
 /// The account an event belongs to, or `None` for an event that names no account.
 pub fn account_of(event: &Event) -> Option<AccountId> {
     match event {
@@ -201,39 +255,6 @@ pub fn account_of(event: &Event) -> Option<AccountId> {
         | Event::AdminApplied
         | Event::AdminRejected { .. } => None,
     }
-}
-
-/// Opens the index at `path` and returns where it resumes: after the last command it took, or at the
-/// start of the log when it has taken none.
-/// Error cases:
-/// - the index cannot be opened, is damaged, or holds another schema (see `Writer::open`)
-/// - its rows were pruned under another retention than `retention_ms`
-/// - `entries`, the whole log, end before the last command it took, or hold another command at its
-///   seq
-fn resume(path: &Path, retention_ms: Millis, entries: &[LogEntry]) -> anyhow::Result<(Writer, Offset)> {
-    let (writer, progress) = Writer::open(path, retention_ms)?;
-    let Some(progress) = progress else {
-        return Ok((writer, Offset::start_of(0)));
-    };
-    ensure!(
-        progress.retention_ms == retention_ms,
-        "its events were pruned under a retention of {} ms, not the {retention_ms} ms history.retention gives",
-        progress.retention_ms
-    );
-    let seq = progress.command.sequenced.seq;
-    let logged = logged_command(seq, entries)
-        .with_context(|| format!("the log ends before seq {seq}, the last command the index took"))?;
-    ensure!(*logged == progress.command, "the log holds another command at seq {seq}, the last command the index took");
-    Ok((writer, Offset::start_of(seq + 1)))
-}
-
-/// The command `entries`, a whole log in order, hold at `seq`.
-fn logged_command(seq: u64, entries: &[LogEntry]) -> Option<&CommandEntry> {
-    let commands = entries.iter().rev().filter_map(|entry| match entry {
-        LogEntry::Command(command) => Some(command),
-        _ => None,
-    });
-    commands.take_while(|command| command.sequenced.seq >= seq).find(|command| command.sequenced.seq == seq)
 }
 
 #[cfg(test)]

@@ -22,10 +22,10 @@ use tower::ServiceExt;
 use crate::clock::test_clock::TestClock;
 use crate::config::RateLimit;
 use crate::history::INDEX_FILE;
-use crate::log::{LogEntry, SegmentedLog};
+use crate::log::LogEntry;
 use crate::sequencer::{Sequencer, SequencerConfig, SignedWithdrawal, replay};
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
-use crate::test_support::{dev_config, sample_around, scratch_dir, sequencer_config};
+use crate::test_support::{dev_config, log_entries, sample_around, scratch_dir, sequencer_config};
 
 const VECTORS: &str = include_str!("../../../core/tests/fixtures/eip712.json");
 /// The time the test sequencer stamps every command with, and the API checks expiries against
@@ -332,7 +332,7 @@ impl Node {
 
     /// Every entry of the node's log, as flushed so far.
     fn entries(&self) -> Vec<LogEntry> {
-        SegmentedLog::open(&self.dir).unwrap().entries
+        log_entries(&self.dir)
     }
 
     /// Credits `client`'s account through the dev deposit and prices BTC at 100000.

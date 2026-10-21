@@ -12,6 +12,8 @@ pub(crate) use segments::segment_seq;
 pub use segments::{LogWriter, MANIFEST, Manifest, SegmentInfo, SegmentedLog};
 
 use std::fmt;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -123,35 +125,47 @@ pub fn offset_of(prev: Option<Offset>, entry: &LogEntry) -> anyhow::Result<Offse
     }
 }
 
-/// The offset of the last of `entries`, a whole log in order.
+/// Reads a single log file a line at a time, handing each entry to `visit` in order.
 /// Error cases:
-/// - a withdrawal or checkpoint comes before any command
-pub fn last_offset(entries: &[LogEntry]) -> anyhow::Result<Option<Offset>> {
-    entries.iter().try_fold(None, |prev, entry| offset_of(prev, entry).map(Some))
+/// - the file does not exist or cannot be read
+/// - a non-blank line is not a valid entry
+/// - `visit` fails
+pub fn read_file(path: &Path, mut visit: impl FnMut(LogEntry) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let file = File::open(path).with_context(|| format!("opening log {}", path.display()))?;
+    read_lines(BufReader::new(file), |n, line| match parse_line(n, line)? {
+        Some(entry) => visit(entry),
+        None => Ok(()),
+    })
+    .with_context(|| format!("log {}", path.display()))
 }
 
-/// Reads every entry of a single log file; a missing file is an empty log.
+/// Hands each line of `input` to `visit` with its line number, line break included where it has
+/// one, holding one line in memory at a time.
 /// Error cases:
-/// - the file exists but cannot be read
-/// - a non-blank line is not a valid entry
-pub fn read_all(path: &Path) -> anyhow::Result<Vec<LogEntry>> {
-    match std::fs::read(path) {
-        Ok(bytes) => parse_lines(&bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e).with_context(|| format!("opening log {}", path.display())),
+/// - `input` cannot be read, or `visit` fails
+fn read_lines(
+    mut input: impl BufRead,
+    mut visit: impl FnMut(usize, &[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let (mut line, mut n) = (Vec::new(), 0);
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line).context("reading")? == 0 {
+            return Ok(());
+        }
+        n += 1;
+        visit(n, &line)?;
     }
 }
 
-/// Parses JSON lines, skipping blank ones.
+/// The entry on line `n`, or `None` for a blank line.
 /// Error cases:
 /// - a non-blank line is not a valid entry
-fn parse_lines(bytes: &[u8]) -> anyhow::Result<Vec<LogEntry>> {
-    bytes
-        .split(|b| *b == b'\n')
-        .enumerate()
-        .filter(|(_, line)| !line.trim_ascii().is_empty())
-        .map(|(n, line)| serde_json::from_slice(line).with_context(|| format!("log line {}", n + 1)))
-        .collect()
+fn parse_line(n: usize, line: &[u8]) -> anyhow::Result<Option<LogEntry>> {
+    if line.trim_ascii().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(line).map(Some).with_context(|| format!("log line {n}"))
 }
 
 #[cfg(test)]

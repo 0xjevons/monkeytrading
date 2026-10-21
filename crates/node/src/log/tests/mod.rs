@@ -8,7 +8,9 @@ use engine_core::types::AccountId;
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
-use crate::test_support::{every_event, scratch_dir};
+use crate::test_support::{every_event, file_entries, log_entries, scratch_dir};
+
+mod reader;
 
 const SEG_0: &str = "00000000000000000000.jsonl";
 const SEG_2: &str = "00000000000000000002.jsonl";
@@ -80,20 +82,21 @@ fn offsets_number_each_seqs_entries_from_its_command() {
 fn sync_writes_buffered_entries_to_the_segment() {
     let dir = scratch_dir("sync");
     let manifest = watch::channel(Manifest::default()).0;
-    let mut writer = SegmentedLog::open(&dir).unwrap().into_writer(100, manifest).unwrap();
+    let mut writer = SegmentedLog::open(&dir, |_| Ok(())).unwrap().into_writer(100, manifest).unwrap();
     writer.append(&cmd(0)).unwrap();
-    assert!(read_all(&dir.join(SEG_0)).unwrap().is_empty(), "appends stay buffered");
+    assert!(file_entries(&dir.join(SEG_0)).is_empty(), "appends stay buffered");
     writer.sync().unwrap();
-    assert_eq!(read_all(&dir.join(SEG_0)).unwrap(), [cmd(0)]);
+    assert_eq!(file_entries(&dir.join(SEG_0)), [cmd(0)]);
 }
 
 #[test]
-fn a_missing_log_is_empty_and_a_corrupt_line_is_an_error() {
+fn a_missing_log_file_and_a_corrupt_line_are_errors() {
     let path = scratch_dir("corrupt").join("log.jsonl");
-    assert!(read_all(&path).unwrap().is_empty());
+    let err = read_file(&path, |_| Ok(())).unwrap_err();
+    assert!(format!("{err:#}").contains("opening log"), "{err:#}");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "\n{\"entry\":\"command\",\"seq\":0,\"ts\":0,\"cmd\":{\"type\":\"tick\"}}\nnot json\n").unwrap();
-    let err = read_all(&path).unwrap_err();
+    let err = read_file(&path, |_| Ok(())).unwrap_err();
     assert!(format!("{err:#}").contains("log line 3"), "{err:#}");
 }
 
@@ -105,7 +108,7 @@ fn segments_start_at_a_command_and_the_manifest_lists_completed_ones() {
 
     assert_eq!(files(&dir), [SEG_0, SEG_2, SEG_4, MANIFEST]);
     // Seq 1's withdrawal and checkpoint stay with its command.
-    assert_eq!(read_all(&dir.join(SEG_0)).unwrap(), entries[..4]);
+    assert_eq!(file_entries(&dir.join(SEG_0)), entries[..4]);
     let manifest = Manifest::load(&dir).unwrap();
     let ranges: Vec<_> = manifest.segments.iter().map(|s| (s.file.as_str(), s.first_seq, s.last_seq)).collect();
     assert_eq!(ranges, [(SEG_0, 0, 1), (SEG_2, 2, 3)]);
@@ -114,7 +117,7 @@ fn segments_start_at_a_command_and_the_manifest_lists_completed_ones() {
         assert_eq!(listed.bytes, bytes.len() as u64);
         assert_eq!(listed.sha256, hex::encode(Sha256::digest(&bytes)));
     }
-    assert_eq!(SegmentedLog::open(&dir).unwrap().entries, entries);
+    assert_eq!(log_entries(&dir), entries);
 }
 
 #[test]
@@ -128,7 +131,7 @@ fn a_reopened_log_lists_its_full_last_segment_at_the_next_command() {
     let ranges: Vec<_> = Manifest::load(&dir).unwrap().segments.iter().map(|s| (s.first_seq, s.last_seq)).collect();
     assert_eq!(ranges, [(0, 1), (2, 3)]);
     assert_eq!(files(&dir), [SEG_0, SEG_2, SEG_4, MANIFEST]);
-    assert_eq!(SegmentedLog::open(&dir).unwrap().entries, [cmd(0), cmd(1), cmd(2), cmd(3), cmd(4)]);
+    assert_eq!(log_entries(&dir), [cmd(0), cmd(1), cmd(2), cmd(3), cmd(4)]);
 }
 
 #[test]
@@ -137,7 +140,7 @@ fn a_reopened_log_appends_to_a_last_segment_with_room() {
     write(&dir, 2, &[cmd(0), cmd(1), cmd(2)]);
     write(&dir, 2, &[cmd(3)]);
     assert_eq!(files(&dir), [SEG_0, SEG_2, MANIFEST]);
-    assert_eq!(read_all(&dir.join(SEG_2)).unwrap(), [cmd(2), cmd(3)]);
+    assert_eq!(file_entries(&dir.join(SEG_2)), [cmd(2), cmd(3)]);
 }
 
 #[test]
@@ -149,7 +152,7 @@ fn a_crash_after_listing_a_segment_but_before_starting_the_next_resumes_cleanly(
 
     write(&dir, 2, &[cmd(4), cmd(5)]);
     assert_eq!(files(&dir), [SEG_0, SEG_2, SEG_4, MANIFEST]);
-    assert_eq!(read_all(&dir.join(SEG_4)).unwrap(), [cmd(4), cmd(5)]);
+    assert_eq!(file_entries(&dir.join(SEG_4)), [cmd(4), cmd(5)]);
     assert_eq!(Manifest::load(&dir).unwrap().segments.len(), 2);
 }
 
@@ -161,11 +164,11 @@ fn a_crash_after_creating_a_segment_but_before_writing_it_resumes_cleanly() {
     fs::write(dir.join(SEG_2), "").unwrap();
 
     write(&dir, 2, &[cmd(2)]);
-    assert_eq!(SegmentedLog::open(&dir).unwrap().entries, [cmd(0), cmd(1), cmd(2)]);
+    assert_eq!(log_entries(&dir), [cmd(0), cmd(1), cmd(2)]);
     // An empty last segment named for any other seq is refused.
     fs::rename(dir.join(SEG_2), dir.join(SEG_4)).unwrap();
     fs::write(dir.join(SEG_4), "").unwrap();
-    let err = SegmentedLog::open(&dir).err().unwrap();
+    let err = SegmentedLog::open(&dir, |_| Ok(())).err().unwrap();
     assert!(format!("{err:#}").contains("not named for the next seq 2"), "{err:#}");
 }
 
@@ -176,11 +179,11 @@ fn opening_refuses_a_segment_that_differs_from_its_manifest_entry() {
     let path = dir.join(SEG_0);
     let text = fs::read_to_string(&path).unwrap();
     fs::write(&path, text.replacen("\"ts\":0,", "\"ts\":9,", 1)).unwrap();
-    let err = SegmentedLog::open(&dir).err().unwrap();
+    let err = SegmentedLog::open(&dir, |_| Ok(())).err().unwrap();
     assert!(format!("{err:#}").contains(&format!("does not match {MANIFEST}")), "{err:#}");
 
     fs::remove_file(&path).unwrap();
-    let err = SegmentedLog::open(&dir).err().unwrap();
+    let err = SegmentedLog::open(&dir, |_| Ok(())).err().unwrap();
     assert!(format!("{err:#}").contains(&format!("does not match {MANIFEST}")), "{err:#}");
 }
 
@@ -189,7 +192,7 @@ fn opening_refuses_an_unlisted_segment_that_is_not_the_last() {
     let dir = scratch_dir("unlisted");
     write(&dir, 2, &[cmd(0), cmd(1), cmd(2)]);
     fs::remove_file(dir.join(MANIFEST)).unwrap();
-    let err = SegmentedLog::open(&dir).err().unwrap();
+    let err = SegmentedLog::open(&dir, |_| Ok(())).err().unwrap();
     assert!(format!("{err:#}").contains(&format!("is not in {MANIFEST}")), "{err:#}");
 }
 
@@ -198,13 +201,13 @@ fn opening_refuses_a_segment_named_for_another_seq_or_ending_mid_line() {
     let dir = scratch_dir("misnamed");
     write(&dir, 2, &[cmd(0), cmd(1), cmd(2)]);
     fs::rename(dir.join(SEG_2), dir.join("00000000000000000003.jsonl")).unwrap();
-    let err = SegmentedLog::open(&dir).err().unwrap();
+    let err = SegmentedLog::open(&dir, |_| Ok(())).err().unwrap();
     assert!(format!("{err:#}").contains("does not start with the command for seq 3"), "{err:#}");
 
     let dir = scratch_dir("torn");
     write(&dir, 2, &[cmd(0)]);
     append(&dir.join(SEG_0), b"{\"entry\":");
-    let err = SegmentedLog::open(&dir).err().unwrap();
+    let err = SegmentedLog::open(&dir, |_| Ok(())).err().unwrap();
     assert!(format!("{err:#}").contains("ends mid-line"), "{err:#}");
 }
 
@@ -220,59 +223,10 @@ fn a_log_written_as_one_file_before_segments_continues_as_the_first_segment() {
     );
     fs::write(dir.join(SEG_0), legacy).unwrap();
     write(&dir, 2, &[cmd(1), cmd(2)]);
-    let entries = SegmentedLog::open(&dir).unwrap().entries;
+    let entries = log_entries(&dir);
     assert!(matches!(&entries[0], LogEntry::Command(c) if c.events.is_none()));
     assert_eq!(entries[2..], [cmd(1), cmd(2)]);
     assert_eq!(files(&dir), [SEG_0, SEG_2, MANIFEST]);
-}
-
-#[test]
-fn the_reader_starts_at_any_offset_across_segments() {
-    let dir = scratch_dir("reader-offsets");
-    write(&dir, 2, &[cmd(0), cmd(1), withdrawal(1), checkpoint(1), cmd(2), cmd(3)]);
-    let all = [(0, 0), (1, 0), (1, 1), (1, 2), (2, 0), (3, 0)];
-    assert_eq!(read_from(&dir, 0, 0), all);
-    assert_eq!(read_from(&dir, 1, 1), all[2..]);
-    assert_eq!(read_from(&dir, 2, 0), all[4..]);
-    assert_eq!(read_from(&dir, 1, 7), all[4..]);
-    assert!(read_from(&dir, 9, 0).is_empty());
-}
-
-#[test]
-fn the_reader_leaves_a_line_still_being_written_for_a_later_call() {
-    let dir = scratch_dir("reader-partial");
-    write(&dir, 4, &[cmd(0)]);
-    let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest_of(&dir)).unwrap();
-    assert_eq!(reader.next_entry().unwrap().map(|(o, _)| o), Some(Offset::start_of(0)));
-    assert!(reader.next_entry().unwrap().is_none());
-
-    let mut line = serde_json::to_vec(&cmd(1)).unwrap();
-    line.push(b'\n');
-    let (head, tail) = line.split_at(10);
-    append(&dir.join(SEG_0), head);
-    assert!(reader.next_entry().unwrap().is_none());
-    append(&dir.join(SEG_0), tail);
-    assert_eq!(reader.next_entry().unwrap(), Some((Offset::start_of(1), cmd(1))));
-}
-
-#[test]
-fn the_reader_follows_the_writer_into_a_new_segment() {
-    let dir = scratch_dir("reader-follow");
-    let (manifest_tx, manifest) = watch::channel(Manifest::default());
-    let mut writer = SegmentedLog::open(&dir).unwrap().into_writer(2, manifest_tx).unwrap();
-    let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest).unwrap();
-    assert!(reader.next_entry().unwrap().is_none());
-
-    writer.append(&cmd(0)).unwrap();
-    writer.flush().unwrap();
-    assert_eq!(reader.next_entry().unwrap(), Some((Offset::start_of(0), cmd(0))));
-    assert!(reader.next_entry().unwrap().is_none());
-    for seq in 1..=4 {
-        writer.append(&cmd(seq)).unwrap();
-    }
-    writer.flush().unwrap();
-    let offsets: Vec<_> = std::iter::from_fn(|| reader.next_entry().unwrap()).map(|(o, _)| o.seq).collect();
-    assert_eq!(offsets, [1, 2, 3, 4]);
 }
 
 #[test]
@@ -281,7 +235,7 @@ fn opening_refuses_a_log_missing_its_newest_listed_segment() {
     write(&dir, 2, &[cmd(0), cmd(1), cmd(2), cmd(3), cmd(4)]);
     fs::remove_file(dir.join(SEG_4)).unwrap();
     fs::remove_file(dir.join(SEG_2)).unwrap();
-    let err = SegmentedLog::open(&dir).err().unwrap();
+    let err = SegmentedLog::open(&dir, |_| Ok(())).err().unwrap();
     assert!(format!("{err:#}").contains(&format!("{MANIFEST} lists 2 segments but 1 are")), "{err:#}");
 }
 
@@ -303,83 +257,10 @@ fn the_manifest_gets_a_line_per_completed_segment_and_drops_a_torn_last_line() {
 }
 
 #[test]
-fn the_reader_refuses_a_completed_segment_that_differs_from_its_listing() {
-    let dir = scratch_dir("reader-tampered");
-    write(&dir, 2, &[cmd(0), cmd(1), cmd(2)]);
-    let manifest = manifest_of(&dir);
-    let path = dir.join(SEG_0);
-    let text = fs::read_to_string(&path).unwrap();
-    fs::write(&path, text.replacen("\"ts\":0,", "\"ts\":9,", 1)).unwrap();
-    let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest).unwrap();
-    let err = reader.next_entry().err().unwrap();
-    assert!(format!("{err:#}").contains("does not match its listing"), "{err:#}");
-}
-
-#[test]
-fn the_reader_refuses_a_completed_segment_that_ends_mid_line() {
-    let dir = scratch_dir("reader-torn");
-    fs::create_dir_all(&dir).unwrap();
-    let mut torn = serde_json::to_vec(&cmd(0)).unwrap();
-    torn.extend(b"\n{\"entry\":");
-    fs::write(dir.join(SEG_0), torn).unwrap();
-    fs::write(dir.join(SEG_2), [serde_json::to_vec(&cmd(2)).unwrap(), b"\n".to_vec()].concat()).unwrap();
-    let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest_of(&dir)).unwrap();
-    assert_eq!(reader.next_entry().unwrap(), Some((Offset::start_of(0), cmd(0))));
-    let err = reader.next_entry().err().unwrap();
-    assert!(format!("{err:#}").contains("ends mid-line"), "{err:#}");
-}
-
-#[test]
-fn the_reader_refuses_a_seq_gap_or_a_missing_start_of_the_log() {
-    let dir = scratch_dir("reader-gap");
-    write(&dir, 2, &[cmd(0), cmd(1), cmd(2), cmd(3), cmd(4), cmd(5)]);
-    fs::remove_file(dir.join(SEG_2)).unwrap();
-    for from in [Offset::start_of(0), Offset::start_of(2)] {
-        let mut reader = LogReader::open(&dir, from, manifest_of(&dir)).unwrap();
-        let err = std::iter::from_fn(|| reader.next_entry().transpose()).find_map(Result::err).unwrap();
-        assert!(format!("{err:#}").contains("seq 4 follows seq 1"), "{err:#}");
-    }
-
-    fs::remove_file(dir.join(SEG_0)).unwrap();
-    let err = LogReader::open(&dir, Offset::start_of(0), manifest_of(&dir)).err().unwrap();
-    assert!(format!("{err:#}").contains("holds seq 0"), "{err:#}");
-}
-
-#[test]
-fn the_reader_refuses_a_segment_that_does_not_start_with_a_command() {
-    let dir = scratch_dir("reader-headless");
-    write(&dir, 2, &[cmd(0), cmd(1), cmd(2)]);
-    let line = |entry: &LogEntry| [serde_json::to_vec(entry).unwrap(), b"\n".to_vec()].concat();
-    fs::write(dir.join(SEG_2), [line(&checkpoint(1)), line(&cmd(2))].concat()).unwrap();
-    let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest_of(&dir)).unwrap();
-    let err = std::iter::from_fn(|| reader.next_entry().transpose()).find_map(Result::err).unwrap();
-    assert!(format!("{err:#}").contains("does not start with a command"), "{err:#}");
-}
-
-#[test]
-fn a_released_reader_resumes_where_it_stopped_and_checks_its_segment_again() {
-    let dir = scratch_dir("reader-release");
-    write(&dir, 3, &[cmd(0), cmd(1), withdrawal(1), cmd(2), cmd(3)]);
-    let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest_of(&dir)).unwrap();
-    let mut seen = vec![reader.next_entry().unwrap().unwrap().0, reader.next_entry().unwrap().unwrap().0];
-    reader.release();
-    seen.extend(std::iter::from_fn(|| reader.next_entry().unwrap()).map(|(o, _)| o));
-    assert_eq!(seen, read_from(&dir, 0, 0).into_iter().map(|(seq, index)| Offset { seq, index }).collect::<Vec<_>>());
-
-    let mut reader = LogReader::open(&dir, Offset::start_of(0), manifest_of(&dir)).unwrap();
-    reader.next_entry().unwrap();
-    reader.release();
-    let text = fs::read_to_string(dir.join(SEG_0)).unwrap();
-    fs::write(dir.join(SEG_0), text.replacen("\"ts\":10,", "\"ts\":19,", 1)).unwrap();
-    let err = reader.next_entry().err().unwrap();
-    assert!(format!("{err:#}").contains("does not match its listing"), "{err:#}");
-}
-
-#[test]
 fn a_segment_that_cannot_be_started_leaves_the_current_one_growing_until_it_can() {
     let dir = scratch_dir("rotation-retry");
     let manifest = watch::channel(Manifest::default()).0;
-    let mut writer = SegmentedLog::open(&dir).unwrap().into_writer(2, manifest).unwrap();
+    let mut writer = SegmentedLog::open(&dir, |_| Ok(())).unwrap().into_writer(2, manifest).unwrap();
     writer.append(&cmd(0)).unwrap();
     writer.append(&cmd(1)).unwrap();
     // A directory in the way of the staged file makes creating it fail.
@@ -390,22 +271,48 @@ fn a_segment_that_cannot_be_started_leaves_the_current_one_growing_until_it_can(
     writer.append(&cmd(3)).unwrap();
     writer.flush().unwrap();
 
-    assert_eq!(read_all(&dir.join(SEG_0)).unwrap(), [cmd(0), cmd(1), cmd(2)]);
-    assert_eq!(read_all(&dir.join("00000000000000000003.jsonl")).unwrap(), [cmd(3)]);
+    assert_eq!(file_entries(&dir.join(SEG_0)), [cmd(0), cmd(1), cmd(2)]);
+    assert_eq!(file_entries(&dir.join("00000000000000000003.jsonl")), [cmd(3)]);
     let ranges: Vec<_> = Manifest::load(&dir).unwrap().segments.iter().map(|s| (s.first_seq, s.last_seq)).collect();
     assert_eq!(ranges, [(0, 2)]);
 }
 
 #[test]
-fn the_reader_refuses_an_unlisted_segment_inside_listed_history() {
-    let dir = scratch_dir("reader-planted");
-    write(&dir, 4, &[cmd(0), cmd(1), cmd(2), cmd(3), cmd(4)]);
-    // The host plants its own copy of seqs 2 and 3 among the completed segments.
-    let line = |entry: &LogEntry| [serde_json::to_vec(entry).unwrap(), b"\n".to_vec()].concat();
-    fs::write(dir.join(SEG_2), [line(&cmd(2)), line(&cmd(3))].concat()).unwrap();
-    let mut reader = LogReader::open(&dir, Offset::start_of(2), manifest_of(&dir)).unwrap();
-    let err = reader.next_entry().err().unwrap();
-    assert!(format!("{err:#}").contains("does not start right after the last segment it lists"), "{err:#}");
+fn opening_hands_on_each_segment_before_it_reads_the_next() {
+    let dir = scratch_dir("open-streams");
+    write(&dir, 2, &[cmd(0), cmd(1), cmd(2), cmd(3), cmd(4)]);
+    // Removing the newest segment once the first entry is handed on fails the open only if that
+    // segment is read after it.
+    let mut seen = Vec::new();
+    let err = SegmentedLog::open(&dir, |entry| {
+        if seen.is_empty() {
+            fs::remove_file(dir.join(SEG_4)).unwrap();
+        }
+        seen.push(entry);
+        Ok(())
+    })
+    .err()
+    .unwrap();
+    assert!(format!("{err:#}").contains(&format!("opening {}", dir.join(SEG_4).display())), "{err:#}");
+    assert_eq!(seen, [cmd(0), cmd(1), cmd(2), cmd(3)]);
+}
+
+#[test]
+fn a_log_file_is_handed_on_a_line_at_a_time() {
+    let path = scratch_dir("file-streams").join("log.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, [line(&cmd(0)), line(&cmd(1))].concat()).unwrap();
+    // A line appended once the first entry is handed on is read only if the file is read after it.
+    let mut seen = Vec::new();
+    read_file(&path, |entry| {
+        if seen.is_empty() {
+            append(&path, &line(&cmd(2)));
+        }
+        seen.push(entry);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, [cmd(0), cmd(1), cmd(2)]);
 }
 
 // ── Helpers ──
@@ -435,7 +342,7 @@ fn checkpoint(seq: u64) -> LogEntry {
 /// Appends `entries` through a writer reopened on `dir`.
 fn write(dir: &Path, segment_commands: u64, entries: &[LogEntry]) {
     let manifest = watch::channel(Manifest::default()).0;
-    let mut writer = SegmentedLog::open(dir).unwrap().into_writer(segment_commands, manifest).unwrap();
+    let mut writer = SegmentedLog::open(dir, |_| Ok(())).unwrap().into_writer(segment_commands, manifest).unwrap();
     for entry in entries {
         writer.append(entry).unwrap();
     }
@@ -449,17 +356,11 @@ fn files(dir: &Path) -> Vec<String> {
     names
 }
 
+/// `entry` as a log line.
+fn line(entry: &LogEntry) -> Vec<u8> {
+    [serde_json::to_vec(entry).unwrap(), b"\n".to_vec()].concat()
+}
+
 fn append(path: &Path, bytes: &[u8]) {
     fs::OpenOptions::new().append(true).open(path).unwrap().write_all(bytes).unwrap();
-}
-
-/// Every `(seq, index)` a reader opened at `seq:index` yields.
-fn read_from(dir: &Path, seq: u64, index: u32) -> Vec<(u64, u32)> {
-    let mut reader = LogReader::open(dir, Offset { seq, index }, manifest_of(dir)).unwrap();
-    std::iter::from_fn(|| reader.next_entry().unwrap()).map(|(o, _)| (o.seq, o.index)).collect()
-}
-
-/// The manifest on disk, as the writer would publish it.
-fn manifest_of(dir: &Path) -> watch::Receiver<Manifest> {
-    watch::channel(Manifest::load(dir).unwrap()).1
 }

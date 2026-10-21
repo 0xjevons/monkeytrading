@@ -13,10 +13,10 @@ use tokio::time::sleep;
 
 use super::*;
 use crate::config::NodeConfig;
-use crate::log::{LogEntry, Manifest, SegmentedLog};
+use crate::log::{LogEntry, Manifest};
 use crate::sequencer::{Sequencer, SequencerConfig};
 use crate::tee::EnclaveKey;
-use crate::test_support::{dev_config, sequencer_config};
+use crate::test_support::{dev_config, log_entries, sequencer_config};
 
 /// Long enough for a silent round and a loopback round trip on a busy runner.
 const WAIT: Duration = Duration::from_secs(10);
@@ -279,7 +279,7 @@ impl Node {
         // The sequencer drains once its last sender is gone.
         drop(self.tx);
         timeout(WAIT, self.sequencer).await.expect("sequencer drained").unwrap().unwrap();
-        let entries = SegmentedLog::open(&self.dir).unwrap().entries;
+        let entries = log_entries(&self.dir);
         if remove_log {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
