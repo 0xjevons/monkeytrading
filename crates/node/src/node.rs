@@ -289,11 +289,11 @@ mod tests {
         node.submit(deposit(1, "dep-1")).await;
         node.stop().await;
         history.finish().await.unwrap();
-        let commands = log_entries(&dir).into_iter().filter_map(|entry| match entry {
+        let mut commands = log_entries(&dir).into_iter().filter_map(|entry| match entry {
             LogEntry::Command(command) => Some(command.sequenced.seq),
             _ => None,
         });
-        let last = commands.last().expect("the log holds commands");
+        let last = commands.next_back().expect("the log holds commands");
 
         let mut cfg = dev_config();
         (cfg.node.log_dir, cfg.history.dir, cfg.history.retention) = (dir, index, RETENTION);
