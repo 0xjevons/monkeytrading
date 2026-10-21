@@ -65,8 +65,8 @@ verifies its checkpoints.
   wait for trusted time, and the genesis commands
 - `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must
   look at, and house NAV below zero
-- `src/sequencer/tests.rs` — sequencer, batching, activation, genesis restart, recovery, and replay
-  tests
+- `src/sequencer/tests.rs` — sequencer, activation, genesis restart, recovery, and replay tests
+- `src/sequencer/batch_tests.rs` — batching: a batch ends after `MAX_BATCH` requests of any kind
 - `src/sequencer/margin_tests.rs` — the margin and solvency dev scenario on the dev genesis (a
   close-out after the rollover's financing, and a withdrawal limited at a stale market's last
   mark), and a genesis with no house capital that trades and alerts on a house deficit

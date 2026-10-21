@@ -416,6 +416,8 @@ mod required;
 pub use required::genesis_commands;
 
 #[cfg(test)]
+mod batch_tests;
+#[cfg(test)]
 mod margin_tests;
 #[cfg(test)]
 mod tests;
