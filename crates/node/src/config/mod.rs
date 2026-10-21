@@ -280,7 +280,8 @@ pub struct HistorySection {
     /// removing the directory while the node is stopped rebuilds the index from the log.
     pub dir: PathBuf,
     /// How long an event stays in the index, counted back from the sequenced time of the newest
-    /// command it holds. The log keeps every event regardless.
+    /// command it holds. The log keeps every event regardless. After a change, the index takes the
+    /// log again from its start.
     #[serde(with = "humantime_serde")]
     pub retention: Duration,
 }
@@ -504,7 +505,7 @@ impl HistorySection {
     /// - the retention is zero, which would empty the index at every write
     /// - it is too long to count in milliseconds
     pub fn retention_ms(&self) -> anyhow::Result<Millis> {
-        anyhow::ensure!(!self.retention.is_zero(), "must be non-zero");
+        ensure!(!self.retention.is_zero(), "must be non-zero");
         Millis::try_from(self.retention.as_millis()).context("too long")
     }
 }

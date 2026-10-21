@@ -12,6 +12,11 @@ use crate::config::Genesis;
 use crate::sequencer::{GENESIS_REF, Sequencer, genesis_commands};
 
 impl Sequencer {
+    /// The seq of the last command in the log, if any.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.engine.last_seq()
+    }
+
     /// Whether genesis has yet to finish: its last command, the house capital credit, is not in
     /// the log. Genesis commands are safe to repeat, so a genesis cut short runs again in full.
     pub fn needs_genesis(&self) -> bool {

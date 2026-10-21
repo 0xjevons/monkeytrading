@@ -14,20 +14,18 @@
 mod store;
 pub use store::Reader;
 
-use std::path::Path;
-
 use anyhow::{Context, bail, ensure};
 use engine_core::event::Event;
 use engine_core::types::{AccountId, Millis};
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::spawn_blocking;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::api::Feed;
 use crate::config::HistorySection;
 use crate::history::store::Writer;
-use crate::log::{CommandEntry, LogEntry, LogReader, Manifest, Offset};
+use crate::log::{CommandEntry, LogEntry, Offset};
 use crate::sequencer::StreamBody;
 
 /// The `type` of every event that names an account: what the `kind` filter accepts.
@@ -91,30 +89,42 @@ pub struct History {
 }
 
 impl History {
-    /// Opens the index in `cfg.dir`, creating it if missing. An index that has taken commands must
-    /// find the last of them unchanged in the log in `log_dir`: otherwise it was built from another
-    /// log, or the log has lost commands since, and serving it would mix the two. Call it before
-    /// recovery writes to the log, so a refusal leaves the log as it was found.
+    /// Opens the index in `cfg.dir`, creating it if missing, and checks it against `entries`, the log
+    /// recovery replays next. An index that has taken commands must find the last of them there,
+    /// unchanged: otherwise it was built from another log, or the log has lost commands since, and
+    /// serving it would mix the two. An index pruned under another retention than `cfg` gives takes
+    /// the log again from its start, which leaves it as a fresh index under the new retention would
+    /// be. Call it before recovery writes to the log, so a refusal leaves the log as it was found.
     /// Error cases:
     /// - the retention is invalid, or the index cannot be opened or read (see `Writer::open`)
-    /// - the log or its manifest cannot be read
-    /// - the log does not hold the last command the index took, unchanged, at its seq
-    pub fn open(cfg: &HistorySection, log_dir: &Path) -> anyhow::Result<Self> {
+    /// - `entries` do not hold the last command the index took, unchanged, at its seq
+    pub fn open(cfg: &HistorySection, entries: &[LogEntry]) -> anyhow::Result<Self> {
         let path = cfg.dir.join(INDEX_FILE);
-        let writer = Writer::open(&path, cfg.retention_ms().context("history.retention")?)?;
-        let resume_at = match writer.last_command()? {
+        let retention_ms = cfg.retention_ms().context("history.retention")?;
+        let (writer, progress) = Writer::open(&path, retention_ms)?;
+        let resume_at = match progress {
             None => Offset::start_of(0),
-            Some(last) => {
-                let seq = last.sequenced.seq;
-                let logged = logged_command(seq, log_dir).context("reading the log to check the history index")?;
+            Some(progress) => {
+                let seq = progress.command.sequenced.seq;
                 ensure!(
-                    logged.as_ref() == Some(&last),
+                    logged_command(seq, entries) == Some(&progress.command),
                     "the history index in {} does not match the log: the log ends before seq {seq}, the last \
                      command the index took, or holds another command there. Once the log is known to be right, \
                      remove the directory, with the node stopped, to rebuild the index",
                     cfg.dir.display()
                 );
-                Offset::start_of(seq + 1)
+                if progress.retention_ms != retention_ms {
+                    // Taking the log again from its start upserts the same rows and prunes them to the
+                    // same horizon, which leaves what a fresh index under this retention would hold.
+                    warn!(
+                        was_ms = progress.retention_ms,
+                        now_ms = retention_ms,
+                        "history.retention changed since the index was pruned; taking the log again from its start"
+                    );
+                    Offset::start_of(0)
+                } else {
+                    Offset::start_of(seq + 1)
+                }
             }
         };
         info!(dir = %cfg.dir.display(), from = %resume_at, "history index opened");
@@ -122,24 +132,14 @@ impl History {
         Ok(Self { writer, reader: Reader::new(path, ready_rx), ready, ready_at: None, resume_at })
     }
 
-    /// Records `tip`, the last command in the log recovery replayed: readers are let in once the
-    /// index has taken it, or now when it already has. A log that ends before the last command the
-    /// index took was swapped since `open` checked it, so the index is refused.
-    /// Error cases:
-    /// - `tip` is before the last command the index took
-    pub fn catch_up_to(&mut self, tip: Option<u64>) -> anyhow::Result<()> {
-        if let Some(taken) = self.resume_at.seq.checked_sub(1) {
-            ensure!(
-                tip.is_some_and(|tip| tip >= taken),
-                "the log recovery replayed ends before seq {taken}, the last command the history index took"
-            );
-        }
+    /// Records `tip`, the last command in the log recovery replayed, the same read `open` checked:
+    /// readers are let in once the index has taken it, or now when it already has.
+    pub fn catch_up_to(&mut self, tip: Option<u64>) {
         self.ready_at = tip.filter(|tip| *tip >= self.resume_at.seq);
         if self.ready_at.is_none() {
             self.ready.send_replace(true);
             info!(?tip, "history index holds the log's tip");
         }
-        Ok(())
     }
 
     /// Where the index resumes: the first command it has not taken.
@@ -207,17 +207,13 @@ pub fn account_of(event: &Event) -> Option<AccountId> {
     }
 }
 
-/// The command the log in `log_dir` holds at `seq`, or `None` when it ends before it. Completed
-/// segments are read against the manifest on disk, which recovery checks the same way.
-/// Error cases:
-/// - the manifest or the log cannot be read (see `LogReader`)
-fn logged_command(seq: u64, log_dir: &Path) -> anyhow::Result<Option<CommandEntry>> {
-    let at = Offset::start_of(seq);
-    let manifest = watch::channel(Manifest::load(log_dir)?).1;
-    Ok(match LogReader::open(log_dir, at, manifest)?.next_entry()? {
-        Some((offset, LogEntry::Command(command))) if offset == at => Some(command),
+/// The command `entries`, a whole log in order, hold at `seq`.
+fn logged_command(seq: u64, entries: &[LogEntry]) -> Option<&CommandEntry> {
+    let commands = entries.iter().rev().filter_map(|entry| match entry {
+        LogEntry::Command(command) => Some(command),
         _ => None,
-    })
+    });
+    commands.take_while(|command| command.sequenced.seq >= seq).find(|command| command.sequenced.seq == seq)
 }
 
 #[cfg(test)]

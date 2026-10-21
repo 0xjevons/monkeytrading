@@ -1,6 +1,7 @@
 //! The history index on disk: one SQLite file. `events` holds each account event under its place in
 //! the log, `(seq, idx)`, so taking a command twice rewrites the same rows; `progress` holds the last
-//! command taken, in the same transaction as its events. The host can rewrite the file, so every
+//! command taken, and the retention the rows were pruned under, in the same transaction as its
+//! events. The host can rewrite the file, so every
 //! connection runs SQLite in defensive mode with triggers and views off, and every write and read
 //! refuses, inside its own transaction, a schema this code did not create.
 
@@ -38,7 +39,8 @@ const SCHEMA: &str = "
     CREATE INDEX events_by_ts ON events (ts);
     CREATE TABLE progress (
         id INTEGER PRIMARY KEY CHECK (id = 0),
-        command TEXT NOT NULL
+        command TEXT NOT NULL,
+        retention_ms INTEGER NOT NULL
     );
 ";
 /// A page, newest first. `INDEXED BY` makes SQLite refuse the query rather than plan a scan, so a
@@ -69,6 +71,12 @@ pub(super) struct Writer {
     schema: Vec<SchemaRow>,
 }
 
+/// What the index has taken: the last command, and the retention its rows were pruned under.
+pub(super) struct Progress {
+    pub(super) command: CommandEntry,
+    pub(super) retention_ms: Millis,
+}
+
 /// Reads pages of the index, each on a new read-only connection.
 #[derive(Clone)]
 pub struct Reader {
@@ -81,12 +89,14 @@ pub struct Reader {
 }
 
 impl Writer {
-    /// Opens the index at `path`, creating its directory, the file, and the schema if missing.
+    /// Opens the index at `path`, creating its directory, the file, and the schema if missing, and
+    /// returns it with what it has taken. One transaction checks the schema and reads that.
     /// Events leave the index `retention_ms` before the newest command it holds.
     /// Error cases:
     /// - the directory or the file cannot be created or opened, or the file is not a SQLite database
     /// - the file holds another version of the schema, or a schema this code did not create
-    pub(super) fn open(path: &Path, retention_ms: Millis) -> anyhow::Result<Self> {
+    /// - the command the index holds does not parse
+    pub(super) fn open(path: &Path, retention_ms: Millis) -> anyhow::Result<(Self, Option<Progress>)> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
@@ -98,6 +108,7 @@ impl Writer {
             .with_context(|| format!("opening {}", path.display()))?;
         ensure!(mode == "wal", "{} cannot use a write-ahead log, only {mode}", path.display());
         conn.pragma_update(None, "synchronous", "normal").context("setting synchronous")?;
+        let schema = expected_schema();
         let tx = conn.transaction().context("starting the schema check")?;
         match tx.pragma_query_value(None, "user_version", |row| row.get(0)).context("reading the schema version")? {
             0 => {
@@ -107,22 +118,21 @@ impl Writer {
             SCHEMA_VERSION => {}
             other => bail!("{} holds history schema {other}, not {SCHEMA_VERSION}", path.display()),
         }
-        tx.commit().context("committing the history schema")?;
-        let schema = expected_schema();
-        check_schema(&conn, &schema, path)?;
-        Ok(Self { conn, path: path.to_owned(), retention_ms, schema })
-    }
-
-    /// The last command the index took, if any.
-    /// Error cases:
-    /// - the index cannot be read, or the command it holds does not parse
-    pub(super) fn last_command(&self) -> anyhow::Result<Option<CommandEntry>> {
-        let json: Option<String> = self
-            .conn
-            .query_row("SELECT command FROM progress WHERE id = 0", [], |row| row.get(0))
+        check_schema(&tx, &schema, path)?;
+        let row: Option<(String, Millis)> = tx
+            .query_row("SELECT command, retention_ms FROM progress WHERE id = 0", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()
             .context("reading history progress")?;
-        json.map(|json| serde_json::from_str(&json).context("history progress")).transpose()
+        let progress = row
+            .map(|(json, retention_ms)| {
+                let command = serde_json::from_str(&json).context("history progress")?;
+                anyhow::Ok(Progress { command, retention_ms })
+            })
+            .transpose()?;
+        tx.commit().context("committing the history schema")?;
+        Ok((Self { conn, path: path.to_owned(), retention_ms, schema }, progress))
     }
 
     /// Takes commands from `rx` until every sender is gone, writing whatever is queued in one
@@ -195,8 +205,11 @@ impl Writer {
             }
         }
         let taken = serde_json::to_string(last).context("encoding a command")?;
-        tx.execute("INSERT OR REPLACE INTO progress (id, command) VALUES (0, ?1)", [taken])
-            .context("storing history progress")?;
+        tx.execute(
+            "INSERT OR REPLACE INTO progress (id, command, retention_ms) VALUES (0, ?1, ?2)",
+            params![taken, self.retention_ms],
+        )
+        .context("storing history progress")?;
         let horizon = last.sequenced.ts.saturating_sub(self.retention_ms);
         tx.execute("DELETE FROM events WHERE ts < ?1", [horizon]).context("dropping events past retention")?;
         tx.commit().context("committing a history write")?;
@@ -365,7 +378,7 @@ mod tests {
         ];
         for (n, alteration) in alterations.into_iter().enumerate() {
             let path = scratch_dir(&format!("history-schema-{n}")).join("history.sqlite");
-            let writer = Writer::open(&path, 1).unwrap();
+            let writer = Writer::open(&path, 1).unwrap().0;
             Connection::open(&path).unwrap().execute_batch(alteration).unwrap();
             let query = PageQuery { account: AccountId([1; 20]), kind: None, before: None, after: None, limit: 1 };
             let read = Reader::new(path.clone(), watch::channel(true).1).page(query).await;
@@ -381,7 +394,7 @@ mod tests {
     #[test]
     fn a_schema_changed_while_the_writer_runs_stops_its_next_write() {
         let path = scratch_dir("history-schema-live").join("history.sqlite");
-        let mut writer = Writer::open(&path, i64::MAX).unwrap();
+        let mut writer = Writer::open(&path, i64::MAX).unwrap().0;
         let deposit = |seq| {
             let events = vec![Event::Deposited { account: AccountId([1; 20]), amount: Fixed::from_int(1) }];
             let sequenced = Sequenced { seq, ts: 0, cmd: Command::Tick };
@@ -395,7 +408,8 @@ mod tests {
         Connection::open(&path).unwrap().execute_batch(wipe).unwrap();
         let err = writer.write(&[deposit(2)]).expect_err("refused");
         assert!(format!("{err:#}").contains("did not create"), "{err:#}");
-        assert_eq!(writer.last_command().unwrap().unwrap().sequenced.seq, 1);
+        let taken: String = writer.conn.query_row("SELECT command FROM progress", [], |row| row.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<CommandEntry>(&taken).unwrap().sequenced.seq, 1);
         let rows: i64 = writer.conn.query_row("SELECT count(*) FROM events", [], |row| row.get(0)).unwrap();
         assert_eq!(rows, 1, "the first write's event is still there");
     }
@@ -403,7 +417,7 @@ mod tests {
     #[test]
     fn every_connection_to_the_index_runs_defensive_with_an_untrusted_schema() {
         let path = scratch_dir("history-defensive").join("history.sqlite");
-        let writer = Writer::open(&path, 1).unwrap();
+        let writer = Writer::open(&path, 1).unwrap().0;
         let reader = open_reader(&path).unwrap();
         for (side, conn) in [("writer", &writer.conn), ("reader", &reader)] {
             assert!(conn.db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE).unwrap(), "{side}");
@@ -435,7 +449,7 @@ mod tests {
     #[test]
     fn a_page_reads_its_account_index_in_order_without_sorting() {
         let path = scratch_dir("history-plan").join("history.sqlite");
-        let writer = Writer::open(&path, 1).unwrap();
+        let writer = Writer::open(&path, 1).unwrap().0;
         for (sql, index) in [(PAGE, "events_by_account"), (PAGE_OF_KIND, "events_by_account_kind")] {
             let mut explain = writer.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
             let mut rows = explain.raw_query();

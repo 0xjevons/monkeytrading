@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn an_index_with_another_schema_version_is_refused() {
     let path = file(&index_dir("schema"));
-    drop(Writer::open(&path, 1).unwrap());
+    drop(Writer::open(&path, 1).unwrap().0);
     Connection::open(&path).unwrap().pragma_update(None, "user_version", 2).unwrap();
     let err = Writer::open(&path, 1).err().expect("refused");
     assert!(format!("{err:#}").contains("history schema 2"), "{err:#}");
@@ -32,7 +32,7 @@ async fn an_index_ahead_of_its_log_is_refused() {
 async fn an_index_built_from_another_log_is_refused() {
     let (dir, index) = (scratch_dir("history-other-log"), index_dir("other-log"));
     indexed_log(&dir, &index, 2).await;
-    // Another log of the same length, with other commands from genesis on.
+    // Another log that also reaches the index's last seq, with other commands from genesis on.
     let other = scratch_dir("history-other-log-2");
     let node = TestSequencer::start(&other, 1024);
     for n in 0..4 {
@@ -95,7 +95,7 @@ fn the_writer_lets_readers_in_once_it_writes_the_tip() {
     for (tip, seqs, let_in) in
         [(Some(5), [3, 4], false), (Some(5), [4, 5], true), (Some(5), [6, 7], true), (None, [1, 2], false)]
     {
-        let writer = Writer::open(&file(&index_dir("writer-ready")), ms(RETENTION)).unwrap();
+        let writer = Writer::open(&file(&index_dir("writer-ready")), ms(RETENTION)).unwrap().0;
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         seqs.iter().for_each(|seq| tx.try_send(command(*seq, 0, Vec::new())).unwrap());
         drop(tx);
@@ -105,67 +105,74 @@ fn the_writer_lets_readers_in_once_it_writes_the_tip() {
     }
 }
 
-/// `catch_up_to` lets readers in at once only when the index already holds the tip, waits when it
-/// has yet to take it, and refuses a recovered log that ends before the index's last command.
+/// `catch_up_to` lets readers in at once only when the index already holds the tip, and waits when
+/// it has yet to take it.
 #[tokio::test]
 async fn readers_wait_for_a_tip_the_index_has_not_taken() {
     let (dir, index) = (scratch_dir("history-tip"), index_dir("tip"));
     indexed_log(&dir, &index, 1).await;
     let next = last_command_seq(&dir) + 1;
     let cfg = HistorySection { dir: index.clone(), retention: RETENTION };
-    // (tip, Some(readers let in at once), or None when refused)
-    let cases = [
-        (None, None),
-        (Some(next - 2), None),
-        (Some(next - 1), Some(true)),
-        (Some(next), Some(false)),
-        (Some(next + 1), Some(false)),
-    ];
-    for (tip, outcome) in cases {
-        let mut history = History::open(&cfg, &dir).unwrap();
+    // (tip, readers let in at once)
+    for (tip, at_once) in [(Some(next - 1), true), (Some(next), false), (Some(next + 1), false)] {
+        let mut history = History::open(&cfg, &entries(&dir)).unwrap();
         assert_eq!(history.resume_at, Offset::start_of(next));
-        match (history.catch_up_to(tip), outcome) {
-            (Ok(()), Some(at_once)) => assert_eq!(*history.ready.borrow(), at_once, "tip {tip:?}"),
-            (Err(err), None) => assert!(format!("{err:#}").contains("ends before seq"), "{err:#}"),
-            (result, _) => panic!("tip {tip:?}: {result:?}"),
-        }
+        history.catch_up_to(tip);
+        assert_eq!(*history.ready.borrow(), at_once, "tip {tip:?}");
     }
     // A fresh index on an empty log has nothing to take.
-    let mut fresh = History::open(&HistorySection { dir: index_dir("tip-fresh"), retention: RETENTION }, &dir).unwrap();
-    fresh.catch_up_to(None).unwrap();
+    let mut fresh = History::open(&HistorySection { dir: index_dir("tip-fresh"), retention: RETENTION }, &[]).unwrap();
+    fresh.catch_up_to(None);
     assert!(*fresh.ready.borrow());
 }
 
-/// A history failure carries its cause: an unusable index directory, a damaged log segment at the
-/// startup check (blamed on the log, not the index), and one the feed meets while catching up.
+/// An index reopened under another retention serves what a fresh index built under that retention
+/// would, whether the retention grew, shrank, or stayed.
+#[tokio::test]
+async fn a_reopened_index_serves_what_a_rebuild_under_its_retention_would() {
+    let dir = scratch_dir("history-retention-log");
+    let deposit_at = |seq, ts| {
+        let events = Some(vec![Event::Deposited { account: A, amount: Fixed::from_int(1) }]);
+        LogEntry::Command(CommandEntry { sequenced: Sequenced { seq, ts, cmd: Command::Tick }, events })
+    };
+    let mut log =
+        SegmentedLog::open(&dir).unwrap().into_writer(SEGMENT_COMMANDS, watch::channel(Manifest::default()).0).unwrap();
+    [deposit_at(0, 0), deposit_at(1, 1_000), deposit_at(2, 2_000)].iter().for_each(|entry| log.append(entry).unwrap());
+    log.flush().unwrap();
+    drop(log);
+    let built = Duration::from_millis(1_500);
+    for (case, retention) in
+        [("same", built), ("shorter", Duration::from_millis(500)), ("longer", Duration::from_secs(3))]
+    {
+        let index = index_dir(&format!("retention-{case}"));
+        assert_eq!(index_to_end(&dir, &index, built).await, Offset::start_of(0));
+        let resumed = index_to_end(&dir, &index, retention).await;
+        assert_eq!(resumed, Offset::start_of(if retention == built { 3 } else { 0 }), "{case}");
+        let fresh = index_dir(&format!("retention-{case}-fresh"));
+        index_to_end(&dir, &fresh, retention).await;
+        let served = every_page(&Reader::new(file(&index), ready()), A, None, 10).await;
+        assert_eq!(served, every_page(&Reader::new(file(&fresh), ready()), A, None, 10).await, "{case}");
+    }
+}
+
+/// A history failure carries its cause: an unusable index directory, and a damaged log segment the
+/// feed meets while catching up.
 #[tokio::test]
 async fn a_history_failure_names_its_cause() {
     let (dir, index) = (scratch_dir("history-causes"), index_dir("causes"));
     let occupied = scratch_dir("history-causes-file");
     File::create(&occupied).unwrap();
     let cfg = HistorySection { dir: occupied.join("history"), retention: RETENTION };
-    let err = History::open(&cfg, &dir).err().expect("no directory under a file");
+    let err = History::open(&cfg, &[]).err().expect("no directory under a file");
     assert!(format!("{err:#}").contains("creating"), "{err:#}");
 
     indexed_log(&dir, &index, 1).await;
-    let last = last_command_seq(&dir);
-    // More commands complete the segment that holds the index's last command.
-    let node = TestSequencer::start(&dir, 1024);
-    for n in 0..SEGMENT_COMMANDS {
-        node.submit(deposit(1, &format!("after-{n}"))).await;
-    }
-    node.stop().await;
     let manifest = Manifest::load(&dir).unwrap();
-    let holding = manifest.segments.iter().find(|s| s.first_seq <= last && last <= s.last_seq).unwrap();
-    OpenOptions::new().append(true).open(dir.join(&holding.file)).unwrap().write_all(b"\n").unwrap();
-    let cfg = HistorySection { dir: index.clone(), retention: RETENTION };
-    let err = format!("{:#}", History::open(&cfg, &dir).err().expect("a damaged segment"));
-    assert!(err.contains("reading the log") && err.contains("does not match its listing"), "{err}");
-    assert!(!err.contains("remove the directory"), "{err}");
-
+    let first = &manifest.segments[0];
+    OpenOptions::new().append(true).open(dir.join(&first.file)).unwrap().write_all(b"\n").unwrap();
     let fresh = HistorySection { dir: index_dir("causes-fresh"), retention: RETENTION };
-    let mut history = History::open(&fresh, &dir).unwrap();
-    history.catch_up_to(None).unwrap();
+    let mut history = History::open(&fresh, &[]).unwrap();
+    history.catch_up_to(None);
     let (live, subscriber) = broadcast::channel(1);
     drop(live);
     let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
@@ -205,6 +212,10 @@ async fn an_index_that_does_not_parse_fails_with_its_cause() {
     let query = PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 10 };
     let err = Reader::new(file(&index), ready()).page(query).await.expect_err("a row out of range");
     assert!(format!("{err:#}").contains("history row -1:0"), "{err:#}");
+    Connection::open(file(&index)).unwrap().execute_batch("UPDATE events SET seq = 5, idx = -1").unwrap();
+    let query = PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 10 };
+    let err = Reader::new(file(&index), ready()).page(query).await.expect_err("an index out of range");
+    assert!(format!("{err:#}").contains("history row 5:-1"), "{err:#}");
 }
 
 #[tokio::test]

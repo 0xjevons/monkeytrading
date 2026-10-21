@@ -25,7 +25,7 @@ use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProv
 use crate::feeds::venue::{self, Timing};
 use crate::history::History;
 use crate::limits::{ApiLimits, run_retain};
-use crate::log::Manifest;
+use crate::log::{Manifest, SegmentedLog};
 use crate::sequencer::{Request, Sequencer, SequencerConfig};
 use crate::tee::{Attestor, ConfigfsTsm, EnclaveKey, MockAttestor, attest_key};
 use crate::tls::{TlsIdentity, serve};
@@ -82,9 +82,12 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         "enclave and TLS keys attested"
     );
 
-    // Before recovery writes anything, so an index that contradicts the log stops the node with the
-    // log as it was found.
-    let mut history = History::open(&cfg.history, &cfg.node.log_dir)
+    // One read of the log: the history index is checked against it before recovery replays it and
+    // writes anything, so a refusal leaves the log as it was found, and no other copy of the log can
+    // come between the check and the replay.
+    let log = SegmentedLog::open(&cfg.node.log_dir)
+        .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
+    let mut history = History::open(&cfg.history, &log.entries)
         .inspect_err(|e| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}"))?;
 
     let vault: AccountId = cfg.custody.vault.parse().context("custody.vault")?;
@@ -104,7 +107,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         max_drift: cfg.time.max_drift,
         client_auth: client_auth.clone(),
     };
-    let mut seq = Sequencer::recover(seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
+    let mut seq = Sequencer::recover_from(log, seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
     // Protocol activation and genesis wait, like any command, for a stamp trusted time admits;
     // with no sample yet, they are queued.
@@ -114,9 +117,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         info!(markets = cfg.genesis.markets.len(), "genesis queued for the first trusted time sample");
         seq.genesis(&cfg.genesis)?;
     }
-    history
-        .catch_up_to(seq.last_seq())
-        .inspect_err(|e| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}"))?;
+    history.catch_up_to(seq.last_seq());
 
     let (tx, rx) = mpsc::channel::<Request>(CHANNEL_CAPACITY);
     // TODO: pin the sequencer to a dedicated core once latency matters.

@@ -123,11 +123,11 @@ impl TestHistory {
 
     /// As `start`, but readers are let in once the index has taken `tip`.
     /// Error cases:
-    /// - the index does not match the log (see `History::open` and `History::catch_up_to`)
+    /// - the index does not match the log (see `History::open`)
     pub fn start_with_tip(node: &TestSequencer, dir: &Path, index: &Path, tip: Option<u64>) -> anyhow::Result<Self> {
         let cfg = HistorySection { dir: index.to_owned(), retention: RETENTION };
-        let mut history = History::open(&cfg, dir)?;
-        history.catch_up_to(tip)?;
+        let mut history = History::open(&cfg, &SegmentedLog::open(dir)?.entries)?;
+        history.catch_up_to(tip);
         let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
         let (reader, resume_at) = (history.reader(), history.resume_at());
         let feed =
