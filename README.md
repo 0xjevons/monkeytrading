@@ -8,8 +8,9 @@ the record and confirm that the state it reports is the state its rules produce.
 house, in turn, is issued to the people who trade with it.
 
 > **Pre-launch.** The engine runs end to end on a single machine, with a mock enclave, mock
-> custody, and simulated prices, or live crypto prices from three venues. On-chain custody,
-> hardware attestation, live prices for other asset classes, and the house equity token are under
+> custody, and simulated prices, or live crypto prices from three venues; vault deposits also run
+> against a local chain. On-chain withdrawals, hardware attestation, live prices for other asset
+> classes, and the house equity token are under
 > construction. Nothing here holds real funds.
 
 ## How it works
@@ -46,8 +47,8 @@ larger of a fraction of its net asset value and a fixed dollar floor, so trading
 house with no capital and carries on while the house is in deficit.
 
 Collateral is USDC, held in a vault contract on Arbitrum One. The chain safeguards funds and never
-executes trades; deposits are being built in
-[#22](https://github.com/0xjevons/monkeytrading/issues/22) and withdrawals in
+executes trades. A deposit is credited once the L2 batch holding it is posted to Ethereum
+([#22](https://github.com/0xjevons/monkeytrading/issues/22)); withdrawals are being built in
 [#23](https://github.com/0xjevons/monkeytrading/issues/23). Ownership of the house is represented
 by the MONKEY token, minted to traders on their losing trades
 ([#36](https://github.com/0xjevons/monkeytrading/issues/36)). Holders who stake it share, in USDC,
@@ -145,14 +146,17 @@ state machine: it performs no input or output, and uses neither clocks, randomne
 floating-point arithmetic. [`crates/node`](crates/node) (`engine-node`, binary `engine`) runs it,
 sequencing commands, writing and streaming the log, signing checkpoints, serving the API, and
 connecting to custody and price feeds. Node configuration lives in [`config`](config), and each
-crate's README describes its files.
+crate's README describes its files. [`contracts`](contracts) is a Foundry project holding the
+custody vault, and [`scripts/dev-vault-deposits.sh`](scripts/dev-vault-deposits.sh) runs a node
+against it on a local Anvil chain.
 
 ## Contributing
 
 Work is tracked in GitHub issues, and pull requests against `main` are welcome. CI checks
-formatting, file length, lints, tests, and dependency advisories and licences, and replays the
-committed reference logs on x86_64 and aarch64 Linux; run the same checks locally before opening a
-pull request. The code's conventions are documented in [`agents/AGENTS.md`](agents/AGENTS.md).
+formatting, file length, lints, tests, and dependency advisories and licences, replays the
+committed reference logs on x86_64 and aarch64 Linux, and checks the contracts' formatting, build,
+and tests and the vault deposit scenario; run the same checks locally before opening a pull
+request. The code's conventions are documented in [`agents/AGENTS.md`](agents/AGENTS.md).
 
 ## Security
 

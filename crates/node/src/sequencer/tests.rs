@@ -363,6 +363,21 @@ fn a_restart_under_other_client_auth_signs_no_withdrawal_the_log_ends_before() {
     assert_eq!(fs::read_to_string(&segment).unwrap(), cut);
 }
 
+#[tokio::test]
+async fn a_sync_request_is_answered_after_the_commands_before_it_are_written() {
+    let dir = scratch_dir("seq-sync");
+    let node = TestSequencer::start(&dir, 16);
+    let tick_seq = node.next_seq().await;
+    node.tx.send(Request::Submit { cmd: Command::Tick, reply: None }).await.unwrap();
+    let (reply, synced) = oneshot::channel();
+    node.tx.send(Request::Sync(reply)).await.unwrap();
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(5), synced).await;
+    assert_eq!(answer.expect("the sync is answered").unwrap(), Some(tick_seq));
+    assert!(!log_messages(&dir, Offset::start_of(tick_seq)).is_empty(), "the tick is on disk");
+    node.stop().await;
+}
+
 // ── Helpers ──
 
 /// The segment file the log appends to.

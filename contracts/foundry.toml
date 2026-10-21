@@ -1,0 +1,34 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["dependencies"]
+solc_version = "0.8.36"
+# Arbitrum One supports Cancun (transient storage, used by the reentrancy guard).
+evm_version = "cancun"
+remappings = [
+    "@openzeppelin-contracts/=dependencies/@openzeppelin-contracts-5.7.0/",
+    "forge-std/=dependencies/forge-std-1.17.0/src/",
+]
+
+[fuzz]
+runs = 1000
+
+[invariant]
+runs = 256
+depth = 50
+fail_on_revert = true
+
+[fmt]
+line_length = 120
+
+# Dependencies come from the Soldeer registry, pinned with checksums in soldeer.lock and
+# installed into the gitignored `dependencies/` by `forge soldeer install`.
+[soldeer]
+remappings_generate = false
+recursive_deps = false
+
+[dependencies]
+forge-std = "1.17.0"
+"@openzeppelin-contracts" = "5.7.0"

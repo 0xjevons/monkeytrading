@@ -58,6 +58,28 @@ fn a_deposit_reference_is_credited_once() {
 }
 
 #[test]
+fn a_reference_counts_as_credited_only_once_a_credit_succeeds() {
+    let mut h = Harness::new();
+    assert!(h.engine.is_credited("genesis"));
+    assert!(!h.engine.is_credited("0xtx:1"));
+    // A refused deposit leaves its reference free, so a valid redelivery can still credit it.
+    h.cmd(Command::Deposit { account: acct(1), amount: f("0"), chain_ref: "0xtx:1".into() });
+    assert!(!h.engine.is_credited("0xtx:1"));
+    h.cmd(Command::Deposit { account: acct(1), amount: f("5"), chain_ref: "0xtx:1".into() });
+    assert!(h.engine.is_credited("0xtx:1"));
+}
+
+#[test]
+fn credited_references_are_listed_by_prefix() {
+    let mut h = Harness::new();
+    for chain_ref in ["0xaa:1", "0xab:1", "0xaa:3", "0xa:1"] {
+        h.cmd(Command::Deposit { account: acct(1), amount: f("1"), chain_ref: chain_ref.into() });
+    }
+    let refs: Vec<&str> = h.engine.credited_refs_with_prefix("0xaa:").collect();
+    assert_eq!(refs, ["0xaa:1", "0xaa:3"]);
+}
+
+#[test]
 fn deposits_out_of_range_are_rejected() {
     let mut h = Harness::new();
     for (i, amount) in ["0", "-1", "1000000000.000000001"].iter().enumerate() {

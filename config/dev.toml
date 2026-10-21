@@ -133,6 +133,7 @@ dir = "data/dev/history"
 retention = "365d"
 
 [genesis]
+# Mock custody only. With EVM custody, house capital enters through vault deposits to the house.
 house_capital = "10000000"
 benchmarks = [
   { name = "SOFR", annual_bps = 400 },

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use engine_core::auth::ClientAuth;
-use engine_core::command::{AdminCommand, Command, Sequenced};
+use engine_core::command::{Command, Sequenced};
 use engine_core::event::Event;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::types::{AccountId, Millis};
@@ -20,7 +20,6 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{error, info, info_span, warn};
 
 use crate::clock::Clock;
-use crate::config::Genesis;
 use crate::log::{self, Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
 use crate::sequencer::alerts::{DeficitAlert, alert_on};
 use crate::tee::EnclaveKey;
@@ -42,6 +41,8 @@ pub enum Request {
     Query(Query),
     /// A trusted time sample from the trusted time task.
     TimeSample(Sample),
+    /// Answered with the last seq once every command before it is synced, so it survives power loss.
+    Sync(oneshot::Sender<Option<u64>>),
 }
 
 /// What `/v1/stream` publishes: each log entry at its offset, in offset order.
@@ -211,14 +212,17 @@ impl Sequencer {
     }
 
     /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch is
-    /// flushed before its replies, stream messages, and queries go out. A command trusted time
-    /// refuses is dropped with its reply, which the API answers as unavailable.
+    /// flushed before its replies, stream messages, and queries go out, and synced to storage first
+    /// when it carries a sync request. A command trusted time refuses is dropped with its reply,
+    /// which the API answers as unavailable.
     /// Error cases:
-    /// - the log cannot be written; the node must stop rather than acknowledge undurable commands
+    /// - the log cannot be written or synced; the node must stop rather than acknowledge
+    ///   undurable commands
     /// - the engine rejects a queued required command
     pub async fn run(mut self, mut rx: mpsc::Receiver<Request>) -> anyhow::Result<()> {
         let mut replies = Vec::new();
         let mut queries: Vec<Query> = Vec::new();
+        let mut syncs = Vec::new();
         while let Some(first) = rx.recv().await {
             let mut next = Some(first);
             while let Some(req) = next.take() {
@@ -232,12 +236,20 @@ impl Sequencer {
                     }
                     Request::Query(q) => queries.push(q),
                     Request::TimeSample(sample) => self.take_sample(sample)?,
+                    Request::Sync(reply) => syncs.push(reply),
                 }
-                if replies.len() + queries.len() < MAX_BATCH {
+                if replies.len() + queries.len() + syncs.len() < MAX_BATCH {
                     next = rx.try_recv().ok();
                 }
             }
             self.flush()?;
+            if !syncs.is_empty() {
+                self.log.sync()?;
+                let last_seq = self.engine.last_seq();
+                syncs.drain(..).for_each(|reply| {
+                    let _ = reply.send(last_seq);
+                });
+            }
             replies.drain(..).for_each(|(reply, events)| {
                 let _ = reply.send(events);
             });
@@ -471,20 +483,9 @@ fn ensure_signed(
     }
 }
 
-/// The commands that sequence `genesis` into an empty log, in order. The last is the house capital
-/// credit under `GENESIS_REF`, a zero one included, which marks genesis done.
-pub fn genesis_commands(genesis: &Genesis) -> Vec<Command> {
-    let mut cmds = vec![Command::Admin(AdminCommand::SetParams(genesis.params.clone()))];
-    cmds.extend(genesis.benchmarks.iter().map(|b| {
-        Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: b.name.clone(), annual_bps: b.annual_bps })
-    }));
-    cmds.extend(genesis.markets.iter().map(|m| Command::Admin(AdminCommand::UpsertMarket(m.clone()))));
-    cmds.push(Command::HouseCapital { amount: genesis.house_capital, chain_ref: GENESIS_REF.into() });
-    cmds
-}
-
 mod alerts;
 mod required;
+pub use required::genesis_commands;
 
 #[cfg(test)]
 mod margin_tests;

@@ -39,6 +39,8 @@ verifies its checkpoints.
   outages, symbols with no fresh quote, and venue times well ahead of the host clock
 - A `house_deficit` alert when house NAV falls below zero, at most one a minute while it keeps
   crossing zero
+- EVM custody: each vault deposit credited once, after a configurable finality tag and
+  confirmations, with a cursor that survives restarts
 - Mock custody and a mock price feed for local development
 
 ## Repository Structure
@@ -47,7 +49,8 @@ verifies its checkpoints.
 - `src/lib.rs` — module index
 - `src/node.rs` — startup, task supervision, and shutdown
 - `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, and log replay
-- `src/sequencer/required.rs` — protocol activation and genesis, which wait for trusted time
+- `src/sequencer/required.rs` — protocol activation and genesis, which wait for trusted time, and
+  the genesis commands
 - `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must
   look at, and house NAV below zero
 - `src/sequencer/tests.rs` — sequencer, activation, genesis restart, and replay tests
@@ -95,9 +98,31 @@ verifies its checkpoints.
 - `src/tls/tests/stream.rs` — the stream end to end over TLS: the subscriber and message caps
 - `src/limits.rs` — request rate limits, connection caps, and the stream subscriber cap
 - `src/config/mod.rs` — the node config schema and loading
+- `src/config/custody.rs` — the `[custody.evm]` section, the redacted RPC URL, and the custody
+  checks
 - `src/config/tests.rs` — config loading and validation tests
 - `src/config/validation.rs` — the checks a parsed config must also pass
-- `src/custody.rs` — the custody adapter (mock only so far)
+- `src/custody/mod.rs` — the custody providers (mock and EVM) and the USDC-to-`Fixed` conversion
+- `src/custody/evm.rs` — the deposit watcher: the chain and token check, range reads from blocks
+  proven to lead to the tagged final block, the completeness check, and stall alerts
+- `src/custody/chain.rs` — the chain of block hashes proven to lead to the tagged block, and the
+  headers of an interrupted proof, kept apart until it ends there
+- `src/custody/watchdog.rs` — alerts for a stale endpoint head, a final block that stops, and
+  reads that keep trailing the final block
+- `src/custody/stall.rs` — what a poll did, the watcher's run loop, and the alert each kind of
+  stall raises
+- `src/custody/sizing.rs` — read sizes that adapt to a provider's limits
+- `src/custody/credit.rs` — crediting one deposit once, and the sequencer round trips it needs
+- `src/custody/rpc.rs` — the vault over JSON-RPC, trusting only compiled-in TLS roots, with
+  errors scrubbed of the endpoint URL
+- `src/custody/cursor.rs` — the deposit cursor kept between restarts
+- `src/custody/tests/mod.rs` — deposit watcher tests against a fake chain and a real sequencer
+- `src/custody/tests/alerts.rs` — the watcher's alerts over time, in paused time
+- `src/custody/tests/cursor.rs` — the deposit cursor across restarts, and which cursors a log
+  refuses
+- `src/custody/tests/fakes.rs` — the fake chain, test sequencer, log capture, and fixtures
+- `src/custody/tests/rpc.rs` — the RPC adapter's log decoding, deadlines, and URL scrubbing
+- `src/custody/tests/reorg.rs` — reorgs and forked answers against the proven chain
 - `src/feeds/mod.rs` — the feed index and the mock feed
 - `src/feeds/venue/mod.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect
 - `src/feeds/venue/validation.rs` — the checks every venue's books pass before they are sequenced
@@ -152,12 +177,32 @@ cargo run -p engine-node -- replay --log data/dev/log
 curl -kf --retry 5 --create-dirs -o archive/manifest.jsonl https://127.0.0.1:8080/v1/archive/manifest.jsonl
 jq -r '.file' archive/manifest.jsonl |
   xargs -I{} curl -kf --retry 5 -o archive/{} https://127.0.0.1:8080/v1/archive/{}
+
+# Run the vault deposit scenario: Anvil, the vault, and a node with EVM custody
+./scripts/dev-vault-deposits.sh
 ```
+
+EVM custody reads the vault through `custody.evm.rpc_url`, which must use HTTPS unless it is on
+this machine and must serve state at past blocks back to `custody.evm.start_block` (an archive
+node): catching up after downtime and rescanning both read past blocks.
+
+A vault deposit credits the trading account its event names: the caller for `deposit`, or the
+account `depositFor` names. The vault refuses deposits under 10 USDC or over 1e9 USDC. A trading
+account must be able to sign requests with its own key, since the engine accepts no contract
+signatures: a contract wallet funds a key that signs for it through `depositFor`, and a balance
+credited to a contract account can be recovered only through the exit (#48).
+
+The adapter trusts its RPC endpoint's answers as far as the chain of block hashes it proves up to
+the finality tag, and the vault's deposit count, bound them. It takes the vault, its token, and the
+finality tag from the host-supplied config, and keeps its cursor on host storage. Reorganisations
+of Arbitrum One that undo a block after its batch reached Ethereum, the finality it waits for, are
+outside its threat model.
 
 Endpoints: `GET /v1/health`, `GET /v1/attestation`, `GET /v1/markets`, `GET /v1/house`,
 `GET /v1/accounts/{address}`, `GET /v1/accounts/{address}/nonce`,
 `GET /v1/accounts/{address}/history`, `POST /v1/orders`, `POST /v1/orders/cancel`,
-`POST /v1/withdrawals`, `POST /v1/dev/deposit` (mock custody only), `GET /v1/stream` (WebSocket), and
+`POST /v1/withdrawals` (mock custody only until withdrawals are paid on-chain), `POST /v1/dev/deposit`
+(mock custody only), `GET /v1/stream` (WebSocket), and
 `GET /v1/archive/{file}` (`manifest.jsonl` or a segment it lists).
 A client over its rate gets 429 with `Retry-After`, a body over `api.max_body_bytes` gets 413, a
 body not received within `api.read_timeout` gets 408, and a subscriber over `api.max_subscribers`

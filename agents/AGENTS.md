@@ -23,28 +23,37 @@ an index: load only the rule whose hint matches the current action.
   sequencer, the public log with signed checkpoints (segmented, with a public archive), `engine
   replay`, the REST API and the resumable WebSocket stream (TLS from an attested in-enclave key,
   with rate limits and connection caps), the account history index (SQLite, derived from the log),
-  TEE attestation (configfs-tsm for TDX and SEV-SNP), the
-  trusted time check against Roughtime servers, the custody adapter (mock only so far), and price
-  feeds: live crypto venue WebSockets (`feeds/`, one adapter per venue) and a mock.
-  `tests/reference/` holds the node-format reference log per protocol version, with events, written
-  once by `examples/reference_log.rs`. Its `README.md` lists every file.
+  TEE attestation (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime
+  servers, the custody adapter (mock, or EVM vault deposits over alloy), and price feeds: live
+  crypto venue WebSockets (`feeds/`, one adapter per venue) and a mock. `tests/reference/` holds
+  the node-format reference log per protocol version, with events, written once by
+  `examples/reference_log.rs`. Its `README.md` lists every file.
+- **contracts/** — Foundry project for the custody vault. `src/Vault.sol` takes USDC deposits of
+  10 to 1e9 USDC for the caller's trading account (`deposit`), for a named one (`depositFor`), or
+  for the house, under one deposit id sequence; `test/` holds unit, fuzz, and invariant tests, with
+  mock tokens and a contract wallet in `test/mocks/`.
+  Dependencies (forge-std, OpenZeppelin) come from the Soldeer registry, pinned with checksums in
+  `soldeer.lock` and installed into the gitignored `dependencies/`; there are no git submodules.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine,
   and checks the clock against public Roughtime servers, citing each server's key source;
   `feeds.provider = "venues"` prices its crypto markets from live venues instead, leaving the
-  others unpriced. Its `[genesis]` section is protocol: it is sequenced into the log as admin
-  commands on first boot. `node.auth`, with `custody.chain_id` and `custody.vault` under `eip712`,
-  is recorded in the log when it first activates protocol versions, so changing it needs a fresh
-  log. `production-genesis.toml` is the production `[genesis]` section alone: the launch markets
-  with their venue calendars, each calendar's sources and unpublished gaps, and the launch margins
-  and fees; a deployment's node sections complete it into a config. Every section rejects unknown
-  keys.
-- **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate, and
-  `check-reference-logs.sh`, which fails a branch that changes a committed reference log.
+  others unpriced. `anvil.toml` runs EVM custody against the vault on a local Anvil chain. The
+  `[genesis]` section is protocol: it is sequenced into the log as admin commands on first boot,
+  and credits house capital from config only under mock custody. `node.auth`, with
+  `custody.chain_id` and `custody.vault` under `eip712`, is recorded in the log when it first
+  activates protocol versions, so changing it needs a fresh log. `production-genesis.toml` is the
+  production `[genesis]` section alone: the launch markets with their venue calendars, each
+  calendar's sources and unpublished gaps, and the launch margins and fees; a deployment's node
+  sections complete it into a config. Every section rejects unknown keys.
+- **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate;
+  `check-reference-logs.sh`, which fails a branch that changes a committed reference log; and
+  `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil.
 - **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, the reference-log
-  replay and invariant tests on x86_64 and aarch64 Linux, the unchanged-reference-log check, and
-  `cargo-deny`, on every push to `main` and every PR. Actions are pinned by commit SHA.
-  `ci-passed` is the one CI check branch rules require: it passes only when every other job
-  succeeded, so each new job must be added to its `needs`.
+  replay and invariant tests on x86_64 and aarch64 Linux, the unchanged-reference-log check,
+  `cargo-deny`, the contracts' `forge fmt --check` / build / test, and the vault deposit dev
+  scenario, on every push to `main` and every PR. Actions are pinned by commit SHA. `ci-passed` is
+  the one CI check branch rules require: it passes only when every other job succeeded, so each
+  new job must be added to its `needs`.
 - **agents/** — this index, `rules/`, and `skills/` (incl. `skills/vendor/` pull-on-demand
   packs); root `AGENTS.md` / `CLAUDE.md` symlink to `agents/AGENTS.md`.
 - **Cargo.toml** — workspace manifest, shared dependencies, and the Cargo profiles (release keeps
@@ -86,6 +95,10 @@ Run from the repo root:
   (both gitignored), and the log level comes from `[logging].level`
 - Verify a published log: `cargo run -p engine-node -- replay --log <path>`, where `<path>` is a
   log directory, a downloaded archive, or a single log file
+- Contracts, from `contracts/`: `forge soldeer install` (once, fetches the pinned dependencies),
+  then `forge fmt --check`, `forge build`, and `forge test`
+- Vault deposit dev scenario: `./scripts/dev-vault-deposits.sh` (starts Anvil, deploys the vault
+  and a mock USDC, runs a node on `config/anvil.toml`, and checks each deposit credits once)
 
 ## Repo facts
 

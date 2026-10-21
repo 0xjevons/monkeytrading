@@ -317,7 +317,7 @@ impl Node {
             stream,
             attestation,
             auth,
-            dev_deposits: true,
+            mock_custody: true,
             clock,
             log_dir: dir.clone(),
             manifest,

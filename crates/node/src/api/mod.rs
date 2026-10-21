@@ -53,6 +53,8 @@ pub enum ApiError {
     Internal,
     Unauthorized(&'static str),
     Forbidden(&'static str),
+    /// The node does not offer this yet.
+    NotImplemented(&'static str),
     /// A signed request whose nonce is not the account's next.
     InvalidNonce {
         expected: u64,
@@ -72,7 +74,9 @@ pub struct ApiState {
     pub attestation: Arc<Attestation>,
     /// The client auth the log records; `Unsigned` trusts the `account` field.
     pub auth: ClientAuth,
-    pub dev_deposits: bool,
+    /// Mock custody credits dev deposits and pays withdrawals by logging them; EVM custody does
+    /// neither until it pays withdrawals on-chain.
+    pub mock_custody: bool,
     /// The clock a signed request's expiry is checked against; the node gives the sequencer the same
     /// one to stamp commands with.
     pub clock: fn() -> Millis,
@@ -148,6 +152,7 @@ impl IntoResponse for ApiError {
             ApiError::TooManySubscribers => (StatusCode::SERVICE_UNAVAILABLE, "too many stream subscribers".to_owned()),
             ApiError::BodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request body too large".to_owned()),
             ApiError::BodyTimeout => (StatusCode::REQUEST_TIMEOUT, "request body not received in time".to_owned()),
+            ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m.to_owned()),
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
@@ -378,9 +383,13 @@ async fn cancel_order(State(s): State<ApiState>, Json(b): Json<CancelRequest>) -
 
 /// Requests a withdrawal; an approval is signed and streamed.
 /// Error cases:
+/// - custody cannot pay withdrawals out yet (EVM custody)
 /// - the request is not authorised for its account
 /// - the sequencer has stopped, or sequencing is halted
 async fn withdraw(State(s): State<ApiState>, Json(b): Json<WithdrawalRequest>) -> ApiResult<Vec<Event>> {
+    if !s.mock_custody {
+        return Err(ApiError::NotImplemented("on-chain withdrawal payouts are not implemented yet"));
+    }
     let auth = s
         .authorise(b.account, b.auth, |domain, auth| {
             withdrawal_hash(domain, b.account, b.amount, auth.nonce, auth.expires_at)
@@ -394,7 +403,7 @@ async fn withdraw(State(s): State<ApiState>, Json(b): Json<WithdrawalRequest>) -
 /// - custody is not the mock provider
 /// - the sequencer has stopped, or sequencing is halted
 async fn dev_deposit(State(s): State<ApiState>, Json(b): Json<AmountBody>) -> ApiResult<Vec<Event>> {
-    if !s.dev_deposits {
+    if !s.mock_custody {
         return Err(ApiError::NotFound);
     }
     Span::current().record("id", display(b.account));
