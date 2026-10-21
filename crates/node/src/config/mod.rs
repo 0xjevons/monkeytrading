@@ -1,8 +1,9 @@
-//! Node configuration: one TOML file, loaded and validated once at startup. Two parts are protocol
+//! Node configuration: one TOML file, loaded and validated once at startup. Three parts are protocol
 //! and go into the log: the client auth (`node.auth`, with `custody.chain_id` and `custody.vault`
-//! under `eip712`), recorded when the log first activates protocol versions and fixed for the life
-//! of the log; and the `[genesis]` section, sequenced after protocol activation. Everything else
-//! configures this node only.
+//! under `eip712`) and the operator (`operator.public_key`, with the same chain id and vault),
+//! each recorded when the log first activates a protocol version that needs it and fixed for the
+//! life of the log; and the `[genesis]` section, sequenced after protocol activation. Everything
+//! else configures this node only.
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -14,10 +15,12 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::VerifyingKey;
 use engine_core::Fixed;
-use engine_core::auth::ClientAuth;
+use engine_core::auth::{ClientAuth, Operator};
+use engine_core::eip712;
 use engine_core::market::MarketSpec;
 use engine_core::params::ProtocolParams;
 use engine_core::types::{AccountId, MarketId, Millis};
+use k256::ecdsa;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
 
@@ -169,6 +172,9 @@ pub struct OperatorSection {
     /// settles. When it's switched on, operators hand over by passing the log and the sealed
     /// signing key between attested enclaves.
     pub rotation_enabled: bool,
+    /// The operator's secp256k1 public key, SEC1-encoded hex, which signs every admin command
+    /// `engine admin` sends. The node holds no operator secret.
+    pub public_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,6 +353,7 @@ impl NodeConfig {
     ///   that is not `host:port`
     /// - `history.retention` is zero, or too long to count in milliseconds
     /// - the custody section does not match its provider (see `validate_custody`)
+    /// - `operator.public_key` or `custody.vault` does not parse
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
     ///   engine would refuse, or genesis lists a market id twice
@@ -372,6 +379,21 @@ impl NodeConfig {
                 ClientAuth::Eip712 { chain_id: self.custody.chain_id, vault }
             }
         })
+    }
+
+    /// The operator this config asks the log to record: the address of `operator.public_key`, signing
+    /// under the domain of `custody.vault` on `custody.chain_id`.
+    /// Error cases:
+    /// - `operator.public_key` is not a SEC1-encoded secp256k1 public key in hex
+    /// - `custody.vault` is not an address
+    pub fn operator(&self) -> anyhow::Result<Operator> {
+        let key = self.operator.public_key.trim_start_matches("0x");
+        let key = hex::decode(key)
+            .ok()
+            .and_then(|bytes| ecdsa::VerifyingKey::from_sec1_bytes(&bytes).ok())
+            .context("operator.public_key is not a SEC1-encoded secp256k1 public key in hex")?;
+        let vault: AccountId = self.custody.vault.parse().context("custody.vault")?;
+        Ok(Operator { address: eip712::address(&key), chain_id: self.custody.chain_id, vault })
     }
 }
 

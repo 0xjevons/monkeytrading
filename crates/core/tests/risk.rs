@@ -156,7 +156,7 @@ fn reduce_only_orders_and_markets_never_add_risk() {
 
     // In a reduce-only market, new risk is refused but closing still works.
     h.market_order(a, BTC, Side::Buy, "0.2", "100000");
-    h.admin(AdminCommand::SetReduceOnly { market: BTC, reduce_only: true });
+    h.admin(AdminCommand::SetReduceOnly { market: Some(BTC), reduce_only: true });
     assert_eq!(rejection(&h.market_order(a, BTC, Side::Buy, "0.1", "100000")), &Reject::ReduceOnly);
     assert_eq!(fills(&h.market_order(a, BTC, Side::Sell, "0.2", "100000")).len(), 1);
 }

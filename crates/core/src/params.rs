@@ -157,6 +157,23 @@ impl ProtocolParams {
         Ok(())
     }
 
+    /// Checks a trade that only reduces a position can always fill: the widest stress spread plus
+    /// the widest toxicity spread stays under the price itself, since a reduction pays no size
+    /// spread and a close-out no toxicity spread.
+    /// Error cases:
+    /// - a stress level's minimum spread and a toxicity tier's extra spread add up to 10000 bps or
+    ///   more
+    pub fn check_closing_spread(&self) -> Result<(), String> {
+        let stress = self.stress_levels.iter().map(|level| level.min_spread_bps).max().unwrap_or(0);
+        let toxicity = self.toxicity.tiers.iter().map(|tier| tier.extra_spread_bps).max().unwrap_or(0);
+        if stress + toxicity >= MAX_RATE_BPS {
+            return Err(format!(
+                "stress and toxicity spreads of {stress} and {toxicity} bps reach the price, so no closing trade could fill"
+            ));
+        }
+        Ok(())
+    }
+
     /// Extra spread for an account with this toxicity score: the highest tier it reaches.
     pub fn toxicity_spread_bps(&self, score_bps: i64) -> i64 {
         self.toxicity.tiers.iter().rev().find(|t| score_bps >= t.min_score_bps).map_or(0, |t| t.extra_spread_bps)

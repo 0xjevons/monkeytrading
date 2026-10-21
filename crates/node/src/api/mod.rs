@@ -1,7 +1,8 @@
-//! Client API: REST for actions and reads, a WebSocket that streams the public log (every
-//! sequenced command with its events, every signed checkpoint, every signed withdrawal), the log
-//! archive, and account history. Every request passes the limits in `limits`.
+//! Client API: REST for actions and reads, the operator's admin route, a WebSocket that streams
+//! the public log (every sequenced command with its events, every signed checkpoint, every signed
+//! withdrawal), the log archive, and account history. Every request passes the limits in `limits`.
 
+mod admin;
 mod archive;
 mod history;
 mod stream;
@@ -20,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use engine_core::account::{Position, RestingOrder};
-use engine_core::auth::{ClientAuth, RequestAuth};
+use engine_core::auth::{ClientAuth, Operator, RequestAuth};
 use engine_core::command::{CancelRequest, Command, OrderRequest, WithdrawalRequest};
 use engine_core::eip712::{B256, Eip712Domain, cancel_hash, order_hash, withdrawal_hash};
 use engine_core::event::{Event, Reject};
@@ -74,6 +75,8 @@ pub struct ApiState {
     pub attestation: Arc<Attestation>,
     /// The client auth the log records; `Unsigned` trusts the `account` field.
     pub auth: ClientAuth,
+    /// The operator the log records, whose signature every admin request needs.
+    pub operator: Operator,
     /// Mock custody credits dev deposits and pays withdrawals by logging them; EVM custody does
     /// neither until it pays withdrawals on-chain.
     pub mock_custody: bool,
@@ -94,6 +97,7 @@ struct MarketView {
     #[serde(flatten)]
     spec: MarketSpec,
     open: bool,
+    /// Whether the market takes no new risk: its own flag, or every market's.
     reduce_only: bool,
     mark: Option<Fixed>,
     /// The FX index a market quoted in another currency than USD is valued at.
@@ -196,6 +200,7 @@ impl ApiState {
                 _ => "invalid signature",
             }));
         }
+        let auth = auth.expect("check refuses an unsigned request wherever signatures are required");
         // Accounts are never removed and nonces only grow, so neither check can pass a request
         // that the engine then sees ahead of its account's next nonce.
         let (credited, next, last_sequenced) =
@@ -204,9 +209,22 @@ impl ApiState {
             debug!("request refused: account never credited");
             return Err(ApiError::Forbidden("account has never been credited"));
         }
-        let nonce = auth.as_ref().map(|auth| auth.nonce);
-        if nonce != Some(next) {
-            debug!(?nonce, expected = next, "request refused: invalid nonce");
+        self.check_fresh(&auth, next, last_sequenced)?;
+        // Counted last, so only a request the node would sequence spends the account's rate. Every
+        // signed request is in the public log, so anyone can replay one; a replay fails the nonce
+        // or expiry check first and spends nothing.
+        self.limits.check_account(account)?;
+        Ok(Some(auth))
+    }
+
+    /// Checks a signed request carries its signer's next nonce, `next`, and has not expired by the
+    /// clock or by `last_sequenced`, the last sequenced time.
+    /// Error cases:
+    /// - a nonce other than `next`
+    /// - an expiry already past
+    fn check_fresh(&self, auth: &RequestAuth, next: u64, last_sequenced: Millis) -> Result<(), ApiError> {
+        if auth.nonce != next {
+            debug!(nonce = auth.nonce, expected = next, "request refused: invalid nonce");
             return Err(ApiError::InvalidNonce { expected: next });
         }
         // The sequencer stamps no earlier than its clock reads now or the last sequenced time, so a
@@ -215,15 +233,11 @@ impl ApiState {
         // the nonce as it refuses it, so the request cannot run later once its expiry comes within
         // the bound.
         let now = (self.clock)().max(last_sequenced);
-        if let Some(Err(Reject::Expired { expires_at })) = auth.as_ref().map(|auth| auth.check_expiry(now)) {
+        if let Err(Reject::Expired { expires_at }) = auth.check_expiry(now) {
             debug!(expires_at, "request refused: expired");
             return Err(ApiError::BadRequest(format!("request expired at {expires_at}")));
         }
-        // Counted last, so only a request the node would sequence spends the account's rate. Every
-        // signed request is in the public log, so anyone can replay one; a replay fails the nonce
-        // or expiry check first and spends nothing.
-        self.limits.check_account(account)?;
-        Ok(auth)
+        Ok(())
     }
 
     /// Sequences a command and waits for its events.
@@ -266,6 +280,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/orders", post(place_order))
         .route("/v1/orders/cancel", post(cancel_order))
         .route("/v1/withdrawals", post(withdraw))
+        .route("/v1/admin", post(admin::admin))
         .route("/v1/dev/deposit", post(dev_deposit))
         .route("/v1/stream", get(stream::stream))
         .route("/v1/archive/{file}", get(archive::archive))
@@ -303,7 +318,7 @@ async fn markets(State(s): State<ApiState>) -> ApiResult<Vec<MarketView>> {
                 .map(|m| MarketView {
                     spec: m.spec.clone(),
                     open: m.open,
-                    reduce_only: m.reduce_only,
+                    reduce_only: e.is_reduce_only(m),
                     mark: m.mark,
                     fx_mark: m.fx_mark,
                     stress_level: m.stress.level,
@@ -414,6 +429,8 @@ async fn dev_deposit(State(s): State<ApiState>, Json(b): Json<AmountBody>) -> Ap
     Ok(Json(s.submit(Command::Deposit { account: b.account, amount: b.amount, chain_ref }).await?))
 }
 
+#[cfg(test)]
+mod admin_tests;
 #[cfg(test)]
 mod auth_tests;
 #[cfg(test)]

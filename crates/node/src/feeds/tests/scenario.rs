@@ -11,12 +11,14 @@ use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest};
 use engine_core::event::{Event, Reject};
 use engine_core::price::PriceError;
 use engine_core::types::{AccountId, MarketId, Millis, Side};
+use k256::ecdsa::SigningKey;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval, sleep, timeout, timeout_at};
 
+use crate::admin::sign;
 use crate::clock::now_ms;
 use crate::config::Venue;
 use crate::feeds::tests::fake::{
@@ -97,10 +99,13 @@ async fn a_market_the_engine_does_not_list_is_alerted_once_and_held_back_until_i
         assert!(!["venue_market_unlisted", "venue_symbol_silent"].contains(&alert["alert"].as_str()), "{alert:?}");
     }
 
-    // Once the engine lists the market, its quotes go again.
+    // Once the operator lists the market, its quotes go again.
     let mut spec = dev_config().genesis.markets.into_iter().find(|market| market.id == 2).expect("ETH-USD");
     (spec.id, spec.symbol) = (99, "ETH-USD-B".into());
-    node.submit(Command::Admin(AdminCommand::UpsertMarket(spec))).await;
+    let operator = dev_config().operator().expect("the dev operator");
+    let key = SigningKey::from_slice(&[0x42; 32]).expect("the dev operator key");
+    let listing = sign(&key, &operator, AdminCommand::UpsertMarket(spec), 0, now_ms() + 60_000);
+    node.submit(Command::SignedAdmin(Box::new(listing))).await;
     node.wait_for_quotes(&[(99, "kraken")]).await;
 }
 

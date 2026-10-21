@@ -1,5 +1,5 @@
-//! Commands the engine must accept before anything else: the client auth, protocol activation,
-//! and genesis. Like any command, they wait for a stamp trusted time admits.
+//! Commands the engine must accept before anything else: the client auth, the operator, protocol
+//! activation, and genesis. Like any command, they wait for a stamp trusted time admits.
 
 use anyhow::bail;
 use engine_core::command::{AdminCommand, Command};
@@ -23,17 +23,20 @@ impl Sequencer {
         !self.engine.is_credited(GENESIS_REF)
     }
 
-    /// Records the config's client auth and activates the latest protocol version, whichever the
-    /// log lacks, then checkpoints. Both run at the log's next seq, so earlier commands keep the
-    /// rules they ran under, once trusted time admits a stamp (see `sequence_required`). `recover`
-    /// has already refused a log that records other client auth.
+    /// Records the config's client auth and operator and activates the latest protocol version,
+    /// whichever the log lacks, then checkpoints. All run at the log's next seq, so earlier commands
+    /// keep the rules they ran under, once trusted time admits a stamp (see `sequence_required`).
+    /// `recover` has already refused a log that records another client auth or operator.
     /// Error cases:
-    /// - the engine rejects either command
+    /// - the engine rejects any of them
     /// - the log cannot be written
     pub fn activate_protocol(&mut self) -> anyhow::Result<()> {
         let mut cmds = Vec::new();
         if self.engine.client_auth().is_none() {
             cmds.push(Command::Admin(AdminCommand::SetClientAuth(self.client_auth.clone())));
+        }
+        if self.engine.operator().is_none() {
+            cmds.push(Command::Admin(AdminCommand::SetOperator(self.operator)));
         }
         if self.engine.protocol_version() < ProtocolVersion::LATEST {
             cmds.push(Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }));

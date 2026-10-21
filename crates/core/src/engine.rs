@@ -13,7 +13,7 @@ use sha3::{Digest, Keccak256};
 
 use crate::Fixed;
 use crate::account::{Account, Position};
-use crate::auth::ClientAuth;
+use crate::auth::{ClientAuth, Operator};
 use crate::command::{Command, Sequenced};
 use crate::event::{Event, Reject};
 use crate::fixed::Rounding;
@@ -59,9 +59,16 @@ pub struct Engine {
     /// How client requests are authorised from `V3`; recorded once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) client_auth: Option<ClientAuth>,
-    /// Each account's next request nonce; an account missing here is at 0.
+    /// Each signer's next request nonce, the accounts' and the operator's; a signer missing here
+    /// is at 0.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) request_nonces: BTreeMap<AccountId, u64>,
+    /// Who signs admin commands from `V8`; recorded once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) operator: Option<Operator>,
+    /// Every market is reduce-only, whatever its own flag says.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) global_reduce_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -163,7 +170,11 @@ impl Engine {
             Command::CancelOrder { account, order_id, auth } => {
                 self.cancel_order(*account, *order_id, auth.as_ref(), &mut events)
             }
-            Command::Admin(cmd) => match self.admin(cmd, &mut events) {
+            Command::Admin(cmd) => match self.unsigned_admin(cmd, &mut events) {
+                Ok(()) => events.push(Event::AdminApplied),
+                Err(reason) => events.push(Event::AdminRejected { reason }),
+            },
+            Command::SignedAdmin(req) => match self.signed_admin(req, &mut events) {
                 Ok(()) => events.push(Event::AdminApplied),
                 Err(reason) => events.push(Event::AdminRejected { reason }),
             },
@@ -206,9 +217,20 @@ impl Engine {
         self.client_auth.as_ref()
     }
 
-    /// The nonce `account`'s next signed request must carry.
+    /// The nonce `account`'s next signed request must carry; for the operator's address, its next
+    /// admin command's.
     pub fn next_request_nonce(&self, account: AccountId) -> u64 {
         self.request_nonces.get(&account).copied().unwrap_or(0)
+    }
+
+    /// Who signs admin commands from `V8`, once recorded.
+    pub fn operator(&self) -> Option<&Operator> {
+        self.operator.as_ref()
+    }
+
+    /// Whether a market takes no new risk: its own flag, or every market's.
+    pub fn is_reduce_only(&self, market: &MarketState) -> bool {
+        market.reduce_only || self.global_reduce_only
     }
 
     /// Every listed market, by id.

@@ -9,9 +9,9 @@ pub mod reference;
 use std::collections::BTreeMap;
 
 use chrono::TimeZone;
-use engine_core::auth::{ClientAuth, RequestAuth};
-use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
-use engine_core::eip712::{self, B256, Eip712Domain, cancel_hash, order_hash, withdrawal_hash};
+use engine_core::auth::{ClientAuth, Operator, RequestAuth};
+use engine_core::command::{AdminCommand, AdminRequest, Command, OrderKind, OrderRequest, Sequenced};
+use engine_core::eip712::{self, B256, Eip712Domain, admin_hash, cancel_hash, order_hash, withdrawal_hash};
 use engine_core::event::{Event, Fill, Reject};
 use engine_core::market::{FinancingSpec, MarketSpec, PriceRules, QuoteCurrency, Tier};
 use engine_core::params::{ProtocolParams, Rollover, StressLevel, StressTrigger, ToxicityParams, ToxicityTier};
@@ -37,6 +37,8 @@ pub const HOUSE_CAPITAL: i64 = 100_000_000;
 /// The custody chain and vault the signed harness records.
 pub const CHAIN_ID: u64 = 31_337;
 pub const VAULT: AccountId = AccountId([0xaa; 20]);
+/// The seed of the operator key the `V8` harness records.
+pub const OPERATOR_SEED: u8 = 0x42;
 
 /// A sequenced engine with three markets and 100m of house capital (none from `zero_house`), plus a
 /// record of the log and of the cash it credited.
@@ -99,6 +101,16 @@ impl Harness {
         h.admin(AdminCommand::SetClientAuth(ClientAuth::Unsigned));
         h.admin(AdminCommand::ActivateProtocol { version });
         h.house_capital = Fixed::ZERO;
+        h.genesis();
+        h
+    }
+
+    /// `new`'s genesis under `V8`, after recording `auth` and the harness operator.
+    pub fn v8(auth: ClientAuth) -> Self {
+        let mut h = Harness::empty();
+        h.admin(AdminCommand::SetClientAuth(auth));
+        h.admin(AdminCommand::SetOperator(operator()));
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V8 });
         h.genesis();
         h
     }
@@ -197,6 +209,20 @@ impl Harness {
             }
             cmd => cmd,
         }
+    }
+
+    /// Applies `command` signed by the harness operator with its next nonce and an expiry a minute
+    /// ahead.
+    pub fn operate(&mut self, command: AdminCommand) -> Vec<Event> {
+        let operator = Client { expires_at: self.ts + 60_000, ..Client::operator() };
+        let nonce = self.engine.next_request_nonce(operator.account);
+        self.cmd(operator.admin(nonce, command))
+    }
+
+    /// `operate` for a command that must apply.
+    pub fn operator_admin(&mut self, command: AdminCommand) {
+        let events = self.operate(command);
+        assert!(events.contains(&Event::AdminApplied), "admin rejected: {events:?}");
     }
 
     /// Applies an admin command that must succeed.
@@ -316,6 +342,17 @@ impl Client {
         Command::PlaceOrder(req)
     }
 
+    /// The operator key the `V8` harness records.
+    pub fn operator() -> Self {
+        Client::new(OPERATOR_SEED)
+    }
+
+    /// `command` with this key's signature over it and `nonce`, as the operator sends it.
+    pub fn admin(&self, nonce: u64, command: AdminCommand) -> Command {
+        let hash = admin_hash(&self.domain, &command, nonce, self.expires_at);
+        Command::SignedAdmin(Box::new(AdminRequest { command, auth: self.auth(nonce, hash) }))
+    }
+
     /// A signed cancel of `order_id` for this account.
     pub fn cancel(&self, nonce: u64, order_id: OrderId) -> Command {
         let hash = cancel_hash(&self.domain, self.account, order_id, nonce, self.expires_at);
@@ -332,6 +369,11 @@ impl Client {
     fn auth(&self, nonce: u64, hash: B256) -> RequestAuth {
         RequestAuth { nonce, expires_at: self.expires_at, signature: eip712::sign(&self.key, &hash) }
     }
+}
+
+/// The operator the `V8` harness records: `Client::operator`'s key under `CHAIN_ID` and `VAULT`.
+pub fn operator() -> Operator {
+    Operator { address: Client::operator().account, chain_id: CHAIN_ID, vault: VAULT }
 }
 
 /// Parses a decimal.

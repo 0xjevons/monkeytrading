@@ -286,7 +286,7 @@ impl Engine {
         let delta = exec.side.signed(qty);
         let (grow_from, grow_to) = growth(pos.qty, delta);
         let increases = grow_to > grow_from;
-        if increases && market.reduce_only {
+        if increases && self.is_reduce_only(market) {
             return Err(Reject::ReduceOnly);
         }
         if increases && usd(qty.mul(mid), Rounding::Down) < market.spec.min_order_notional {

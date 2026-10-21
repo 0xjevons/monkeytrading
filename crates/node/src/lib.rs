@@ -1,6 +1,8 @@
 //! The TEE-hosted node around `engine-core`: the sequencer and public log, log replay, the client
-//! API with its TLS and limits, enclave attestation, trusted time, custody, and price feeds.
+//! API with its TLS and limits, enclave attestation, trusted time, custody, and price feeds; and
+//! `engine admin`, the operator's client.
 
+pub mod admin;
 mod api;
 mod clock;
 pub mod config;

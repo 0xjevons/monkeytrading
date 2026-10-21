@@ -1,0 +1,67 @@
+//! Recovery, activation, and replay with the operator the log records.
+
+use super::*;
+
+#[test]
+fn a_v7_log_records_the_operator_and_activates_v8_at_its_next_seq() {
+    let dir = scratch_dir("activation-v7");
+    let v7 = vec![
+        Command::Admin(AdminCommand::SetClientAuth(signed(31_337))),
+        Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V3 }),
+        Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V7 }),
+    ];
+    recover(&dir, &signed(31_337)).sequence_required("V7 activation", v7).unwrap();
+    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
+    let written = entries(&dir);
+    let cmds = commands(&written);
+    assert_eq!(
+        cmds[3..],
+        [
+            Command::Admin(AdminCommand::SetOperator(dev_config().operator().unwrap())),
+            Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V8 }),
+        ]
+    );
+    let replayed = replay(&written).unwrap();
+    assert_eq!(replayed.activations, [(ProtocolVersion::V3, 1), (ProtocolVersion::V7, 2), (ProtocolVersion::V8, 4)]);
+}
+
+#[test]
+fn a_log_recording_another_operator_refuses_to_start_and_writes_nothing() {
+    let dir = scratch_dir("activation-other-operator");
+    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
+    let written = entries(&dir).len();
+    let operator = dev_config().operator().unwrap();
+    for other in [Operator { address: AccountId([9; 20]), ..operator }, Operator { chain_id: 1, ..operator }] {
+        let (stream, _) = broadcast::channel(16);
+        let (manifest, _) = watch::channel(Manifest::default());
+        let cfg = SequencerConfig { client_auth: signed(31_337), operator: other, ..sequencer_config(&dir, manifest) };
+        let recovered = Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, mpsc::unbounded_channel().0);
+        let err = recovered.err().unwrap();
+        assert!(format!("{err:#}").contains("the log records operator"), "{err:#}");
+    }
+    assert_eq!(entries(&dir).len(), written);
+}
+
+#[test]
+fn a_log_claiming_an_unsigned_operator_command_applied_after_funds_does_not_replay() {
+    let dir = scratch_dir("unsigned-admin");
+    let mut seq = recover(&dir, &ClientAuth::Unsigned);
+    seq.activate_protocol().unwrap();
+    seq.genesis(&dev_config().genesis).unwrap();
+    seq.sequence(deposit(100, "dep-1")).unwrap();
+    let every_market = Command::Admin(AdminCommand::SetReduceOnly { market: None, reduce_only: true });
+    let events = seq.sequence(every_market.clone()).unwrap().expect("trusted time admits a stamp");
+    assert!(matches!(&events[..], [Event::AdminRejected { .. }]), "{events:?}");
+    seq.flush().unwrap();
+    drop(seq);
+
+    // As if the host rewrote the entry to say it applied.
+    let mut entries = entries(&dir);
+    let forged = entries.iter_mut().find_map(|entry| match entry {
+        LogEntry::Command(c) if c.sequenced.cmd == every_market => Some(c),
+        _ => None,
+    });
+    forged.expect("the command is logged").events = Some(vec![Event::AdminApplied]);
+    let err = replay(&entries).err().unwrap();
+    assert!(format!("{err:#}").contains("differ from the events replay gives"), "{err:#}");
+}

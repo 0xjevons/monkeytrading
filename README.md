@@ -60,6 +60,13 @@ by the MONKEY token, minted to traders on their losing trades
 the house's net asset value above a reserve floor
 ([#50](https://github.com/0xjevons/monkeytrading/issues/50)).
 
+The operator lists markets and their trading calendars, sets benchmark rates and protocol
+parameters, raises stress levels, and can stop new risk in one market or in all of them at once;
+neither those modes nor any spread stops a trader reducing or closing a position in an open market
+with a price. Once the engine has credited any funds, each
+of these is a command the operator's key signs, published in the log with its signature, and replay
+checks every one.
+
 The reasoning behind each of these choices is recorded in the decision issues
 [#1](https://github.com/0xjevons/monkeytrading/issues/1) to
 [#16](https://github.com/0xjevons/monkeytrading/issues/16).
@@ -143,6 +150,16 @@ expiry at most five minutes ahead, and replay checks every one. The first start 
 setting in the log, so changing it later needs a fresh log: with the node stopped, remove both
 `data/dev/log` and `data/dev/history`, the account history index built from it. The node's full API
 is described in [`crates/node/README.md`](crates/node/README.md).
+
+As the operator, `engine admin` signs a command and submits it over TLS pinned to the node's
+attested key. The local configuration names the public key of a test key, so on a local node this
+stops new risk in every market:
+
+```bash
+PIN=$(curl -sk https://127.0.0.1:8080/v1/attestation | jq -r .tls_public_key_sha256)
+OPERATOR_KEY=0x4242424242424242424242424242424242424242424242424242424242424242 \
+  cargo run -p engine-node -- admin --pin $PIN set-reduce-only true
+```
 
 ## Repository layout
 

@@ -12,23 +12,24 @@ an index: load only the rule whose hint matches the current action.
 - **crates/core/** — `engine-core`: the protocol state machine. Covers pricing against the index,
   size and stress spreads, margin and close-out, the profit fee, overnight financing, trading
   sessions, house exposure caps, toxicity scoring, signed client requests (EIP-712, per-account
-  nonces, and expiries), USD settlement of markets quoted in other currencies, and protocol
-  versions. It does no IO and uses no clocks, randomness, or floats. `impl Engine` is split by area
-  (`engine.rs`, `execution.rs`, `closeout.rs`, `funds.rs`, `admin.rs`, `auth.rs`). Unit tests sit
-  inline; protocol tests are in `tests/` by area, with the shared harness in `tests/common/`.
-  `tests/reference/` holds one reference log per protocol version, written once by
-  `examples/reference_log.rs` and replayed to its roots by
+  nonces, and expiries), USD settlement of markets quoted in other currencies, admin commands signed
+  by the operator key the log records, and protocol versions. It does no IO and uses no clocks,
+  randomness, or floats. `impl Engine` is split by area (`engine.rs`, `execution.rs`, `closeout.rs`,
+  `funds.rs`, `admin.rs`, `auth.rs`). Unit tests sit inline; protocol tests are in `tests/` by area,
+  with the shared harness in `tests/common/`. `tests/reference/` holds one reference log per
+  protocol version, written once by `examples/reference_log.rs` and replayed to its roots by
   `tests/reference_logs.rs`; `tests/invariants/` holds the property tests. Its `README.md` lists
   every file.
 - **crates/node/** — `engine-node`, binary `engine` (`main.rs` over `lib.rs`). Contains the
   sequencer, the public log with signed checkpoints (segmented, with a public archive), `engine
-  replay`, the REST API and the resumable WebSocket stream (TLS from an attested in-enclave key,
-  with rate limits and connection caps), the account history index (SQLite, derived from the log),
-  TEE attestation (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime
-  servers, the custody adapter (mock, or EVM vault deposits over alloy), and price feeds: live
-  crypto venue WebSockets (`feeds/`, one adapter per venue) and a mock. `tests/reference/` holds
-  the node-format reference log per protocol version, with events, written once by
-  `examples/reference_log.rs`. Its `README.md` lists every file.
+  replay`, `engine admin` (the operator's signing client), the REST API with the operator's admin
+  route and the resumable WebSocket stream (TLS from an attested in-enclave key, with rate limits
+  and connection caps), the account history index (SQLite, derived from the log), TEE attestation
+  (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime servers, the custody
+  adapter (mock, or EVM vault deposits over alloy), and price feeds: live crypto venue WebSockets
+  (`feeds/`, one adapter per venue) and a mock. `tests/reference/` holds the node-format reference
+  log per protocol version, with events, written once by `examples/reference_log.rs`. Its
+  `README.md` lists every file.
 - **contracts/** — Foundry project for the custody vault. `src/Vault.sol` takes USDC deposits of
   10 to 1e9 USDC for the caller's trading account (`deposit`), for a named one (`depositFor`), or
   for the house, under one deposit id sequence; `test/` holds unit, fuzz, and invariant tests, with
@@ -37,15 +38,16 @@ an index: load only the rule whose hint matches the current action.
   `soldeer.lock` and installed into the gitignored `dependencies/`; there are no git submodules.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine,
   and checks the clock against public Roughtime servers, citing each server's key source;
-  `feeds.provider = "venues"` prices its crypto markets from live venues instead, leaving the
-  others unpriced. `anvil.toml` runs EVM custody against the vault on a local Anvil chain. The
-  `[genesis]` section is protocol: it is sequenced into the log as admin commands on first boot,
-  and credits house capital from config only under mock custody. `node.auth`, with
-  `custody.chain_id` and `custody.vault` under `eip712`, is recorded in the log when it first
-  activates protocol versions, so changing it needs a fresh log. `production-genesis.toml` is the
-  production `[genesis]` section alone: the launch markets with their venue calendars, each
-  calendar's sources and unpublished gaps, their quote currencies, and the launch margins and fees;
-  a deployment's node sections complete it into a config. Every section rejects unknown keys.
+  `feeds.provider = "venues"` prices its crypto markets from live venues instead, leaving the others
+  unpriced. `anvil.toml` runs EVM custody against the vault on a local Anvil chain. The `[genesis]`
+  section is protocol: it is sequenced into the log as admin commands on first boot, and credits
+  house capital from config only under mock custody. `node.auth`, with `custody.chain_id` and
+  `custody.vault` under `eip712`, and `operator.public_key`, with the same chain id and vault, are
+  recorded in the log when it first activates the protocol versions that need them, so changing
+  either needs a fresh log. `production-genesis.toml` is the production `[genesis]` section alone:
+  the launch markets with their venue calendars, each calendar's sources and unpublished gaps, their
+  quote currencies, and the launch margins and fees; a deployment's node sections complete it into a
+  config. Every section rejects unknown keys.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate;
   `check-reference-logs.sh`, which fails a branch that changes a committed reference log; and
   `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil.
@@ -100,6 +102,10 @@ Run from the repo root:
   then `forge fmt --check`, `forge build`, and `forge test`
 - Vault deposit dev scenario: `./scripts/dev-vault-deposits.sh` (starts Anvil, deploys the vault
   and a mock USDC, runs a node on `config/anvil.toml`, and checks each deposit credits once)
+- Sign and submit an admin command as the operator: `cargo run -p engine-node -- admin --pin <the
+  node's attested tls_public_key_sha256> <command>`, with the key from `--key-file`,
+  `OPERATOR_KEY_FILE`, or `OPERATOR_KEY`; `config/dev.toml` names the public key of the local test
+  key `0x4242…42`. Against anything but a local dev node, [no-deploy](rules/no-deploy.md) applies
 
 ## Repo facts
 

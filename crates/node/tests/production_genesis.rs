@@ -199,10 +199,10 @@ fn easter_week_2027_opens_and_closes_each_market_on_its_venue_hours() {
 
 // ── Helpers ──
 
-/// Sequences the production genesis at `start` as the node does, after client auth and the latest
-/// protocol version, which leaves the house with no capital. Then ticks once a minute until `end` and
-/// checks every market opens and closes exactly as `expected` says, while crypto never closes. Both
-/// ends fall on a weekend when every other venue is shut.
+/// Sequences the production genesis at `start` as the node does, after client auth, the operator,
+/// and the latest protocol version, which leaves the house with no capital. Then ticks once a
+/// minute until `end` and checks every market opens and closes exactly as `expected` says, while
+/// crypto never closes. Both ends fall on a weekend when every other venue is shut.
 fn assert_week(test: &str, start: Millis, end: Millis, expected: Week) {
     let mut engine = Engine::new();
     let mut seq = 0;
@@ -211,9 +211,12 @@ fn assert_week(test: &str, start: Millis, end: Millis, expected: Week) {
         seq += 1;
         events
     };
-    // The node records client auth and activates the latest protocol version before genesis.
+    // The node records client auth and the operator and activates the latest protocol version
+    // before genesis.
+    let operator = NodeConfig::load(Path::new(DEV)).unwrap().operator().unwrap();
     let activation = [
         Command::Admin(AdminCommand::SetClientAuth(ClientAuth::Unsigned)),
+        Command::Admin(AdminCommand::SetOperator(operator)),
         Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }),
     ];
     for cmd in activation.into_iter().chain(genesis_commands(&production_genesis(test))) {

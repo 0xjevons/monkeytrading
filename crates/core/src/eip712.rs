@@ -1,4 +1,5 @@
-//! EIP-712 typed-data signatures: the domain, the request types clients sign, and signer recovery.
+//! EIP-712 typed-data signatures: the domain, the request types clients and the operator sign, and
+//! signer recovery.
 //!
 //! A client signs each order, cancel, and withdrawal with its account key, as a wallet does with
 //! `eth_signTypedData_v4`. The domain names the custody chain and vault, and each request carries
@@ -8,8 +9,9 @@
 //! `MAX_EXPIRY_AHEAD_MS`). Amounts and prices are `int128` in `Fixed`'s raw units (9 decimals);
 //! `expiresAt` is milliseconds since the Unix epoch, the unit of sequenced time; sides and order
 //! kinds are their JSON names. `crates/core/tests/fixtures/eip712.json` holds the
-//! typed data and signatures of each request type, and `examples/sign_request.rs` signs a request
-//! body for the API.
+//! typed data and signatures of each client request type, and `examples/sign_request.rs` signs a request
+//! body for the API. From protocol `V8` the operator signs admin commands under the same domain,
+//! each as its JSON, with the operator's next nonce and an expiry; `engine admin` signs them.
 
 pub use alloy_primitives::B256;
 use alloy_primitives::{Address, FixedBytes, U256};
@@ -19,7 +21,7 @@ use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey, Verifying
 use sha3::{Digest, Keccak256};
 
 use crate::Fixed;
-use crate::command::{OrderKind, OrderRequest};
+use crate::command::{AdminCommand, OrderKind, OrderRequest};
 use crate::types::{AccountId, Millis, OrderId, Side};
 
 /// The domain name every request is signed under.
@@ -67,6 +69,14 @@ mod typed {
             uint64 nonce;
             int64 expiresAt;
             int128 amount;
+        }
+
+        /// `Command::SignedAdmin`. `command` is the admin command's JSON as the engine encodes it,
+        /// so a wallet shows the operator exactly what it signs.
+        struct AdminRequest {
+            uint64 nonce;
+            int64 expiresAt;
+            string command;
         }
     }
 }
@@ -134,6 +144,15 @@ pub fn withdrawal_hash(
 ) -> B256 {
     typed::WithdrawalRequest { account: Address::from(account.0), nonce, expiresAt: expires_at, amount: amount.raw() }
         .eip712_signing_hash(domain)
+}
+
+/// The digest the operator signs to apply `command` with `nonce`, until `expires_at`.
+pub fn admin_hash(domain: &Eip712Domain, command: &AdminCommand, nonce: u64, expires_at: Millis) -> B256 {
+    // The engine's own encoding is the canonical form: the signer and every replay encode the same
+    // command with this code. Every field is a string, integer, list, or map, all of which
+    // serde_json encodes.
+    let command = serde_json::to_string(command).expect("admin commands serialise");
+    typed::AdminRequest { nonce, expiresAt: expires_at, command }.eip712_signing_hash(domain)
 }
 
 /// The account whose key signed `hash`, or `None` when `signature` is malformed or recovers no key.

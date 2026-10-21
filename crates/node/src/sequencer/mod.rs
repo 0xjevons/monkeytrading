@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use engine_core::auth::ClientAuth;
+use engine_core::auth::{ClientAuth, Operator};
 use engine_core::command::{Command, Sequenced};
 use engine_core::event::Event;
 use engine_core::protocol::ProtocolVersion;
@@ -95,6 +95,7 @@ pub struct Sequencer {
     client_auth: ClientAuth,
     /// The alert for house NAV below zero.
     deficit: DeficitAlert,
+    operator: Operator,
 }
 
 pub struct SequencerConfig<'a> {
@@ -111,6 +112,8 @@ pub struct SequencerConfig<'a> {
     pub max_drift: Duration,
     /// The client auth the config gives, which a log that records one must match.
     pub client_auth: ClientAuth,
+    /// The operator the config gives, which a log that records one must match.
+    pub operator: Operator,
 }
 
 /// The result of replaying a log.
@@ -146,7 +149,7 @@ impl Sequencer {
     /// Error cases:
     /// - the log cannot be read, or fails its manifest check (see `SegmentedLog::open`) or replay
     ///   (see `replay`)
-    /// - the log records a client auth other than the config's
+    /// - the log records a client auth or an operator other than the config's
     /// - the log cannot be opened for appending, or written
     pub fn recover(
         cfg: SequencerConfig<'_>,
@@ -171,10 +174,13 @@ impl Sequencer {
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
         let Replayed { engine, commands, checkpoints, unsigned, .. } = replay(&log.entries)?;
-        // A config naming another client auth, and so another chain or vault, is the wrong one for
-        // this log: refuse before anything is written or signed under it.
+        // A config naming another client auth or operator, and so another chain, vault, or admin key,
+        // is the wrong one for this log: refuse before anything is written or signed under it.
         if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
             bail!("the log records client auth {recorded:?}, but the config gives {:?}", cfg.client_auth);
+        }
+        if let Some(recorded) = engine.operator().filter(|recorded| **recorded != cfg.operator) {
+            bail!("the log records operator {recorded:?}, but the config gives {:?}", cfg.operator);
         }
         let last_offset = log::last_offset(&log.entries)?;
         info!(commands, checkpoints, "recovered from log");
@@ -197,6 +203,7 @@ impl Sequencer {
             required: Vec::new(),
             client_auth: cfg.client_auth,
             deficit: DeficitAlert::default(),
+            operator: cfg.operator,
         };
         {
             let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();

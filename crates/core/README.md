@@ -35,6 +35,13 @@ this crate and reproduce the signed state roots exactly.
   exact average rounded once, up for a long and down for a short, realised and unrealised PnL round
   down, and the profit fee and financing charges round up, so no sequence of fills realises more
   than its exact PnL
+- From protocol `V8`, admin commands signed by the operator key the log records, with the operator's
+  nonces and expiries, limited to listings, parameters, benchmark rates, stress floors, and
+  reduce-only; once any deposit or house capital is credited, an unsigned one is refused, so only
+  genesis runs unsigned
+- One command that makes every market reduce-only, including markets listed later; trades that
+  reduce or close a position fill in every reduce-only mode, and from `V8` parameters whose stress
+  and toxicity spreads would reach the price are refused
 
 ## Repository Structure
 
@@ -43,10 +50,11 @@ this crate and reproduce the signed state roots exactly.
 - `src/execution.rs` — order placement, triggers, pricing, risk checks, and booking fills
 - `src/closeout.rs` — account close-out and bad-debt write-off
 - `src/funds.rs` — deposits, withdrawals, house capital, and overnight financing
-- `src/admin.rs` — operator commands and stress levels
-- `src/auth.rs` — client auth, request signatures and nonces, and the check every client request
-  passes
-- `src/eip712.rs` — the EIP-712 domain, the request types clients sign, and signer recovery
+- `src/admin.rs` — operator commands, signed admin commands, and stress levels
+- `src/auth.rs` — client auth, the operator record, request signatures and nonces, and the checks
+  every client request and signed admin command pass
+- `src/eip712.rs` — the EIP-712 domain, the request types clients and the operator sign, and signer
+  recovery
 - `src/protocol.rs` — protocol versions, and how to add one
 - `src/fixed.rs` — `Fixed`, the 9-decimal fixed-point type used for all money
 - `src/market.rs` — market listings, tier tables, and quote currencies with their USD conversion
@@ -58,7 +66,8 @@ this crate and reproduce the signed state roots exactly.
 - `src/command.rs` / `src/event.rs` — engine inputs and outputs
 - `src/types.rs` — ids, sides, and asset classes
 - `tests/` — protocol tests through `Engine::apply`, with a shared harness and the reference-log
-  format in `tests/common/`
+  format in `tests/common/`; `tests/operator.rs` covers signed admin commands and every-market
+  reduce-only
 - `tests/reference/` — one reference log per protocol version: each line is a sequenced command and
   the state root after it
 - `tests/reference_logs.rs` — replays every reference log and fails at the first seq whose root
@@ -91,6 +100,9 @@ account's next nonce and an expiry at most five minutes ahead:
 SIGNER_KEY=<private key> cargo run -p engine-core --example sign_request -- \
     <chain id> <vault> <nonce> <expires at> <order|cancel|withdrawal> '<unsigned body>'
 ```
+
+The operator signs each admin command the same way, as its JSON under the vault's domain, with the
+operator's next nonce; `engine admin`, in `engine-node`, signs and submits it.
 
 ## Configuration
 
@@ -132,8 +144,11 @@ and a session check and live-index valuation on every close-out; its log is `v6.
 markets quoted in another currency than USD (`MarketSpec::quote_currency`): their PnL, margin, house
 exposure, and financing convert to USD at an FX market's index, rounding toward the house on top of
 `V5`'s rounding, and they have no price while that FX market has none. Before `V7` activates, a
-listing that declares another quote currency is refused, and a USD market has no FX mark and
-encodes as before, so earlier logs replay unchanged; its log is `v7.jsonl`. For each later version:
+listing that declares another quote currency is refused, and a USD market has no FX mark and encodes
+as before, so earlier logs replay unchanged; its log is `v7.jsonl`. `V8` adds admin commands signed
+by the operator, refuses an unsigned operator command once anything is credited, adds every-market
+reduce-only, and refuses parameters whose spreads would refuse a close; it activates the same way,
+and its log is `v8.jsonl`. For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log.rs` so it activates the new version and exercises the new rules.

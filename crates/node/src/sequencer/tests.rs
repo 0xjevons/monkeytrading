@@ -232,18 +232,21 @@ async fn replay_refuses_a_checkpoint_after_an_approval_whose_signed_entry_is_mis
 }
 
 #[test]
-fn a_fresh_log_records_client_auth_and_activates_the_latest_version_before_genesis() {
+fn a_fresh_log_records_client_auth_and_the_operator_and_activates_the_latest_version_before_genesis() {
     let dir = scratch_dir("activation-fresh");
     let mut seq = recover(&dir, &signed(31_337));
     seq.activate_protocol().unwrap();
     seq.genesis(&dev_config().genesis).unwrap();
     let entries = entries(&dir);
     let cmds = commands(&entries);
+    let operator = dev_config().operator().unwrap();
     assert_eq!(cmds[0], Command::Admin(AdminCommand::SetClientAuth(signed(31_337))));
-    assert_eq!(cmds[1], Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }));
+    assert_eq!(cmds[1], Command::Admin(AdminCommand::SetOperator(operator)));
+    assert_eq!(cmds[2], Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }));
     let replayed = replay(&entries).unwrap();
     assert_eq!(replayed.engine.protocol_version(), ProtocolVersion::LATEST);
     assert_eq!(replayed.engine.client_auth(), Some(&signed(31_337)));
+    assert_eq!(replayed.engine.operator(), Some(&operator));
 }
 
 #[test]
@@ -253,10 +256,11 @@ fn an_existing_v1_log_activates_at_its_next_seq_and_still_verifies() {
     // A log written as one file before segments existed continues as the first segment.
     fs::copy(V1_DEV, dir.join("00000000000000000000.jsonl")).unwrap();
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
-    // The original 63 commands and 3 checkpoints, then the activation and its checkpoint.
+    // The original 63 commands and 3 checkpoints, then client auth, the operator, and the
+    // activation, with the scheduled checkpoint after the third and the activation's own.
     let replayed = replay(&entries(&dir)).unwrap();
-    assert_eq!((replayed.commands, replayed.checkpoints), (65, 4));
-    assert_eq!(replayed.activations, [(ProtocolVersion::LATEST, 64)]);
+    assert_eq!((replayed.commands, replayed.checkpoints), (66, 5));
+    assert_eq!(replayed.activations, [(ProtocolVersion::LATEST, 65)]);
 }
 
 #[test]
@@ -269,7 +273,8 @@ fn protocol_activation_and_genesis_wait_for_trusted_time_then_go_in_order() {
     seq.trust(trusted_now()).unwrap();
     let written = commands(&entries(&dir));
     assert!(matches!(written[0], Command::Admin(AdminCommand::SetClientAuth(_))), "{:?}", written[0]);
-    assert!(matches!(written[1], Command::Admin(AdminCommand::ActivateProtocol { .. })), "{:?}", written[1]);
+    assert!(matches!(written[1], Command::Admin(AdminCommand::SetOperator(_))), "{:?}", written[1]);
+    assert!(matches!(written[2], Command::Admin(AdminCommand::ActivateProtocol { .. })), "{:?}", written[2]);
     assert!(matches!(written.last(), Some(Command::HouseCapital { .. })), "{written:?}");
     assert!(!seq.needs_genesis());
 }
@@ -431,3 +436,5 @@ fn commands(entries: &[LogEntry]) -> Vec<Command> {
         })
         .collect()
 }
+
+mod operator;

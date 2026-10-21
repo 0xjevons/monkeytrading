@@ -1,11 +1,13 @@
-//! Who may act for an account. From protocol `V3`, every order, cancel, and withdrawal is
-//! authorised as the log's `ClientAuth` records: under `Eip712`, by the account's signature over
-//! the request, the account's next nonce, and an expiry the request has not passed, so a replay of
-//! the log proves each request was the account's and ran in time. `V2` logs, and dev logs that
-//! record `Unsigned`, accept unsigned requests.
+//! Who may act for an account, and who may change the rules. From protocol `V3`, every order,
+//! cancel, and withdrawal is authorised as the log's `ClientAuth` records: under `Eip712`, by the
+//! account's signature over the request, the account's next nonce, and an expiry the request has
+//! not passed, so a replay of the log proves each request was the account's and ran in time. `V2`
+//! logs, and dev logs that record `Unsigned`, accept unsigned requests. From `V8`, the operator
+//! signs admin commands the same way, with the key the log's `Operator` records.
 
 use serde::{Deserialize, Serialize};
 
+use crate::command::AdminCommand;
 use crate::eip712::{self, B256, Eip712Domain, Signature};
 use crate::engine::Engine;
 use crate::event::Reject;
@@ -30,6 +32,16 @@ pub enum ClientAuth {
     /// Each request carries the account's EIP-712 signature under the domain of `vault` on
     /// `chain_id`, the account's next nonce, and an expiry.
     Eip712 { chain_id: u64, vault: AccountId },
+}
+
+/// The key that signs admin commands from `V8`, by its address, and the domain it signs under: the
+/// vault `vault` on chain `chain_id`. Recorded once, so a replay needs only the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Operator {
+    pub address: AccountId,
+    pub chain_id: u64,
+    pub vault: AccountId,
 }
 
 /// A client's signature over a request, the account nonce the request uses, and the latest
@@ -75,6 +87,21 @@ impl ClientAuth {
     }
 }
 
+impl Operator {
+    /// Checks `auth` carries this operator's signature over `command` with its nonce and expiry,
+    /// leaving the nonce and expiry to the caller.
+    /// Error cases:
+    /// - `InvalidSignature`: not signed by this operator's key, or over other content
+    pub fn check(&self, command: &AdminCommand, auth: &RequestAuth) -> Result<(), Reject> {
+        let domain = eip712::domain(self.chain_id, self.vault);
+        let hash = eip712::admin_hash(&domain, command, auth.nonce, auth.expires_at);
+        match eip712::recover(&hash, &auth.signature) {
+            Some(signer) if signer == self.address => Ok(()),
+            _ => Err(Reject::InvalidSignature),
+        }
+    }
+}
+
 impl RequestAuth {
     /// Checks the request may execute at sequenced time `now`.
     /// Error cases:
@@ -115,13 +142,35 @@ impl Engine {
             &ORIGINAL
         };
         rules.check(account, auth, hash)?;
-        let Some(auth) = auth else { return Ok(()) };
-        let expected = self.next_request_nonce(account);
+        match auth {
+            Some(auth) => self.use_nonce(account, auth),
+            None => Ok(()),
+        }
+    }
+
+    /// Checks an admin command is signed by the operator the log records, and uses the operator's
+    /// nonce, as `authorise` does for a client request.
+    /// Error cases:
+    /// - `InvalidSignature`: see `Operator::check`
+    /// - `InvalidNonce`, `Expired`, or `ExpiryTooFar`: see `use_nonce`
+    pub(crate) fn authorise_admin(&mut self, command: &AdminCommand, auth: &RequestAuth) -> Result<(), Reject> {
+        // `ActivateProtocol` refuses `V8` until the operator is recorded, and callers check `V8`.
+        let operator = self.operator.expect("the operator is recorded before V8");
+        operator.check(command, auth)?;
+        self.use_nonce(operator.address, auth)
+    }
+
+    /// Uses `signer`'s next nonce if the request carries it, then checks the request's expiry.
+    /// Error cases:
+    /// - `InvalidNonce`: a nonce other than `signer`'s next; nothing changes
+    /// - `Expired` or `ExpiryTooFar`: see `RequestAuth::check_expiry`; the nonce is used
+    fn use_nonce(&mut self, signer: AccountId, auth: &RequestAuth) -> Result<(), Reject> {
+        let expected = self.next_request_nonce(signer);
         if auth.nonce != expected {
             return Err(Reject::InvalidNonce { expected });
         }
-        // One nonce per request: 2^64 requests from one account cannot happen.
-        self.request_nonces.insert(account, expected + 1);
+        // One nonce per request: 2^64 requests from one signer cannot happen.
+        self.request_nonces.insert(signer, expected + 1);
         auth.check_expiry(self.now)
     }
 }
