@@ -41,14 +41,19 @@ an index: load only the rule whose hint matches the current action.
   and checks the clock against public Roughtime servers, citing each server's key source;
   `feeds.provider = "venues"` prices its crypto markets from live venues instead, leaving the others
   unpriced. `anvil.toml` runs EVM custody against the vault on a local Anvil chain. The `[genesis]`
-  section is protocol: it is sequenced into the log as admin commands on first boot, and credits
-  house capital from config only under mock custody. `node.auth`, with `custody.chain_id` and
-  `custody.vault` under `eip712`, and `operator.public_key`, with the same chain id and vault, are
-  recorded in the log when it first activates the protocol versions that need them, so changing
-  either needs a fresh log. `production-genesis.toml` is the production `[genesis]` section alone:
-  the launch markets with their venue calendars, each calendar's sources and unpublished gaps, their
-  quote currencies, and the launch margins and fees; a deployment's node sections complete it into a
-  config. Every section rejects unknown keys.
+  section is protocol: it is sequenced into the log as admin commands on first boot, all or
+  nothing, and credits house capital from config only under mock custody. Loading refuses a genesis
+  value the engine would reject or an entry listed twice, and recovery refuses a log whose genesis
+  did not apply in full. `node.auth`, with `custody.chain_id` and `custody.vault` under `eip712`, and
+  `operator.public_key`, with the same chain id and vault, are recorded in the log when it first
+  activates the protocol versions that need them, so changing either needs a fresh log.
+  `test-keys.toml` lists the keys whose private keys the repo publishes for development (the dev
+  configs' operator key and Anvil's default accounts); a node whose TEE is not the mock refuses them
+  as its operator key, and a dev config or script that adds such a key lists it there.
+  `production-genesis.toml` is the production `[genesis]` section alone: the launch markets with
+  their venue calendars, each calendar's sources and unpublished gaps, their quote currencies, and
+  the launch margins and fees; a deployment's node sections complete it into a config. Every
+  section rejects unknown keys.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate;
   `check-reference-logs.sh`, which fails a branch that changes a committed reference log; and
   `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil.

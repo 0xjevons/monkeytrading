@@ -322,37 +322,6 @@ fn a_restart_with_the_recorded_client_auth_sequences_nothing() {
 }
 
 #[test]
-fn a_genesis_cut_short_runs_again_on_restart() {
-    // With house capital and without it, a genesis cut short at any command runs again in full, and
-    // a finished one is not run again.
-    for capital in [dev_config().genesis.house_capital, Fixed::ZERO] {
-        let mut genesis = dev_config().genesis;
-        genesis.house_capital = capital;
-        let all = genesis_commands(&genesis);
-        assert!(matches!(all.last(), Some(Command::HouseCapital { .. })), "genesis ends with its credit");
-        for cut in [0, 1, all.len() / 2, all.len() - 1] {
-            let name = format!("capital-{capital}-cut-{cut}");
-            let dir = scratch_dir(&format!("genesis-{name}"));
-            let mut seq = recover(&dir, &signed(31_337));
-            seq.activate_protocol().unwrap();
-            seq.sequence_required("genesis", all[..cut].to_vec()).unwrap();
-            drop(seq);
-
-            let mut seq = recover(&dir, &signed(31_337));
-            assert!(seq.needs_genesis(), "{name}");
-            seq.activate_protocol().unwrap();
-            seq.genesis(&genesis).unwrap();
-            drop(seq);
-            let replayed = replay(&log_entries(&dir)).unwrap();
-            assert_eq!(replayed.engine.markets().len(), genesis.markets.len(), "{name}");
-            assert_eq!(replayed.engine.house_cash(), genesis.house_capital, "{name}");
-            // The credit is in the log now, so no later edit to the config's genesis reopens it.
-            assert!(!recover(&dir, &signed(31_337)).needs_genesis(), "{name}");
-        }
-    }
-}
-
-#[test]
 fn a_log_holding_only_client_auth_activates_on_restart() {
     let dir = scratch_dir("activation-auth-only");
     let auth = Command::Admin(AdminCommand::SetClientAuth(signed(31_337)));
@@ -496,4 +465,5 @@ fn commands(entries: &[LogEntry]) -> Vec<Command> {
         .collect()
 }
 
+mod genesis;
 mod operator;

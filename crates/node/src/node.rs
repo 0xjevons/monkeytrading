@@ -56,7 +56,9 @@ pub fn init_logging(level: &str) -> anyhow::Result<()> {
 /// - `feeds.provider = "venues"` without `[feeds.venues]`, or the TLS config cannot be built
 /// - generating the TLS key, attesting the keys, opening the history index (or a fresh one in place
 ///   of an index the log does not match), recovering the log (including a log that records another
-///   client auth or operator), connecting custody, or binding the listener fails
+///   client auth or operator, or whose genesis did not apply in full), connecting custody, or
+///   binding the listener fails
+/// - the engine would reject a genesis command
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
 pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.operator.rotation_enabled {
@@ -116,7 +118,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         .inspect_err(|e| error!(alert = "protocol_activation_failed", "refusing to serve: {e:#}"))?;
     if seq.needs_genesis() {
         info!(markets = cfg.genesis.markets.len(), "genesis queued for the first trusted time sample");
-        seq.genesis(&cfg.genesis)?;
+        seq.genesis(&cfg.genesis).inspect_err(|e| error!(alert = "genesis_refused", "refusing to serve: {e:#}"))?;
     }
     history.catch_up_to(seq.last_seq());
 
@@ -273,7 +275,7 @@ mod tests {
 
     use crate::config::HistorySection;
     use crate::history::INDEX_FILE;
-    use crate::log::{LogEntry, MANIFEST, Offset};
+    use crate::log::{LogEntry, MANIFEST, Offset, segment_seq};
     use crate::test_support::{
         RETENTION, TestHistory, TestSequencer, capture_alerts, deposit, dev_config, log_entries, open_history,
         scratch_dir,
@@ -350,6 +352,47 @@ mod tests {
         let expected = [("history_index_discarded", "WARN"), ("history_recovery_failed", "ERROR")];
         assert_eq!(levels, expected.map(|(alert, level)| (alert.to_owned(), level.to_owned())));
         assert_eq!(files(&kept), before, "the log is as it was found");
+    }
+
+    #[tokio::test]
+    async fn a_genesis_cut_short_stops_the_node_before_it_writes_to_the_log() {
+        let (dir, index) = (scratch_dir("node-genesis-cut"), scratch_dir("node-genesis-cut-index"));
+        TestSequencer::start(&dir, 1024).stop().await;
+        // As if the boot that ran genesis died before its house capital credit reached disk.
+        let segment = files(&dir).into_keys().filter(|name| segment_seq(name).is_some()).max().expect("a segment");
+        let text = fs::read_to_string(dir.join(&segment)).unwrap();
+        let credit = text.find(r#""cmd":{"type":"house_capital""#).expect("the credit is in the last segment");
+        let line = text[..credit].rfind('\n').expect("a command before it");
+        fs::write(dir.join(&segment), &text[..line + 1]).unwrap();
+        let before = files(&dir);
+
+        let mut cfg = dev_config();
+        (cfg.node.log_dir, cfg.history.dir) = (dir.clone(), index);
+        cfg.node.listen = "127.0.0.1:0".parse().unwrap();
+        let refused = timeout(Duration::from_secs(10), run(cfg)).await.expect("the node stops in time");
+        let err = refused.expect_err("genesis did not finish");
+        assert!(format!("{err:#}").contains("did not reach the checkpoint after its house capital credit"), "{err:#}");
+        assert_eq!(files(&dir), before, "the log is as it was found");
+    }
+
+    /// A genesis the engine would reject, in a config that skipped validation, stops the node with a
+    /// Critical alert before anything reaches the log.
+    #[tokio::test]
+    async fn a_genesis_the_engine_would_reject_stops_the_node_with_an_alert_and_writes_nothing() {
+        let (dir, index) = (scratch_dir("node-genesis-refused"), scratch_dir("node-genesis-refused-index"));
+        let mut cfg = dev_config();
+        (cfg.node.log_dir, cfg.history.dir) = (dir.clone(), index);
+        cfg.node.listen = "127.0.0.1:0".parse().unwrap();
+        cfg.genesis.benchmarks[0].annual_bps = 40_000;
+        let (_guard, mut alerts) = capture_alerts();
+        let refused = timeout(Duration::from_secs(10), run(cfg)).await.expect("the node stops in time");
+        let err = refused.expect_err("the engine rejects the benchmark");
+        assert!(format!("{err:#}").contains("genesis benchmark SOFR: the engine rejects it"), "{err:#}");
+        let raised: Vec<_> = iter::from_fn(|| alerts.try_recv().ok())
+            .map(|alert| (alert["alert"].clone(), alert["level"].clone()))
+            .collect();
+        assert_eq!(raised, [("genesis_refused".to_owned(), "ERROR".to_owned())]);
+        assert!(log_entries(&dir).is_empty(), "nothing reached the log");
     }
 
     // ── Helpers ──

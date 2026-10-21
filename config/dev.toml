@@ -4,7 +4,9 @@
 #
 # Everything under [genesis] is protocol. On first boot it is sequenced into
 # the public log as admin commands, so the rules every fill ran under are on
-# record.
+# record. It goes in all or nothing: a value the engine would reject fails the
+# config load, and a log whose first boot stopped partway through genesis is
+# refused (remove data/dev/log and data/dev/history with the node stopped).
 #
 # Margin rates, the fee, financing markups and benchmark rates are placeholders
 # at professional-client leverage levels; set them before launch.
@@ -45,6 +47,8 @@ max_subscribers = 256
 # A client that takes longer than this to take a response, or a subscriber a message, is dropped.
 send_timeout = "30s"
 
+# A tracing filter directive; it must enable at least "error" for engine_node,
+# the level every Critical alert logs at.
 [logging]
 level = "info"
 
@@ -56,7 +60,8 @@ rotation_enabled = false
 # Signs admin commands sent with `engine admin`; recorded in the log on first
 # start, with the custody chain id and vault, so changing it needs a fresh log.
 # This is the public key of the local test key 0x4242…42 (32 bytes of 0x42),
-# whose private key is public: local nodes only.
+# whose private key is public: local nodes only. It is listed in test-keys.toml,
+# so a node whose tee.provider is not "mock" refuses it.
 public_key = "0x0424653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c119fc5009a032aa9fe47f5e149bb8442f71f884ccb516590686d8ff6ab91c613"
 
 [custody]

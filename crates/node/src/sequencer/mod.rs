@@ -29,8 +29,6 @@ use crate::trusted_time::{Sample, TimeGate};
 
 /// Most requests of any kind taken into one batch before it is flushed and answered.
 const MAX_BATCH: usize = 1024;
-/// The custody reference genesis credits house capital under, as its last command.
-const GENESIS_REF: &str = "genesis";
 
 pub type Query = Box<dyn FnOnce(&Engine) + Send>;
 
@@ -144,7 +142,8 @@ impl Sequencer {
     /// replayed root against the latest root posted on-chain.
     /// Error cases:
     /// - the log cannot be read or replayed (see `read_log`)
-    /// - the log records a client auth or an operator other than the config's
+    /// - the log records a client auth or an operator other than the config's, or a genesis it did
+    ///   not apply in full
     /// - the log cannot be opened for appending, or written
     pub fn recover(
         cfg: SequencerConfig<'_>,
@@ -172,7 +171,8 @@ impl Sequencer {
 
     /// As `recover`, from `log`, which `read_log` read and replayed.
     /// Error cases:
-    /// - the log records a client auth other than the config's
+    /// - the log records a client auth or an operator other than the config's, or a genesis it did
+    ///   not apply in full (see `GenesisProgress::ensure_closed`)
     /// - the log cannot be opened for appending, or written
     pub fn recover_from(
         log: ReplayedLog,
@@ -181,7 +181,7 @@ impl Sequencer {
         stream: broadcast::Sender<Arc<StreamMsg>>,
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
-        let ReplayedLog { log, replayed: Replayed { engine, commands, checkpoints, unsigned, .. } } = log;
+        let ReplayedLog { log, replayed: Replayed { engine, commands, checkpoints, unsigned, genesis, .. } } = log;
         // A config naming another client auth or operator, and so another chain, vault, or admin key,
         // is the wrong one for this log: refuse before anything is written or signed under it.
         if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
@@ -190,6 +190,7 @@ impl Sequencer {
         if let Some(recorded) = engine.operator().filter(|recorded| **recorded != cfg.operator) {
             bail!("the log records operator {recorded:?}, but the config gives {:?}", cfg.operator);
         }
+        genesis.ensure_closed()?;
         info!(commands, checkpoints, "recovered from log");
         let mut sequencer = Self {
             next_seq: engine.last_seq().map_or(0, |s| s + 1),
@@ -412,8 +413,9 @@ impl Sequencer {
 }
 
 mod alerts;
+pub(crate) mod genesis;
+pub use genesis::{GenesisProgress, genesis_commands};
 mod required;
-pub use required::genesis_commands;
 
 #[cfg(test)]
 mod batch_tests;

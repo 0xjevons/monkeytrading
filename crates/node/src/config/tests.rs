@@ -1,8 +1,6 @@
 use super::*;
 
-use crate::test_support::DEV_CONFIG as DEV;
-
-const ANVIL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/anvil.toml");
+use crate::test_support::{ANVIL_CONFIG as ANVIL, DEV_CONFIG as DEV, own_operator_key};
 
 #[test]
 fn the_committed_dev_config_loads() {
@@ -39,7 +37,9 @@ fn unsigned_requests_need_the_mock_tee_and_mock_custody() {
         let cfg: NodeConfig = toml::from_str(text).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("node.auth = \"none\""), "{err:#}");
-        let signed: NodeConfig = toml::from_str(&text.replace("auth = \"none\"", "auth = \"eip712\"")).unwrap();
+        let mut signed: NodeConfig = toml::from_str(&text.replace("auth = \"none\"", "auth = \"eip712\"")).unwrap();
+        // Real attestation also refuses the dev configs' published operator key.
+        signed.operator.public_key = own_operator_key();
         signed.validate().unwrap();
     }
 }
@@ -85,24 +85,23 @@ fn genesis_values_the_engine_would_refuse_fail_the_boot() {
     let rate = |bps: i64| {
         dev.replace("{ name = \"SOFR\", annual_bps = 400 }", &format!("{{ name = \"SOFR\", annual_bps = {bps} }}"))
     };
-    // The first listing again, at the end: market id 1 twice.
-    let first = &dev[dev.find("[[genesis.markets]]").unwrap()..];
-    let first = &first[..first[1..].find("[[genesis.markets]]").unwrap() + 1];
-    let repeated_market = format!("{dev}\n{first}");
-    let negative_total_floor = dev.replace("house_total_cap_floor = \"2000000\"", "house_total_cap_floor = \"-1\"");
-    let negative_market_floor = dev.replace("house_cap_floor = \"300000\"", "house_cap_floor = \"-1\"");
+    let total_floor = dev.replace("house_total_cap_floor = \"2000000\"", "house_total_cap_floor = \"-1\"");
+    let market_floor = dev.replace("house_cap_floor = \"300000\"", "house_cap_floor = \"-1\"");
+    // Each genesis command: the parameters, a benchmark rate, a market, and the house capital.
     let refused = [
-        capital("-1"),
-        capital("1000000000.000000001"),
-        rate(10_001),
-        rate(i64::MIN),
-        repeated_market,
-        negative_total_floor,
-        negative_market_floor,
+        (dev.replace("profit_fee_bps = 1000", "profit_fee_bps = 10000"), "genesis.params: the engine rejects it"),
+        (total_floor, "genesis.params: the engine rejects it: house_total_cap_floor out of range"),
+        (rate(40_000), "genesis benchmark SOFR: the engine rejects it: benchmark rate 40000bps out of range"),
+        (rate(i64::MIN), "genesis benchmark SOFR: the engine rejects it"),
+        (market_floor, "genesis market BTC-USD: the engine rejects it: house_cap_floor out of range"),
+        (dev.replace("house_cap_bps = 1000\n", "house_cap_bps = 0\n"), "genesis market AAPL: the engine rejects it"),
+        (capital("-1"), "genesis.house_capital: the engine rejects it"),
+        (capital("1000000000.000000001"), "genesis.house_capital: the engine rejects it"),
     ];
-    for text in &refused {
+    for (text, expected) in &refused {
         assert_ne!(text, &dev, "the replacement must change the config");
-        assert!(toml::from_str::<NodeConfig>(text).unwrap().validate().is_err());
+        let err = toml::from_str::<NodeConfig>(text).unwrap().validate().unwrap_err();
+        assert!(format!("{err:#}").contains(expected), "expected {expected:?}, got {err:#}");
     }
     // A house that starts with no capital, and the rate limit itself, are accepted.
     for text in [capital("0"), rate(-10_000)] {
@@ -116,15 +115,80 @@ fn a_genesis_market_converting_at_anything_but_its_pair_listed_before_it_fails_t
     let dev = std::fs::read_to_string(DEV).unwrap();
     let via = "quote_currency = { currency = \"eur\", fx_market = 10 }";
     let at = |fx_market: u32| format!("quote_currency = {{ currency = \"eur\", fx_market = {fx_market} }}");
-    // US500 (20) is not EUR-USD, 99 is never listed, and XAU-USD (30), renamed EUR-USD here, is
-    // listed after Germany 40.
+    // US500 (20) is not EUR-USD, 99 is never listed, and XAU-USD (30), renamed EUR-USD here while
+    // the EUR-USD listing takes another symbol, is listed after Germany 40.
     let not_the_pair = dev.replace(via, &at(20));
     let unlisted = dev.replace(via, &at(99));
-    let listed_after = dev.replace(via, &at(30)).replace("symbol = \"XAU-USD\"", "symbol = \"EUR-USD\"");
+    let listed_after = dev
+        .replace(via, &at(30))
+        .replace("symbol = \"EUR-USD\"", "symbol = \"EUR-USD-SPOT\"")
+        .replace("symbol = \"XAU-USD\"", "symbol = \"EUR-USD\"");
     for text in [&not_the_pair, &unlisted, &listed_after] {
         assert_ne!(text, &dev, "the replacement must change the config");
         let err = toml::from_str::<NodeConfig>(text).unwrap().validate().unwrap_err();
         assert!(format!("{err:#}").contains("is not the listed EUR-USD market"), "{err:#}");
+    }
+}
+
+#[test]
+fn genesis_entries_listed_twice_fail_the_boot() {
+    let dev = std::fs::read_to_string(DEV).unwrap();
+    let us500 = &dev[dev.find("[[genesis.markets]]\nid = 20").unwrap()..];
+    let us500 = &us500[..us500[1..].find("[[genesis.markets]]").unwrap() + 1];
+    let refused = [
+        // A block copied from US500 that keeps its id under a new symbol.
+        (format!("{dev}\n{}", us500.replace("\"US500\"", "\"US100\"")), "genesis lists market 20 twice"),
+        // The same listing under a new id.
+        (format!("{dev}\n{}", us500.replace("id = 20", "id = 21")), "genesis lists market symbol US500 twice"),
+        (
+            dev.replace("{ name = \"ESTR\", annual_bps = 200 }", "{ name = \"SOFR\", annual_bps = 200 }"),
+            "genesis lists benchmark SOFR twice",
+        ),
+    ];
+    for (text, expected) in &refused {
+        assert_ne!(text, &dev, "the replacement must change the config");
+        let err = toml::from_str::<NodeConfig>(text).unwrap().validate().unwrap_err();
+        assert!(format!("{err:#}").contains(expected), "expected {expected:?}, got {err:#}");
+    }
+}
+
+#[test]
+fn a_logging_level_that_hides_the_nodes_errors_fails_the_boot() {
+    let dev = std::fs::read_to_string(DEV).unwrap();
+    let level = |level: &str| dev.replace("level = \"info\"", &format!("level = \"{level}\""));
+    let refused = [
+        "warning",
+        "",
+        "off",
+        "engine_node=off",
+        "info,engine_node=off",
+        "engine_node::node=error",
+        "error,engine_node::sequencer=off",
+        "info,engine_node::custody=0",
+        "info,engine_node:=off",
+        "info,engine=off",
+        "info,engine_node::feeds[{venue}]=off",
+    ];
+    for refused in refused {
+        let err = toml::from_str::<NodeConfig>(&level(refused)).unwrap().validate().unwrap_err();
+        assert!(format!("{err:#}").contains("logging.level must enable at least"), "{refused:?}: {err:#}");
+    }
+    // A span-scoped directive only enables events in its scope, and another crate is not the node.
+    let accepted = [
+        "error",
+        "warn",
+        "debug",
+        "off,engine_node=error",
+        "info,hyper=off,engine_node::feeds=error",
+        "info,engine_node::trusted_time[sample]=off",
+        "info,engine_node::feeds[{venue=kraken}]=off",
+        "info,engine_core=off",
+    ];
+    for accepted in accepted {
+        toml::from_str::<NodeConfig>(&level(accepted))
+            .unwrap()
+            .validate()
+            .unwrap_or_else(|e| panic!("{accepted}: {e:#}"));
     }
 }
 

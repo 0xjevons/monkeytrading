@@ -87,9 +87,8 @@ pub struct NodeConfig {
     pub feeds: FeedsSection,
     pub time: TimeSection,
     pub history: HistorySection,
-    /// Sequenced as admin commands after protocol activation, and again on each boot until its
-    /// house capital credit is in the log, so the rules every fill ran under are part of the public
-    /// record.
+    /// Sequenced as admin commands after protocol activation on a log's first boot, all or nothing,
+    /// so the rules every fill ran under are part of the public record.
     pub genesis: Genesis,
 }
 
@@ -342,11 +341,13 @@ impl NodeConfig {
     /// Error cases:
     /// - the file cannot be read, or is not valid TOML for this schema (unknown keys included);
     ///   the error names the line but never quotes it, since a line may hold a credential
-    /// - `logging.level` is not a valid filter directive
+    /// - `logging.level` is not a valid filter directive, or one that disables the node's errors
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, `feeds.interval`,
     ///   `time.max_drift`, `time.interval`, or an `api` timeout is zero, or `time.interval` plus
     ///   twice `time.max_drift` is not under 60s
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
+    /// - `tee.provider` is not `mock` and `operator.public_key` is a published test key, listed in
+    ///   `config/test-keys.toml`
     /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
     ///   no longer than `feeds.interval`
     /// - `time.servers` has fewer than two servers, lists a public key twice, or has an address
@@ -354,10 +355,8 @@ impl NodeConfig {
     /// - `history.retention` is zero, or too long to count in milliseconds
     /// - the custody section does not match its provider (see `validate_custody`)
     /// - `operator.public_key` or `custody.vault` does not parse
-    /// - genesis parameters or a market spec fail validation
-    /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
-    ///   engine would refuse, or genesis lists a market id twice
-    /// - a genesis market fails `MarketSpec::check_fx_market` against the markets listed before it
+    /// - genesis lists a market id, a market symbol, or a benchmark name twice
+    /// - the engine would reject a genesis command
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg: NodeConfig = toml::from_str(&text)
@@ -387,13 +386,9 @@ impl NodeConfig {
     /// - `operator.public_key` is not a SEC1-encoded secp256k1 public key in hex
     /// - `custody.vault` is not an address
     pub fn operator(&self) -> anyhow::Result<Operator> {
-        let key = self.operator.public_key.trim_start_matches("0x");
-        let key = hex::decode(key)
-            .ok()
-            .and_then(|bytes| ecdsa::VerifyingKey::from_sec1_bytes(&bytes).ok())
-            .context("operator.public_key is not a SEC1-encoded secp256k1 public key in hex")?;
+        let address = public_key_address(&self.operator.public_key).context("operator.public_key")?;
         let vault: AccountId = self.custody.vault.parse().context("custody.vault")?;
-        Ok(Operator { address: eip712::address(&key), chain_id: self.custody.chain_id, vault })
+        Ok(Operator { address, chain_id: self.custody.chain_id, vault })
     }
 }
 
@@ -418,6 +413,17 @@ fn parse_error(e: &toml::de::Error, text: &str) -> anyhow::Error {
     }
 }
 
+/// The account address of `key`, a SEC1-encoded secp256k1 public key in hex, compressed or not.
+/// Error cases:
+/// - `key` is not one
+fn public_key_address(key: &str) -> anyhow::Result<AccountId> {
+    let key = hex::decode(key.trim_start_matches("0x"))
+        .ok()
+        .and_then(|bytes| ecdsa::VerifyingKey::from_sec1_bytes(&bytes).ok())
+        .context("not a SEC1-encoded secp256k1 public key in hex")?;
+    Ok(eip712::address(&key))
+}
+
 /// Decodes a base64 Ed25519 public key.
 /// Error cases:
 /// - the text is not base64, does not decode to 32 bytes, or is not a valid Ed25519 key
@@ -427,6 +433,7 @@ fn public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<VerifyingKey
     VerifyingKey::from_bytes(&bytes).map_err(D::Error::custom)
 }
 
+mod test_keys;
 mod validation;
 
 #[cfg(test)]

@@ -11,6 +11,8 @@ verifies its checkpoints.
 ## Features
 
 - Single-task sequencer: commands are logged and flushed before any client sees their effect
+- Genesis all or nothing: the engine checks every genesis command at config load and again before
+  any is written, and recovery refuses a log whose genesis stopped short of its closing checkpoint
 - Signed checkpoints and withdrawals, bound to the chain id and vault, from an attested key
 - Attestation through Linux configfs-tsm, covering TDX and SEV-SNP, or a clearly marked mock
 - Trusted time: every stamp is checked against signed Roughtime readings that independent servers
@@ -62,10 +64,16 @@ verifies its checkpoints.
 - `src/sequencer/mod.rs` — the sequencer, stream messages, and checkpoints
 - `src/sequencer/replay.rs` — log replay, which recovery and `engine replay` share
 - `src/sequencer/required.rs` — client auth, the operator, protocol activation, and genesis, which
-  wait for trusted time, and the genesis commands
+  wait for trusted time
+- `src/sequencer/genesis.rs` — the genesis commands, the check that the engine accepts every one
+  before any is written, and how far a replayed log got through genesis
 - `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must
   look at, and house NAV below zero
-- `src/sequencer/tests.rs` — sequencer, activation, genesis restart, recovery, and replay tests
+- `src/sequencer/tests/mod.rs` — sequencer, activation, recovery, and replay tests
+- `src/sequencer/tests/genesis.rs` — genesis tests: a rejected genesis writes nothing, and a log
+  whose genesis did not apply in full is refused at recovery
+- `src/sequencer/tests/operator.rs` — recovery, activation, and replay with the operator the log
+  records
 - `src/sequencer/batch_tests.rs` — batching: a batch ends after `MAX_BATCH` requests of any kind
 - `src/sequencer/margin_tests.rs` — the margin and solvency dev scenario on the dev genesis (a
   close-out after the rollover's financing, and a withdrawal limited at a stale market's last
@@ -128,6 +136,8 @@ verifies its checkpoints.
   checks
 - `src/config/tests.rs` — config loading and validation tests
 - `src/config/validation.rs` — the checks a parsed config must also pass
+- `src/config/test_keys.rs` — the published test keys from `config/test-keys.toml`, which a node
+  with real attestation refuses, and their tests
 - `src/custody/mod.rs` — the custody providers (mock and EVM) and the USDC-to-`Fixed` conversion
 - `src/custody/evm.rs` — the deposit watcher: the chain and token check, range reads from blocks
   proven to lead to the tagged final block, the completeness check, and stall alerts
@@ -295,6 +305,15 @@ The first start records `auth`, and under `eip712` the custody chain id and vaul
 changing any of them needs a fresh log, removed while the node is stopped. The history index in
 `history.dir` then no longer matches the log, so the node rebuilds it from the new one.
 
+The first start also sequences `[genesis]`, all or nothing. Loading the config refuses a genesis
+value the engine would reject, or a market id, market symbol, or benchmark name listed twice.
+Recovery refuses (`log_recovery_failed`) a log whose genesis did not apply in full: one that stops
+short of the checkpoint after the house capital credit, as a crash during the first start leaves
+it, or one that holds a genesis command the engine rejected, or genesis run again before its first
+run finished, as earlier builds left it. When nothing follows genesis in the log, remove
+`node.log_dir` and `history.dir` while the node is stopped and start again; when commands follow,
+keep the log for an operator to examine.
+
 `/v1/accounts/{address}/history` returns `{"events": [...], "next": ...}`: the account's events,
 newest first. Each event carries its `cursor`, `<seq>:<index>`, which is the seq of the command that
 produced it and its index among that command's events; then `ts`, the command's sequenced time; then
@@ -350,7 +369,9 @@ parameters whose stress and toxicity spreads would price a closing trade at the 
 any deposit or house capital is credited, the engine refuses an unsigned operator command, so only
 genesis, which credits its house capital last, runs unsigned. The first start under protocol `V8`
 records `operator.public_key`, with the custody chain id and vault, in the log; changing it needs a
-fresh log, and `engine replay` prints the operator a log records.
+fresh log, and `engine replay` prints the operator a log records. A node whose `tee.provider` is not
+`mock` refuses to start with an operator key that `config/test-keys.toml` lists, in either SEC1
+encoding: the repository publishes those keys' private keys for local nodes.
 
 `/v1/accounts/{address}/proof` returns, against the state root of the last checkpoint, whose `seq`
 and `root` it names: the account's leaf (balance, withdrawal nonce, toxicity score, and number of
