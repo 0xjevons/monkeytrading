@@ -287,8 +287,8 @@ pub struct HistorySection {
     /// removing the directory while the node is stopped rebuilds the index from the log.
     pub dir: PathBuf,
     /// How long an event stays in the index, counted back from the sequenced time of the newest
-    /// command it holds. The log keeps every event regardless. After a change, the index takes the
-    /// log again from its start.
+    /// command it holds. The log keeps every event regardless. After a change, the node discards the
+    /// index and rebuilds it from the log.
     #[serde(with = "humantime_serde")]
     pub retention: Duration,
 }

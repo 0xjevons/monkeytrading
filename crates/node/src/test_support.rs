@@ -1,6 +1,8 @@
-//! Shared test harness: scratch directories, the committed dev config, a running sequencer, and a
-//! history index following it.
+//! Shared test harness: scratch directories, the committed dev config, a running sequencer, a
+//! history index following it, and a log layer that hands every alert to the test.
 
+use std::collections::BTreeMap;
+use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +17,11 @@ use futures_util::FutureExt;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::field::{Field, Visit};
+use tracing::subscriber::DefaultGuard;
+use tracing::{Event as LogEvent, Subscriber};
+use tracing_subscriber::Registry;
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 use crate::api::{Feed, MAX_BACKFILLS};
 use crate::clock::{Clock, SystemClock};
@@ -32,6 +39,9 @@ pub const CHECKPOINT_EVERY: u64 = 3;
 pub const TRADER: AccountId = AccountId([7; 20]);
 /// Long enough that no test event leaves the history index.
 pub const RETENTION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
+/// One alert's fields, by name, and its `level`.
+pub type Alert = BTreeMap<String, String>;
 
 /// A sequencer task running on a log directory, with the ends of its channels.
 pub struct TestSequencer {
@@ -117,7 +127,7 @@ impl TestHistory {
     /// Opens the index in `index` against the log `node` writes in `dir`, and runs it, letting
     /// readers in once it has taken the log's last command now.
     /// Error cases:
-    /// - the index does not match the log (see `History::open`)
+    /// - the index cannot be opened, nor a fresh one in its place (see `History::open`)
     pub async fn start(node: &TestSequencer, dir: &Path, index: &Path) -> anyhow::Result<Self> {
         let tip = node.next_seq().await.checked_sub(1);
         Self::start_with_tip(node, dir, index, tip)
@@ -125,7 +135,7 @@ impl TestHistory {
 
     /// As `start`, but readers are let in once the index has taken `tip`.
     /// Error cases:
-    /// - the index does not match the log (see `History::open`)
+    /// - the index cannot be opened, nor a fresh one in its place (see `History::open`)
     pub fn start_with_tip(node: &TestSequencer, dir: &Path, index: &Path, tip: Option<u64>) -> anyhow::Result<Self> {
         let cfg = HistorySection { dir: index.to_owned(), retention: RETENTION };
         let mut history = History::open(&cfg, &SegmentedLog::open(dir)?.entries)?;
@@ -146,6 +156,34 @@ impl TestHistory {
     }
 }
 
+/// Collects the fields of every event that carries an `alert` field.
+struct AlertLayer(mpsc::UnboundedSender<Alert>);
+
+/// Records an event's fields as strings.
+#[derive(Default)]
+struct Fields(Alert);
+
+impl<S: Subscriber> Layer<S> for AlertLayer {
+    fn on_event(&self, event: &LogEvent<'_>, _: Context<'_, S>) {
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        if fields.0.contains_key("alert") {
+            fields.0.insert("level".to_owned(), event.metadata().level().to_string());
+            let _ = self.0.send(fields.0);
+        }
+    }
+}
+
+impl Visit for Fields {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
 /// Polls `read` once, so that it takes one of `permits` and starts blocking work that cannot finish
 /// yet, then drops it: the blocking work must keep the permit until `release` lets it end. It
 /// releases before asserting, so a failure never leaves the work blocked.
@@ -161,6 +199,13 @@ pub async fn assert_a_dropped_read_keeps_its_permit(permits: &Semaphore, read: i
     let every = u32::try_from(free).expect("few permits");
     let back = timeout(Duration::from_secs(10), permits.acquire_many(every)).await;
     drop(back.expect("the permit comes back once the work ends").expect("the semaphore is open"));
+}
+
+/// Routes this thread's logs to an alert collector until the guard drops. `#[tokio::test]` runs
+/// every task on the test's thread, so the alerts of the tasks a test spawns all arrive.
+pub fn capture_alerts() -> (DefaultGuard, mpsc::UnboundedReceiver<Alert>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (tracing::subscriber::set_default(Registry::default().with(AlertLayer(tx))), rx)
 }
 
 /// An empty directory for one test, named after it.

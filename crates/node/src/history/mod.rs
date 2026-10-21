@@ -1,21 +1,24 @@
 //! Account history: every event that names an account, indexed from the log the sequencer
 //! publishes and served newest first. The index is derived from the log alone, never from engine
-//! state, so removing its file rebuilds it from the log's segments. On a restart it resumes after the
-//! last command it took, once that command is found unchanged in the log, and serves pages only once
-//! it has taken every command the log held at startup. History is public, like the log it comes
-//! from.
+//! state, so it can always be rebuilt from the log's segments. On a restart it resumes after the
+//! last command it took, once that command is found unchanged in the log; an index the log does not
+//! match, one pruned under another retention, or a damaged file is discarded and rebuilt instead. It
+//! serves pages only once it has taken every command the log held at startup. History is public,
+//! like the log it comes from.
 //!
 //! TODO: the index sits on host disk, which the host can rewrite between runs and during one. SQLite
 //! reads it in defensive mode and refuses a schema this code did not create, which bounds what a
 //! rewritten file can make it run, but the rows themselves are unchecked. The startup check compares
-//! one command, the newest the index has taken, so it catches a log rolled back, truncated, or
-//! replaced by another, but not one forged to end with that same command; a host able to forge the
-//! log can rewrite the index anyway. Each event served names its place in the log, where anyone can
-//! check it; keeping the index in enclave memory or on an integrity-protected volume would bound
+//! one command, the last the index has taken, so it rebuilds after a log rolled back, truncated, or
+//! replaced by another, but not after one forged to end with that same command; a host able to forge
+//! the log can rewrite the index anyway. Each event served names its place in the log, where anyone
+//! can check it; keeping the index in enclave memory or on an integrity-protected volume would bound
 //! both.
 
 mod store;
 pub use store::Reader;
+
+use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
 use engine_core::event::Event;
@@ -27,7 +30,7 @@ use tracing::{info, warn};
 
 use crate::api::Feed;
 use crate::config::HistorySection;
-use crate::history::store::Writer;
+use crate::history::store::{Writer, discard};
 use crate::log::{CommandEntry, LogEntry, Offset};
 use crate::sequencer::StreamBody;
 
@@ -93,43 +96,32 @@ pub struct History {
 
 impl History {
     /// Opens the index in `cfg.dir`, creating it if missing, and checks it against `entries`, the log
-    /// recovery replays next. An index that has taken commands must find the newest of them there,
-    /// unchanged: otherwise the log was rolled back, truncated, or replaced by another, and serving
-    /// the index would mix two logs. A log forged to end with that same command passes; see the
-    /// module's TODO. An index pruned under another retention than `cfg` gives takes
-    /// the log again from its start, which leaves it as a fresh index under the new retention would
-    /// be. Call it before recovery writes to the log, so a refusal leaves the log as it was found.
+    /// recovery replays next, so that it resumes after the last command it took. An index whose
+    /// file is damaged or holds another schema, whose rows were pruned under another retention than
+    /// `cfg` gives, or whose last command `entries` do not hold unchanged is discarded with a
+    /// Warning alert and rebuilt from the start of the log. A power loss can leave the index ahead
+    /// of the log, and a log rolled back, truncated, or replaced does the same; a log forged to end
+    /// with that same command passes (see the module's TODO).
     /// Error cases:
-    /// - the retention is invalid, or the index cannot be opened or read (see `Writer::open`)
-    /// - `entries` do not hold the newest command the index has taken, unchanged, at its seq
+    /// - the retention is invalid
+    /// - no index was on disk and a new one cannot be opened, or a discarded one cannot be removed or
+    ///   replaced (see `Writer::open`)
     pub fn open(cfg: &HistorySection, entries: &[LogEntry]) -> anyhow::Result<Self> {
         let path = cfg.dir.join(INDEX_FILE);
         let retention_ms = cfg.retention_ms().context("history.retention")?;
-        let (writer, progress) = Writer::open(&path, retention_ms)?;
-        let resume_at = match progress {
-            None => Offset::start_of(0),
-            Some(progress) => {
-                let seq = progress.high_water.sequenced.seq;
-                ensure!(
-                    logged_command(seq, entries) == Some(&progress.high_water),
-                    "the history index in {} does not match the log: the log ends before seq {seq}, the newest \
-                     command the index has taken, or holds another command there. Once the log is known to be \
-                     right, remove the directory, with the node stopped, to rebuild the index",
-                    cfg.dir.display()
+        let found = path.exists();
+        let (writer, resume_at) = match resume(&path, retention_ms, entries) {
+            Ok(resumed) => resumed,
+            Err(reason) if found => {
+                warn!(
+                    alert = "history_index_discarded",
+                    dir = %cfg.dir.display(),
+                    "rebuilding the history index from the log: {reason:#}"
                 );
-                if progress.retention_ms != retention_ms {
-                    // Taking the log again from its start upserts the same rows and prunes them to the
-                    // same horizon, which leaves what a fresh index under this retention would hold.
-                    warn!(
-                        was_ms = progress.retention_ms,
-                        now_ms = retention_ms,
-                        "history.retention changed since the index was pruned; taking the log again from its start"
-                    );
-                    Offset::start_of(0)
-                } else {
-                    Offset::start_of(progress.command.sequenced.seq + 1)
-                }
+                discard(&path)?;
+                (Writer::open(&path, retention_ms)?.0, Offset::start_of(0))
             }
+            Err(e) => return Err(e),
         };
         info!(dir = %cfg.dir.display(), from = %resume_at, "history index opened");
         let (ready, ready_rx) = watch::channel(false);
@@ -209,6 +201,30 @@ pub fn account_of(event: &Event) -> Option<AccountId> {
         | Event::AdminApplied
         | Event::AdminRejected { .. } => None,
     }
+}
+
+/// Opens the index at `path` and returns where it resumes: after the last command it took, or at the
+/// start of the log when it has taken none.
+/// Error cases:
+/// - the index cannot be opened, is damaged, or holds another schema (see `Writer::open`)
+/// - its rows were pruned under another retention than `retention_ms`
+/// - `entries`, the whole log, end before the last command it took, or hold another command at its
+///   seq
+fn resume(path: &Path, retention_ms: Millis, entries: &[LogEntry]) -> anyhow::Result<(Writer, Offset)> {
+    let (writer, progress) = Writer::open(path, retention_ms)?;
+    let Some(progress) = progress else {
+        return Ok((writer, Offset::start_of(0)));
+    };
+    ensure!(
+        progress.retention_ms == retention_ms,
+        "its events were pruned under a retention of {} ms, not the {retention_ms} ms history.retention gives",
+        progress.retention_ms
+    );
+    let seq = progress.command.sequenced.seq;
+    let logged = logged_command(seq, entries)
+        .with_context(|| format!("the log ends before seq {seq}, the last command the index took"))?;
+    ensure!(*logged == progress.command, "the log holds another command at seq {seq}, the last command the index took");
+    Ok((writer, Offset::start_of(seq + 1)))
 }
 
 /// The command `entries`, a whole log in order, hold at `seq`.

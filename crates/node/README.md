@@ -30,8 +30,8 @@ verifies its checkpoints.
   caps on request size, connections, and stream subscribers, and read timeouts, all set in `[api]`
 - `engine replay` to verify a published log, or a downloaded archive, against the open-source engine
 - Account history: every event that names an account, indexed in SQLite from the log and paged
-  newest first by a `<seq>:<index>` cursor, with a stated retention; it survives restarts and
-  rebuilds from the log
+  newest first by a `<seq>:<index>` cursor, with a stated retention; it survives restarts, and
+  rebuilds from the log when it is missing, damaged, or does not match the log
 - `engine admin` to sign an admin command with the operator's key, read from a file or
   `OPERATOR_KEY`, and submit it over TLS pinned to the node's attested key; the node holds only the
   operator's public key, recorded in the log, and refuses a request before the log unless it carries
@@ -83,13 +83,17 @@ verifies its checkpoints.
 - `src/api/tests.rs` — API tests, including the dev scenarios of the resumable stream and archive,
   and of account history, and `Retry-After`
 - `src/history/mod.rs` — the history index: which events name an account, the startup check
-  against the log, and the supervised task that follows the log into the index
-- `src/history/store.rs` — the index's SQLite schema, its writer, and its page reader
+  against the log and the rebuild when it fails, and the supervised task that follows the log into
+  the index
+- `src/history/store.rs` — the index's SQLite schema, its writer, its page reader, and its discard
 - `src/history/tests/mod.rs` — history index tests: pages, filters, retention, following the log,
   and restarts
 - `src/history/tests/recovery.rs` — startup checks against the log, readiness to serve, and
   failures
-- `src/test_support.rs` — the shared test harness
+- `src/history/tests/rebuild.rs` — power losses and other damage: an index left behind the log
+  resumes, and one ahead of it, contradicting it, damaged, or pruned under another retention is
+  rebuilt
+- `src/test_support.rs` — the shared test harness, including the capture of alerts and their levels
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
 - `src/trusted_time/mod.rs` — the trusted time task: queries the Roughtime servers, backs off
   failing ones, and turns agreeing replies into a sample
@@ -150,7 +154,7 @@ verifies its checkpoints.
 - `src/feeds/tests/mod.rs` — venue tasks against loopback venues: what they sequence, refuse,
   and alert, and how they reconnect
 - `src/feeds/tests/fake.rs` — the loopback venues, the feed harness with an engine that applies
-  what the feed sequences, and the alert capture the feed tests use
+  what the feed sequences, and the wait for the next alert
 - `src/feeds/tests/late.rs` — venue tasks against a sequencer that answers late: when a quote
   counts as the venue quoting, and how a connection's last quotes are settled after it ends
 - `src/feeds/tests/scenario.rs` — the dev scenario through the sequencer and engine
@@ -271,8 +275,8 @@ the nonce. Two requests that race for one nonce are both sequenced, and the engi
 second with `invalid_nonce`.
 
 The first start records `auth`, and under `eip712` the custody chain id and vault, in the log;
-changing any of them needs a fresh log, and with it a fresh `history.dir`, both removed while the
-node is stopped.
+changing any of them needs a fresh log, removed while the node is stopped. The history index in
+`history.dir` then no longer matches the log, so the node rebuilds it from the new one.
 
 `/v1/accounts/{address}/history` returns `{"events": [...], "next": ...}`: the account's events,
 newest first. Each event carries its `cursor`, `<seq>:<index>`, which is the seq of the command that
@@ -292,20 +296,22 @@ so the sequencer never waits for it; once caught up, history trails the log by t
 for the writer, and reads from disk whatever it falls behind the live log by. Each write stores the
 account events of a batch of commands, keyed by cursor, and the last command taken, in one
 transaction. Events whose command is older than `history.retention`, counted back from the newest
-command in the index, leave it; the log keeps them. After `history.retention` changes, the index
-takes the log again from its start, which leaves it as a fresh index under the new retention would
-be; until that pass passes its old newest command, the startup check stays on that command. The node
-reads its log once at startup, and before recovery replays that read and writes anything, the index
-checks that it holds the newest command the index has taken, unchanged, and resumes after the last
-command it took. If the log ends before that newest command or holds another one there, the log was
-rolled back, truncated, or replaced, and the node refuses to start (`history_recovery_failed`) with
-the log as it found it. The check compares that one command, so a log forged to end with it passes;
-a host able to forge the log can rewrite the index as well. A power loss can also leave the index
-ahead of the log, since neither syncs every write. SQLite opens the file in defensive mode, with
-triggers and views off, its schema untrusted, and cell sizes checked, and every write and read
-refuses, inside its own transaction, a schema this code did not create. Removing `history.dir` while
-the node is stopped rebuilds the index from the log's segments. Commands logged before events were
-recorded add nothing to history.
+command in the index, leave it; the log keeps them. The node reads its log once at startup, and
+before recovery replays that read and writes anything, the index checks that the log holds the last
+command the index took, unchanged, and resumes after it. Since the index is derived from the log,
+an index that fails that check is discarded with a Warning (`history_index_discarded`) and rebuilt
+from the log's segments, and the route answers 503 until the rebuild has taken the log's tip. The
+log ends before that command after a power loss, since neither the log nor the index syncs every
+write, or after the log was rolled back or truncated; it holds another command there after it was
+replaced. An index is rebuilt the same way when SQLite's integrity check finds its file damaged,
+when the file holds another schema, or when `history.retention` has changed since its events were
+pruned. The node refuses to start (`history_recovery_failed`) only when it cannot open a fresh
+index. The check compares that one command, so a log forged to end with it passes; a host able to
+forge the log can rewrite the index as well. SQLite opens the file in defensive mode, with triggers
+and views off, its schema untrusted, and cell sizes checked, and every write and read refuses,
+inside its own transaction, a schema this code did not create. Removing `history.dir` while the node
+is stopped rebuilds the index too. Commands logged before events were recorded add nothing to
+history.
 
 `engine admin` reads the node config (`--config`, or `CONFIG_PATH`) for the operator's public key
 and the custody chain id and vault, refuses a key that is not the operator's, takes the operator's

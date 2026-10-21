@@ -16,13 +16,14 @@ use tokio::time::timeout;
 
 use crate::api::MAX_BACKFILLS;
 use crate::config::HistorySection;
-use crate::log::{Manifest, SegmentedLog};
+use crate::log::{MANIFEST, Manifest, SegmentedLog};
 use crate::sequencer::StreamMsg;
 use crate::test_support::{
     RETENTION, SEGMENT_COMMANDS, TRADER, TestHistory, TestSequencer, assert_a_dropped_read_keeps_its_permit, deposit,
     every_event, logged_history, scratch_dir, withdraw,
 };
 
+mod rebuild;
 mod recovery;
 
 const A: AccountId = AccountId([0xa; 20]);
@@ -215,13 +216,28 @@ async fn index_to_end(dir: &Path, index: &Path, retention: Duration) -> Offset {
     let mut history = History::open(&HistorySection { dir: index.to_owned(), retention }, &entries(dir)).unwrap();
     history.catch_up_to(None);
     let resume_at = history.resume_at();
+    follow_to_end(history, dir).await;
+    resume_at
+}
+
+/// Runs `history` from where it resumes over the rest of the log in `dir`, with no live messages
+/// after it.
+async fn follow_to_end(history: History, dir: &Path) {
     let (live, subscriber) = broadcast::channel(1);
     drop(live);
     let (manifest, backfills) =
         (watch::channel(Manifest::load(dir).unwrap()).1, Arc::new(Semaphore::new(MAX_BACKFILLS)));
-    let feed = Feed::new(subscriber, dir.to_owned(), manifest, backfills, Some(resume_at));
+    let feed = Feed::new(subscriber, dir.to_owned(), manifest, backfills, Some(history.resume_at()));
     timeout(Duration::from_secs(10), history.run(feed)).await.unwrap().unwrap();
-    resume_at
+}
+
+/// Empties the segment the log in `dir` is still writing, which a power loss does to whatever the
+/// node never synced: completed segments are synced before they are listed.
+fn lose_log_tail(dir: &Path) {
+    let segments = fs::read_dir(dir).unwrap().map(|file| file.unwrap().file_name().into_string().unwrap());
+    let last = segments.filter(|name| name.ends_with(".jsonl") && name != MANIFEST).max().expect("a segment");
+    assert!(Manifest::load(dir).unwrap().segments.iter().all(|listed| listed.file != last), "{last} is listed");
+    fs::write(dir.join(last), b"").unwrap();
 }
 
 /// Writes a log in `dir` of `count` commands, seq `n` stamped `n` seconds in, each depositing to `A`,
@@ -241,6 +257,21 @@ fn deposit_log(dir: &Path, count: u64) -> Vec<LogEntry> {
     entries
 }
 
+/// Appends `count` commands to the log in `dir`, or starts one there, each depositing `amount` to `A`
+/// and stamped half a second after `deposit_log` stamps its seq, so none matches a command it wrote.
+fn append_deposits(dir: &Path, amount: i64, count: u64) {
+    let log = SegmentedLog::open(dir).unwrap();
+    let next = log.entries.iter().rev().find_map(command_seq).map_or(0, |seq| seq + 1);
+    let mut writer = log.into_writer(SEGMENT_COMMANDS, watch::channel(Manifest::default()).0).unwrap();
+    for seq in next..next + count {
+        let ts = Millis::try_from(seq).unwrap() * 1_000 + 500;
+        let events = Some(vec![Event::Deposited { account: A, amount: Fixed::from_int(amount) }]);
+        let sequenced = Sequenced { seq, ts, cmd: Command::Tick };
+        writer.append(&LogEntry::Command(CommandEntry { sequenced, events })).unwrap();
+    }
+    writer.flush().unwrap();
+}
+
 /// Every entry of the log in `dir`.
 fn entries(dir: &Path) -> Vec<LogEntry> {
     SegmentedLog::open(dir).unwrap().entries
@@ -249,11 +280,15 @@ fn entries(dir: &Path) -> Vec<LogEntry> {
 /// The seq of the last command in the log in `dir`.
 fn last_command_seq(dir: &Path) -> u64 {
     let entries = SegmentedLog::open(dir).unwrap().entries;
-    let last = entries.iter().rev().find_map(|entry| match entry {
+    entries.iter().rev().find_map(command_seq).expect("the log holds a command")
+}
+
+/// The seq of `entry`, if it is a command.
+fn command_seq(entry: &LogEntry) -> Option<u64> {
+    match entry {
         LogEntry::Command(command) => Some(command.sequenced.seq),
         _ => None,
-    });
-    last.expect("the log holds a command")
+    }
 }
 
 fn ms(duration: Duration) -> Millis {

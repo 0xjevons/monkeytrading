@@ -3,9 +3,10 @@ use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 use super::*;
 use crate::config::VenueSymbol;
 use crate::feeds::kraken;
-use crate::feeds::tests::fake::{WAIT, capture_alerts, coinbase_levels, fast, kraken_book, next_alert};
+use crate::feeds::tests::fake::{WAIT, coinbase_levels, fast, kraken_book, next_alert};
 use crate::feeds::venue::quotes::counts;
 use crate::feeds::venue::setup::next_backoff;
+use crate::test_support::capture_alerts;
 use crate::throttle::REALERT_AFTER;
 
 #[tokio::test(start_paused = true)]

@@ -1,11 +1,12 @@
 //! The history index on disk: one SQLite file. `events` holds each account event under its place in
 //! the log, `(seq, idx)`, so taking a command twice rewrites the same rows; `progress` holds, in the
-//! same transaction as the events, the last command taken, the newest command any row came from,
-//! and the retention the rows were pruned under. The host can rewrite the file, so every
-//! connection runs SQLite in defensive mode with triggers and views off, and every write and read
-//! refuses, inside its own transaction, a schema this code did not create.
+//! same transaction as the events, the last command taken and the retention the rows were pruned
+//! under. The host can rewrite the file, so every connection runs SQLite in defensive mode with
+//! triggers and views off, and every write and read refuses, inside its own transaction, a schema
+//! this code did not create.
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +24,7 @@ use crate::log::{CommandEntry, Offset};
 use crate::sequencer::{StreamBody, StreamMsg};
 
 /// The schema this code writes, kept in the file's `user_version`.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &str = "
     CREATE TABLE events (
         seq INTEGER NOT NULL,
@@ -40,7 +41,6 @@ const SCHEMA: &str = "
     CREATE TABLE progress (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         command TEXT NOT NULL,
-        high_water TEXT NOT NULL,
         retention_ms INTEGER NOT NULL
     );
 ";
@@ -68,18 +68,13 @@ pub(super) struct Writer {
     conn: Connection,
     path: PathBuf,
     retention_ms: Millis,
-    /// The seq of the newest command any row came from.
-    high_water: Option<u64>,
     /// What `SCHEMA` creates, which every write checks the file against.
     schema: Vec<SchemaRow>,
 }
 
-/// What the index has taken: the last command, the newest one any row came from, which differ while
-/// the index takes the log again after a change of retention, and the retention its rows were
-/// pruned under.
+/// What the index has taken: the last command, and the retention its rows were pruned under.
 pub(super) struct Progress {
     pub(super) command: CommandEntry,
-    pub(super) high_water: CommandEntry,
     pub(super) retention_ms: Millis,
 }
 
@@ -96,11 +91,13 @@ pub struct Reader {
 
 impl Writer {
     /// Opens the index at `path`, creating its directory, the file, and the schema if missing, and
-    /// returns it with what it has taken. One transaction checks the schema and reads that.
-    /// Events leave the index `retention_ms` before the newest command it holds.
+    /// returns it with what it has taken. One transaction checks the schema and the integrity of
+    /// the whole file, and reads that. Events leave the index `retention_ms` before the newest
+    /// command it holds.
     /// Error cases:
     /// - the directory or the file cannot be created or opened, or the file is not a SQLite database
     /// - the file holds another version of the schema, or a schema this code did not create
+    /// - SQLite's integrity check finds the file damaged
     /// - the command the index holds does not parse
     pub(super) fn open(path: &Path, retention_ms: Millis) -> anyhow::Result<(Self, Option<Progress>)> {
         if let Some(dir) = path.parent() {
@@ -125,23 +122,25 @@ impl Writer {
             other => bail!("{} holds history schema {other}, not {SCHEMA_VERSION}", path.display()),
         }
         check_schema(&tx, &schema, path)?;
-        let row: Option<(String, String, Millis)> = tx
-            .query_row("SELECT command, high_water, retention_ms FROM progress WHERE id = 0", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        // A torn page, or an index that no longer matches its table, would fail a later write or
+        // serve another row; one bad entry is enough to refuse the file.
+        let integrity: String =
+            tx.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0)).context("checking the history index")?;
+        ensure!(integrity == "ok", "{} is damaged: {integrity}", path.display());
+        let row: Option<(String, Millis)> = tx
+            .query_row("SELECT command, retention_ms FROM progress WHERE id = 0", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
             })
             .optional()
             .context("reading history progress")?;
         let progress = row
-            .map(|(command, high_water, retention_ms)| {
+            .map(|(command, retention_ms)| {
                 let command = serde_json::from_str(&command).context("history progress: the last command taken")?;
-                let high_water =
-                    serde_json::from_str(&high_water).context("history progress: the newest command taken")?;
-                anyhow::Ok(Progress { command, high_water, retention_ms })
+                anyhow::Ok(Progress { command, retention_ms })
             })
             .transpose()?;
         tx.commit().context("committing the history schema")?;
-        let high_water = progress.as_ref().map(|p: &Progress| p.high_water.sequenced.seq);
-        Ok((Self { conn, path: path.to_owned(), retention_ms, high_water, schema }, progress))
+        Ok((Self { conn, path: path.to_owned(), retention_ms, schema }, progress))
     }
 
     /// Takes commands from `rx` until every sender is gone, writing whatever is queued in one
@@ -214,20 +213,15 @@ impl Writer {
             }
         }
         let taken = serde_json::to_string(last).context("encoding a command")?;
-        let advances = self.high_water.is_none_or(|seq| last.sequenced.seq > seq);
         tx.execute(
-            "INSERT INTO progress (id, command, high_water, retention_ms) VALUES (0, ?1, ?1, ?2)
-             ON CONFLICT (id) DO UPDATE SET command = excluded.command, retention_ms = excluded.retention_ms,
-                 high_water = CASE WHEN ?3 THEN excluded.high_water ELSE high_water END",
-            params![taken, self.retention_ms, advances],
+            "INSERT INTO progress (id, command, retention_ms) VALUES (0, ?1, ?2)
+             ON CONFLICT (id) DO UPDATE SET command = excluded.command, retention_ms = excluded.retention_ms",
+            params![taken, self.retention_ms],
         )
         .context("storing history progress")?;
         let horizon = last.sequenced.ts.saturating_sub(self.retention_ms);
         tx.execute("DELETE FROM events WHERE ts < ?1", [horizon]).context("dropping events past retention")?;
         tx.commit().context("committing a history write")?;
-        if advances {
-            self.high_water = Some(last.sequenced.seq);
-        }
         debug!(seq = last.sequenced.seq, commands = commands.len(), "history index took commands");
         Ok(Some(last.sequenced.seq))
     }
@@ -309,6 +303,23 @@ fn read_page(path: &Path, schema: &[SchemaRow], query: &PageQuery) -> anyhow::Re
         None
     };
     Ok(Page { events, next })
+}
+
+/// Removes the index at `path`, then the write-ahead log and shared-memory files SQLite keeps beside
+/// it: once the database file is gone, SQLite discards a write-ahead log left without one.
+/// Error cases:
+/// - a file exists but cannot be removed
+pub(super) fn discard(path: &Path) -> anyhow::Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        if let Err(e) = fs::remove_file(&file)
+            && e.kind() != ErrorKind::NotFound
+        {
+            return Err(e).with_context(|| format!("removing {}", Path::new(&file).display()));
+        }
+    }
+    Ok(())
 }
 
 /// A read-only connection to the index at `path`, hardened.

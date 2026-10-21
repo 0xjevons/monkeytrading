@@ -147,9 +147,9 @@ cargo run -p engine-node -- replay --log data/dev/log
 The local configuration accepts unsigned requests (`auth = "none"`). With `auth = "eip712"`, each
 order, cancel, and withdrawal must carry its account's EIP-712 signature, its next nonce, and an
 expiry at most five minutes ahead, and replay checks every one. The first start records this
-setting in the log, so changing it later needs a fresh log: with the node stopped, remove both
-`data/dev/log` and `data/dev/history`, the account history index built from it. The node's full API
-is described in [`crates/node/README.md`](crates/node/README.md).
+setting in the log, so changing it later needs a fresh log: with the node stopped, remove
+`data/dev/log`, and the node rebuilds the account history index in `data/dev/history` from the new
+one. The node's full API is described in [`crates/node/README.md`](crates/node/README.md).
 
 As the operator, `engine admin` signs a command and submits it over TLS pinned to the node's
 attested key. The local configuration names the public key of a test key, so on a local node this

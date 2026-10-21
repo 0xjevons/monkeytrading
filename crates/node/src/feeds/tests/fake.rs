@@ -1,8 +1,6 @@
 //! Test support: loopback venue servers that speak each venue's message format, a harness that
-//! runs a venue task against one, and a log layer that hands every alert to the test.
+//! runs a venue task against one, and the wait for the next alert.
 
-use std::collections::BTreeMap;
-use std::fmt::Debug;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat};
@@ -17,24 +15,16 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, accept_async};
-use tracing::field::{Field, Visit};
-use tracing::subscriber::DefaultGuard;
-use tracing::{Event, Subscriber};
-use tracing_subscriber::Registry;
-use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 use crate::clock::now_ms;
 use crate::config::{Venue, VenueConnection, VenueSymbol};
 use crate::feeds::kraken;
 use crate::feeds::venue::{self, Timing};
 use crate::sequencer::{Query, Request};
-use crate::test_support::dev_config;
+use crate::test_support::{Alert, dev_config};
 
 /// How long a test waits for anything before failing, so a broken feed never hangs the suite.
 pub const WAIT: Duration = Duration::from_secs(5);
-
-/// One alert's fields, by name.
-pub type Alert = BTreeMap<String, String>;
 
 /// A fake venue's accepted connection.
 pub type Conn = WebSocketStream<TcpStream>;
@@ -44,33 +34,6 @@ pub type Conn = WebSocketStream<TcpStream>;
 pub struct FakeEngine {
     engine: Engine,
     next_seq: u64,
-}
-
-/// Collects the fields of every event that carries an `alert` field.
-struct AlertLayer(mpsc::UnboundedSender<Alert>);
-
-/// Records an event's fields as strings.
-#[derive(Default)]
-struct Fields(Alert);
-
-impl<S: Subscriber> Layer<S> for AlertLayer {
-    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
-        let mut fields = Fields::default();
-        event.record(&mut fields);
-        if fields.0.contains_key("alert") {
-            let _ = self.0.send(fields.0);
-        }
-    }
-}
-
-impl Visit for Fields {
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.0.insert(field.name().to_owned(), value.to_owned());
-    }
-
-    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
-        self.0.insert(field.name().to_owned(), format!("{value:?}"));
-    }
 }
 
 impl FakeEngine {
@@ -94,13 +57,6 @@ impl FakeEngine {
     pub fn answer(&self, query: Query) {
         query(&self.engine);
     }
-}
-
-/// Routes this thread's logs to an alert collector until the guard drops. `#[tokio::test]` runs
-/// every task on the test's thread, so the feed's alerts all arrive.
-pub fn capture_alerts() -> (DefaultGuard, mpsc::UnboundedReceiver<Alert>) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    (tracing::subscriber::set_default(Registry::default().with(AlertLayer(tx))), rx)
 }
 
 /// The next alert, failing the test after `WAIT`.

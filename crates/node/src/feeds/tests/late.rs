@@ -11,10 +11,11 @@ use tokio::time::{sleep, timeout};
 use crate::clock::now_ms;
 use crate::config::Venue;
 use crate::feeds::tests::fake::{
-    FakeEngine, WAIT, accept, capture_alerts, fast, kraken_book, listen, next_alert, send, spawn_feed_into, stream,
+    FakeEngine, WAIT, accept, fast, kraken_book, listen, next_alert, send, spawn_feed_into, stream,
 };
 use crate::feeds::venue::Timing;
 use crate::sequencer::Request;
+use crate::test_support::capture_alerts;
 
 #[tokio::test]
 async fn quotes_the_sequencer_applies_too_late_do_not_count_as_the_venue_quoting() {

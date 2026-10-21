@@ -22,14 +22,13 @@ use crate::admin::sign;
 use crate::clock::now_ms;
 use crate::config::Venue;
 use crate::feeds::tests::fake::{
-    Alert, WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_book, listen, next_alert, send,
-    spawn_feed_into, stream,
+    WAIT, accept, bitstamp_book, coinbase_levels, fast, kraken_book, listen, next_alert, send, spawn_feed_into, stream,
 };
 use crate::feeds::venue::Timing;
 use crate::log::Manifest;
 use crate::sequencer::{Request, Sequencer, SequencerConfig, StreamBody, StreamMsg};
 use crate::tee::EnclaveKey;
-use crate::test_support::{dev_config, scratch_dir, sequencer_config, trusted_now};
+use crate::test_support::{Alert, capture_alerts, dev_config, scratch_dir, sequencer_config, trusted_now};
 
 /// Each fake venue's book: BTC-USD 81250 / 81251 and ETH-USD 2377 / 2377.1.
 const BTC: (&str, &str, &str) = ("81250", "81251", "81250.5");

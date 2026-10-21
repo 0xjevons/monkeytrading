@@ -54,9 +54,9 @@ pub fn init_logging(level: &str) -> anyhow::Result<()> {
 /// Error cases:
 /// - operator rotation is enabled
 /// - `feeds.provider = "venues"` without `[feeds.venues]`, or the TLS config cannot be built
-/// - generating the TLS key, attesting the keys, opening the history index (including one the log
-///   does not match), recovering the log (including a log that records another client auth or
-///   operator), connecting custody, or binding the listener fails
+/// - generating the TLS key, attesting the keys, opening the history index (or a fresh one in place
+///   of an index the log does not match), recovering the log (including a log that records another
+///   client auth or operator), connecting custody, or binding the listener fails
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
 pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.operator.rotation_enabled {
@@ -85,9 +85,9 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         "enclave and TLS keys attested"
     );
 
-    // One read of the log: the history index is checked against it before recovery replays it and
-    // writes anything, so a refusal leaves the log as it was found, and no other copy of the log can
-    // come between the check and the replay.
+    // One read of the log: the history index is checked against it, and rebuilt if it does not match,
+    // before recovery replays it and writes anything, so no other copy of the log can come between
+    // the check and the replay.
     let log = SegmentedLog::open(&cfg.node.log_dir)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
     let mut history = History::open(&cfg.history, &log.entries)
@@ -256,49 +256,49 @@ fn sequencer_outcome(joined: Result<anyhow::Result<()>, JoinError>) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use std::fs::{self, OpenOptions};
-    use std::io::Write;
-    use std::path::Path;
+    use std::fs;
+    use std::net;
 
-    use crate::log::MANIFEST;
-    use crate::test_support::{TestHistory, TestSequencer, deposit, dev_config, scratch_dir};
+    use crate::config::HistorySection;
+    use crate::log::Offset;
+    use crate::test_support::{
+        RETENTION, TestHistory, TestSequencer, capture_alerts, deposit, dev_config, scratch_dir,
+    };
 
+    /// A power loss that keeps what the history index took but not the log's unsynced tail leaves
+    /// the index ahead of the log. The node discards the index with a Warning alert and goes on to
+    /// start: here as far as binding the API, whose port the test holds.
     #[tokio::test]
-    async fn a_history_index_the_log_contradicts_stops_the_node_before_it_writes_to_the_log() {
-        let (dir, index) = (scratch_dir("node-history-refused"), scratch_dir("node-history-refused-index"));
+    async fn a_history_index_ahead_of_its_log_is_discarded_and_the_node_starts() {
+        let (dir, index) = (scratch_dir("node-history-ahead"), scratch_dir("node-history-ahead-index"));
         let node = TestSequencer::start(&dir, 1024);
         let history = TestHistory::start(&node, &dir, &index).await.unwrap();
         node.submit(deposit(1, "dep-1")).await;
-        // The log as it stands now, which a host that rolls the log back would restore.
-        let older = scratch_dir("node-history-refused-older");
-        fs::create_dir_all(&older).unwrap();
+        // The log as the disk keeps it when the power fails now.
+        let kept = scratch_dir("node-history-ahead-kept");
+        fs::create_dir_all(&kept).unwrap();
         for file in fs::read_dir(&dir).unwrap() {
             let file = file.unwrap();
-            fs::copy(file.path(), older.join(file.file_name())).unwrap();
+            fs::copy(file.path(), kept.join(file.file_name())).unwrap();
         }
         node.submit(deposit(1, "dep-2")).await;
         node.stop().await;
         history.finish().await.unwrap();
-        // A listing a crash cut short, which recovery trims.
-        let mut manifest = OpenOptions::new().append(true).open(older.join(MANIFEST)).unwrap();
-        manifest.write_all(br#"{"file":"#).unwrap();
-        let before = files(&older);
 
+        let held = net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut cfg = dev_config();
-        (cfg.node.log_dir, cfg.history.dir) = (older.clone(), index);
-        cfg.node.listen = "127.0.0.1:0".parse().unwrap();
-        let refused = timeout(Duration::from_secs(10), run(cfg)).await.expect("the node stops in time");
-        let err = refused.expect_err("the index took a command the log no longer holds");
-        assert!(format!("{err:#}").contains("does not match the log"), "{err:#}");
-        assert_eq!(files(&older), before, "the log is as it was found");
-    }
-
-    // ── Helpers ──
-
-    /// Every file in `dir` and its bytes.
-    fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
-        let names = fs::read_dir(dir).unwrap().map(|file| file.unwrap().file_name().into_string().unwrap());
-        names.map(|name| (name.clone(), fs::read(dir.join(name)).unwrap())).collect()
+        (cfg.node.log_dir, cfg.history.dir) = (kept.clone(), index.clone());
+        cfg.node.listen = held.local_addr().unwrap();
+        let (_guard, mut alerts) = capture_alerts();
+        let stopped = timeout(Duration::from_secs(10), run(cfg)).await.expect("the node stops in time");
+        let err = stopped.expect_err("the API port is held");
+        assert!(format!("{err:#}").contains("binding"), "{err:#}");
+        let alert = alerts.try_recv().expect("an alert");
+        assert_eq!((alert["alert"].as_str(), alert["level"].as_str()), ("history_index_discarded", "WARN"));
+        // What the node left is a fresh index, which takes the log from its start with no alert.
+        let cfg = HistorySection { dir: index, retention: RETENTION };
+        let reopened = History::open(&cfg, &SegmentedLog::open(&kept).unwrap().entries).unwrap();
+        assert_eq!(reopened.resume_at(), Offset::start_of(0));
+        assert!(alerts.try_recv().is_err(), "one alert");
     }
 }

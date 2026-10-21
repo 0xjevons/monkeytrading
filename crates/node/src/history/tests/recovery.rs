@@ -2,46 +2,13 @@
 
 use super::*;
 
-use crate::log::offset_of;
-
 #[test]
-fn an_index_with_another_schema_version_is_refused() {
+fn the_writer_refuses_another_schema_version() {
     let path = file(&index_dir("schema"));
     drop(Writer::open(&path, 1).unwrap().0);
-    Connection::open(&path).unwrap().pragma_update(None, "user_version", 2).unwrap();
+    Connection::open(&path).unwrap().pragma_update(None, "user_version", 1).unwrap();
     let err = Writer::open(&path, 1).err().expect("refused");
-    assert!(format!("{err:#}").contains("history schema 2"), "{err:#}");
-}
-
-#[tokio::test]
-async fn an_index_ahead_of_its_log_is_refused() {
-    let (dir, index) = (scratch_dir("history-ahead"), index_dir("ahead"));
-    indexed_log(&dir, &index, 2).await;
-    // The log as it stands now, which a host that rolls the log back would restore.
-    let older = scratch_dir("history-ahead-older");
-    fs::create_dir_all(&older).unwrap();
-    for file in fs::read_dir(&dir).unwrap() {
-        let file = file.unwrap();
-        fs::copy(file.path(), older.join(file.file_name())).unwrap();
-    }
-    indexed_log(&dir, &index, 4).await;
-    let node = TestSequencer::start(&older, 1024);
-    let err = TestHistory::start(&node, &older, &index).await.err().expect("refused");
-    assert!(format!("{err:#}").contains("the log ends before seq"), "{err:#}");
-}
-
-#[tokio::test]
-async fn an_index_built_from_another_log_is_refused() {
-    let (dir, index) = (scratch_dir("history-other-log"), index_dir("other-log"));
-    indexed_log(&dir, &index, 2).await;
-    // Another log that also reaches the index's last seq, with other commands from genesis on.
-    let other = scratch_dir("history-other-log-2");
-    let node = TestSequencer::start(&other, 1024);
-    for n in 0..4 {
-        node.submit(deposit(7, &format!("other-{n}"))).await;
-    }
-    let err = TestHistory::start(&node, &other, &index).await.err().expect("refused");
-    assert!(format!("{err:#}").contains("holds another command there"), "{err:#}");
+    assert!(format!("{err:#}").contains("history schema 1, not 2"), "{err:#}");
 }
 
 /// Pages wait until the index has taken every command the log held when it started: a rebuild over
@@ -176,9 +143,9 @@ async fn a_history_failure_names_its_cause() {
     assert!(format!("{err:#}").contains("does not match its listing"), "{err:#}");
 }
 
-/// An index the host corrupted, or that SQLite cannot use, fails with its cause: each kind of bad
-/// row, a progress value that does not decode, a file that is not SQLite or is gone, and no
-/// write-ahead log.
+/// An index the host corrupted, or that SQLite cannot use, fails with its cause, which is what the
+/// Warning names when the node discards it: each kind of bad row a read meets, a progress value that
+/// does not decode, a file that is not SQLite or is gone, and no write-ahead log.
 #[tokio::test]
 async fn an_unusable_index_fails_with_its_cause() {
     let (dir, built) = (scratch_dir("history-corrupt"), index_dir("corrupt"));
@@ -191,12 +158,6 @@ async fn an_unusable_index_fails_with_its_cause() {
         ("a seq out of range", "UPDATE events SET seq = -1", false, "history row -1:0"),
         ("an index out of range", "UPDATE events SET seq = 5, idx = -1", false, "history row 5:-1"),
         ("a last command that does not parse", "UPDATE progress SET command = 'x'", true, "the last command taken"),
-        (
-            "a newest command that does not parse",
-            "UPDATE progress SET high_water = 'x'",
-            true,
-            "the newest command taken",
-        ),
         (
             "a retention that is not a number",
             "UPDATE progress SET retention_ms = 'x'",
@@ -213,8 +174,7 @@ async fn an_unusable_index_fails_with_its_cause() {
         }
         Connection::open(file(&index)).unwrap().execute_batch(change).unwrap();
         let err = if at_open {
-            let cfg = HistorySection { dir: index.clone(), retention: RETENTION };
-            History::open(&cfg, &entries(&dir)).err().expect(case)
+            Writer::open(&file(&index), ms(RETENTION)).err().expect(case)
         } else {
             Reader::new(file(&index), ready()).page(query()).await.expect_err(case)
         };
@@ -233,45 +193,6 @@ async fn an_unusable_index_fails_with_its_cause() {
 
     let err = Writer::open(Path::new(":memory:"), 1).err().expect("no write-ahead log");
     assert!(format!("{err:#}").contains("cannot use a write-ahead log"), "{err:#}");
-}
-
-/// A change of retention makes the index take the log again from its start, and the startup check
-/// stays on the newest command any row came from until that pass reaches it: a pass cut short
-/// resumes and ends as a fresh index would, unless the log has since lost that command.
-#[tokio::test]
-async fn a_pass_cut_short_after_a_retention_change_still_checks_the_newest_command_taken() {
-    let (dir, short) = (scratch_dir("history-repass-log"), scratch_dir("history-repass-short"));
-    let logged = deposit_log(&dir, 5);
-    deposit_log(&short, 3);
-    let (before, after) = (Duration::from_millis(1_500), Duration::from_secs(10));
-    for (case, log, matches) in [("log intact", &dir, true), ("log lost its tail", &short, false)] {
-        let index = index_dir(&format!("repass-{}", case.replace(' ', "-")));
-        index_to_end(&dir, &index, before).await;
-        // The node restarts under the new retention and takes seqs 0 and 1 again, then stops.
-        let cfg = HistorySection { dir: index.clone(), retention: after };
-        assert_eq!(History::open(&cfg, &entries(&dir)).unwrap().resume_at, Offset::start_of(0));
-        let pass: Vec<_> =
-            logged[..2].iter().map(|e| Arc::new(StreamMsg::new(offset_of(None, e).unwrap(), e.clone()))).collect();
-        Writer::open(&file(&index), ms(after)).unwrap().0.write(&pass).unwrap();
-        match History::open(&cfg, &entries(log)) {
-            Ok(history) => {
-                assert!(matches, "{case}: opened");
-                assert_eq!(history.resume_at, Offset::start_of(2), "{case}");
-                index_to_end(log, &index, after).await;
-                let fresh = index_dir(&format!("repass-{}-fresh", case.replace(' ', "-")));
-                index_to_end(log, &fresh, after).await;
-                let reader = |path| Reader::new(file(path), ready());
-                assert_eq!(
-                    every_page(&reader(&index), A, None, 10).await,
-                    every_page(&reader(&fresh), A, None, 10).await
-                );
-            }
-            Err(err) => {
-                assert!(!matches, "{case}: {err:#}");
-                assert!(format!("{err:#}").contains("the newest command the index has taken"), "{err:#}");
-            }
-        }
-    }
 }
 
 #[tokio::test]
