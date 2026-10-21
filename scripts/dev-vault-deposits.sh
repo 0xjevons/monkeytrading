@@ -10,13 +10,19 @@
 # equals the house deposits, and the node's log replays.
 #
 # Needs anvil, forge, cast, curl, and jq, and the contract dependencies
-# (`forge soldeer install` in contracts/). ANVIL_PORT and API_PORT override 8545 and 8080.
+# (`forge soldeer install` in contracts/). ANVIL_PORT, API_PORT, and METRICS_PORT override 8545,
+# 8080, and 9464.
 set -euo pipefail
+
+# EVM custody needs a Critical alert route. No alert may fire in this scenario (checked at the
+# end), so nothing is posted to it; a closed local port stands in for the webhook.
+export ENGINE_ALERTS_CRITICAL_URL="http://127.0.0.1:9/alerts"
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d)"
 anvil_port="${ANVIL_PORT:-8545}"
 api_port="${API_PORT:-8080}"
+metrics_port="${METRICS_PORT:-9464}"
 rpc="http://127.0.0.1:$anvil_port"
 # The node serves its API over TLS with a key it generates at startup, so curl skips verification.
 api="https://127.0.0.1:$api_port"
@@ -132,7 +138,7 @@ done
 
 step "A first boot without trusted time stores the deposit cursor while the log is empty"
 sed -e "s#data/anvil#$work#g" -e "s#127.0.0.1:8545#127.0.0.1:$anvil_port#" -e "s#127.0.0.1:8080#127.0.0.1:$api_port#" \
-  config/anvil.toml >"$work/anvil.toml"
+  -e "s#127.0.0.1:9464#127.0.0.1:$metrics_port#" config/anvil.toml >"$work/anvil.toml"
 # Every Roughtime server points at a closed local port, so no sample arrives and nothing is
 # sequenced, while the watcher reads the blocks so far and stores its cursor. That boot's time
 # alerts are expected, so it logs apart from node.log.

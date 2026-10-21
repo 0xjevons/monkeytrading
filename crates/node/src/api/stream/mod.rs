@@ -201,7 +201,7 @@ async fn send_feed<S: Sink<Message> + Unpin>(sink: &mut S, mut feed: Feed, send_
         let json = match serde_json::to_string(&*msg) {
             Ok(json) => json,
             Err(e) => {
-                error!(alert = "stream_encode_failed", offset = %msg.offset, "{e}");
+                error!(alert = "stream_encode_failed", "encoding the message at {}: {e}", msg.offset);
                 return;
             }
         };

@@ -143,6 +143,16 @@ dir = "data/dev/history"
 # Events older than this, counted back from the newest command, leave the index; the log keeps them.
 retention = "365d"
 
+[metrics]
+listen = "127.0.0.1:9464"
+
+[alerts]
+no_price_after = "5s"
+episode_quiet = "15m"
+# Post Critical alerts as JSON to the URL in an environment variable:
+# [alerts.critical]
+# url_env = "ENGINE_ALERTS_CRITICAL_URL"
+
 [genesis]
 # Mock custody only. With EVM custody, house capital enters through vault deposits to the house.
 house_capital = "10000000"

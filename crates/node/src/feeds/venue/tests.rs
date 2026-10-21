@@ -1,11 +1,20 @@
 use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 
 use super::*;
+use tracing::subscriber::set_default;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry;
+
+use crate::alerts::{self, Routes, is_alert_callsite};
 use crate::config::VenueSymbol;
 use crate::feeds::kraken;
 use crate::feeds::tests::fake::{WAIT, coinbase_levels, fast, kraken_book, next_alert};
+use crate::feeds::venue::confirm::Confirmation;
 use crate::feeds::venue::quotes::counts;
 use crate::feeds::venue::setup::next_backoff;
+use crate::metrics::Metrics;
 use crate::test_support::capture_alerts;
 use crate::throttle::REALERT_AFTER;
 
@@ -19,9 +28,9 @@ async fn refusals_alert_again_after_the_window_with_the_count_between() {
     feed.refuse("fourth", "");
 
     let first = next_alert(&mut alerts).await;
-    assert_eq!((first["reason"].as_str(), first["suppressed"].as_str()), ("first", "0"));
+    assert!(first["message"].contains("(0 more since the last alert): first"), "{first:?}");
     let again = next_alert(&mut alerts).await;
-    assert_eq!((again["reason"].as_str(), again["suppressed"].as_str()), ("fourth", "2"));
+    assert!(again["message"].contains("(2 more since the last alert): fourth"), "{again:?}");
     assert!(alerts.try_recv().is_err());
 }
 
@@ -35,9 +44,10 @@ async fn clock_alerts_are_held_to_one_a_window() {
     feed.clock_ahead(1, 60_000);
 
     let first = next_alert(&mut alerts).await;
-    assert_eq!((first["alert"].as_str(), first["suppressed"].as_str()), ("venue_clock_ahead", "0"));
+    assert_eq!(first["alert"].as_str(), "venue_clock_ahead");
+    assert!(first["message"].contains("60000ms ahead of the host clock (0 more since the last alert)"), "{first:?}");
     let again = next_alert(&mut alerts).await;
-    assert_eq!((again["alert"].as_str(), again["suppressed"].as_str()), ("venue_clock_ahead", "4"));
+    assert!(again["message"].contains("(4 more since the last alert)"), "{again:?}");
     assert!(alerts.try_recv().is_err());
 }
 
@@ -208,6 +218,49 @@ fn a_connection_that_quoted_retries_at_once_and_one_that_did_not_backs_off() {
     assert_eq!(next_attempt(grown, true, &timing), (timing.reconnect_min, Duration::from_secs(1)));
     // A failed attempt waits the current backoff and doubles it for the next.
     assert_eq!(next_attempt(grown, false, &timing), (grown, Duration::from_secs(16)));
+}
+
+/// Every venue alert keys on its venue and market alone, so its repeats share one episode whatever
+/// the lead, count, or reason, and each recovery resolves it under the same key.
+#[tokio::test(start_paused = true)]
+async fn venue_alerts_keep_one_key_per_subject_and_resolve_under_it() {
+    let (layer, router) = alerts::channel(Routes::default(), Arc::new(Metrics::new()));
+    let _logging = set_default(registry().with(layer.with_filter(filter_fn(is_alert_callsite))));
+    let window = Duration::from_millis(300);
+    let mut feed = kraken_feed(&[(1, "BTC/USD"), (2, "ETH/USD")], window);
+
+    feed.dropped(&anyhow::anyhow!("refused"), Duration::from_secs(1));
+    feed.delivered(1);
+    tokio::time::advance(window).await;
+    assert!(feed.check_silent());
+    feed.delivered(2);
+    feed.clock_ahead(1, 60_000);
+    feed.refuse("unparseable", "{");
+    tokio::time::advance(REALERT_AFTER).await;
+    feed.clock_ahead(1, 70_000);
+    feed.refuse("unknown symbol", "[]");
+    feed.confirmed(Confirmation { fresh: Vec::new(), unlisted: vec![2] });
+    feed.confirmed(Confirmation { fresh: Vec::new(), unlisted: Vec::new() });
+
+    let lines: Vec<(String, bool)> = router.queued().iter().map(|line| (line.key(), line.severity.is_none())).collect();
+    let fired = |key: &str| (key.to_owned(), false);
+    let resolved = |key: &str| (key.to_owned(), true);
+    assert_eq!(
+        lines,
+        [
+            fired("venue_feed_down{venue=kraken}"),
+            resolved("venue_feed_down{venue=kraken}"),
+            fired("venue_symbol_silent{market=1,symbol=BTC/USD,venue=kraken}"),
+            fired("venue_symbol_silent{market=2,symbol=ETH/USD,venue=kraken}"),
+            resolved("venue_symbol_silent{market=2,symbol=ETH/USD,venue=kraken}"),
+            fired("venue_clock_ahead{market=1,venue=kraken}"),
+            fired("venue_message_refused{venue=kraken}"),
+            fired("venue_clock_ahead{market=1,venue=kraken}"),
+            fired("venue_message_refused{venue=kraken}"),
+            fired("venue_market_unlisted{market=2,symbol=ETH/USD,venue=kraken}"),
+            resolved("venue_market_unlisted{market=2,symbol=ETH/USD,venue=kraken}"),
+        ]
+    );
 }
 
 // ── Helpers ──

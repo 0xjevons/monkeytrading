@@ -344,12 +344,18 @@ impl VenueFeed {
         if self.down {
             self.down = false;
             self.last_quote.values_mut().for_each(|at| *at = now);
-            info!(venue, "venue feed recovered");
+            info!(alert_resolved = "venue_feed_down", venue, "venue feed recovered");
         }
         self.last_quote.insert(market, now);
         if self.silent.remove(&market) {
-            info!(venue, market, "venue symbol quoting again");
+            let symbol = self.symbol_of(market);
+            info!(alert_resolved = "venue_symbol_silent", venue, symbol, market, "venue symbol quoting again");
         }
+    }
+
+    /// The venue's symbol for `market`, as its alerts and their resolves carry it.
+    fn symbol_of(&self, market: MarketId) -> Option<&String> {
+        self.markets.iter().find(|(_, listed)| **listed == market).map(|(symbol, _)| symbol)
     }
 
     /// Alerts once for each symbol that has gone `timing.timeout` without a fresh quote sequenced,
@@ -389,9 +395,12 @@ impl VenueFeed {
     fn clock_ahead(&mut self, market: MarketId, lead_ms: Millis) {
         if let Some(suppressed) = self.clock_alerts.ready(Instant::now()) {
             let venue = self.conn.venue.name();
+            // The lead and the count change while the clock stays wrong, so they are not alert fields.
             warn!(
                 alert = "venue_clock_ahead",
-                venue, market, lead_ms, suppressed, "venue time ahead of the host clock"
+                venue,
+                market,
+                "venue time {lead_ms}ms ahead of the host clock ({suppressed} more since the last alert)"
             );
         }
     }
@@ -404,7 +413,11 @@ impl VenueFeed {
             return;
         };
         let excerpt: String = text.chars().take(EXCERPT_CHARS).collect();
-        warn!(alert = "venue_message_refused", venue, reason, suppressed, excerpt, "venue message refused");
+        // The reason and excerpt differ from message to message, so the venue alone is the key.
+        warn!(
+            alert = "venue_message_refused",
+            venue, "venue message refused ({suppressed} more since the last alert): {reason}: {excerpt}"
+        );
     }
 
     /// Logs a lost connection. A connection that sequenced fresh quotes is a routine drop; one that
@@ -415,7 +428,7 @@ impl VenueFeed {
             info!(venue, ?retry_in, "venue feed dropped: {error:#}");
         } else if !self.down {
             self.down = true;
-            warn!(alert = "venue_feed_down", venue, ?retry_in, "venue feed down: {error:#}");
+            warn!(alert = "venue_feed_down", venue, "venue feed down, retrying in {retry_in:?}: {error:#}");
         } else {
             debug!(venue, ?retry_in, "venue still down: {error:#}");
         }

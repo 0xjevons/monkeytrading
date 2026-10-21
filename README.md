@@ -140,6 +140,13 @@ PIN=$(curl -sk $API/v1/attestation | jq -r '.report_data[66:]' | xxd -r -p | bas
 curl -s --insecure --pinnedpubkey "sha256//$PIN" $API/v1/health
 ```
 
+The node's metrics are at `localhost:9464/metrics` in Prometheus format, and
+[`ops/grafana/engine-node.json`](ops/grafana/engine-node.json) is a Grafana dashboard for them;
+[`ops/prometheus/engine-node-rules.yml`](ops/prometheus/engine-node-rules.yml) holds alerting rules
+for a node that goes silent or cannot deliver its pages. To have Critical alerts posted to a
+webhook, add an `[alerts.critical]` section naming the environment variable that holds its URL, as
+`config/dev.toml` shows.
+
 Stopping the node with ctrl-c lets it finish what is queued and write a final checkpoint. You can
 then verify the log it wrote:
 
@@ -170,10 +177,11 @@ The workspace has two crates. [`crates/core`](crates/core) (`engine-core`) is th
 state machine: it performs no input or output, and uses neither clocks, randomness, nor
 floating-point arithmetic. [`crates/node`](crates/node) (`engine-node`, binary `engine`) runs it,
 sequencing commands, writing and streaming the log, signing checkpoints, serving the API, and
-connecting to custody and price feeds. Node configuration lives in [`config`](config), and each
-crate's README describes its files. [`contracts`](contracts) is a Foundry project holding the
-custody vault, and [`scripts/dev-vault-deposits.sh`](scripts/dev-vault-deposits.sh) runs a node
-against it on a local Anvil chain.
+connecting to custody and price feeds. Node configuration lives in [`config`](config), operator
+assets such as the Grafana dashboard in [`ops`](ops), and each crate's README describes its files.
+[`contracts`](contracts) is a Foundry project holding the custody vault, and
+[`scripts/dev-vault-deposits.sh`](scripts/dev-vault-deposits.sh) runs a node against it on a local
+Anvil chain.
 
 ## Contributing
 

@@ -17,6 +17,9 @@ pub(super) enum Polled {
     Waiting,
 }
 
+/// What a refused stamp is logged under: trusted time alerts it, so it raises no alert of its own.
+const REFUSED: &str = "custody_stamp_refused";
+
 /// An uninterrupted run of stalled polls.
 struct StallEpisode {
     /// The alerts raised so far, so each kind of stall alerts once.
@@ -78,18 +81,31 @@ impl Stall {
             Stall::Rpc(_) => "custody_rpc_failed",
             Stall::Unsettled(_) => "custody_chain_unsettled",
             Stall::Inconsistent(_) => "custody_chain_inconsistent",
-            Stall::Refused(_) => "custody_stamp_refused",
+            Stall::Refused(_) => REFUSED,
         }
     }
 
     /// Raises the alert: a Warning when a retry may clear it (a stall that lasts escalates
     /// separately), Critical when it contradicts the configuration or the cursor. A refused stamp
-    /// only logs, since trusted time alerts it.
+    /// only logs, since trusted time alerts it. The block goes in the message, so the alert's key
+    /// is its kind alone.
     pub(super) fn raise(&self, next_block: u64) {
         match self {
-            Stall::Rpc(e) | Stall::Unsettled(e) => warn!(alert = self.alert(), next_block, "deposits paused: {e:#}"),
-            Stall::Inconsistent(e) => error!(alert = self.alert(), next_block, "deposits paused: {e:#}"),
+            Stall::Rpc(e) | Stall::Unsettled(e) => {
+                warn!(alert = self.alert(), "deposits paused at block {next_block}: {e:#}")
+            }
+            Stall::Inconsistent(e) => error!(alert = self.alert(), "deposits paused at block {next_block}: {e:#}"),
             Stall::Refused(e) => info!(next_block, "deposits wait for trusted time: {e:#}"),
+        }
+    }
+}
+
+impl StallEpisode {
+    /// Resolves each alert the episode raised, now that a read has gone through.
+    fn resolve(&self) {
+        let escalated = self.escalated.then_some("custody_deposits_stalled");
+        for alert in self.raised.iter().copied().filter(|alert| *alert != REFUSED).chain(escalated) {
+            info!(alert_resolved = alert, "vault deposits are read again");
         }
     }
 }
@@ -119,6 +135,7 @@ impl<V: VaultReader> DepositWatcher<V> {
                 Ok(Polled::Read { caught_up }) => {
                     if let Some(episode) = stalled.take() {
                         info!(next_block, stalled_for = ?episode.since.elapsed(), "deposit watcher resumed");
+                        episode.resolve();
                     }
                     caught_up
                 }
@@ -142,9 +159,7 @@ impl<V: VaultReader> DepositWatcher<V> {
                         let cause = stall.error();
                         error!(
                             alert = "custody_deposits_stalled",
-                            next_block,
-                            ?stalled_for,
-                            "no vault deposit read: {cause:#}"
+                            "no vault deposit read at block {next_block} for {stalled_for:?}: {cause:#}"
                         );
                         episode.escalated = true;
                     }

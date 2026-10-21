@@ -338,7 +338,7 @@ impl Engine {
     /// - the FX market's schedule is closed at the sequenced time, or it has no valid index, or one
     ///   that cannot convert the currency
     /// - the market has no FX mark yet, so a position in it could not be valued
-    pub(crate) fn live_fx(&self, market_id: MarketId) -> Result<Option<Fixed>, Reject> {
+    pub fn live_fx(&self, market_id: MarketId) -> Result<Option<Fixed>, Reject> {
         let market = &self.markets[&market_id];
         let currency = market.spec.quote_currency;
         let Some(fx_market) = currency.fx_market() else { return Ok(None) };

@@ -19,9 +19,9 @@ use crate::sequencer::{Query, Request};
 #[derive(Debug, Default)]
 pub(super) struct Confirmation {
     /// Markets where the quote the engine holds from the venue counts as the venue quoting.
-    fresh: Vec<MarketId>,
+    pub(super) fresh: Vec<MarketId>,
     /// Markets the engine does not list.
-    unlisted: Vec<MarketId>,
+    pub(super) unlisted: Vec<MarketId>,
 }
 
 impl VenueFeed {
@@ -69,11 +69,15 @@ impl VenueFeed {
         for market in self.unlisted.difference(&unlisted).copied().collect::<Vec<_>>() {
             self.unlisted.remove(&market);
             self.last_quote.insert(market, Instant::now());
-            info!(venue, market, "venue market listed, quoting it again");
+            let symbol = self.symbol_of(market);
+            info!(
+                alert_resolved = "venue_market_unlisted",
+                venue, symbol, market, "venue market listed, quoting it again"
+            );
         }
         for market in unlisted {
             if self.unlisted.insert(market) {
-                let symbol = self.markets.iter().find(|(_, listed)| **listed == market).map(|(symbol, _)| symbol);
+                let symbol = self.symbol_of(market);
                 warn!(
                     alert = "venue_market_unlisted",
                     venue, symbol, market, "the engine does not list this market, so its quotes are held back"

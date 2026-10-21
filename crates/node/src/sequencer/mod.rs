@@ -22,6 +22,7 @@ use tracing::{debug, error, info, info_span, warn};
 
 use crate::clock::Clock;
 use crate::log::{Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
+use crate::metrics::Metrics;
 use crate::sequencer::alerts::{DeficitAlert, alert_on};
 use crate::sequencer::replay::Replay;
 use crate::tee::EnclaveKey;
@@ -96,6 +97,7 @@ pub struct Sequencer {
     /// The alert for house NAV below zero.
     deficit: DeficitAlert,
     operator: Operator,
+    metrics: Arc<Metrics>,
 }
 
 pub struct SequencerConfig<'a> {
@@ -114,6 +116,8 @@ pub struct SequencerConfig<'a> {
     pub client_auth: ClientAuth,
     /// The operator the config gives, which a log that records one must match.
     pub operator: Operator,
+    /// Where the sequencer records its metrics.
+    pub metrics: Arc<Metrics>,
 }
 
 /// A log read from disk and replayed, before anything is written to it.
@@ -181,7 +185,8 @@ impl Sequencer {
         stream: broadcast::Sender<Arc<StreamMsg>>,
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
-        let ReplayedLog { log, replayed: Replayed { engine, commands, checkpoints, unsigned, genesis, .. } } = log;
+        let ReplayedLog { log, replayed } = log;
+        let Replayed { engine, commands, checkpoints, unsigned, genesis, last_checkpoint_ts, .. } = replayed;
         // A config naming another client auth or operator, and so another chain, vault, or admin key,
         // is the wrong one for this log: refuse before anything is written or signed under it.
         if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
@@ -192,6 +197,9 @@ impl Sequencer {
         }
         genesis.ensure_closed()?;
         info!(commands, checkpoints, "recovered from log");
+        if let Some(ts) = last_checkpoint_ts {
+            cfg.metrics.last_checkpoint_seconds.set(ts as f64 / 1000.0);
+        }
         let mut sequencer = Self {
             next_seq: engine.last_seq().map_or(0, |s| s + 1),
             last_ts: engine.now(),
@@ -211,6 +219,7 @@ impl Sequencer {
             client_auth: cfg.client_auth,
             deficit: DeficitAlert::default(),
             operator: cfg.operator,
+            metrics: cfg.metrics,
         };
         {
             let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
@@ -238,14 +247,16 @@ impl Sequencer {
         let mut queries: Vec<Query> = Vec::new();
         let mut syncs = Vec::new();
         while let Some(first) = rx.recv().await {
+            let started = self.clock.instant();
+            let mut sequenced = false;
             let (mut next, mut taken) = (Some(first), 0);
             while let Some(req) = next.take() {
                 taken += 1;
                 match req {
                     Request::Submit { cmd, reply } => {
-                        if let Some(events) = self.sequence(cmd)?
-                            && let Some(reply) = reply
-                        {
+                        let events = self.sequence(cmd)?;
+                        sequenced |= events.is_some();
+                        if let (Some(events), Some(reply)) = (events, reply) {
                             replies.push((reply, events));
                         }
                     }
@@ -268,6 +279,10 @@ impl Sequencer {
             replies.drain(..).for_each(|(reply, events)| {
                 let _ = reply.send(events);
             });
+            // Only admitted commands are written: a batch of reads or refusals would dilute the latency.
+            if sequenced {
+                self.metrics.batch_seconds.observe(self.clock.instant().duration_since(started).as_secs_f64());
+            }
             queries.drain(..).for_each(|q| q(&self.engine));
         }
         if self.last_checkpoint != self.engine.last_seq() {
@@ -333,9 +348,11 @@ impl Sequencer {
         self.next_seq += 1;
         self.last_ts = ts;
         self.record(LogEntry::Command(CommandEntry { sequenced, events: Some(events.clone()) }))?;
+        self.metrics.commands.inc();
 
         for event in &events {
             alert_on(event);
+            self.metrics.record(event);
             if let Event::WithdrawalApproved { account, amount, nonce } = event {
                 self.sign_withdrawal(*account, *amount, *nonce)?;
             }
@@ -390,6 +407,7 @@ impl Sequencer {
         };
         self.record(LogEntry::Checkpoint(cp))?;
         self.last_checkpoint = Some(seq);
+        self.metrics.last_checkpoint_seconds.set(self.last_ts as f64 / 1000.0);
         Ok(())
     }
 
@@ -421,5 +439,7 @@ mod required;
 mod batch_tests;
 #[cfg(test)]
 mod margin_tests;
+#[cfg(test)]
+mod metrics_tests;
 #[cfg(test)]
 mod tests;

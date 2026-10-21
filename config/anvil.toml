@@ -111,6 +111,16 @@ name = "txryan"
 address = "time.txryan.com:5319"
 public_key = "iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA="
 
+[metrics]
+listen = "127.0.0.1:9464"
+
+[alerts]
+no_price_after = "5s"
+episode_quiet = "15m"
+# Custody other than the mock needs a Critical route: the URL comes from this environment variable.
+[alerts.critical]
+url_env = "ENGINE_ALERTS_CRITICAL_URL"
+
 [genesis]
 house_capital = "0"
 benchmarks = [

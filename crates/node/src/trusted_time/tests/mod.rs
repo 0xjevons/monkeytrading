@@ -8,6 +8,7 @@ use crate::roughtime::testing::TestServer;
 use crate::roughtime::{VERSION_1, VERSION_DRAFT};
 use crate::trusted_time::tests::logs::Logs;
 
+mod alerts;
 mod gate;
 mod logs;
 mod sampler;

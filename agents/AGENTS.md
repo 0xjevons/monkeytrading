@@ -27,10 +27,11 @@ an index: load only the rule whose hint matches the current action.
   route and account proofs, and the resumable WebSocket stream (TLS from an attested in-enclave key,
   with rate limits and connection caps), the account history index (SQLite, derived from the log),
   TEE attestation (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime
-  servers, the custody adapter (mock, or EVM vault deposits over alloy), and price feeds: live
-  crypto venue WebSockets (`feeds/`, one adapter per venue) and a mock. `tests/reference/` holds the
-  node-format reference log per protocol version, with events, written once by
-  `examples/reference_log.rs`. Its `README.md` lists every file.
+  servers, the custody adapter (mock, or EVM vault deposits over alloy), price feeds: live crypto
+  venue WebSockets (`feeds/`, one adapter per venue) and a mock, Prometheus metrics on an operator
+  listener, and alert routing to webhooks. `tests/reference/` holds the node-format reference log
+  per protocol version, with events, written once by `examples/reference_log.rs`. Its `README.md`
+  lists every file.
 - **contracts/** — Foundry project for the custody vault. `src/Vault.sol` takes USDC deposits of
   10 to 1e9 USDC for the caller's trading account (`deposit`), for a named one (`depositFor`), or
   for the house, under one deposit id sequence; `test/` holds unit, fuzz, and invariant tests, with
@@ -55,14 +56,17 @@ an index: load only the rule whose hint matches the current action.
   the launch margins and fees; a deployment's node sections complete it into a config. Every
   section rejects unknown keys.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate;
-  `check-reference-logs.sh`, which fails a branch that changes a committed reference log; and
-  `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil.
+  `check-reference-logs.sh`, which fails a branch that changes a committed reference log;
+  `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil; and `dev-metrics-alerts.sh`,
+  the metrics and alert routing dev scenario.
+- **ops/** — operator assets: `grafana/engine-node.json`, the node's Grafana dashboard, and
+  `prometheus/engine-node-rules.yml`, the alerting rules for a down node or failing alert pages.
 - **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, the reference-log
   replay and invariant tests on x86_64 and aarch64 Linux, the unchanged-reference-log check,
-  `cargo-deny`, the contracts' `forge fmt --check` / build / test, and the vault deposit dev
-  scenario, on every push to `main` and every PR. Actions are pinned by commit SHA. `ci-passed` is
-  the one CI check branch rules require: it passes only when every other job succeeded, so each
-  new job must be added to its `needs`.
+  `cargo-deny`, the contracts' `forge fmt --check` / build / test, the vault deposit dev scenario,
+  and the metrics and alert routing dev scenario, on every push to `main` and every PR. Actions are
+  pinned by commit SHA. `ci-passed` is the one CI check branch rules require: it passes only when
+  every other job succeeded, so each new job must be added to its `needs`.
 - **agents/** — this index, `rules/`, and `skills/` (incl. `skills/vendor/` pull-on-demand
   packs); root `AGENTS.md` / `CLAUDE.md` symlink to `agents/AGENTS.md`.
 - **Cargo.toml** — workspace manifest, shared dependencies, and the Cargo profiles (release keeps
@@ -99,9 +103,12 @@ Run from the repo root:
 - Supply chain: `cargo deny check` (CI runs it; install `cargo-deny` to run it locally)
 - Run a local node: `cargo run -p engine-node -- run --config config/dev.toml` (or set
   `CONFIG_PATH`); the API is served over TLS on `https://127.0.0.1:8080` with a self-signed
-  certificate (`curl -k`, or pin the attested key), its limits come from `[api]`, the log goes to
-  segment files and a manifest in `data/dev/log/` and the history index to `data/dev/history/`
-  (both gitignored), and the log level comes from `[logging].level`
+  certificate (`curl -k`, or pin the attested key), its limits come from `[api]`, metrics are on
+  `127.0.0.1:9464/metrics`, the log goes to segment files and a manifest in `data/dev/log/` and the
+  history index to `data/dev/history/` (both gitignored), and the log level comes from
+  `[logging].level`
+- Metrics and alert routing dev scenario: `./scripts/dev-metrics-alerts.sh` (needs `python3`,
+  `curl`, and `jq`)
 - Verify a published log: `cargo run -p engine-node -- replay --log <path>`, where `<path>` is a
   log directory, a downloaded archive, or a single log file
 - Contracts, from `contracts/`: `forge soldeer install` (once, fetches the pinned dependencies),
