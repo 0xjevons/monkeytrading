@@ -1,6 +1,7 @@
 //! Accounting invariants under generated sessions. Each case sequences random client, feed,
 //! custody, and operator commands, with values inside and outside the engine's input bounds, under
-//! `V2`, the rules every log starts under, and again under `V6`. It checks after every command that
+//! `V2`, the rules every log starts under, and again under `V6`, under `V7` with markets quoted in
+//! other currencies, and under `V10`. It checks after every command that
 //! it did not panic, that cash is conserved, and that each market's aggregates match its accounts'
 //! positions. Under each version the same sessions must reach every path that moves cash and the
 //! refusal of out-of-range amounts, order numbers, and quotes, and under `V6` a close-out that no
@@ -84,14 +85,15 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
         "admin rejected",
     ];
     let reached = reached.into_inner();
-    let missed: Vec<(ProtocolVersion, &str)> = [ProtocolVersion::V2, ProtocolVersion::V6, ProtocolVersion::V7]
-        .into_iter()
-        .flat_map(|version| expected.iter().map(move |path| (version, *path)))
-        .chain([(ProtocolVersion::V6, "close-out without a price")])
-        // Only `V7` lists markets quoted in another currency.
-        .chain([(ProtocolVersion::V7, "fill converted to USD"), (ProtocolVersion::V7, "no FX price")])
-        .filter(|(version, path)| !reached.get(version).is_some_and(|paths| paths.contains(path)))
-        .collect();
+    let missed: Vec<(ProtocolVersion, &str)> =
+        [ProtocolVersion::V2, ProtocolVersion::V6, ProtocolVersion::V7, ProtocolVersion::V10]
+            .into_iter()
+            .flat_map(|version| expected.iter().map(move |path| (version, *path)))
+            .chain([(ProtocolVersion::V6, "close-out without a price")])
+            // Only `V7` lists markets quoted in another currency.
+            .chain([(ProtocolVersion::V7, "fill converted to USD"), (ProtocolVersion::V7, "no FX price")])
+            .filter(|(version, path)| !reached.get(version).is_some_and(|paths| paths.contains(path)))
+            .collect();
     assert!(missed.is_empty(), "generated sessions never reach {missed:?}");
 }
 

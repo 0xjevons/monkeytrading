@@ -307,12 +307,13 @@ impl Engine {
             let size_cost = currency.from_usd(size_cost_usd, fx, Rounding::Up);
             mid.mul_bps_rounded(stress.min_spread_bps + toxicity_bps, charge) + size_cost.div_rounded(qty, charge)
         };
-        // The truncated spread decides whether the trade can fill. From `V10` the spread rounds up but
-        // stops a unit short of the price, so rounding changes what a fill pays, never whether it fills.
+        // The truncated spread decides whether a spread reaches the price. From `V10` the spread rounds
+        // up, and a sell's stops a unit short of the price, so rounding never makes it reach the price.
         if spread(Rounding::TowardZero) >= mid {
             return Err(Reject::InvalidOrder { reason: "spread at this size reaches the price".into() });
         }
-        let adjust = spread(self.charge_rounding()).min(mid - Fixed::from_raw(1));
+        let rounded = spread(self.charge_rounding());
+        let adjust = if exec.side == Side::Sell { rounded.min(mid - Fixed::from_raw(1)) } else { rounded };
         let price = mid + adjust.mul_int(exec.side.sign());
 
         match exec.guard {

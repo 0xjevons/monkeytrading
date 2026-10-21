@@ -48,8 +48,8 @@ this crate and reproduce the signed state roots exactly.
   reduce or close a position fill in every reduce-only mode, and from `V8` parameters whose stress
   and toxicity spreads would reach the price are refused
 - From protocol `V10`, spreads and margin round in the house's favour: every spread charge rounds up
-  for the trader paying it, buying or selling, and every margin requirement rounds up, from a
-  position's notional to the close-out level
+  for the trader paying it, buying or selling, though a sell's stops a unit short of the price, and
+  every margin requirement rounds up, from a position's notional to the close-out level
 - Products and quotients that never overflow while the result fits, whatever the position size or
   price ratio
 
@@ -158,7 +158,7 @@ Two suites guard replay and accounting:
   aarch64 Linux, and `scripts/check-reference-logs.sh` fails a branch that changes, renames, or
   deletes a committed log.
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
-  under `V2` and again under `V5`. Each mixes client, feed, custody, and operator commands, with
+  under `V2`, `V6`, `V7` with markets quoted in other currencies, and `V10`. Each mixes client, feed, custody, and operator commands, with
   values inside and outside the input bounds, and checks after every command that nothing panicked,
   cash is conserved, and every market's aggregates match its accounts' positions. Raise `CASES` or
   change `SEED` in `tests/invariants/main.rs` to search further. The same suite generates adds,

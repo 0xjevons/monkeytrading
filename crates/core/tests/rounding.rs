@@ -260,12 +260,15 @@ fn a_liquidation_at_one_unit_of_precision_under_stress_closes_in_v9_and_v10() {
 fn rounding_a_spread_up_refuses_no_fill_the_truncated_spread_allows() {
     // Each row is a stress spread, a spread band, a mid, a side, and the fill price under `V9` and
     // `V10`, or `None` where the spread reaches the price. A 99.96% spread on a mid of two units of
-    // precision truncates to one unit and rounds up to the mid itself, so from `V10` it stops a unit
-    // short; on a mid of 1.000000001 it rounds up a unit as usual. A 100% band reaches the price
-    // however it rounds.
+    // precision truncates to one unit and rounds up to the mid itself: a buyer pays it, and a seller
+    // stops a unit short of the price. A 5bps spread on a mid of one unit truncates to nothing and
+    // rounds up to the mid in the same way. On a mid of 1.000000001 the spread rounds up a unit as
+    // usual, and a 100% band reaches the price however it rounds.
     let rows = [
         (9_996, 0, "0.000000002", Side::Sell, Some("0.000000001"), Some("0.000000001")),
-        (9_996, 0, "0.000000002", Side::Buy, Some("0.000000003"), Some("0.000000003")),
+        (9_996, 0, "0.000000002", Side::Buy, Some("0.000000003"), Some("0.000000004")),
+        (5, 0, "0.000000001", Side::Sell, Some("0.000000001"), Some("0.000000001")),
+        (5, 0, "0.000000001", Side::Buy, Some("0.000000001"), Some("0.000000002")),
         (9_996, 0, "1.000000001", Side::Sell, Some("0.000400001"), Some("0.0004")),
         (0, 10_000, "1", Side::Buy, None, None),
     ];

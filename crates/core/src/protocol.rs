@@ -62,9 +62,9 @@ pub enum ProtocolVersion {
     /// commands changed it, and which proves an account's leaf against a posted root.
     V9,
     /// Spreads and margin round in the house's favour: every spread charge rounds up for the trader
-    /// paying it, from the size spread's notional and band charges to its share per unit, stopping a
-    /// unit short of the price so a trade the truncated spread lets fill still fills; and every
-    /// margin requirement rounds up, from the position's notional to the close-out level.
+    /// paying it, from the size spread's notional and band charges to its share per unit, though a
+    /// sell's stops a unit short of the price, so rounding never makes a spread reach the price; and
+    /// every margin requirement rounds up, from the position's notional to the close-out level.
     V10,
 }
 

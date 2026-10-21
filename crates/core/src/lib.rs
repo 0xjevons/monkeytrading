@@ -25,7 +25,8 @@
 //! - From `V9`, the state root is a sparse Merkle tree over accounts, positions, markets, and the
 //!   rest of the state, so a checkpoint rehashes only what changed, and an account's balance and
 //!   positions can be proven against a posted root.
-//! - From `V10`, every spread charge and margin requirement rounds up against the trader.
+//! - From `V10`, every spread charge and margin requirement rounds up against the trader, though a
+//!   sell's spread stops a unit short of the price.
 
 pub mod account;
 mod admin;
