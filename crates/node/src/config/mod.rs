@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -76,6 +77,7 @@ pub enum Venue {
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub node: NodeSection,
+    pub api: ApiSection,
     pub logging: LoggingSection,
     pub tee: TeeSection,
     pub operator: OperatorSection,
@@ -104,6 +106,47 @@ pub struct NodeSection {
     #[serde(with = "humantime_serde")]
     pub tick: Duration,
     pub auth: AuthMode,
+}
+
+/// Limits on the public API. A client is its socket peer IP, with an IPv6 client counted by its
+/// /64; forwarding headers are ignored because the host could forge them.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiSection {
+    /// Open connections, in total and from one client; one over either is closed unread. Keep the
+    /// total below the process's open-file limit, or accepts fail before the cap is reached.
+    pub max_connections: NonZeroUsize,
+    pub max_connections_per_ip: NonZeroUsize,
+    /// A connection that has not finished its TLS handshake by then is closed.
+    #[serde(with = "humantime_serde")]
+    pub handshake_timeout: Duration,
+    /// A client gets this long to send a request's headers, and again its body; a connection idle
+    /// this long between requests is closed.
+    #[serde(with = "humantime_serde")]
+    pub read_timeout: Duration,
+    /// Largest request body, which gets 413 when larger, and largest message a stream subscriber
+    /// may send, which ends its stream when larger.
+    pub max_body_bytes: NonZeroUsize,
+    /// Requests from one client, and requests that act for one account; excess requests get 429.
+    pub per_ip: RateLimit,
+    pub per_account: RateLimit,
+    /// New connections from one client; one over it is closed before its TLS handshake. Set it
+    /// above `per_ip`, so a client that opens a connection per request gets 429 first.
+    pub per_ip_connections: RateLimit,
+    /// Open WebSocket stream subscriptions; one more gets 503.
+    pub max_subscribers: NonZeroUsize,
+    /// A client that takes longer than this to take a response, or a stream subscriber one
+    /// message, is disconnected.
+    #[serde(with = "humantime_serde")]
+    pub send_timeout: Duration,
+}
+
+/// A token bucket: `burst` requests at once, refilled at `per_second`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimit {
+    pub per_second: NonZeroU32,
+    pub burst: NonZeroU32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,8 +322,8 @@ impl NodeConfig {
     /// - the file cannot be read, or is not valid TOML for this schema (unknown keys included)
     /// - `logging.level` is not a valid filter directive
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, `feeds.interval`,
-    ///   `time.max_drift`, or `time.interval` is zero, or `time.interval` plus twice
-    ///   `time.max_drift` is not under 60s
+    ///   `time.max_drift`, `time.interval`, or an `api` timeout is zero, or `time.interval` plus
+    ///   twice `time.max_drift` is not under 60s
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
     /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
     ///   no longer than `feeds.interval`
@@ -314,8 +357,8 @@ impl NodeConfig {
     /// Error cases:
     /// - `logging.level` is not a valid filter directive
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, `feeds.interval`,
-    ///   `time.max_drift`, or `time.interval` is zero, or `time.interval` plus twice
-    ///   `time.max_drift` is not under 60s
+    ///   `time.max_drift`, `time.interval`, or an `api` timeout is zero, or `time.interval` plus
+    ///   twice `time.max_drift` is not under 60s
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
     /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
     ///   no longer than `feeds.interval`
@@ -346,6 +389,9 @@ impl NodeConfig {
                 bail!("feeds.provider = \"venues\" needs [feeds.venues]")
             }
             None => {}
+        }
+        if [self.api.handshake_timeout, self.api.read_timeout, self.api.send_timeout].iter().any(Duration::is_zero) {
+            anyhow::bail!("api.handshake_timeout, api.read_timeout, and api.send_timeout must be non-zero");
         }
         // Unsigned requests let anyone act for any account, so they never run beside a real
         // enclave or real funds.

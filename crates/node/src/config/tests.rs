@@ -8,6 +8,7 @@ fn the_committed_dev_config_loads() {
     assert_eq!(cfg.node.tick, Duration::from_millis(250));
     assert!(!cfg.genesis.markets.is_empty());
     assert!(!cfg.operator.rotation_enabled);
+    assert_eq!((cfg.api.per_ip.per_second.get(), cfg.api.per_ip.burst.get()), (50, 100));
 }
 
 #[test]
@@ -207,5 +208,32 @@ fn venue_settings_that_would_fail_silently_are_refused() {
         edit(cfg.feeds.venues.as_mut().unwrap());
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(err.contains(expected), "expected {expected:?}, got {err}");
+    }
+}
+
+#[test]
+fn a_zero_api_timeout_is_refused() {
+    let dev = std::fs::read_to_string(DEV).unwrap();
+    for (from, to) in [
+        ("send_timeout = \"30s\"", "send_timeout = \"0s\""),
+        ("read_timeout = \"30s\"", "read_timeout = \"0s\""),
+        ("handshake_timeout = \"10s\"", "handshake_timeout = \"0s\""),
+    ] {
+        let cfg: NodeConfig = toml::from_str(&dev.replace(from, to)).unwrap();
+        assert!(cfg.validate().is_err(), "{to}");
+    }
+}
+
+#[test]
+fn a_zero_api_rate_or_cap_fails_the_boot() {
+    let dev = std::fs::read_to_string(DEV).unwrap();
+    for (from, to) in [
+        ("per_ip = { per_second = 50,", "per_ip = { per_second = 0,"),
+        ("per_second = 10, burst = 20 }", "per_second = 10, burst = 0 }"),
+        ("max_subscribers = 256", "max_subscribers = 0"),
+    ] {
+        // Each edit touches one value, so nothing else can be what fails the parse.
+        assert_eq!(dev.matches(from).count(), 1, "{from}");
+        assert!(toml::from_str::<NodeConfig>(&dev.replace(from, to)).is_err(), "{to}");
     }
 }

@@ -24,6 +24,9 @@ feeds. The same binary replays a published log and verifies its checkpoints.
   from disk, then goes live, getting each message once; one that falls behind resumes from disk
 - Segmented log: completed segments and a manifest of their seq ranges and SHA-256 hashes are a
   public archive served over HTTP
+- TLS terminated in the enclave, with a key generated there and its hash in the attestation
+- Rate limits on requests per client IP and per account and on new connections per client IP,
+  caps on request size, connections, and stream subscribers, and read timeouts, all set in `[api]`
 - `engine replay` to verify a published log, or a downloaded archive, against the open-source engine
 - Supervised tasks: any task stopping stops the node, and SIGTERM drains to a final checkpoint
 - Live crypto prices from Coinbase, Kraken, and Bitstamp over WebSocket: one supervised task per
@@ -46,11 +49,14 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/log/checked.rs` — reads a completed segment in chunks checked against its listing
 - `src/log/tests.rs` — log format, segment, and reader tests
 - `src/api/mod.rs` — REST routes, request signature checks, and the request span
-- `src/api/stream.rs` — the WebSocket stream: backfill from disk, then live
+- `src/api/stream/mod.rs` — the WebSocket stream: backfill from disk, then live, under the
+  subscriber cap, reading what the subscriber sends
+- `src/api/stream/tests.rs` — feed, backfill, and subscriber tests
 - `src/api/archive.rs` — the archive routes: the manifest and completed segments
 - `src/api/auth_tests.rs` — signed-request API tests: signatures, nonces, expiries, refused
   accounts, and racing requests
-- `src/api/tests.rs` — API tests, including the resumable stream and archive dev scenario
+- `src/api/tests.rs` — API tests, including the resumable stream and archive dev scenario, and
+  `Retry-After`
 - `src/test_support.rs` — the shared test harness
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
 - `src/trusted_time/mod.rs` — the trusted time task: queries the Roughtime servers, backs off
@@ -64,6 +70,11 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/roughtime/testing.rs` — a Roughtime server for tests that signs with its own keys
 - `src/roughtime/tests.rs` — client tests over recorded and locally signed replies
 - `src/roughtime/fixtures/replies.json` — replies recorded from the servers in `config/dev.toml`
+- `src/tls/mod.rs` — the TLS key and certificate, and the server loop that applies the connection
+  caps and timeouts
+- `src/tls/tests/mod.rs` — the API end to end over TLS: key pinning, limits, caps, and the harness
+- `src/tls/tests/stream.rs` — the stream end to end over TLS: the subscriber and message caps
+- `src/limits.rs` — request rate limits, connection caps, and the stream subscriber cap
 - `src/config/mod.rs` — the node config schema and validation
 - `src/config/tests.rs` — config loading and validation tests
 - `src/custody.rs` — the custody adapter (mock only so far)
@@ -100,8 +111,14 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 ## Usage
 
 ```bash
-# Run a local node with mock TEE, custody, and feeds (API on 127.0.0.1:8080)
+# Run a local node with mock TEE, custody, and feeds (API on https://127.0.0.1:8080)
 cargo run -p engine-node -- run --config config/dev.toml
+
+# Call it pinned to the attested TLS key: report data bytes 32..64 are the SHA-256 of the
+# certificate's DER SubjectPublicKeyInfo
+API=https://127.0.0.1:8080
+PIN=$(curl -sk $API/v1/attestation | jq -r '.report_data[66:]' | xxd -r -p | base64)
+curl -s --insecure --pinnedpubkey "sha256//$PIN" $API/v1/health
 
 # Price BTC-USD and ETH-USD from live venues instead, leaving the other markets unpriced: set
 # feeds.provider = "venues" in a copy
@@ -110,16 +127,21 @@ cargo run -p engine-node -- run --config <copy of config/dev.toml>
 # Verify a node's log directory, a downloaded archive, or a single log file
 cargo run -p engine-node -- replay --log data/dev/log
 
-# Download the archive: the manifest, then each segment it lists
-curl --create-dirs -o archive/manifest.jsonl http://127.0.0.1:8080/v1/archive/manifest.jsonl
+# Download the archive: the manifest, then each segment it lists (`--retry` waits out a 429)
+curl -kf --retry 5 --create-dirs -o archive/manifest.jsonl https://127.0.0.1:8080/v1/archive/manifest.jsonl
 jq -r '.file' archive/manifest.jsonl |
-  xargs -I{} curl -o archive/{} http://127.0.0.1:8080/v1/archive/{}
+  xargs -I{} curl -kf --retry 5 -o archive/{} https://127.0.0.1:8080/v1/archive/{}
 ```
 
 Endpoints: `GET /v1/health`, `GET /v1/attestation`, `GET /v1/markets`, `GET /v1/house`,
 `GET /v1/accounts/{address}`, `GET /v1/accounts/{address}/nonce`, `POST /v1/orders`,
 `POST /v1/orders/cancel`, `POST /v1/withdrawals`, `POST /v1/dev/deposit` (mock custody only),
 `GET /v1/stream` (WebSocket), and `GET /v1/archive/{file}` (`manifest.jsonl` or a segment it lists).
+A client over its rate gets 429 with `Retry-After`, a body over `api.max_body_bytes` gets 413, a
+body not received within `api.read_timeout` gets 408, and a subscriber over `api.max_subscribers`
+gets 503. A connection over a connection cap or over its client's connection rate is closed before
+its TLS handshake. A client is its socket peer IP, with IPv6 counted by its /64; forwarding headers
+are ignored.
 
 `/v1/stream` is live from now by default. `?from=<seq>` starts at the first message of `seq`
 (`from=0` is the whole log), and `?after=<seq>:<index>` resumes after the `offset` of the last

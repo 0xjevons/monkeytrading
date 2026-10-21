@@ -1,20 +1,26 @@
 //! API tests for signed client requests: signatures, nonces, expiries, and the account trust path.
 
 use super::*;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
+use axum::extract::connect_info::MockConnectInfo;
 use axum::http::Request as HttpRequest;
 use engine_core::auth::MAX_EXPIRY_AHEAD_MS;
 use engine_core::command::OrderKind;
 use engine_core::eip712;
 use engine_core::price::SourceQuote;
 use engine_core::types::{Millis, Side};
+use governor::Quota;
+use governor::clock::DefaultClock;
 use k256::ecdsa::SigningKey;
 use serde_json::Value;
 use tower::ServiceExt;
 
 use crate::clock::test_clock::TestClock;
+use crate::config::RateLimit;
 use crate::log::{LogEntry, SegmentedLog};
 use crate::sequencer::{Sequencer, SequencerConfig, SignedWithdrawal, replay};
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
@@ -54,6 +60,40 @@ async fn a_signed_order_fills_and_a_reused_or_ahead_nonce_stays_out_of_the_log()
         .filter(|e| matches!(e, LogEntry::Command(c) if matches!(c.sequenced.cmd, Command::PlaceOrder(_))));
     assert_eq!(orders.count(), 1);
     assert_eq!(replay(&entries).unwrap().engine.client_auth(), Some(&signed()));
+}
+
+#[tokio::test]
+async fn only_a_request_the_node_would_sequence_spends_the_accounts_rate() {
+    let node = Node::start("account-rate", signed()).await;
+    let client = SigningKey::from_slice(&[1; 32]).unwrap();
+    let forger = SigningKey::from_slice(&[2; 32]).unwrap();
+    node.fund(&client).await;
+    let burst = dev_config().api.per_account.burst.get();
+    let first = signed_order(&client, 0, "0.001");
+    assert_eq!(node.post("/v1/orders", first.clone()).await.0, StatusCode::OK);
+
+    // Anyone can send these: each names the account, and none would be sequenced. If one kind spent
+    // the account's rate, the burst below would run out early.
+    let mut forged = signed_order(&forger, 1, "0.001");
+    forged["account"] = serde_json::to_value(account_of(&client)).unwrap();
+    let refused = [
+        ("signed by another key", forged, StatusCode::UNAUTHORIZED),
+        ("a replay of a used nonce", first, StatusCode::CONFLICT),
+        ("a nonce ahead", signed_order(&client, 9, "0.001"), StatusCode::CONFLICT),
+        ("an expired request", signed_order_until(&client, 1, "0.001", NOW - 1), StatusCode::BAD_REQUEST),
+    ];
+    for (what, request, status) in refused {
+        for _ in 0..6 {
+            assert_eq!(node.post("/v1/orders", request.clone()).await.0, status, "{what}");
+        }
+    }
+
+    // The account's own sequenced requests spend it: the one above and the rest of the burst.
+    for nonce in 1..u64::from(burst) {
+        assert_eq!(node.post("/v1/orders", signed_order(&client, nonce, "0.001")).await.0, StatusCode::OK);
+    }
+    let over = signed_order(&client, u64::from(burst), "0.001");
+    assert_eq!(node.post("/v1/orders", over).await.0, StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]
@@ -126,7 +166,7 @@ async fn a_request_expired_by_sequenced_time_stays_out_of_the_log_though_the_clo
     let node = Node::start_with_clock("lagging-clock", signed(), || 0).await;
     let client = SigningKey::from_slice(&[1; 32]).unwrap();
     node.fund(&client).await;
-    let last_sequenced = node.state.query(|e| e.now()).await.ok().expect("the sequencer is running");
+    let last_sequenced = node.state.query(|e| e.now()).await.expect("the sequencer is running");
     let logged = node.entries().len();
     let (status, body) = node.post("/v1/orders", signed_order_until(&client, 0, "0.1", last_sequenced - 1)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -147,11 +187,11 @@ async fn two_copies_of_a_withdrawal_that_both_pass_the_api_are_paid_once() {
         eip712::sign(&client, &withdrawal_hash(&eip712::domain(CHAIN_ID, VAULT), account, amount, 0, expires_at));
     let auth = RequestAuth { nonce: 0, expires_at, signature };
     // Both copies pass the API's checks before either is sequenced, as two racing requests can.
-    let first = node.state.authorise(account, Some(auth.clone()), hash).await.ok().expect("passes the API");
-    let second = node.state.authorise(account, Some(auth), hash).await.ok().expect("passes the API");
+    let first = node.state.authorise(account, Some(auth.clone()), hash).await.expect("passes the API");
+    let second = node.state.authorise(account, Some(auth), hash).await.expect("passes the API");
     let withdraw = |auth| Command::Withdraw { account, amount, auth };
-    let approved = node.state.submit(withdraw(first)).await.ok().expect("the sequencer is running");
-    let refused = node.state.submit(withdraw(second)).await.ok().expect("the sequencer is running");
+    let approved = node.state.submit(withdraw(first)).await.expect("the sequencer is running");
+    let refused = node.state.submit(withdraw(second)).await.expect("the sequencer is running");
     assert!(matches!(&approved[..], [Event::WithdrawalApproved { .. }]), "{approved:?}");
     let expected = Reject::InvalidNonce { expected: 1 };
     assert!(matches!(&refused[..], [Event::WithdrawalRejected { reason, .. }] if *reason == expected), "{refused:?}");
@@ -268,7 +308,9 @@ impl Node {
         seq.trust(sample_around(stamps.as_ref())).unwrap();
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(seq.run(rx));
-        let attestation = Arc::new(attest_key(&MockAttestor, &key).unwrap());
+        let attestation = Arc::new(attest_key(&MockAttestor, &key, &[0; 32]).unwrap());
+        // The dev limits, on buckets that refill once an hour, so no test depends on its speed.
+        let hourly = |rate: RateLimit| Quota::with_period(Duration::from_secs(3600)).unwrap().allow_burst(rate.burst);
         let state = ApiState {
             tx,
             stream,
@@ -279,8 +321,10 @@ impl Node {
             log_dir: dir.clone(),
             manifest,
             backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
+            limits: Arc::new(ApiLimits::with_quota(&dev_config().api, hourly, DefaultClock::default())),
         };
-        Node { app: router(state.clone()), state, dir, withdrawals }
+        let app = router(state.clone()).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))));
+        Node { app, state, dir, withdrawals }
     }
 
     /// Every entry of the node's log, as flushed so far.
@@ -295,7 +339,7 @@ impl Node {
         let quotes = ["a", "b"]
             .map(|venue| SourceQuote { source: venue.into(), mid: "100000".parse().unwrap(), ts: NOW })
             .to_vec();
-        self.state.submit(Command::Prices { market: 1, quotes }).await.ok().expect("the sequencer is running");
+        self.state.submit(Command::Prices { market: 1, quotes }).await.expect("the sequencer is running");
     }
 
     /// The status and JSON body of a POST of `body` to `path`.

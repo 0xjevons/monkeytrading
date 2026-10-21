@@ -3,9 +3,10 @@
 //! At boot the enclave generates a secp256k1 key that never leaves it. It puts the key's EVM
 //! address in the attestation report data, so a hardware quote proves "this address belongs to an
 //! enclave running this measurement". The vault contract and anyone reading the log trust
-//! signatures from that address and nothing else. Every signed digest carries a domain tag, the
-//! chain id and vault it is meant for, and a sequence number or nonce, so no signature can be
-//! replayed in another context.
+//! signatures from that address and nothing else. The report data also carries the hash of the
+//! API's TLS public key (see `tls`), so the same quote proves which key terminates client
+//! connections. Every signed digest carries a domain tag, the chain id and vault it is meant for,
+//! and a sequence number or nonce, so no signature can be replayed in another context.
 
 use std::path::PathBuf;
 
@@ -35,6 +36,8 @@ pub struct EnclaveKey {
 pub struct Attestation {
     pub provider: String,
     pub enclave_address: String,
+    /// SHA-256 of the API certificate's DER SubjectPublicKeyInfo, hex.
+    pub tls_public_key_sha256: String,
     pub report_data: String,
     /// Hardware quote (TDX quote or SEV-SNP report), hex.
     pub quote: String,
@@ -138,16 +141,23 @@ impl EnclaveKey {
     }
 }
 
-/// Attests the enclave key: its address in the first 20 bytes of the report data, the rest zero.
+/// Attests the enclave key and the API's TLS key. The report data is the enclave address in bytes
+/// 0..20, zeros in 20..32, and the TLS public key hash in 32..64.
 /// Error cases:
 /// - the attestor cannot produce a quote
-pub fn attest_key(attestor: &dyn Attestor, key: &EnclaveKey) -> anyhow::Result<Attestation> {
+pub fn attest_key(
+    attestor: &dyn Attestor,
+    key: &EnclaveKey,
+    tls_public_key_sha256: &[u8; 32],
+) -> anyhow::Result<Attestation> {
     let mut report_data = [0u8; 64];
     report_data[..20].copy_from_slice(&key.address());
+    report_data[32..].copy_from_slice(tls_public_key_sha256);
     let (provider, quote) = attestor.attest(report_data)?;
     Ok(Attestation {
         provider,
         enclave_address: key.address_hex(),
+        tls_public_key_sha256: format!("0x{}", hex::encode(tls_public_key_sha256)),
         report_data: format!("0x{}", hex::encode(report_data)),
         quote: format!("0x{}", hex::encode(quote)),
     })
@@ -195,10 +205,18 @@ mod tests {
     }
 
     #[test]
-    fn mock_attestation_binds_the_enclave_address() {
+    fn mock_attestation_binds_the_enclave_address_and_tls_key() {
         let key = EnclaveKey::generate();
-        let att = attest_key(&MockAttestor, &key).unwrap();
+        let tls_key_hash = [0xab; 32];
+        let att = attest_key(&MockAttestor, &key, &tls_key_hash).unwrap();
         assert_eq!(att.provider, "mock");
-        assert!(att.report_data.starts_with(&key.address_hex()));
+        assert_eq!(att.tls_public_key_sha256, format!("0x{}", hex::encode(tls_key_hash)));
+
+        let report_data = hex::decode(att.report_data.trim_start_matches("0x")).unwrap();
+        assert_eq!(report_data[..20], key.address());
+        assert_eq!(report_data[20..32], [0u8; 12]);
+        assert_eq!(report_data[32..], tls_key_hash);
+        // The mock quote echoes the report data it was asked to bind.
+        assert!(att.quote.ends_with(&hex::encode(&report_data)));
     }
 }

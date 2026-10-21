@@ -1,0 +1,258 @@
+//! `/v1/stream`: the public log over a WebSocket. A subscriber that names an offset gets the log
+//! from there, read from disk, then live messages, each once and in offset order. A subscriber
+//! that falls behind the live channel reads from disk again from its last offset instead of being
+//! dropped. A subscriber that stops reading is closed, and can resume. Subscribers are capped by
+//! `api.max_subscribers`, and what a subscriber sends is read and dropped, so its close is
+//! answered.
+
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, ensure};
+use axum::Error;
+use axum::extract::ws::{Message, WebSocketUpgrade};
+use axum::extract::{Query, State};
+use axum::response::Response;
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use serde::Deserialize;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
+use tokio::task::coop::consume_budget;
+use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::time::timeout;
+use tracing::field::display;
+use tracing::{Instrument, Span, error, info};
+
+use crate::api::{ApiError, ApiState};
+use crate::log::{LogReader, Manifest, Offset};
+use crate::sequencer::StreamMsg;
+
+/// Most messages read from disk per blocking call.
+const BACKFILL_BATCH: usize = 256;
+/// Subscribers reading a batch from disk at once, each holding one checked chunk of a segment while
+/// it reads. A subscriber keeps up to `BACKFILL_BATCH` decoded messages after it reads them.
+pub const MAX_BACKFILLS: usize = 16;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamParams {
+    /// Start right after this offset: the last one the subscriber received.
+    after: Option<Offset>,
+    /// Start at the first message of this seq; `0` is the whole log.
+    from: Option<u64>,
+}
+
+/// One subscriber's messages, in offset order, each once.
+struct Feed {
+    live: broadcast::Receiver<Arc<StreamMsg>>,
+    log_dir: PathBuf,
+    manifest: watch::Receiver<Manifest>,
+    /// Shared by every subscriber; one is held while reading a batch from disk.
+    backfills: Arc<Semaphore>,
+    /// The lowest offset not yet yielded; `None` until a live-only feed yields its first message.
+    next: Option<Offset>,
+    /// Reading from disk until it reaches what has been written.
+    catching_up: bool,
+    reader: Option<LogReader>,
+    /// Read from disk, not yet yielded.
+    backlog: VecDeque<Arc<StreamMsg>>,
+}
+
+impl Feed {
+    /// A feed that starts at `start`, or with the next live message if `None`. `live` must be
+    /// subscribed before the feed first reads the disk, so that every message is either on disk by
+    /// then or still to come live.
+    fn new(
+        live: broadcast::Receiver<Arc<StreamMsg>>,
+        log_dir: PathBuf,
+        manifest: watch::Receiver<Manifest>,
+        backfills: Arc<Semaphore>,
+        start: Option<Offset>,
+    ) -> Self {
+        let (catching_up, reader, backlog) = (start.is_some(), None, VecDeque::new());
+        Self { live, log_dir, manifest, backfills, next: start, catching_up, reader, backlog }
+    }
+
+    /// The next message, or `None` once the sequencer has stopped.
+    /// Error cases:
+    /// - the log on disk cannot be read (see `LogReader`)
+    /// - the next live message does not follow the last one yielded, so history is missing from
+    ///   the log on disk
+    async fn next(&mut self) -> anyhow::Result<Option<Arc<StreamMsg>>> {
+        loop {
+            if let Some(msg) = self.backlog.pop_front() {
+                self.next = Some(msg.offset.next());
+                return Ok(Some(msg));
+            }
+            if self.catching_up {
+                // Catching up starts only from a start offset, or after a lag once one is set.
+                let from = self.next.expect("a feed catches up from a known offset");
+                let permit: OwnedSemaphorePermit =
+                    self.backfills.clone().acquire_owned().await.expect("the backfill semaphore is never closed");
+                let (dir, manifest, reader) = (self.log_dir.clone(), self.manifest.clone(), self.reader.take());
+                let (reader, batch) = read_holding(permit, move || read_batch(&dir, manifest, from, reader))
+                    .await
+                    .context("log reader task")??;
+                self.catching_up = reader.is_some();
+                self.reader = reader;
+                self.backlog.extend(batch);
+                continue;
+            }
+            match self.live.recv().await {
+                // Before the next offset to yield: already yielded, or before the start.
+                Ok(msg) if self.next.is_some_and(|next| msg.offset < next) => {}
+                Ok(msg) => {
+                    if let Some(next) = self.next {
+                        ensure!(
+                            // The next seq follows only once this one has yielded its command.
+                            msg.offset == next || (next.index > 0 && msg.offset == Offset::start_of(next.seq + 1)),
+                            "messages from {next} up to {} are missing from the log on disk",
+                            msg.offset
+                        );
+                    }
+                    self.next = Some(msg.offset.next());
+                    return Ok(Some(msg));
+                }
+                // What the channel dropped is on disk. A live-only feed that has yielded nothing yet
+                // has no gap: it starts at whatever the channel still holds.
+                Err(RecvError::Lagged(_)) => self.catching_up = self.next.is_some(),
+                Err(RecvError::Closed) => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Upgrades to a WebSocket that streams the public log: live from now by default, or from `after`
+/// or `from` through what is on disk and then live. The subscriber holds one of the capped places
+/// until it disconnects, and may send messages up to `api.max_body_bytes`.
+/// Error cases:
+/// - both `after` and `from` are given
+/// - every subscriber place is taken
+pub async fn stream(
+    State(s): State<ApiState>,
+    Query(params): Query<StreamParams>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let start = match (params.after, params.from) {
+        (Some(_), Some(_)) => return Err(ApiError::BadRequest("give after or from, not both".into())),
+        (Some(after), None) => Some(after.next()),
+        (None, Some(seq)) => Some(Offset::start_of(seq)),
+        (None, None) => None,
+    };
+    Span::current().record("id", display(start.map_or_else(|| "live".to_owned(), |from| from.to_string())));
+    let place = s.limits.subscribe()?;
+    let feed = Feed::new(s.stream.subscribe(), s.log_dir.clone(), s.manifest.clone(), s.backfills.clone(), start);
+    let (send_timeout, span) = (s.limits.send_timeout, Span::current());
+    let ws = ws.max_message_size(s.limits.max_body_bytes).max_frame_size(s.limits.max_body_bytes);
+    Ok(ws.on_upgrade(move |socket| {
+        async move {
+            forward(socket, feed, send_timeout).await;
+            drop(place);
+        }
+        .instrument(span)
+    }))
+}
+
+/// Sends the feed to one subscriber until it closes or disconnects, stops reading for
+/// `send_timeout`, or the sequencer stops. What the subscriber sends is read alongside, so its
+/// close is answered while messages are still waiting for it.
+async fn forward<S>(socket: S, feed: Feed, send_timeout: Duration)
+where
+    S: Sink<Message> + Stream<Item = Result<Message, Error>> + Unpin,
+{
+    let (mut sink, mut input) = socket.split();
+    tokio::select! {
+        closed = read_until_closed(&mut input) => if closed {
+            // Sends the close reply queued when the close was read.
+            let _ = timeout(send_timeout, sink.close()).await;
+        },
+        () = send_feed(&mut sink, feed, send_timeout) => {}
+    }
+}
+
+/// Reads and drops what the subscriber sends, which also answers its pings, until it closes
+/// (`true`), or fails or disconnects (`false`).
+async fn read_until_closed<S: Stream<Item = Result<Message, Error>> + Unpin>(input: &mut S) -> bool {
+    while let Some(Ok(msg)) = input.next().await {
+        if let Message::Close(_) = msg {
+            return true;
+        }
+        // A subscriber that floods its input yields to its own stream, so it is still sent to.
+        consume_budget().await;
+    }
+    false
+}
+
+/// Sends the feed until the subscriber disconnects, stops reading for `send_timeout`, or the
+/// sequencer stops.
+async fn send_feed<S: Sink<Message> + Unpin>(sink: &mut S, mut feed: Feed, send_timeout: Duration) {
+    loop {
+        let msg = match feed.next().await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return,
+            Err(e) => {
+                error!(alert = "stream_backfill_failed", "{e:#}");
+                return;
+            }
+        };
+        // Closing rather than skipping keeps the subscriber's view gap-free; it can resume.
+        let json = match serde_json::to_string(&*msg) {
+            Ok(json) => json,
+            Err(e) => {
+                error!(alert = "stream_encode_failed", offset = %msg.offset, "{e}");
+                return;
+            }
+        };
+        match timeout(send_timeout, sink.send(Message::Text(json.into()))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return,
+            Err(_) => {
+                info!(offset = %msg.offset, "closing a subscriber that stopped reading");
+                return;
+            }
+        }
+    }
+}
+
+/// Runs `read` on the blocking pool holding `permit` until it returns, so a subscriber that leaves
+/// mid-read does not free its backfill permit while the read still runs.
+fn read_holding<T: Send + 'static>(
+    permit: OwnedSemaphorePermit,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> JoinHandle<T> {
+    spawn_blocking(move || {
+        let _held = permit;
+        read()
+    })
+}
+
+/// Up to `BACKFILL_BATCH` messages from disk, opening a reader at `from` when there is none yet,
+/// and the reader to go on with, released so it holds no segment in memory, or `None` once it has
+/// read everything written.
+/// Error cases:
+/// - the log cannot be read (see `LogReader`)
+fn read_batch(
+    dir: &Path,
+    manifest: watch::Receiver<Manifest>,
+    from: Offset,
+    reader: Option<LogReader>,
+) -> anyhow::Result<(Option<LogReader>, Vec<Arc<StreamMsg>>)> {
+    let mut reader = match reader {
+        Some(reader) => reader,
+        None => LogReader::open(dir, from, manifest)?,
+    };
+    let mut batch = Vec::new();
+    while batch.len() < BACKFILL_BATCH {
+        let Some((offset, entry)) = reader.next_entry()? else {
+            return Ok((None, batch));
+        };
+        batch.push(Arc::new(StreamMsg::new(offset, entry)));
+    }
+    reader.release();
+    Ok((Some(reader), batch))
+}
+
+#[cfg(test)]
+mod tests;

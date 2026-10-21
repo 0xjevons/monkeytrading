@@ -19,6 +19,26 @@ tick = "250ms"
 # "eip712"; changing it needs a fresh log.
 auth = "none"
 
+# Limits on the public API, served over TLS with a key generated in the enclave. A client is its
+# socket peer IP (an IPv6 client by its /64); forwarding headers are ignored.
+[api]
+# Keep max_connections below the process's open-file limit (`ulimit -n`).
+max_connections = 512
+max_connections_per_ip = 32
+handshake_timeout = "10s"
+read_timeout = "30s"
+# Largest request body (413 when larger) and largest message a stream subscriber may send.
+max_body_bytes = 65536
+# A token bucket: `burst` requests at once, refilled at `per_second`. Excess requests get 429.
+per_ip = { per_second = 50, burst = 100 }
+# Requests that act for one account: orders, cancels, and withdrawals.
+per_account = { per_second = 10, burst = 20 }
+# New connections from one client, closed before the TLS handshake when over. Keep it above per_ip.
+per_ip_connections = { per_second = 100, burst = 200 }
+max_subscribers = 256
+# A client that takes longer than this to take a response, or a subscriber a message, is dropped.
+send_timeout = "30s"
+
 [logging]
 level = "info"
 
