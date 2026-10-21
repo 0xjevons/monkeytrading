@@ -2,6 +2,8 @@
 
 use super::*;
 
+use crate::log::offset_of;
+
 #[test]
 fn an_index_with_another_schema_version_is_refused() {
     let path = file(&index_dir("schema"));
@@ -131,15 +133,7 @@ async fn readers_wait_for_a_tip_the_index_has_not_taken() {
 #[tokio::test]
 async fn a_reopened_index_serves_what_a_rebuild_under_its_retention_would() {
     let dir = scratch_dir("history-retention-log");
-    let deposit_at = |seq, ts| {
-        let events = Some(vec![Event::Deposited { account: A, amount: Fixed::from_int(1) }]);
-        LogEntry::Command(CommandEntry { sequenced: Sequenced { seq, ts, cmd: Command::Tick }, events })
-    };
-    let mut log =
-        SegmentedLog::open(&dir).unwrap().into_writer(SEGMENT_COMMANDS, watch::channel(Manifest::default()).0).unwrap();
-    [deposit_at(0, 0), deposit_at(1, 1_000), deposit_at(2, 2_000)].iter().for_each(|entry| log.append(entry).unwrap());
-    log.flush().unwrap();
-    drop(log);
+    deposit_log(&dir, 3);
     let built = Duration::from_millis(1_500);
     for (case, retention) in
         [("same", built), ("shorter", Duration::from_millis(500)), ("longer", Duration::from_secs(3))]
@@ -216,6 +210,45 @@ async fn an_index_that_does_not_parse_fails_with_its_cause() {
     let query = PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 10 };
     let err = Reader::new(file(&index), ready()).page(query).await.expect_err("an index out of range");
     assert!(format!("{err:#}").contains("history row 5:-1"), "{err:#}");
+}
+
+/// A change of retention makes the index take the log again from its start, and the startup check
+/// stays on the newest command any row came from until that pass reaches it: a pass cut short
+/// resumes and ends as a fresh index would, unless the log has since lost that command.
+#[tokio::test]
+async fn a_pass_cut_short_after_a_retention_change_still_checks_the_newest_command_taken() {
+    let (dir, short) = (scratch_dir("history-repass-log"), scratch_dir("history-repass-short"));
+    let logged = deposit_log(&dir, 5);
+    deposit_log(&short, 3);
+    let (before, after) = (Duration::from_millis(1_500), Duration::from_secs(10));
+    for (case, log, matches) in [("log intact", &dir, true), ("log lost its tail", &short, false)] {
+        let index = index_dir(&format!("repass-{}", case.replace(' ', "-")));
+        index_to_end(&dir, &index, before).await;
+        // The node restarts under the new retention and takes seqs 0 and 1 again, then stops.
+        let cfg = HistorySection { dir: index.clone(), retention: after };
+        assert_eq!(History::open(&cfg, &entries(&dir)).unwrap().resume_at, Offset::start_of(0));
+        let pass: Vec<_> =
+            logged[..2].iter().map(|e| Arc::new(StreamMsg::new(offset_of(None, e).unwrap(), e.clone()))).collect();
+        Writer::open(&file(&index), ms(after)).unwrap().0.write(&pass).unwrap();
+        match History::open(&cfg, &entries(log)) {
+            Ok(history) => {
+                assert!(matches, "{case}: opened");
+                assert_eq!(history.resume_at, Offset::start_of(2), "{case}");
+                index_to_end(log, &index, after).await;
+                let fresh = index_dir(&format!("repass-{}-fresh", case.replace(' ', "-")));
+                index_to_end(log, &fresh, after).await;
+                let reader = |path| Reader::new(file(path), ready());
+                assert_eq!(
+                    every_page(&reader(&index), A, None, 10).await,
+                    every_page(&reader(&fresh), A, None, 10).await
+                );
+            }
+            Err(err) => {
+                assert!(!matches, "{case}: {err:#}");
+                assert!(format!("{err:#}").contains("the newest command the index has taken"), "{err:#}");
+            }
+        }
+    }
 }
 
 #[tokio::test]

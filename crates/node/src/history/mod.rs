@@ -90,14 +90,14 @@ pub struct History {
 
 impl History {
     /// Opens the index in `cfg.dir`, creating it if missing, and checks it against `entries`, the log
-    /// recovery replays next. An index that has taken commands must find the last of them there,
+    /// recovery replays next. An index that has taken commands must find the newest of them there,
     /// unchanged: otherwise it was built from another log, or the log has lost commands since, and
     /// serving it would mix the two. An index pruned under another retention than `cfg` gives takes
     /// the log again from its start, which leaves it as a fresh index under the new retention would
     /// be. Call it before recovery writes to the log, so a refusal leaves the log as it was found.
     /// Error cases:
     /// - the retention is invalid, or the index cannot be opened or read (see `Writer::open`)
-    /// - `entries` do not hold the last command the index took, unchanged, at its seq
+    /// - `entries` do not hold the newest command the index has taken, unchanged, at its seq
     pub fn open(cfg: &HistorySection, entries: &[LogEntry]) -> anyhow::Result<Self> {
         let path = cfg.dir.join(INDEX_FILE);
         let retention_ms = cfg.retention_ms().context("history.retention")?;
@@ -105,12 +105,12 @@ impl History {
         let resume_at = match progress {
             None => Offset::start_of(0),
             Some(progress) => {
-                let seq = progress.command.sequenced.seq;
+                let seq = progress.high_water.sequenced.seq;
                 ensure!(
-                    logged_command(seq, entries) == Some(&progress.command),
-                    "the history index in {} does not match the log: the log ends before seq {seq}, the last \
-                     command the index took, or holds another command there. Once the log is known to be right, \
-                     remove the directory, with the node stopped, to rebuild the index",
+                    logged_command(seq, entries) == Some(&progress.high_water),
+                    "the history index in {} does not match the log: the log ends before seq {seq}, the newest \
+                     command the index has taken, or holds another command there. Once the log is known to be \
+                     right, remove the directory, with the node stopped, to rebuild the index",
                     cfg.dir.display()
                 );
                 if progress.retention_ms != retention_ms {
@@ -123,7 +123,7 @@ impl History {
                     );
                     Offset::start_of(0)
                 } else {
-                    Offset::start_of(seq + 1)
+                    Offset::start_of(progress.command.sequenced.seq + 1)
                 }
             }
         };

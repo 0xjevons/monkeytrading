@@ -65,7 +65,7 @@ async fn a_kind_filter_returns_only_events_of_that_kind() {
 }
 
 #[test]
-fn every_event_that_names_an_account_is_indexed_under_it_by_its_type() {
+fn account_of_and_kinds_cover_every_event_that_names_an_account() {
     let mut kinds = BTreeSet::new();
     for event in every_event() {
         let json = serde_json::to_value(&event).unwrap();
@@ -222,6 +222,23 @@ async fn index_to_end(dir: &Path, index: &Path, retention: Duration) -> Offset {
     let feed = Feed::new(subscriber, dir.to_owned(), manifest, backfills, Some(resume_at));
     timeout(Duration::from_secs(10), history.run(feed)).await.unwrap().unwrap();
     resume_at
+}
+
+/// Writes a log in `dir` of `count` commands, seq `n` stamped `n` seconds in, each depositing to `A`,
+/// and returns its entries.
+fn deposit_log(dir: &Path, count: u64) -> Vec<LogEntry> {
+    let events = || Some(vec![Event::Deposited { account: A, amount: Fixed::from_int(1) }]);
+    let entries: Vec<LogEntry> = (0..count)
+        .map(|seq| {
+            let sequenced = Sequenced { seq, ts: Millis::try_from(seq).unwrap() * 1_000, cmd: Command::Tick };
+            LogEntry::Command(CommandEntry { sequenced, events: events() })
+        })
+        .collect();
+    let mut log =
+        SegmentedLog::open(dir).unwrap().into_writer(SEGMENT_COMMANDS, watch::channel(Manifest::default()).0).unwrap();
+    entries.iter().for_each(|entry| log.append(entry).unwrap());
+    log.flush().unwrap();
+    entries
 }
 
 /// Every entry of the log in `dir`.
