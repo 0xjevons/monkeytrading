@@ -12,6 +12,8 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
+use crate::clock::Clock;
+use crate::clock::test_clock::TestClock;
 use crate::history::{HistoryEvent, INDEX_FILE, account_of};
 use crate::log::{LogEntry, MANIFEST, Manifest, Offset, SegmentedLog, read_all, segment_seq};
 use crate::sequencer::replay;
@@ -146,8 +148,14 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
         .collect();
     accounts.insert(TRADER);
     let addr = serve_history(Reader::new(index.join(INDEX_FILE), watch::channel(true).1)).await;
+    // Trusted time admits stamps near the clock, so the node runs on one set just after the log.
+    let last_ts = reference.iter().filter_map(|entry| match entry {
+        LogEntry::Command(c) => Some(c.sequenced.ts),
+        _ => None,
+    });
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::at(last_ts.max().unwrap() + 1_000));
 
-    let node = TestSequencer::start(&dir, 1024);
+    let node = TestSequencer::start_at(&dir, 1024, clock.clone());
     let history = TestHistory::start(&node, &dir, &index).unwrap();
     node.submit(deposit(100, "dep-1")).await;
     node.submit(withdraw(40)).await;
@@ -161,7 +169,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
     }
 
     let segments = Manifest::load(&dir).unwrap().segments.len();
-    let node = TestSequencer::start(&dir, 1024);
+    let node = TestSequencer::start_at(&dir, 1024, clock.clone());
     let history = TestHistory::start(&node, &dir, &index).unwrap();
     for n in 0..SEGMENT_COMMANDS {
         node.submit(deposit(1, &format!("dep-rotate-{n}"))).await;
@@ -177,7 +185,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
     assert_eq!(second[&TRADER].len(), first[&TRADER].len() + SEGMENT_COMMANDS as usize);
 
     fs::remove_dir_all(&index).unwrap();
-    let node = TestSequencer::start(&dir, 1024);
+    let node = TestSequencer::start_at(&dir, 1024, clock.clone());
     let history = TestHistory::start(&node, &dir, &index).unwrap();
     node.stop().await;
     history.finish().await.unwrap();

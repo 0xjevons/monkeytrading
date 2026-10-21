@@ -47,17 +47,22 @@ impl TestSequencer {
     /// Recovers a sequencer from `dir`, sequences the dev genesis if the log is empty, and runs it.
     /// The stream channel holds `stream_capacity` messages.
     pub fn start(dir: &Path, stream_capacity: usize) -> Self {
+        Self::start_at(dir, stream_capacity, Arc::new(SystemClock))
+    }
+
+    /// As `start`, stamping commands on `clock`, which trusted time admits.
+    pub fn start_at(dir: &Path, stream_capacity: usize, clock: Arc<dyn Clock>) -> Self {
         let (stream, _) = broadcast::channel(stream_capacity);
         let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
         let (manifest_tx, manifest) = watch::channel(Manifest::default());
         let key = Arc::new(EnclaveKey::generate());
-        let mut seq = Sequencer::recover(sequencer_config(dir, manifest_tx), key, stream.clone(), withdrawals_tx)
-            .expect("sequencer recovers");
+        let cfg = SequencerConfig { clock: clock.clone(), ..sequencer_config(dir, manifest_tx) };
+        let mut seq = Sequencer::recover(cfg, key, stream.clone(), withdrawals_tx).expect("sequencer recovers");
         if seq.needs_genesis() {
             seq.genesis(&dev_config().genesis).expect("dev genesis");
         }
-        // Trusted time admits stamps on the system clock, so the queued genesis goes in now.
-        seq.trust(trusted_now()).expect("dev genesis");
+        // Trusted time admits stamps on `clock`, so the queued genesis goes in now.
+        seq.trust(sample_around(clock.as_ref())).expect("dev genesis");
         let (tx, rx) = mpsc::channel(64);
         let task = tokio::spawn(seq.run(rx));
         Self { tx, stream, manifest, withdrawals, task }
