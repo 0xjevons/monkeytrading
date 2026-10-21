@@ -5,6 +5,7 @@ use super::*;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::extract::connect_info::MockConnectInfo;
@@ -14,6 +15,8 @@ use engine_core::auth::MAX_EXPIRY_AHEAD_MS;
 use engine_core::command::{AdminCommand, AdminRequest};
 use engine_core::price::SourceQuote;
 use engine_core::protocol::ProtocolVersion;
+use governor::Quota;
+use governor::clock::DefaultClock;
 use k256::ecdsa::SigningKey;
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -21,6 +24,7 @@ use tower::ServiceExt;
 
 use crate::admin::{self, AdminArgs, HexKey, KeyEnv, NodeApi, sign};
 use crate::clock::test_clock::TestClock;
+use crate::config::RateLimit;
 use crate::history::Reader;
 use crate::limits::ApiLimits;
 use crate::log::{LogEntry, SegmentedLog};
@@ -103,7 +107,10 @@ async fn a_reused_ahead_or_expired_admin_request_stays_out_of_the_log() {
 
 #[tokio::test]
 async fn only_an_admin_request_the_node_would_sequence_spends_the_operators_rate() {
-    let node = Node::start("admin-rate").await;
+    let mut node = Node::start("admin-rate").await;
+    // Buckets that refill hourly, so only the burst counts however long the requests take.
+    let hourly = |rate: RateLimit| Quota::with_period(Duration::from_secs(3600)).unwrap().allow_burst(rate.burst);
+    node.state.limits = Arc::new(ApiLimits::with_quota(&dev_config().api, hourly, DefaultClock::default()));
     let burst = u64::from(dev_config().api.per_account.burst.get());
     let request = |nonce| serde_json::to_value(node.sign(nonce, reduce_only(Some(1)), NOW + 60_000)).unwrap();
     assert_eq!(node.post("/v1/admin", request(0)).await.0, StatusCode::OK);
