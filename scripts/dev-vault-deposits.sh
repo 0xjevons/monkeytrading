@@ -188,8 +188,9 @@ stays trader_balance 1377
 
 step "The log holds one command per deposit and replays"
 stop_node
-deposits="$(jq -c 'select(.entry == "command" and (.cmd.type == "deposit" or .cmd.type == "house_capital"))' \
-  "$work"/log/[0-9]*.jsonl | wc -l | tr -d ' ')"
+# Genesis's zero house capital credit marks genesis done; every other credit is a vault deposit.
+deposits="$(jq -c 'select(.entry == "command" and (.cmd.type == "deposit" or .cmd.type == "house_capital")
+  and .cmd.chain_ref != "genesis")' "$work"/log/[0-9]*.jsonl | wc -l | tr -d ' ')"
 [[ "$deposits" == "5" ]] || fail "expected 5 deposit commands in the log, found $deposits"
 "$engine" replay --log "$work/log" | grep -q '^verified' || fail "the log does not replay"
 # Restarts, the rescan, and the reorg are all expected: none of them may raise an alert.

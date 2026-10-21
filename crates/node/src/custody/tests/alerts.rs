@@ -3,13 +3,17 @@
 
 use std::time::Duration;
 
-use tokio::time::sleep;
+use engine_core::Engine;
+use tokio::sync::oneshot;
+use tokio::time::{sleep, timeout};
 
 use crate::custody::evm::{Beneficiary, VaultIdentity};
 use crate::custody::stall::Polled;
 use crate::custody::tests::fakes::{
-    FakeChain, Logs, Node, TRADER, USDC, USDC_TOKEN, deposit, scratch, usdc, wait_for_polls, watcher,
+    FakeChain, Logs, Node, TRADER, USDC, USDC_TOKEN, deposit, refusing_sequencer, scratch, stored_cursor, usdc,
+    wait_for_polls, watcher,
 };
+use crate::sequencer::Request;
 
 #[tokio::test(start_paused = true)]
 async fn an_rpc_outage_alerts_once_escalates_once_and_crediting_resumes_after_it() {
@@ -225,5 +229,29 @@ async fn a_proof_that_holds_back_every_read_raises_the_lag_alert() {
     sleep(Duration::from_millis(1_500)).await;
     assert!(chain.reads().is_empty(), "no deposit is read while the chain is proven");
     assert_eq!(logs.count("alert=\"custody_deposits_lagging\""), 1);
+    run.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_deposit_whose_stamp_the_sequencer_refuses_is_retried_without_an_alert() {
+    let (logs, _guard) = Logs::capture();
+    let dir = scratch("refused-stamp");
+    let chain = FakeChain::default();
+    chain.add(deposit(0, 1, Beneficiary::Trader(TRADER), USDC));
+    chain.set_final(Some(1));
+    let tx = refusing_sequencer(true, 3);
+    let run = tokio::spawn(watcher(&chain, &dir, 1_000, None).run(tx.clone()));
+
+    // A stopped watcher polls no more, so the wait times out.
+    timeout(Duration::from_secs(5), wait_for_polls(&chain, 20)).await.expect("the watcher keeps polling");
+    let (reply, balance) = oneshot::channel();
+    let query = Box::new(move |e: &Engine| {
+        let _ = reply.send(e.accounts().get(&TRADER).map(|a| a.balance));
+    });
+    tx.send(Request::Query(query)).await.unwrap();
+    assert_eq!(balance.await.unwrap(), Some(usdc("1")));
+    assert_eq!(stored_cursor(&dir).next_block, 2);
+    assert_eq!(logs.count("alert="), 0);
+    assert!(!run.is_finished(), "a refused stamp must not stop the watcher");
     run.abort();
 }

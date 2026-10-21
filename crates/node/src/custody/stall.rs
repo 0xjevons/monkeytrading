@@ -41,6 +41,9 @@ pub(super) enum Stall {
     Unsettled(anyhow::Error),
     /// The chain contradicts the configuration or the cursor; no retry is likely to fix it.
     Inconsistent(anyhow::Error),
+    /// The sequencer refused a deposit's stamp, as it does until trusted time admits one, which
+    /// trusted time alerts itself.
+    Refused(anyhow::Error),
 }
 
 impl PollError {
@@ -64,25 +67,29 @@ impl Stall {
     /// What stopped the poll.
     pub(super) fn error(&self) -> &anyhow::Error {
         match self {
-            Stall::Rpc(e) | Stall::Unsettled(e) | Stall::Inconsistent(e) => e,
+            Stall::Rpc(e) | Stall::Unsettled(e) | Stall::Inconsistent(e) | Stall::Refused(e) => e,
         }
     }
 
-    /// The alert this stall raises, so a repeat of the same stall stays quiet.
+    /// The alert this stall raises, or for a refused stamp the name it is logged under, so a
+    /// repeat of the same stall stays quiet.
     pub(super) fn alert(&self) -> &'static str {
         match self {
             Stall::Rpc(_) => "custody_rpc_failed",
             Stall::Unsettled(_) => "custody_chain_unsettled",
             Stall::Inconsistent(_) => "custody_chain_inconsistent",
+            Stall::Refused(_) => "custody_stamp_refused",
         }
     }
 
     /// Raises the alert: a Warning when a retry may clear it (a stall that lasts escalates
-    /// separately), Critical when it contradicts the configuration or the cursor.
+    /// separately), Critical when it contradicts the configuration or the cursor. A refused stamp
+    /// only logs, since trusted time alerts it.
     pub(super) fn raise(&self, next_block: u64) {
         match self {
             Stall::Rpc(e) | Stall::Unsettled(e) => warn!(alert = self.alert(), next_block, "deposits paused: {e:#}"),
             Stall::Inconsistent(e) => error!(alert = self.alert(), next_block, "deposits paused: {e:#}"),
+            Stall::Refused(e) => info!(next_block, "deposits wait for trusted time: {e:#}"),
         }
     }
 }

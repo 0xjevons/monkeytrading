@@ -11,14 +11,16 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{Instrument, debug, error, info, info_span};
 
 use crate::custody::evm::{Beneficiary, VaultDeposit};
+use crate::custody::stall::{PollError, Stall};
 use crate::custody::usdc_to_fixed;
 use crate::sequencer::Request;
 
 /// Sequences one final deposit, unless its reference is already credited. Its span carries the
 /// reference as `id`.
 /// Error cases:
-/// - the sequencer has stopped
-pub(super) async fn credit(tx: &mpsc::Sender<Request>, deposit: &VaultDeposit) -> anyhow::Result<()> {
+/// - stalled: the sequencer refused the command's stamp (see `submit`)
+/// - fatal: the sequencer has stopped
+pub(super) async fn credit(tx: &mpsc::Sender<Request>, deposit: &VaultDeposit) -> Result<(), PollError> {
     let chain_ref = deposit.chain_ref();
     let span = info_span!("deposit", id = %chain_ref, block = deposit.block, deposit_id = deposit.id);
     async move {
@@ -28,7 +30,7 @@ pub(super) async fn credit(tx: &mpsc::Sender<Request>, deposit: &VaultDeposit) -
             return Ok(());
         };
         let credited_ref = chain_ref.clone();
-        if query(tx, move |engine| engine.is_credited(&credited_ref)).await? {
+        if query(tx, move |engine| engine.is_credited(&credited_ref)).await.map_err(PollError::Fatal)? {
             debug!("deposit already credited");
             return Ok(());
         }
@@ -77,11 +79,20 @@ pub(super) async fn moved_credits(
 
 /// Sequences `cmd` and returns its events once they are durable.
 /// Error cases:
-/// - the sequencer has stopped
-async fn submit(tx: &mpsc::Sender<Request>, cmd: Command) -> anyhow::Result<Vec<Event>> {
+/// - stalled: the sequencer dropped the reply but still runs, as it does for a command whose stamp
+///   trusted time refuses; nothing was sequenced, and the next poll retries
+/// - fatal: the sequencer has stopped
+async fn submit(tx: &mpsc::Sender<Request>, cmd: Command) -> Result<Vec<Event>, PollError> {
+    let stopped = || PollError::Fatal(anyhow!("sequencer stopped"));
     let (reply, rx) = oneshot::channel();
-    tx.send(Request::Submit { cmd, reply: Some(reply) }).await.map_err(|_| anyhow!("sequencer stopped"))?;
-    rx.await.map_err(|_| anyhow!("sequencer stopped"))
+    tx.send(Request::Submit { cmd, reply: Some(reply) }).await.map_err(|_| stopped())?;
+    match rx.await {
+        Ok(events) => Ok(events),
+        Err(_) if !tx.is_closed() => {
+            Err(PollError::Stalled(Stall::Refused(anyhow!("the sequencer refused the deposit's stamp"))))
+        }
+        Err(_) => Err(stopped()),
+    }
 }
 
 /// Waits until every command sequenced so far is synced to storage, and returns the last seq.

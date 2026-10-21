@@ -224,7 +224,7 @@ impl<V: VaultReader> DepositWatcher<V> {
             self.store_cursor().await?;
         }
         for deposit in &deposits {
-            credit(tx, deposit).await.map_err(PollError::Fatal)?;
+            credit(tx, deposit).await?;
         }
         // The cursor file is synced, so the credits it moves past must be on storage first.
         if !deposits.is_empty() {

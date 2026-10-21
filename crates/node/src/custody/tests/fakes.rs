@@ -269,11 +269,18 @@ impl Logs {
 /// A sequencer over an in-memory engine that answers sync requests only when `answer_syncs`,
 /// as when its fsync fails otherwise.
 pub(super) fn engine_sequencer(answer_syncs: bool) -> mpsc::Sender<Request> {
+    refusing_sequencer(answer_syncs, 0)
+}
+
+/// `engine_sequencer` that also drops its first `refusals` commands unapplied, with their
+/// replies, and keeps running, as the node's sequencer does while trusted time refuses stamps.
+pub(super) fn refusing_sequencer(answer_syncs: bool, refusals: usize) -> mpsc::Sender<Request> {
     let (tx, mut rx) = mpsc::channel::<Request>(64);
     tokio::spawn(async move {
-        let (mut engine, mut seq) = (Engine::new(), 0);
+        let (mut engine, mut seq, mut refusals) = (Engine::new(), 0, refusals);
         while let Some(request) = rx.recv().await {
             match request {
+                Request::Submit { .. } if refusals > 0 => refusals -= 1,
                 Request::Submit { cmd, reply } => {
                     let events = engine.apply(&Sequenced { seq, ts: 0, cmd }).unwrap();
                     seq += 1;
