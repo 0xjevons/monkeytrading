@@ -110,7 +110,7 @@ impl Engine {
         } else {
             (None, self.equity_and_margin(acct, None))
         };
-        if margin.is_zero() || equity >= margin.mul_bps(level_bps) {
+        if margin.is_zero() || equity >= margin.mul_bps_rounded(level_bps, self.charge_rounding()) {
             return None;
         }
         let indexes = indexes.unwrap_or_else(tradeable);

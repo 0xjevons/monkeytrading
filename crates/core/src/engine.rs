@@ -313,7 +313,7 @@ impl Engine {
 
     /// (equity, margin requirement) in USD with each position valued at the price and FX index
     /// `price_of(market id, market, position)` gives: PnL converts rounded down and notional rounded
-    /// up.
+    /// up. From `V10` the requirement rounds up, from each position's notional to each band's charge.
     pub(crate) fn equity_and_margin_at(
         &self,
         acct: &Account,
@@ -325,9 +325,9 @@ impl Engine {
             .fold((acct.balance, Fixed::ZERO), |(equity, margin), (market_id, pos, market)| {
                 let (price, fx) = price_of(market_id, market, pos);
                 let usd = |amount, rounding| market.spec.quote_currency.to_usd(amount, fx, rounding);
-                let notional = usd(pos.qty.abs().mul(price), Rounding::Up);
+                let notional = usd(pos.qty.abs().mul_rounded(price, self.charge_rounding()), Rounding::Up);
                 let pnl = usd(pos.unrealised(price, self.protocol_version), Rounding::Down);
-                (equity + pnl, margin + market.spec.margin_for(notional))
+                (equity + pnl, margin + market.spec.margin_for(notional, self.charge_rounding()))
             })
     }
 

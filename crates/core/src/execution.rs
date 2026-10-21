@@ -295,16 +295,25 @@ impl Engine {
         }
 
         let stress = &params.stress_levels[market.stress.level];
-        // Widening the slice outwards can only add to its cost.
-        let (from, to) = (usd(grow_from.mul(mid), Rounding::Down), usd(grow_to.mul(mid), Rounding::Up));
-        let size_cost_usd = staircase(&market.spec.spread_tiers, from, to).mul_bps(stress.size_spread_multiplier_bps);
-        let size_cost = currency.from_usd(size_cost_usd, fx, Rounding::Up);
         let toxicity_bps = if exec.liquidation { 0 } else { params.toxicity_spread_bps(acct.toxicity_bps) };
-        // Per-unit adjustment; dividing the size cost by qty (not by notional) keeps full precision.
-        let adjust = mid.mul_bps(stress.min_spread_bps + toxicity_bps) + size_cost.div(qty);
-        if adjust >= mid {
+        // The spread per unit with every charge rounded as `charge` says. Widening the growth slice
+        // outwards can only add to its cost, and dividing the size cost by qty (not by notional) keeps
+        // full precision.
+        let spread = |charge: Rounding| {
+            let (from, to) =
+                (usd(grow_from.mul(mid), Rounding::Down), usd(grow_to.mul_rounded(mid, charge), Rounding::Up));
+            let size_cost_usd = staircase(&market.spec.spread_tiers, from, to, charge)
+                .mul_bps_rounded(stress.size_spread_multiplier_bps, charge);
+            let size_cost = currency.from_usd(size_cost_usd, fx, Rounding::Up);
+            mid.mul_bps_rounded(stress.min_spread_bps + toxicity_bps, charge) + size_cost.div_rounded(qty, charge)
+        };
+        // The truncated spread decides whether a spread reaches the price. From `V10` the spread rounds
+        // up, and a sell's stops a unit short of the price, so rounding never makes it reach the price.
+        if spread(Rounding::TowardZero) >= mid {
             return Err(Reject::InvalidOrder { reason: "spread at this size reaches the price".into() });
         }
+        let rounded = spread(self.charge_rounding());
+        let adjust = if exec.side == Side::Sell { rounded.min(mid - Fixed::from_raw(1)) } else { rounded };
         let price = mid + adjust.mul_int(exec.side.sign());
 
         match exec.guard {
@@ -409,6 +418,12 @@ impl Engine {
             position,
             liquidation: exec.liquidation,
         }
+    }
+
+    /// How a spread charge or a margin requirement rounds: up from `V10`, so a trader never pays or
+    /// posts less than the exact amount, and toward zero before.
+    pub(crate) fn charge_rounding(&self) -> Rounding {
+        if self.protocol_version >= ProtocolVersion::V10 { Rounding::Up } else { Rounding::TowardZero }
     }
 
     /// Removes a resting order from its account and its market's book.
