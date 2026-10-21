@@ -17,7 +17,8 @@ work="$(mktemp -d)"
 anvil_port="${ANVIL_PORT:-8545}"
 api_port="${API_PORT:-8080}"
 rpc="http://127.0.0.1:$anvil_port"
-api="http://127.0.0.1:$api_port"
+# The node serves its API over TLS with a key it generates at startup, so curl skips verification.
+api="https://127.0.0.1:$api_port"
 # Anvil's default test mnemonic: account 0 deploys, 1 trades, 2 funds the house.
 mnemonic="test test test test test test test test test test test junk"
 key() { cast wallet private-key --mnemonic "$mnemonic" --mnemonic-index "$1"; }
@@ -62,19 +63,19 @@ stays() {
   [[ "$got" == "$2" ]] || fail "$1: expected $2 to hold, got $got"
 }
 
-trader_balance() { curl -s "$api/v1/accounts/$trader" | jq -r '.balance // "none"'; }
-house_nav() { curl -s "$api/v1/house" | jq -r '.nav'; }
+trader_balance() { curl -sk "$api/v1/accounts/$trader" | jq -r '.balance // "none"'; }
+house_nav() { curl -sk "$api/v1/house" | jq -r '.nav'; }
 rescanned_deposits() { jq -r '.next_deposit_id' "$work/custody-cursor.json" 2>/dev/null || echo none; }
 mine() { cast rpc anvil_mine "$(printf '0x%x' "$1")" --rpc-url "$rpc" >/dev/null; }
 send() { cast send "$@" --rpc-url "$rpc" >/dev/null; }
 
 start_node() {
-  curl -s "$api/v1/health" >/dev/null 2>&1 && fail "port $api_port already serves an API"
+  curl -sk "$api/v1/health" >/dev/null 2>&1 && fail "port $api_port already serves an API"
   "$engine" run --config "$work/anvil.toml" >>"$work/node.log" 2>&1 &
   node_pid=$!
   for _ in $(seq 1 100); do
     kill -0 "$node_pid" 2>/dev/null || fail "node exited at startup"
-    curl -sf "$api/v1/health" >/dev/null && return 0
+    curl -skf "$api/v1/health" >/dev/null && return 0
     sleep 0.2
   done
   fail "node did not come up"
@@ -124,10 +125,10 @@ sed -e "s#data/anvil#$work#g" -e "s#127.0.0.1:8545#127.0.0.1:$anvil_port#" -e "s
   config/anvil.toml >"$work/anvil.toml"
 start_node
 [[ "$(house_nav)" == "0" ]] || fail "genesis credited house capital under EVM custody"
-code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/v1/dev/deposit" \
+code="$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$api/v1/dev/deposit" \
   -H 'content-type: application/json' -d "{\"account\":\"$trader\",\"amount\":\"1\"}")"
 [[ "$code" == "404" ]] || fail "the mock-only deposit endpoint answered $code under EVM custody"
-code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/v1/withdrawals" \
+code="$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$api/v1/withdrawals" \
   -H 'content-type: application/json' -d "{\"account\":\"$trader\",\"amount\":\"1\"}")"
 [[ "$code" == "501" ]] || fail "a withdrawal answered $code under EVM custody, which cannot pay it out yet"
 
@@ -149,7 +150,7 @@ send "$vault" "depositFor(address,uint256)" "$trader" $((50 * usdc_units)) --pri
 mine 3
 wait_for trader_balance 1050
 payer="$(cast wallet address --private-key "$house_key" | tr '[:upper:]' '[:lower:]')"
-[[ "$(curl -s "$api/v1/accounts/$payer" | jq -r '.balance // "none"')" == "none" ]] || fail "the paying account was credited"
+[[ "$(curl -sk "$api/v1/accounts/$payer" | jq -r '.balance // "none"')" == "none" ]] || fail "the paying account was credited"
 [[ "$(house_nav)" == "5000000" ]] || fail "a deposit for the trader changed house NAV"
 
 step "A deposit made while the node is down is credited after the restart"
