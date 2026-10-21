@@ -1,7 +1,7 @@
 //! The checks a node config must pass once it parses: values that would fail silently or at the
 //! wrong moment.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
@@ -30,6 +30,7 @@ impl NodeConfig {
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
     ///   engine would refuse, or genesis lists a market id twice
+    /// - a genesis market fails `MarketSpec::check_fx_market` against the markets listed before it
     pub(super) fn validate(&self) -> anyhow::Result<()> {
         EnvFilter::try_new(&self.logging.level).context("logging.level")?;
         if self.node.tick.is_zero()
@@ -104,8 +105,14 @@ impl NodeConfig {
         {
             anyhow::bail!("genesis benchmark {} is outside ±{MAX_BENCHMARK_BPS} bps", b.name);
         }
+        let mut listed = BTreeMap::new();
         for m in &self.genesis.markets {
             m.validate().map_err(anyhow::Error::msg).with_context(|| format!("market {}", m.symbol))?;
+            // A market quoted outside USD converts at its pair's market, listed before it.
+            m.check_fx_market(|id| listed.get(&id).copied())
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("market {}", m.symbol))?;
+            listed.insert(m.id, m.symbol.as_str());
         }
         Ok(())
     }

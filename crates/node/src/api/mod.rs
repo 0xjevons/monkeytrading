@@ -96,6 +96,8 @@ struct MarketView {
     open: bool,
     reduce_only: bool,
     mark: Option<Fixed>,
+    /// The FX index a market quoted in another currency than USD is valued at.
+    fx_mark: Option<Fixed>,
     stress_level: usize,
 }
 
@@ -303,6 +305,7 @@ async fn markets(State(s): State<ApiState>) -> ApiResult<Vec<MarketView>> {
                     open: m.open,
                     reduce_only: m.reduce_only,
                     mark: m.mark,
+                    fx_mark: m.fx_mark,
                     stress_level: m.stress.level,
                 })
                 .collect()

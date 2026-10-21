@@ -91,6 +91,23 @@ fn genesis_values_the_engine_would_refuse_fail_the_boot() {
 }
 
 #[test]
+fn a_genesis_market_converting_at_anything_but_its_pair_listed_before_it_fails_the_boot() {
+    let dev = std::fs::read_to_string(DEV).unwrap();
+    let via = "quote_currency = { currency = \"eur\", fx_market = 10 }";
+    let at = |fx_market: u32| format!("quote_currency = {{ currency = \"eur\", fx_market = {fx_market} }}");
+    // US500 (20) is not EUR-USD, 99 is never listed, and XAU-USD (30), renamed EUR-USD here, is
+    // listed after Germany 40.
+    let not_the_pair = dev.replace(via, &at(20));
+    let unlisted = dev.replace(via, &at(99));
+    let listed_after = dev.replace(via, &at(30)).replace("symbol = \"XAU-USD\"", "symbol = \"EUR-USD\"");
+    for text in [&not_the_pair, &unlisted, &listed_after] {
+        assert_ne!(text, &dev, "the replacement must change the config");
+        let err = toml::from_str::<NodeConfig>(text).unwrap().validate().unwrap_err();
+        assert!(format!("{err:#}").contains("is not the listed EUR-USD market"), "{err:#}");
+    }
+}
+
+#[test]
 fn the_dev_config_checks_time_against_three_roughtime_servers() {
     let cfg = NodeConfig::load(Path::new(DEV)).unwrap();
     let keys: Vec<String> = cfg.time.servers.iter().map(|s| STANDARD.encode(s.public_key.as_bytes())).collect();

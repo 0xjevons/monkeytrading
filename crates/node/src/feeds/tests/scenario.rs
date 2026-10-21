@@ -117,8 +117,9 @@ async fn quotes_older_than_the_engines_market_bound_do_not_count_as_quoting() {
 // ── Helpers ──
 
 impl Node {
-    /// Sequences the committed dev genesis, with `MAX_AGE_MS` on the crypto markets, into a fresh
-    /// log and runs the sequencer.
+    /// Boots a fresh log as the node does, records client auth and activates the latest protocol, then
+    /// sequences the committed dev genesis, with `MAX_AGE_MS` on the crypto markets, and runs the
+    /// sequencer.
     async fn start(name: &str) -> Self {
         let mut cfg = dev_config();
         for market in cfg.genesis.markets.iter_mut().filter(|market| [1, 2].contains(&market.id)) {
@@ -136,6 +137,7 @@ impl Node {
         };
         let mut seq = Sequencer::recover(seq_cfg, Arc::new(EnclaveKey::generate()), stream_tx, withdrawals_tx)
             .expect("fresh sequencer");
+        seq.activate_protocol().expect("protocol activation");
         seq.genesis(&cfg.genesis).expect("genesis");
         // Trusted time admits stamps on the system clock, so the queued genesis goes in now.
         seq.trust(trusted_now()).expect("genesis");

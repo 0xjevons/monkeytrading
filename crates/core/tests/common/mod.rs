@@ -13,7 +13,7 @@ use engine_core::auth::{ClientAuth, RequestAuth};
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::eip712::{self, B256, Eip712Domain, cancel_hash, order_hash, withdrawal_hash};
 use engine_core::event::{Event, Fill, Reject};
-use engine_core::market::{FinancingSpec, MarketSpec, PriceRules, Tier};
+use engine_core::market::{FinancingSpec, MarketSpec, PriceRules, QuoteCurrency, Tier};
 use engine_core::params::{ProtocolParams, Rollover, StressLevel, StressTrigger, ToxicityParams, ToxicityTier};
 use engine_core::price::SourceQuote;
 use engine_core::protocol::ProtocolVersion;
@@ -25,6 +25,12 @@ use k256::ecdsa::SigningKey;
 pub const BTC: MarketId = 1;
 pub const ETH: MarketId = 2;
 pub const AAPL: MarketId = 3;
+/// EUR-USD, listed by `Harness::list_fx`.
+pub const EURUSD: MarketId = 4;
+/// USD-JPY, quoted in yen at its own index, listed by `Harness::list_fx`.
+pub const USDJPY: MarketId = 5;
+/// Germany 40, quoted in euros at EUR-USD, listed by `Harness::list_fx`.
+pub const DE40: MarketId = 6;
 /// A market id nothing lists.
 pub const UNLISTED: MarketId = 99;
 pub const HOUSE_CAPITAL: i64 = 100_000_000;
@@ -130,6 +136,30 @@ impl Harness {
         if self.house_capital.is_positive() {
             self.cmd(Command::HouseCapital { amount: self.house_capital, chain_ref: "genesis".into() });
         }
+    }
+
+    /// `v6`, then `V7`, which allows markets quoted in other currencies.
+    pub fn v7() -> Self {
+        let mut h = Harness::v6();
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V7 });
+        h
+    }
+
+    /// `v7` with `list_fx`'s markets.
+    pub fn fx() -> Self {
+        let mut h = Harness::v7();
+        h.list_fx();
+        h
+    }
+
+    /// Lists EUR-USD (USD-quoted), USD-JPY (quoted in yen and converted at its own index), both with
+    /// 2% margin, and Germany 40 (5% margin) quoted in euros and converted at EUR-USD; all 24/7.
+    pub fn list_fx(&mut self) {
+        self.admin(AdminCommand::UpsertMarket(market(EURUSD, "EUR-USD", AssetClass::Fx, Schedule::AlwaysOpen, 200)));
+        let usdjpy = market(USDJPY, "USD-JPY", AssetClass::Fx, Schedule::AlwaysOpen, 200);
+        let yen = QuoteCurrency::Jpy { fx_market: USDJPY };
+        self.admin(AdminCommand::UpsertMarket(MarketSpec { quote_currency: yen, ..usdjpy }));
+        self.admin(AdminCommand::UpsertMarket(de40(500)));
     }
 
     /// Sequences and applies one command at the current time, recording it in the log. An unsigned
@@ -242,6 +272,11 @@ impl Harness {
         self.order(account, market, side, qty, OrderKind::Market { quoted: f(quoted), max_slippage_bps: None })
     }
 
+    /// The account's (equity, margin requirement) in USD at current marks.
+    pub fn equity_and_margin(&self, account: AccountId) -> (Fixed, Fixed) {
+        self.engine.equity_and_margin(&self.engine.accounts()[&account], None)
+    }
+
     /// The account's cash balance.
     pub fn balance(&self, account: AccountId) -> Fixed {
         self.engine.accounts()[&account].balance
@@ -347,6 +382,7 @@ pub fn market(id: MarketId, symbol: &str, class: AssetClass, schedule: Schedule,
         id,
         symbol: symbol.into(),
         asset_class: class,
+        quote_currency: QuoteCurrency::Usd,
         schedule,
         margin_tiers: vec![Tier { up_to: None, bps: margin_bps }],
         spread_tiers: vec![
@@ -361,6 +397,12 @@ pub fn market(id: MarketId, symbol: &str, class: AssetClass, schedule: Schedule,
         min_order_notional: Fixed::ZERO,
         house_cap_floor: Fixed::ZERO,
     }
+}
+
+/// Germany 40, 24/7, quoted in euros and converted at EUR-USD, with one margin rate.
+pub fn de40(margin_bps: i64) -> MarketSpec {
+    let spec = market(DE40, "DE40", AssetClass::Index, Schedule::AlwaysOpen, margin_bps);
+    MarketSpec { quote_currency: QuoteCurrency::Eur { fx_market: EURUSD }, ..spec }
 }
 
 /// US equity exchange hours, Monday to Friday.
@@ -392,6 +434,14 @@ pub fn fills(events: &[Event]) -> Vec<&Fill> {
             _ => None,
         })
         .collect()
+}
+
+/// The one fill among `events`; panics unless there is exactly one.
+pub fn only_fill(events: &[Event]) -> &Fill {
+    match fills(events)[..] {
+        [fill] => fill,
+        _ => panic!("expected one fill, got {events:?}"),
+    }
 }
 
 /// The order rejection among `events`; panics if there is none.

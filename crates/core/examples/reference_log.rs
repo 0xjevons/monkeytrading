@@ -15,12 +15,14 @@ use std::path::PathBuf;
 use anyhow::anyhow;
 use chrono::NaiveDate;
 use common::reference::{ReferenceEntry, root_hex};
-use common::{AAPL, BTC, Client, ETH, Harness, UNLISTED, acct, f, market, ny, params, us_equities};
+use common::{
+    AAPL, BTC, Client, DE40, ETH, EURUSD, Harness, UNLISTED, USDJPY, acct, de40, f, market, ny, params, us_equities,
+};
 use engine_core::Engine;
 use engine_core::auth::MAX_EXPIRY_AHEAD_MS;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::Event;
-use engine_core::market::{MarketSpec, Tier};
+use engine_core::market::{MarketSpec, QuoteCurrency, Tier};
 use engine_core::params::{ProtocolParams, ToxicityParams};
 use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 use engine_core::protocol::ProtocolVersion;
@@ -78,8 +80,9 @@ fn main() -> anyhow::Result<()> {
 /// venue quotes stamped ahead of the sequenced time, and dust adds to a long and a short held over a
 /// rollover, with a rejection of each kind along the way. Then, under `V6`, close-outs after a
 /// margin-table rise, a close-out level rise, and a rollover's financing, house cap floors at a
-/// drawn-down NAV, and a close-out just after a session close that skips the closed market. Every
-/// client request is signed by its account's key unless the comment says otherwise.
+/// drawn-down NAV, and a close-out just after a session close that skips the closed market. Then,
+/// under `V7`, USD settlement of markets quoted in euros and yen. Every client request is signed by
+/// its account's key unless the comment says otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -369,6 +372,51 @@ fn session() -> Vec<Sequenced> {
     h.price(AAPL, "200");
     h.advance(150);
     h.price(BTC, "92000");
+
+    // USD settlement: a listing quoted in euros is refused under `V6`, then `V7` activates. Germany
+    // 40 is quoted in euros at EUR-USD, and USD-JPY in yen at its own index. A listing that converts
+    // at a market other than its pair's is refused, and Germany 40 has no price until EUR-USD marks
+    // it.
+    h.cmd(Command::Admin(AdminCommand::UpsertMarket(de40(500))));
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V7 });
+    // Fresh capital, so the house caps the drawn-down NAV set admit these trades.
+    h.cmd(Command::HouseCapital { amount: f("10000000"), chain_ref: "0xcap:5".into() });
+    h.list_fx();
+    let uk100 = market(30, "UK100", AssetClass::Index, Schedule::AlwaysOpen, 500);
+    let via_btc = MarketSpec { quote_currency: QuoteCurrency::Gbp { fx_market: BTC }, ..uk100 };
+    h.cmd(Command::Admin(AdminCommand::UpsertMarket(via_btc)));
+    h.price(DE40, "20000");
+    h.market_order(a, DE40, Side::Buy, "2", "20000");
+    h.price(EURUSD, "1.08");
+    h.market_order(a, DE40, Side::Buy, "2", "20000");
+    h.price(USDJPY, "150");
+    h.market_order(b, USDJPY, Side::Sell, "10000", "150");
+    // A leveraged Germany 40 long closed out by an EUR-USD move alone, the index holding still.
+    let q = h.signer(16);
+    h.admin(AdminCommand::UpsertMarket(de40(100)));
+    h.deposit(q, "2300");
+    h.market_order(q, DE40, Side::Buy, "10", "20000");
+    h.price(DE40, "19900");
+    h.price(EURUSD, "1.2");
+    // The quote currency of a market with open positions cannot change.
+    let in_dollars = MarketSpec { quote_currency: QuoteCurrency::Usd, ..de40(100) };
+    h.cmd(Command::Admin(AdminCommand::UpsertMarket(in_dollars)));
+    // EUR-USD goes stale: a limit Germany 40 reaches keeps resting and orders are refused. An index
+    // that values a euro above 10 USD converts nothing; the next valid one lets the limit fill.
+    h.order(a, DE40, Side::Sell, "1", OrderKind::Limit { price: f("19950") });
+    h.advance(1_500);
+    h.price(DE40, "20000");
+    h.market_order(a, DE40, Side::Sell, "1", "20000");
+    h.price(EURUSD, "11");
+    h.market_order(a, DE40, Side::Sell, "1", "20000");
+    h.price(EURUSD, "1.1");
+    h.price(DE40, "20000");
+    // Yen PnL realised at the USD-JPY index, then the Germany 40 long's euro financing charged in USD
+    // at the next rollover.
+    h.price(USDJPY, "151");
+    h.market_order(b, USDJPY, Side::Buy, "10000", "151");
+    h.advance_to(ny(2026, 10, 26, 18, 30));
+    h.cmd(Command::Tick);
     h.log
 }
 

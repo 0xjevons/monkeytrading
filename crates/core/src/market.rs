@@ -6,6 +6,7 @@ use std::iter::once;
 use serde::{Deserialize, Serialize};
 
 use crate::Fixed;
+use crate::fixed::Rounding;
 use crate::session::Schedule;
 use crate::types::{AssetClass, MarketId};
 
@@ -13,20 +14,35 @@ use crate::types::{AssetClass, MarketId};
 const MAX_RATE_BPS: i64 = 10_000;
 /// The most a house exposure cap may be: ten times house NAV.
 const MAX_HOUSE_CAP_BPS: i64 = 100_000;
+/// The FX pairs the engine converts at, by symbol.
+const EUR_USD: &str = "EUR-USD";
+const GBP_USD: &str = "GBP-USD";
+const USD_JPY: &str = "USD-JPY";
+/// The most one unit of a quote currency may be worth: 10 USD, above any real currency's value. It
+/// bounds how far a conversion scales an amount up; an FX index past it converts nothing.
+const MAX_USD_PER_UNIT: Fixed = Fixed::from_int(10);
 
+/// A market listing. Prices are in the quote currency. Every notional bound here is USD, and so is
+/// every amount the market moves for an account or the house: PnL and financing accrue in the quote
+/// currency and convert at the FX index, rounding toward the house. What a trader is credited or
+/// may use rounds down; what a trader is charged, and the exposure and limits that guard the house,
+/// round up.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarketSpec {
     pub id: MarketId,
     pub symbol: String,
     pub asset_class: AssetClass,
+    /// USD unless declared. Left out of the encoding while USD, so USD listings keep their roots.
+    #[serde(default, skip_serializing_if = "QuoteCurrency::is_usd")]
+    pub quote_currency: QuoteCurrency,
     pub schedule: Schedule,
     /// Margin bands by position notional (USD): each band's rate applies to the slice of notional
     /// inside it.
     pub margin_tiers: Vec<Tier>,
-    /// Size spread bands. Spread is charged only on the slice of a trade that grows the account's
-    /// absolute position notional through each band, so normal size pays zero and splitting a
-    /// large order doesn't avoid it.
+    /// Size spread bands by position notional (USD). Spread is charged only on the slice of a trade
+    /// that grows the account's absolute position notional through each band, so normal size pays
+    /// zero and splitting a large order doesn't avoid it.
     pub spread_tiers: Vec<Tier>,
     pub price_rules: PriceRules,
     /// Largest adverse move from the price the client saw that a market order will still fill at.
@@ -35,12 +51,28 @@ pub struct MarketSpec {
     pub financing: FinancingSpec,
     /// Cap on the house's net notional in this market, in bps of house NAV.
     pub house_cap_bps: i64,
+    /// Smallest notional (USD) of an order that adds risk, measured on the whole order.
     #[serde(default)]
     pub min_order_notional: Fixed,
     /// From protocol `V6`, the least the market cap may be, in USD notional, however small or
     /// negative house NAV is. Zero means none, and is left out of the encoding.
     #[serde(default, skip_serializing_if = "Fixed::is_zero")]
     pub house_cap_floor: Fixed,
+}
+
+/// The currency a market's prices are quoted in. Any other than USD names the FX market whose index
+/// converts it to USD: the listed market for its pair. USD-JPY may name itself, for its own yen PnL.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "currency", rename_all = "snake_case", deny_unknown_fields)]
+pub enum QuoteCurrency {
+    #[default]
+    Usd,
+    /// Converted at a EUR-USD index: USD per euro.
+    Eur { fx_market: MarketId },
+    /// Converted at a GBP-USD index: USD per pound.
+    Gbp { fx_market: MarketId },
+    /// Converted at a USD-JPY index: yen per USD.
+    Jpy { fx_market: MarketId },
 }
 
 /// A band in a tier table. `up_to: None` means unbounded and must be last.
@@ -121,6 +153,98 @@ impl MarketSpec {
     /// Margin required for a position of `notional` (either sign).
     pub fn margin_for(&self, notional: Fixed) -> Fixed {
         staircase(&self.margin_tiers, Fixed::ZERO, notional.abs())
+    }
+
+    /// Checks this listing's quote currency against the FX pairs, given the symbol of each market
+    /// already listed. A pair's own listing (EUR-USD, GBP-USD, or USD-JPY, by symbol) is quoted in its
+    /// second currency: USD, or yen at its own index for USD-JPY. Any other listing quoted outside USD
+    /// converts at the listed market for its pair.
+    /// Error cases:
+    /// - a pair's listing quoted in a currency other than the pair's second
+    /// - a quote currency other than USD whose FX market is not the listed market for its pair
+    pub fn check_fx_market<'m>(&'m self, listed_symbol: impl Fn(MarketId) -> Option<&'m str>) -> Result<(), String> {
+        let own = match self.symbol.as_str() {
+            EUR_USD | GBP_USD => Some(QuoteCurrency::Usd),
+            USD_JPY => Some(QuoteCurrency::Jpy { fx_market: self.id }),
+            _ => None,
+        };
+        if let Some(own) = own
+            && own != self.quote_currency
+        {
+            return Err(format!("{} must be quoted as {own:?}", self.symbol));
+        }
+        let (Some(fx_market), Some(pair)) = (self.quote_currency.fx_market(), self.quote_currency.pair()) else {
+            return Ok(());
+        };
+        let symbol = if fx_market == self.id { Some(self.symbol.as_str()) } else { listed_symbol(fx_market) };
+        let is_pair = symbol == Some(pair);
+        if !is_pair {
+            return Err(format!("fx_market {fx_market} is not the listed {pair} market"));
+        }
+        Ok(())
+    }
+}
+
+impl QuoteCurrency {
+    /// True for USD, which needs no conversion.
+    pub fn is_usd(&self) -> bool {
+        *self == QuoteCurrency::Usd
+    }
+
+    /// The symbol of the FX market whose index converts this currency, or `None` for USD.
+    fn pair(self) -> Option<&'static str> {
+        match self {
+            QuoteCurrency::Usd => None,
+            QuoteCurrency::Eur { .. } => Some(EUR_USD),
+            QuoteCurrency::Gbp { .. } => Some(GBP_USD),
+            QuoteCurrency::Jpy { .. } => Some(USD_JPY),
+        }
+    }
+
+    /// The market whose index converts this currency to USD, or `None` for USD.
+    pub fn fx_market(self) -> Option<MarketId> {
+        match self {
+            QuoteCurrency::Usd => None,
+            QuoteCurrency::Eur { fx_market } | QuoteCurrency::Gbp { fx_market } | QuoteCurrency::Jpy { fx_market } => {
+                Some(fx_market)
+            }
+        }
+    }
+
+    /// `amount` in this currency, in USD at `fx`, its FX market's index: times a EUR-USD or GBP-USD
+    /// index, over a USD-JPY one, rounded as `rounding` says. A USD amount is returned as it is.
+    /// Panics on a non-zero amount in another currency with no index, which callers rule out.
+    pub fn to_usd(self, amount: Fixed, fx: Option<Fixed>, rounding: Rounding) -> Fixed {
+        match (self, fx) {
+            (QuoteCurrency::Usd, _) => amount,
+            (QuoteCurrency::Eur { .. } | QuoteCurrency::Gbp { .. }, Some(fx)) => amount.mul_rounded(fx, rounding),
+            (QuoteCurrency::Jpy { .. }, Some(fx)) => amount.div_rounded(fx, rounding),
+            (_, None) => {
+                assert!(amount.is_zero(), "{amount} in {self:?} has no FX index to convert at");
+                amount
+            }
+        }
+    }
+
+    /// `amount` in USD, in this currency at `fx`: the inverse of [`QuoteCurrency::to_usd`], rounded
+    /// as `rounding` says.
+    /// Panics on a non-zero amount in another currency with no index, which callers rule out.
+    pub fn from_usd(self, amount: Fixed, fx: Option<Fixed>, rounding: Rounding) -> Fixed {
+        match (self, fx) {
+            (QuoteCurrency::Usd, _) => amount,
+            (QuoteCurrency::Eur { .. } | QuoteCurrency::Gbp { .. }, Some(fx)) => amount.div_rounded(fx, rounding),
+            (QuoteCurrency::Jpy { .. }, Some(fx)) => amount.mul_rounded(fx, rounding),
+            (_, None) => {
+                assert!(amount.is_zero(), "{amount} USD has no FX index to convert to {self:?} at");
+                amount
+            }
+        }
+    }
+
+    /// Whether `fx`, a valid index of this currency's FX market, can convert it: one unit of the
+    /// currency is worth at most `MAX_USD_PER_UNIT`.
+    pub(crate) fn converts_at(self, fx: Fixed) -> bool {
+        self.to_usd(Fixed::ONE, Some(fx), Rounding::Up) <= MAX_USD_PER_UNIT
     }
 }
 
@@ -223,5 +347,86 @@ mod tests {
     #[test]
     fn unknown_tier_fields_are_rejected() {
         assert!(serde_json::from_str::<Tier>(r#"{"up_to":"1","bps":1,"bsp":2}"#).is_err());
+    }
+
+    const EUR: QuoteCurrency = QuoteCurrency::Eur { fx_market: 10 };
+    const JPY: QuoteCurrency = QuoteCurrency::Jpy { fx_market: 12 };
+
+    fn d(s: &str) -> Fixed {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn euros_multiply_and_yen_divide_by_the_fx_index_rounding_the_way_asked() {
+        use Rounding::{Down, Up};
+        // (currency, amount, index, rounded down, rounded up): a gain and a loss through a USD-quote
+        // pair (EUR-USD, times the index) and a USD-base pair (USD-JPY, over the index).
+        let cases = [
+            (EUR, "0.000000003", "1.5", "0.000000004", "0.000000005"),
+            (EUR, "-0.000000003", "1.5", "-0.000000005", "-0.000000004"),
+            (EUR, "200", "1.08", "216", "216"),
+            (JPY, "100", "150", "0.666666666", "0.666666667"),
+            (JPY, "-100", "150", "-0.666666667", "-0.666666666"),
+            (JPY, "-300", "150", "-2", "-2"),
+        ];
+        for (currency, amount, fx, down, up) in cases {
+            let convert = |rounding| currency.to_usd(d(amount), Some(d(fx)), rounding);
+            assert_eq!((convert(Down), convert(Up)), (d(down), d(up)), "{currency:?} {amount} at {fx}");
+        }
+        assert_eq!(EUR.from_usd(d("1"), Some(d("3")), Down), d("0.333333333"));
+        assert_eq!(EUR.from_usd(d("1"), Some(d("3")), Up), d("0.333333334"));
+        assert_eq!(JPY.from_usd(d("0.000000003"), Some(d("1.5")), Up), d("0.000000005"));
+        assert_eq!(JPY.from_usd(d("2"), Some(d("150")), Down), d("300"));
+        let usd = QuoteCurrency::Usd;
+        assert_eq!((usd.to_usd(d("7"), None, Up), usd.from_usd(d("7"), None, Down)), (d("7"), d("7")));
+    }
+
+    #[test]
+    fn a_market_with_no_fx_index_converts_only_zero() {
+        assert_eq!(EUR.to_usd(Fixed::ZERO, None, Rounding::Down), Fixed::ZERO);
+        assert_eq!(JPY.from_usd(Fixed::ZERO, None, Rounding::Up), Fixed::ZERO);
+        let converted = std::panic::catch_unwind(|| EUR.to_usd(d("1"), None, Rounding::Down));
+        assert!(converted.is_err(), "a non-zero amount without an index must not convert");
+    }
+
+    #[test]
+    fn an_fx_index_converts_while_a_unit_is_worth_at_most_ten_dollars() {
+        assert!(EUR.converts_at(d("10")));
+        assert!(!EUR.converts_at(d("10.000000001")));
+        // A yen is worth 1 / index USD, so a USD-JPY index converts from 0.1 up.
+        assert!(JPY.converts_at(d("0.1")));
+        assert!(!JPY.converts_at(d("0.099999999")));
+        assert!(JPY.converts_at(Fixed::MAX_INPUT));
+        assert!(EUR.converts_at(Fixed::from_raw(1)));
+    }
+
+    #[test]
+    fn a_usd_listing_leaves_the_currency_out_and_others_name_their_fx_market() {
+        let spec = |extra: serde_json::Value| {
+            let mut json = serde_json::json!({
+                "id": 23, "symbol": "DE40", "asset_class": "index", "schedule": { "kind": "always_open" },
+                "margin_tiers": [{ "bps": 50 }], "spread_tiers": [{ "bps": 0 }],
+                "price_rules": { "max_age_ms": 1000, "max_divergence_bps": 10, "min_sources": 2 },
+                "max_slippage_bps": 10, "financing": { "benchmark": "ESTR", "markup_bps": 250, "day_basis": 360 },
+                "house_cap_bps": 5000,
+            });
+            json.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<MarketSpec>(json)
+        };
+        let usd = spec(serde_json::json!({})).unwrap();
+        assert_eq!(usd.quote_currency, QuoteCurrency::Usd);
+        assert!(!serde_json::to_string(&usd).unwrap().contains("quote_currency"));
+        let de40 = spec(serde_json::json!({ "quote_currency": { "currency": "eur", "fx_market": 10 } })).unwrap();
+        assert_eq!(de40.quote_currency, EUR);
+        assert_eq!(de40.quote_currency.fx_market(), Some(10));
+        let encoded = serde_json::to_string(&de40).unwrap();
+        assert!(encoded.contains(r#""quote_currency":{"currency":"eur","fx_market":10}"#), "{encoded}");
+        for bad in [
+            serde_json::json!({ "quote_currency": { "currency": "eur" } }),
+            serde_json::json!({ "quote_currency": { "currency": "chf", "fx_market": 10 } }),
+            serde_json::json!({ "quote_currency": { "currency": "eur", "fx_market": 10, "fx": 1 } }),
+        ] {
+            assert!(spec(bad.clone()).is_err(), "{bad}");
+        }
     }
 }

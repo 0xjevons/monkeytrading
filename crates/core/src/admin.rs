@@ -8,6 +8,8 @@ use crate::Fixed;
 use crate::command::AdminCommand;
 use crate::engine::{Engine, MarketState};
 use crate::event::Event;
+use crate::fixed::Rounding;
+use crate::market::MarketSpec;
 use crate::params::{MAX_BENCHMARK_BPS, StressLevel};
 use crate::protocol::ProtocolVersion;
 use crate::types::MarketId;
@@ -15,11 +17,12 @@ use crate::types::MarketId;
 impl Engine {
     /// Applies an operator command. From `V6`, new parameters check every account for close-out, as
     /// the close-out level may rise, and a listing checks every account holding the market, as its
-    /// margin table may rise.
+    /// margin table may rise. From `V7`, a listing of a market others convert at also marks it and
+    /// them as a price update does.
     /// Error cases:
     /// - `SetParams` with parameters that fail `ProtocolParams::validate`
-    /// - `UpsertMarket` with a spec that fails `MarketSpec::validate`, or with dated closures or
-    ///   special sessions before `V4`
+    /// - `UpsertMarket` with a spec that fails `MarketSpec::validate` or `check_quote_currency`, or with
+    ///   dated closures or special sessions before `V4`
     /// - `SetBenchmarkRate` outside ±10000 bps a year
     /// - `SetStressFloor` before parameters are set, at a level that does not exist, or for an
     ///   unknown market
@@ -43,13 +46,31 @@ impl Engine {
                 if spec.schedule.has_exceptions() && self.protocol_version < ProtocolVersion::V4 {
                     return Err(format!("dated closures and special sessions need protocol {:?}", ProtocolVersion::V4));
                 }
+                self.check_quote_currency(spec)?;
                 match self.markets.get_mut(&spec.id) {
-                    Some(market) => market.spec = spec.clone(),
+                    Some(market) => {
+                        // An FX mark belongs to the currency it was taken for.
+                        if market.spec.quote_currency != spec.quote_currency {
+                            market.fx_mark = None;
+                        }
+                        market.spec = spec.clone();
+                    }
                     None => {
                         self.markets.insert(spec.id, MarketState::new(spec.clone()));
                     }
                 }
                 self.refresh_session(spec.id, events);
+                // A new listing for a market others convert at can change what its index converts
+                // at, so it is their price update too, before any close-out runs.
+                let converts_here = |market: &MarketState| {
+                    market.spec.id != spec.id && market.spec.quote_currency.fx_market() == Some(spec.id)
+                };
+                if self.protocol_version >= ProtocolVersion::V7
+                    && self.params.is_some()
+                    && self.markets.values().any(converts_here)
+                {
+                    self.reprice(spec.id, events);
+                }
                 if self.protocol_version >= ProtocolVersion::V6 && self.params.is_some() {
                     self.check_closeouts(spec.id, events);
                 }
@@ -115,7 +136,8 @@ impl Engine {
                 0
             }
         };
-        let util_bps = if cap.is_positive() { market.client_qty.abs().mul(mid).bps_of(cap) } else { i64::MAX };
+        let exposure = market.usd_at_mark(market.client_qty.abs().mul(mid), Rounding::Up);
+        let util_bps = if cap.is_positive() { exposure.bps_of(cap) } else { i64::MAX };
         let target = auto_stress_target(&params.stress_levels, divergence_bps, move_bps, util_bps);
 
         let stress = &mut market.stress;
@@ -125,6 +147,41 @@ impl Engine {
         }
         let max_level = params.stress_levels.len() - 1;
         set_stress_level(market_id, market, global_floor, max_level, events);
+    }
+
+    /// Checks a listing's quote currency against the protocol version and the markets already listed.
+    /// Before `V7` every market is quoted in USD, whatever its symbol.
+    /// Error cases:
+    /// - a quote currency other than USD before `V7`
+    /// - from `V7`, a listing that fails `MarketSpec::check_fx_market`, or that makes a market which
+    ///   converts at it fail it
+    /// - a change of quote currency while an account holds a position in the market
+    fn check_quote_currency(&self, spec: &MarketSpec) -> Result<(), String> {
+        if self.protocol_version < ProtocolVersion::V7 {
+            if spec.quote_currency.is_usd() {
+                return Ok(());
+            }
+            return Err(format!("a quote currency other than USD needs protocol {:?}", ProtocolVersion::V7));
+        }
+        let symbol = |id: MarketId| {
+            if id == spec.id {
+                Some(spec.symbol.as_str())
+            } else {
+                self.markets.get(&id).map(|market| market.spec.symbol.as_str())
+            }
+        };
+        spec.check_fx_market(symbol)?;
+        // A market others convert at must stay their pair.
+        let dependents = self.markets.values().map(|market| &market.spec);
+        for dependent in dependents.filter(|d| d.id != spec.id && d.quote_currency.fx_market() == Some(spec.id)) {
+            dependent.check_fx_market(symbol).map_err(|e| format!("market {} converts here: {e}", dependent.id))?;
+        }
+        let changed =
+            self.markets.get(&spec.id).is_some_and(|market| market.spec.quote_currency != spec.quote_currency);
+        if changed && self.accounts.values().any(|acct| acct.positions.contains_key(&spec.id)) {
+            return Err(format!("market {} has open positions, so its quote currency cannot change", spec.id));
+        }
+        Ok(())
     }
 
     /// Recomputes every market's effective stress level after a floor or parameter change.

@@ -44,7 +44,8 @@ pub struct TestSequencer {
 }
 
 impl TestSequencer {
-    /// Recovers a sequencer from `dir`, sequences the dev genesis if the log is empty, and runs it.
+    /// Recovers a sequencer from `dir` and boots it as the node does: records client auth and
+    /// activates the latest protocol, sequences the dev genesis if the log lacks it, and runs it.
     /// The stream channel holds `stream_capacity` messages.
     pub fn start(dir: &Path, stream_capacity: usize) -> Self {
         Self::start_at(dir, stream_capacity, Arc::new(SystemClock))
@@ -58,6 +59,7 @@ impl TestSequencer {
         let key = Arc::new(EnclaveKey::generate());
         let cfg = SequencerConfig { clock: clock.clone(), ..sequencer_config(dir, manifest_tx) };
         let mut seq = Sequencer::recover(cfg, key, stream.clone(), withdrawals_tx).expect("sequencer recovers");
+        seq.activate_protocol().expect("protocol activation");
         if seq.needs_genesis() {
             seq.genesis(&dev_config().genesis).expect("dev genesis");
         }
@@ -252,6 +254,7 @@ pub fn every_event() -> Vec<Event> {
         Reject::ReduceOnly,
         Reject::NoPrice { error: PriceError::Stale { fresh: 1, needed: 2 } },
         Reject::NoPrice { error: PriceError::Divergent { divergence_bps: 30 } },
+        Reject::NoFxPrice { fx_market: 10 },
         Reject::Slippage { quoted: amount, live: amount, slippage_bps: 5 },
         Reject::InsufficientMargin { equity: amount, required: amount },
         Reject::InsufficientFunds { available: amount },
@@ -272,6 +275,7 @@ pub fn every_event() -> Vec<Event> {
             | Reject::MarketClosed
             | Reject::ReduceOnly
             | Reject::NoPrice { .. }
+            | Reject::NoFxPrice { .. }
             | Reject::Slippage { .. }
             | Reject::InsufficientMargin { .. }
             | Reject::InsufficientFunds { .. }
@@ -295,6 +299,7 @@ pub fn every_event() -> Vec<Event> {
         index: amount,
         spread_bps: 4,
         realised_pnl: -amount,
+        fx_index: Some(amount),
         profit_fee: Fixed::ZERO,
         position: amount,
         liquidation: true,

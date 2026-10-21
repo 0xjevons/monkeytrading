@@ -105,6 +105,11 @@ pub enum Reject {
     NoPrice {
         error: PriceError,
     },
+    /// The market is quoted in another currency than USD, and its FX market has no price to convert
+    /// at.
+    NoFxPrice {
+        fx_market: MarketId,
+    },
     /// The live price is further from the client's quote than allowed.
     Slippage {
         quoted: Fixed,
@@ -162,8 +167,11 @@ pub struct Fill {
     /// Reference mid at fill time. `price` minus `index` is the spread paid.
     pub index: Fixed,
     pub spread_bps: i64,
-    /// Price PnL realised by this fill, before the fee.
+    /// Price PnL realised by this fill, in USD, before the fee.
     pub realised_pnl: Fixed,
+    /// The FX index `realised_pnl` converted to USD at; absent for a USD market.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fx_index: Option<Fixed>,
     pub profit_fee: Fixed,
     /// Signed position after the fill.
     pub position: Fixed,

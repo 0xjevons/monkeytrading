@@ -148,11 +148,14 @@ verifies its checkpoints.
 - `src/clock.rs` — the wall and monotonic clocks the sequencer stamps and checks with
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
 - `tests/reference_logs.rs` — replays every committed node reference log, events included
+- `tests/usd_settlement.rs` — the USD settlement dev scenario on the committed dev config: Germany 40
+  valued at EUR-USD's index while EUR-USD moves, then refusing orders while EUR-USD is stale
 - `tests/reference/` — one node-format reference log per protocol version, never regenerated
 - `tests/replay.rs` — replays a log the node wrote before protocol versions, kept in
   `tests/fixtures/`
 - `tests/production_genesis.rs` — loads `config/production-genesis.toml` as a dev node's genesis,
-  checks the launch values, and steps it through weeks with holidays and early closes
+  checks the launch values and quote currencies, and steps it through weeks with holidays and early
+  closes
 
 ## Usage
 

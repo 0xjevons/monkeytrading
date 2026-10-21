@@ -201,22 +201,46 @@ impl Fixed {
     }
 
     // Named methods rather than `Mul`/`Div` impls, so truncation is visible at every call site.
-    /// Product, truncated toward zero.
+    /// Product, truncated toward zero. The larger factor is split at the scale, so the full product
+    /// never forms and only a result outside `Fixed`'s range overflows.
     #[allow(clippy::should_implement_trait)]
     pub fn mul(self, rhs: Fixed) -> Fixed {
-        Fixed(self.0 * rhs.0 / SCALE)
+        let (big, small) = if self.0.abs() >= rhs.0.abs() { (self.0, rhs.0) } else { (rhs.0, self.0) };
+        // `whole * small` is a whole number of units with the product's sign, so truncating the
+        // part's share truncates the product.
+        let (whole, part) = (big / SCALE, big % SCALE);
+        Fixed(whole * small + part * small / SCALE)
     }
 
-    /// Quotient, truncated toward zero. Panics on a zero divisor, which callers rule out first.
+    /// Quotient, truncated toward zero. The dividend is split at the divisor, so only a result outside
+    /// `Fixed`'s range, or a divisor above `i128::MAX / 10^9` in raw units, overflows. Panics on a
+    /// zero divisor, which callers rule out first.
     #[allow(clippy::should_implement_trait)]
     pub fn div(self, rhs: Fixed) -> Fixed {
         assert!(rhs.0 != 0, "fixed-point division by zero");
-        Fixed(self.0 * SCALE / rhs.0)
+        // `self` is `whole * rhs + part`, and the part's share has the quotient's sign.
+        let (whole, part) = (self.0 / rhs.0, self.0 % rhs.0);
+        Fixed(whole * SCALE + part * SCALE / rhs.0)
     }
 
-    /// Product, rounded as `rounding` says.
+    /// Product, rounded as `rounding` says. The larger factor is split at the scale, so the full
+    /// product never forms and only a result outside `Fixed`'s range overflows.
     pub fn mul_rounded(self, rhs: Fixed, rounding: Rounding) -> Fixed {
-        self.mul_div(rhs, Fixed::ONE, rounding)
+        let (big, small) = if self.0.abs() >= rhs.0.abs() { (self.0, rhs.0) } else { (rhs.0, self.0) };
+        // `big` is `whole * SCALE + part`; `whole * small` is a whole number of units, so only the
+        // part's share needs rounding.
+        let (whole, part) = (big / SCALE, big % SCALE);
+        Fixed(whole * small + round_div(part * small, SCALE, rounding))
+    }
+
+    /// Quotient, rounded as `rounding` says. The dividend is split at the divisor, so only a result
+    /// outside `Fixed`'s range, or a divisor above `i128::MAX / 10^9` in raw units, overflows. Panics
+    /// on a zero divisor, which callers rule out first.
+    pub fn div_rounded(self, rhs: Fixed, rounding: Rounding) -> Fixed {
+        assert!(rhs.0 != 0, "fixed-point division by zero");
+        // `self` is `whole * rhs + part`, so the quotient is `whole` units plus the part's share.
+        let (whole, part) = (self.0 / rhs.0, self.0 % rhs.0);
+        Fixed(whole * SCALE + round_div(part * SCALE, rhs.0, rounding))
     }
 
     /// `self * num / den` from the exact product, rounded once as `rounding` says. Panics on a zero
@@ -314,6 +338,67 @@ mod tests {
     }
 
     #[test]
+    fn directed_rounding_brackets_the_exact_result_for_either_sign() {
+        // 0.000000003 * 1.5 = 0.0000000045, and 1 / 3 = 0.333..., each of either sign.
+        let cases = [
+            (f("0.000000003").mul_rounded(f("1.5"), Rounding::Down), f("0.000000004")),
+            (f("0.000000003").mul_rounded(f("1.5"), Rounding::Up), f("0.000000005")),
+            (f("-0.000000003").mul_rounded(f("1.5"), Rounding::Down), f("-0.000000005")),
+            (f("-0.000000003").mul_rounded(f("1.5"), Rounding::Up), f("-0.000000004")),
+            (f("1").div_rounded(f("3"), Rounding::Down), f("0.333333333")),
+            (f("1").div_rounded(f("3"), Rounding::Up), f("0.333333334")),
+            (f("-1").div_rounded(f("3"), Rounding::Down), f("-0.333333334")),
+            (f("-1").div_rounded(f("3"), Rounding::Up), f("-0.333333333")),
+            (f("1").div_rounded(f("-3"), Rounding::Down), f("-0.333333334")),
+            (f("1").div_rounded(f("-3"), Rounding::Up), f("-0.333333333")),
+            // Exact results do not move.
+            (f("2.5").mul_rounded(f("-4"), Rounding::Down), f("-10")),
+            (f("2.5").mul_rounded(f("-4"), Rounding::Up), f("-10")),
+            (f("-9").div_rounded(f("3"), Rounding::Down), f("-3")),
+            (f("-9").div_rounded(f("3"), Rounding::Up), f("-3")),
+        ];
+        for (n, (got, want)) in cases.into_iter().enumerate() {
+            assert_eq!(got, want, "case {n}");
+        }
+        // Products and quotients whose full intermediate exceeds `i128` but whose result fits.
+        let big = Fixed::from_raw(18_000_000_000_000_000_000_000_000_000);
+        assert_eq!(big.mul_rounded(f("10"), Rounding::Up), Fixed::from_raw(180_000_000_000_000_000_000_000_000_000));
+        assert_eq!(f("10").mul_rounded(big, Rounding::Down), big.mul_int(10));
+        let odd = big + Fixed::from_raw(1);
+        assert_eq!(odd.mul_rounded(f("0.5"), Rounding::Down), Fixed::from_raw(big.raw() / 2));
+        assert_eq!(odd.mul_rounded(f("0.5"), Rounding::Up), Fixed::from_raw(big.raw() / 2 + 1));
+        let huge = big.mul_int(100) + Fixed::from_raw(1);
+        assert_eq!(huge.div_rounded(f("0.1"), Rounding::Down), huge.mul_int(10));
+        assert_eq!(huge.div_rounded(f("3"), Rounding::Down), Fixed::from_raw(huge.raw() / 3));
+        assert_eq!(huge.div_rounded(f("3"), Rounding::Up), Fixed::from_raw(huge.raw() / 3 + 1));
+        assert_eq!((-huge).div_rounded(f("3"), Rounding::Down), Fixed::from_raw(-huge.raw() / 3 - 1));
+        // Over a grid of signs and magnitudes: down <= exact <= up, one unit apart unless exact.
+        let values = [-7_000_000_001i128, -1_500_000_000, -3, -1, 1, 2, 999_999_999, 1_083_712_345, 151_370_000_000];
+        for (a, b) in values.iter().flat_map(|a| values.iter().map(move |b| (*a, *b))) {
+            for (num, den, down, up) in [
+                (
+                    a * b,
+                    SCALE,
+                    Fixed(a).mul_rounded(Fixed(b), Rounding::Down),
+                    Fixed(a).mul_rounded(Fixed(b), Rounding::Up),
+                ),
+                (
+                    a * SCALE,
+                    b,
+                    Fixed(a).div_rounded(Fixed(b), Rounding::Down),
+                    Fixed(a).div_rounded(Fixed(b), Rounding::Up),
+                ),
+            ] {
+                // Compare `down * den <= num <= up * den`, flipping the inequalities for a negative `den`.
+                let (lo, hi) = (down.0 * den, up.0 * den);
+                let bracketed = if den > 0 { lo <= num && num <= hi } else { lo >= num && num >= hi };
+                assert!(bracketed, "{a} {b}: {down:?} {up:?}");
+                assert_eq!(up.0 - down.0, i128::from(num % den != 0), "{a} {b}");
+            }
+        }
+    }
+
+    #[test]
     fn parse_and_display_round_trip() {
         for s in ["0", "1", "-1", "1.5", "-0.000000001", "123456.789"] {
             assert_eq!(f(s).to_string(), s);
@@ -358,6 +443,29 @@ mod tests {
         assert_eq!(f("1").div_int_rounded(3, Rounding::Up), f("0.333333334"));
         assert_eq!(f("-1").div_int_rounded(3, Rounding::Up), -third);
         assert_eq!(f("-1").div_int_rounded(3, Rounding::Down), f("-0.333333334"));
+    }
+
+    #[test]
+    fn truncating_products_and_quotients_overflow_only_outside_the_range() {
+        // 1.71e11 units at an index of 1e9: the scaled product, 1.71e38, is past `i128`, the result
+        // is not. Each sign truncates toward zero, as the plain formula does where it fits.
+        let qty = Fixed::from_int(171_000_000_000);
+        let mid = Fixed::MAX_INPUT;
+        assert_eq!(qty.mul(mid), Fixed::from_int(171_000_000_000).mul_int(1_000_000_000));
+        assert_eq!((-qty).mul(mid), -qty.mul(mid));
+        let odd = Fixed::from_raw(qty.raw() + 1);
+        assert_eq!(odd.mul(f("0.5")), Fixed::from_raw(qty.raw() / 2));
+        assert_eq!((-odd).mul(f("0.5")), Fixed::from_raw(-qty.raw() / 2));
+        let huge = Fixed::from_raw(1_800_000_000_000_000_000_000_000_000_001);
+        assert_eq!(huge.div(f("0.1")), huge.mul_int(10));
+        assert_eq!(huge.div(f("3")), Fixed::from_raw(huge.raw() / 3));
+        assert_eq!((-huge).div(f("3")), Fixed::from_raw(-huge.raw() / 3));
+        // Where the plain formula fits, the result is the same, for every sign.
+        let values = [-7_000_000_001i128, -1_500_000_000, -3, -1, 1, 2, 999_999_999, 1_083_712_345, 151_370_000_000];
+        for (a, b) in values.iter().flat_map(|a| values.iter().map(move |b| (*a, *b))) {
+            assert_eq!(Fixed(a).mul(Fixed(b)), Fixed(a * b / SCALE), "{a} * {b}");
+            assert_eq!(Fixed(a).div(Fixed(b)), Fixed(a * SCALE / b), "{a} / {b}");
+        }
     }
 
     #[test]

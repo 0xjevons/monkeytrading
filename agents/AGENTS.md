@@ -12,11 +12,12 @@ an index: load only the rule whose hint matches the current action.
 - **crates/core/** — `engine-core`: the protocol state machine. Covers pricing against the index,
   size and stress spreads, margin and close-out, the profit fee, overnight financing, trading
   sessions, house exposure caps, toxicity scoring, signed client requests (EIP-712, per-account
-  nonces, and expiries), and protocol versions. It does no IO and uses no clocks, randomness, or
-  floats. `impl Engine` is split by area (`engine.rs`, `execution.rs`, `closeout.rs`, `funds.rs`,
-  `admin.rs`, `auth.rs`). Unit tests sit inline; protocol tests are in `tests/` by area, with the
-  shared harness in `tests/common/`. `tests/reference/` holds one reference log per protocol
-  version, written once by `examples/reference_log.rs` and replayed to its roots by
+  nonces, and expiries), USD settlement of markets quoted in other currencies, and protocol
+  versions. It does no IO and uses no clocks, randomness, or floats. `impl Engine` is split by area
+  (`engine.rs`, `execution.rs`, `closeout.rs`, `funds.rs`, `admin.rs`, `auth.rs`). Unit tests sit
+  inline; protocol tests are in `tests/` by area, with the shared harness in `tests/common/`.
+  `tests/reference/` holds one reference log per protocol version, written once by
+  `examples/reference_log.rs` and replayed to its roots by
   `tests/reference_logs.rs`; `tests/invariants/` holds the property tests. Its `README.md` lists
   every file.
 - **crates/node/** — `engine-node`, binary `engine` (`main.rs` over `lib.rs`). Contains the
@@ -43,8 +44,8 @@ an index: load only the rule whose hint matches the current action.
   `custody.chain_id` and `custody.vault` under `eip712`, is recorded in the log when it first
   activates protocol versions, so changing it needs a fresh log. `production-genesis.toml` is the
   production `[genesis]` section alone: the launch markets with their venue calendars, each
-  calendar's sources and unpublished gaps, and the launch margins and fees; a deployment's node
-  sections complete it into a config. Every section rejects unknown keys.
+  calendar's sources and unpublished gaps, their quote currencies, and the launch margins and fees;
+  a deployment's node sections complete it into a config. Every section rejects unknown keys.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate;
   `check-reference-logs.sh`, which fails a branch that changes a committed reference log; and
   `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil.

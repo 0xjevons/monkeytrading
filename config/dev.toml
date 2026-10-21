@@ -67,6 +67,7 @@ mock_mids = [
   { market = 2, mid = "4000" },
   { market = 10, mid = "1.08" },
   { market = 20, mid = "6500" },
+  { market = 23, mid = "23500" },
   { market = 30, mid = "2600" },
   { market = 40, mid = "230" },
 ]
@@ -251,6 +252,32 @@ windows = [
   { open = "Thu 18:00", close = "Fri 17:00" },
 ]
 closed_dates = ["2026-12-25", "2027-01-01"]
+
+# --- Index quoted in euros: PnL converts to USD at EUR-USD's index ------------
+
+[[genesis.markets]]
+id = 23
+symbol = "DE40"
+asset_class = "index"
+quote_currency = { currency = "eur", fx_market = 10 }
+max_slippage_bps = 10
+house_cap_bps = 5000
+margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]
+spread_tiers = [{ up_to = "5000000", bps = 0 }, { up_to = "25000000", bps = 1 }, { bps = 4 }]
+price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
+financing = { benchmark = "ESTR", markup_bps = 250, day_basis = 360 }
+
+[genesis.markets.schedule]
+kind = "weekly"
+tz = "Europe/Berlin"
+windows = [
+  { open = "Mon 02:10", close = "Mon 22:00" },
+  { open = "Tue 02:10", close = "Tue 22:00" },
+  { open = "Wed 02:10", close = "Wed 22:00" },
+  { open = "Thu 02:10", close = "Thu 22:00" },
+  { open = "Fri 02:10", close = "Fri 22:00" },
+]
+closed_dates = ["2026-12-24", "2026-12-25", "2026-12-31", "2027-01-01"]
 
 # --- Commodity ---------------------------------------------------------------
 
