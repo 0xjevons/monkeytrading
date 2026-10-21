@@ -22,6 +22,7 @@ use tracing::{error, info, info_span, warn};
 use crate::clock::Clock;
 use crate::config::Genesis;
 use crate::log::{self, Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
+use crate::sequencer::alerts::{DeficitAlert, alert_on};
 use crate::tee::EnclaveKey;
 use crate::trusted_time::{Sample, TimeGate};
 
@@ -91,6 +92,8 @@ pub struct Sequencer {
     /// what it is for.
     required: Vec<(&'static str, Vec<Command>)>,
     client_auth: ClientAuth,
+    /// The alert for house NAV below zero.
+    deficit: DeficitAlert,
 }
 
 pub struct SequencerConfig<'a> {
@@ -192,7 +195,12 @@ impl Sequencer {
             clock: cfg.clock,
             required: Vec::new(),
             client_auth: cfg.client_auth,
+            deficit: DeficitAlert::default(),
         };
+        {
+            let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
+            sequencer.deficit.note(sequencer.engine.house_nav());
+        }
         for (account, amount, nonce) in unsigned {
             let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
             warn!(%account, nonce, "the log ends before this approved withdrawal was signed; signing it now");
@@ -305,6 +313,7 @@ impl Sequencer {
                 self.sign_withdrawal(*account, *amount, *nonce)?;
             }
         }
+        self.deficit.note(self.engine.house_nav());
         if self.next_seq.is_multiple_of(self.checkpoint_every) {
             self.checkpoint()?;
         }
@@ -474,25 +483,10 @@ pub fn genesis_commands(genesis: &Genesis) -> Vec<Command> {
     cmds
 }
 
-/// Raises an alert for an engine rejection an operator must look at.
-fn alert_on(event: &Event) {
-    match event {
-        // A finalised deposit the engine will not credit leaves user funds in the vault and
-        // nothing re-examines it.
-        Event::DepositRejected { account, amount, chain_ref, reason } => {
-            error!(alert = "deposit_rejected", %account, %amount, chain_ref, ?reason, "deposit not credited");
-        }
-        Event::PricesRejected { market, reason } => {
-            warn!(alert = "prices_rejected", market, reason, "price update refused");
-        }
-        Event::BadDebt { account, amount } => {
-            warn!(alert = "bad_debt", %account, %amount, "loss beyond balance written off against the house");
-        }
-        _ => {}
-    }
-}
-
+mod alerts;
 mod required;
 
+#[cfg(test)]
+mod margin_tests;
 #[cfg(test)]
 mod tests;

@@ -31,11 +31,14 @@
 #   sequences them; until then a benchmark with no rate counts as zero.
 # - house_capital is 0: the house starts with no capital and builds it from
 #   trader losses. Genesis records a zero house capital credit, which moves no
-#   cash and marks genesis done, so the vault holds only trader deposits. Exposure caps have no dollar floor yet; margin and solvency
-#   checks (#45) add one so trading can start from a zero house (#15 §2).
-#   Until then caps are a fraction of house NAV alone, so this genesis admits no
-#   opening trade, and house utilisation reads as full, so every priced market
-#   sits at the top stress level; the floor must cover the stress trigger too.
+#   cash and marks genesis done, so the vault holds only trader deposits.
+# - Each exposure cap is the larger of its share of house NAV and a dollar
+#   floor (house_cap_floor per market, house_total_cap_floor in total), so
+#   trading can start from a zero house (#15 §2). The floors are not set here
+#   yet: until they are, every cap is zero at zero NAV, so this genesis admits
+#   no opening trade, and house utilisation reads as full, so every priced
+#   market sits at the top stress level. Each floor must cover the stress
+#   trigger too.
 #
 # Calendars. Each schedule uses its venue's time zone. `windows` are the weekly
 # sessions, `closed_dates` whole local days the venue is shut, `closures`

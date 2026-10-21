@@ -12,6 +12,7 @@ use chrono_tz::Tz;
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::event::Event;
+use engine_core::params::ProtocolParams;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::session::{Period, Schedule};
 use engine_core::types::{AssetClass, MarketId, Millis};
@@ -67,9 +68,11 @@ fn a_dev_node_loads_the_production_genesis_and_every_market_validates() {
 fn the_production_genesis_applies_the_launch_decisions() {
     let production = production_genesis("launch-decisions");
     let dev = NodeConfig::load(Path::new(DEV)).unwrap().genesis;
-    // A 10% profit fee (#9); the other parameters, stress levels included, are dev's.
+    // A 10% profit fee (#9); the other parameters, stress levels included, are dev's, except the
+    // total cap floor, whose production value is not chosen yet.
     assert_eq!(production.params.profit_fee_bps, 1_000);
-    assert_eq!(production.params, dev.params);
+    let floor = dev.params.house_total_cap_floor;
+    assert_eq!(ProtocolParams { house_total_cap_floor: floor, ..production.params.clone() }, dev.params);
     // The house starts with no capital and builds it from trader losses, and no benchmark rate is
     // set until the daily benchmark feed sequences one.
     assert_eq!(production.house_capital, Fixed::ZERO);

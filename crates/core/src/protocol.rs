@@ -38,11 +38,16 @@ pub enum ProtocolVersion {
     /// the held entry and the fill price, rounded once, up for a long and down for a short; realised
     /// and unrealised PnL round down; and the profit fee and a financing charge round up.
     V5,
+    /// Each house exposure cap is the larger of its share of house NAV and its fixed dollar floor.
+    /// Close-outs are also checked after each rollover's financing and after a parameter or listing
+    /// change, close out only markets inside their trading session, and value a market that can
+    /// trade at the index they fill at.
+    V6,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V5;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V6;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

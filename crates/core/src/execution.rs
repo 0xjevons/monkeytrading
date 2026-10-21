@@ -338,7 +338,7 @@ impl Engine {
             // `house_gross_exposure` values this market at its mark; swap that term for `after`.
             let at_mark = market.mark.map_or(Fixed::ZERO, |mark| market.client_qty.abs().mul(mark));
             let total_after = self.house_gross_exposure() - at_mark + after;
-            if after > nav.mul_bps(market.spec.house_cap_bps) || total_after > nav.mul_bps(params.house_total_cap_bps) {
+            if after > self.market_cap(&market.spec, nav) || total_after > self.total_cap(params, nav) {
                 return Err(Reject::HouseCapacity);
             }
         }

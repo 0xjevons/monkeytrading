@@ -32,13 +32,15 @@ pub const HOUSE_CAPITAL: i64 = 100_000_000;
 pub const CHAIN_ID: u64 = 31_337;
 pub const VAULT: AccountId = AccountId([0xaa; 20]);
 
-/// A sequenced engine with three markets and 100m of house capital, plus a record of the log and
-/// of the cash it credited.
+/// A sequenced engine with three markets and 100m of house capital (none from `zero_house`), plus a
+/// record of the log and of the cash it credited.
 pub struct Harness {
     pub engine: Engine,
     pub log: Vec<Sequenced>,
     pub ts: Millis,
     pub deposits: Fixed,
+    /// House capital credited at genesis.
+    pub house_capital: Fixed,
     /// Keys `cmd` signs unsigned client requests with, by account.
     pub signers: BTreeMap<AccountId, SigningKey>,
 }
@@ -76,9 +78,35 @@ impl Harness {
         h
     }
 
+    /// `v5`, then `V6`, which floors the house exposure caps and checks close-outs after financing
+    /// and parameter or listing changes.
+    pub fn v6() -> Self {
+        let mut h = Harness::v5();
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V6 });
+        h
+    }
+
+    /// `version`, with unsigned requests, and a house that starts with no capital, so house NAV is
+    /// zero until traders win or lose.
+    pub fn zero_house(version: ProtocolVersion) -> Self {
+        let mut h = Harness::empty();
+        h.admin(AdminCommand::SetClientAuth(ClientAuth::Unsigned));
+        h.admin(AdminCommand::ActivateProtocol { version });
+        h.house_capital = Fixed::ZERO;
+        h.genesis();
+        h
+    }
+
     /// No commands yet, at the harness start time.
     fn empty() -> Self {
-        Harness { engine: Engine::new(), log: vec![], ts: start(), deposits: Fixed::ZERO, signers: BTreeMap::new() }
+        Harness {
+            engine: Engine::new(),
+            log: vec![],
+            ts: start(),
+            deposits: Fixed::ZERO,
+            house_capital: Fixed::from_int(HOUSE_CAPITAL),
+            signers: BTreeMap::new(),
+        }
     }
 
     /// `V3` with signed requests under `CHAIN_ID` and `VAULT`.
@@ -93,13 +121,15 @@ impl Harness {
         client.account
     }
 
-    /// Parameters, three markets, and house capital.
+    /// Parameters, three markets, and any house capital.
     fn genesis(&mut self) {
         self.admin(AdminCommand::SetParams(params()));
         self.admin(AdminCommand::UpsertMarket(market(BTC, "BTC-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000)));
         self.admin(AdminCommand::UpsertMarket(market(ETH, "ETH-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000)));
         self.admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, us_equities(), 2_000)));
-        self.cmd(Command::HouseCapital { amount: Fixed::from_int(HOUSE_CAPITAL), chain_ref: "genesis".into() });
+        if self.house_capital.is_positive() {
+            self.cmd(Command::HouseCapital { amount: self.house_capital, chain_ref: "genesis".into() });
+        }
     }
 
     /// Sequences and applies one command at the current time, recording it in the log. An unsigned
@@ -221,7 +251,7 @@ impl Harness {
     /// house capital, less approved withdrawals.
     pub fn assert_conserved(&self, withdrawn: Fixed) {
         let balances: Fixed = self.engine.accounts().values().map(|a| a.balance).sum();
-        let expected = self.deposits + Fixed::from_int(HOUSE_CAPITAL) - withdrawn;
+        let expected = self.deposits + self.house_capital - withdrawn;
         assert_eq!(balances + self.engine.house_cash(), expected);
     }
 }
@@ -306,6 +336,7 @@ pub fn params() -> ProtocolParams {
             tiers: vec![ToxicityTier { min_score_bps: 20, extra_spread_bps: 3 }],
         },
         rollover: Rollover { tz: chrono_tz::Europe::London, hour: 22, minute: 0 },
+        house_total_cap_floor: Fixed::ZERO,
     }
 }
 
@@ -328,6 +359,7 @@ pub fn market(id: MarketId, symbol: &str, class: AssetClass, schedule: Schedule,
         financing: FinancingSpec { benchmark: "SOFR".into(), markup_bps: 250, day_basis: 365 },
         house_cap_bps: 5_000,
         min_order_notional: Fixed::ZERO,
+        house_cap_floor: Fixed::ZERO,
     }
 }
 

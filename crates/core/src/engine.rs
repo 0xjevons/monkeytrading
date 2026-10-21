@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
 use crate::Fixed;
-use crate::account::Account;
+use crate::account::{Account, Position};
 use crate::auth::ClientAuth;
 use crate::command::{Command, Sequenced};
 use crate::event::Event;
@@ -233,19 +233,41 @@ impl Engine {
         self.markets.values().filter_map(|market| market.mark.map(|mark| market.client_qty.abs().mul(mark))).sum()
     }
 
+    /// The cap on the house's absolute net notional in `spec`'s market at house NAV `nav`: its share
+    /// of NAV, or from `V6` the larger of that and the market's floor.
+    pub(crate) fn market_cap(&self, spec: &MarketSpec, nav: Fixed) -> Fixed {
+        self.floored(nav.mul_bps(spec.house_cap_bps), spec.house_cap_floor)
+    }
+
+    /// The cap on the house's gross exposure across markets at house NAV `nav`: its share of NAV,
+    /// or from `V6` the larger of that and the total floor.
+    pub(crate) fn total_cap(&self, params: &ProtocolParams, nav: Fixed) -> Fixed {
+        self.floored(nav.mul_bps(params.house_total_cap_bps), params.house_total_cap_floor)
+    }
+
     /// (equity, margin requirement) at current marks, optionally overriding one market's mark.
     pub fn equity_and_margin(&self, acct: &Account, mark_override: Option<(MarketId, Fixed)>) -> (Fixed, Fixed) {
+        self.equity_and_margin_at(acct, |market_id, market, pos| match mark_override {
+            Some((id, mid)) if id == market_id => mid,
+            _ => market.mark.unwrap_or(pos.entry),
+        })
+    }
+
+    /// (equity, margin requirement) with each position valued at `price_of(market id, market,
+    /// position)`.
+    pub(crate) fn equity_and_margin_at(
+        &self,
+        acct: &Account,
+        price_of: impl Fn(MarketId, &MarketState, &Position) -> Fixed,
+    ) -> (Fixed, Fixed) {
         acct.positions
             .iter()
             .filter_map(|(market_id, pos)| self.markets.get(market_id).map(|market| (*market_id, pos, market)))
             .fold((acct.balance, Fixed::ZERO), |(equity, margin), (market_id, pos, market)| {
-                let mark = match mark_override {
-                    Some((id, mid)) if id == market_id => mid,
-                    _ => market.mark.unwrap_or(pos.entry),
-                };
+                let price = price_of(market_id, market, pos);
                 (
-                    equity + pos.unrealised(mark, self.protocol_version),
-                    margin + market.spec.margin_for(pos.qty.abs().mul(mark)),
+                    equity + pos.unrealised(price, self.protocol_version),
+                    margin + market.spec.margin_for(pos.qty.abs().mul(price)),
                 )
             })
     }
@@ -265,6 +287,11 @@ impl Engine {
         } else {
             events.push(Event::MarketClosed { market: market_id });
         }
+    }
+
+    /// `share`, or from `V6` the larger of `share` and `floor`.
+    fn floored(&self, share: Fixed, floor: Fixed) -> Fixed {
+        if self.protocol_version >= ProtocolVersion::V6 { share.max(floor) } else { share }
     }
 
     /// Refreshes every market's session, so opens and closes fire even without price traffic.

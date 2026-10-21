@@ -36,10 +36,8 @@ use crate::clock::now_ms;
 use crate::config::{Venue, VenueConnection, VenuesSection};
 use crate::feeds::{bitstamp, coinbase, kraken};
 use crate::sequencer::Request;
+use crate::throttle::Throttle;
 
-/// After a refused-message or clock alert, the same alert from the same venue waits this long, so
-/// a venue that changes its format raises one alert a minute, not one per message.
-const REALERT_AFTER: Duration = Duration::from_secs(60);
 /// How much of a refused message its log line keeps.
 const EXCERPT_CHARS: usize = 200;
 
@@ -118,25 +116,6 @@ struct VenueFeed {
     unlisted: BTreeSet<MarketId>,
     refusals: Throttle,
     clock_alerts: Throttle,
-}
-
-/// Holds an alert to one per `REALERT_AFTER`, counting the ones it held back.
-#[derive(Default)]
-struct Throttle {
-    last: Option<Instant>,
-    held: u64,
-}
-
-impl Throttle {
-    /// Whether to alert at `now`, and if so, how many alerts it held back since the last one.
-    fn ready(&mut self, now: Instant) -> Option<u64> {
-        if self.last.is_some_and(|at| now.duration_since(at) < REALERT_AFTER) {
-            self.held += 1;
-            return None;
-        }
-        self.last = Some(now);
-        Some(take(&mut self.held))
-    }
 }
 
 impl Timing {

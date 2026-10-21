@@ -92,13 +92,17 @@ impl Engine {
     }
 
     /// Charges financing for every rollover the sequenced time has passed. After downtime each
-    /// missed day is charged in turn, at the marks the engine holds.
+    /// missed day is charged in turn, at the marks the engine holds. From `V6`, each day's charges
+    /// are followed by a close-out check of every account.
     pub(crate) fn run_rollovers(&mut self, events: &mut Vec<Event>) {
         let Some(params) = &self.params else { return };
         let rollover = params.rollover.clone();
         while let Some(at) = self.next_rollover.filter(|at| *at <= self.now) {
             self.charge_financing(events);
             self.next_rollover = Some(rollover.next_after(at));
+            if self.protocol_version >= ProtocolVersion::V6 {
+                self.check_all_closeouts(events);
+            }
         }
     }
 

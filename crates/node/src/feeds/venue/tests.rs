@@ -6,17 +6,7 @@ use crate::feeds::kraken;
 use crate::feeds::tests::fake::{WAIT, capture_alerts, coinbase_levels, fast, kraken_book, next_alert};
 use crate::feeds::venue::quotes::counts;
 use crate::feeds::venue::setup::next_backoff;
-
-#[test]
-fn a_throttle_lets_one_alert_through_a_window_and_counts_the_rest() {
-    let mut throttle = Throttle::default();
-    let start = Instant::now();
-    assert_eq!(throttle.ready(start), Some(0));
-    assert_eq!(throttle.ready(start + Duration::from_secs(1)), None);
-    assert_eq!(throttle.ready(start + REALERT_AFTER - Duration::from_millis(1)), None);
-    assert_eq!(throttle.ready(start + REALERT_AFTER), Some(2));
-    assert_eq!(throttle.ready(start + REALERT_AFTER), None);
-}
+use crate::throttle::REALERT_AFTER;
 
 #[tokio::test(start_paused = true)]
 async fn refusals_alert_again_after_the_window_with_the_count_between() {

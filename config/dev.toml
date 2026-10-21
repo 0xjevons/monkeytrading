@@ -8,6 +8,11 @@
 #
 # Margin rates, the fee, financing markups and benchmark rates are placeholders
 # at professional-client leverage levels; set them before launch.
+#
+# House caps are the larger of a share of house NAV (house_cap_bps,
+# house_total_cap_bps) and a dollar floor (house_cap_floor,
+# house_total_cap_floor), so trading opens from a zero or negative house. The
+# floors here are the caps a house with 1m of NAV would have.
 
 [node]
 listen = "127.0.0.1:8080"
@@ -139,6 +144,7 @@ benchmarks = [
 profit_fee_bps = 1000
 closeout_level_bps = 5000
 house_total_cap_bps = 20000
+house_total_cap_floor = "2000000"
 stress_move_window_ms = 60000
 stress_cooldown_ms = 300000
 
@@ -179,6 +185,7 @@ symbol = "BTC-USD"
 asset_class = "crypto"
 max_slippage_bps = 25
 house_cap_bps = 3000
+house_cap_floor = "300000"
 margin_tiers = [{ up_to = "1000000", bps = 1000 }, { bps = 2000 }]
 spread_tiers = [{ up_to = "2000000", bps = 0 }, { up_to = "10000000", bps = 3 }, { bps = 8 }]
 schedule = { kind = "always_open" }
@@ -191,6 +198,7 @@ symbol = "ETH-USD"
 asset_class = "crypto"
 max_slippage_bps = 25
 house_cap_bps = 2000
+house_cap_floor = "200000"
 margin_tiers = [{ up_to = "1000000", bps = 1000 }, { bps = 2000 }]
 spread_tiers = [{ up_to = "1000000", bps = 0 }, { up_to = "5000000", bps = 3 }, { bps = 8 }]
 schedule = { kind = "always_open" }
@@ -205,6 +213,7 @@ symbol = "EUR-USD"
 asset_class = "fx"
 max_slippage_bps = 5
 house_cap_bps = 5000
+house_cap_floor = "500000"
 margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 300 }]
 spread_tiers = [{ up_to = "10000000", bps = 0 }, { up_to = "50000000", bps = 1 }, { bps = 3 }]
 price_rules = { max_age_ms = 1000, max_divergence_bps = 5, min_sources = 2 }
@@ -224,6 +233,7 @@ symbol = "US500"
 asset_class = "index"
 max_slippage_bps = 10
 house_cap_bps = 5000
+house_cap_floor = "500000"
 margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]
 spread_tiers = [{ up_to = "5000000", bps = 0 }, { up_to = "25000000", bps = 1 }, { bps = 4 }]
 price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
@@ -249,6 +259,7 @@ symbol = "XAU-USD"
 asset_class = "commodity"
 max_slippage_bps = 10
 house_cap_bps = 3000
+house_cap_floor = "300000"
 margin_tiers = [{ up_to = "2000000", bps = 100 }, { bps = 500 }]
 spread_tiers = [{ up_to = "2000000", bps = 0 }, { up_to = "10000000", bps = 2 }, { bps = 6 }]
 price_rules = { max_age_ms = 1000, max_divergence_bps = 10, min_sources = 2 }
@@ -273,6 +284,7 @@ symbol = "AAPL"
 asset_class = "equity"
 max_slippage_bps = 15
 house_cap_bps = 1000
+house_cap_floor = "100000"
 min_order_notional = "10"
 margin_tiers = [{ up_to = "500000", bps = 1000 }, { up_to = "2000000", bps = 2000 }, { bps = 5000 }]
 spread_tiers = [{ up_to = "500000", bps = 0 }, { up_to = "2000000", bps = 3 }, { bps = 10 }]

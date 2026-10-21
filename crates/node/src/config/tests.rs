@@ -65,7 +65,17 @@ fn genesis_values_the_engine_would_refuse_fail_the_boot() {
     let first = &dev[dev.find("[[genesis.markets]]").unwrap()..];
     let first = &first[..first[1..].find("[[genesis.markets]]").unwrap() + 1];
     let repeated_market = format!("{dev}\n{first}");
-    let refused = [capital("-1"), capital("1000000000.000000001"), rate(10_001), rate(i64::MIN), repeated_market];
+    let negative_total_floor = dev.replace("house_total_cap_floor = \"2000000\"", "house_total_cap_floor = \"-1\"");
+    let negative_market_floor = dev.replace("house_cap_floor = \"300000\"", "house_cap_floor = \"-1\"");
+    let refused = [
+        capital("-1"),
+        capital("1000000000.000000001"),
+        rate(10_001),
+        rate(i64::MIN),
+        repeated_market,
+        negative_total_floor,
+        negative_market_floor,
+    ];
     for text in &refused {
         assert_ne!(text, &dev, "the replacement must change the config");
         assert!(toml::from_str::<NodeConfig>(text).unwrap().validate().is_err());
