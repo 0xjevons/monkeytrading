@@ -2,9 +2,10 @@
 //!
 //! Every price, quantity and cash amount in the engine is a [`Fixed`]: an `i128` scaled by 10^9.
 //! Floats never touch engine state, so replaying the log on any machine gives identical results.
-//! Multiplication and division truncate toward zero. Release builds keep overflow checks on, so
-//! an overflow halts the engine rather than corrupting state; external input is bounded by
-//! [`Fixed::MAX_INPUT`] first, so validated input cannot overflow.
+//! `mul`, `div`, `mul_bps`, and `div_int` truncate toward zero; `mul_div` and the `_rounded` methods
+//! round the exact result once, in the direction the caller names. Release builds keep overflow
+//! checks on, so an overflow halts the engine rather than corrupting state; external input is
+//! bounded by [`Fixed::MAX_INPUT`] first, so validated input cannot overflow.
 
 use std::fmt;
 use std::iter::Sum;
@@ -23,6 +24,16 @@ const BPS: i128 = 10_000;
 enum FixedRepr {
     Str(String),
     Int(i64),
+}
+
+/// Which way [`Fixed::mul_div`] and the `_rounded` methods round a result that falls between two
+/// representable values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rounding {
+    /// Toward negative infinity.
+    Down,
+    /// Toward positive infinity.
+    Up,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -203,9 +214,25 @@ impl Fixed {
         Fixed(self.0 * SCALE / rhs.0)
     }
 
+    /// Product, rounded as `rounding` says.
+    pub fn mul_rounded(self, rhs: Fixed, rounding: Rounding) -> Fixed {
+        self.mul_div(rhs, Fixed::ONE, rounding)
+    }
+
+    /// `self * num / den` from the exact product, rounded once as `rounding` says. Panics on a zero
+    /// `den`, which callers rule out first.
+    pub fn mul_div(self, num: Fixed, den: Fixed, rounding: Rounding) -> Fixed {
+        Fixed(round_div(self.0 * num.0, den.0, rounding))
+    }
+
     /// `bps` basis points of this value, truncated toward zero.
     pub fn mul_bps(self, bps: i64) -> Fixed {
         Fixed(self.0 * bps as i128 / BPS)
+    }
+
+    /// `bps` basis points of this value, rounded as `rounding` says.
+    pub fn mul_bps_rounded(self, bps: i64, rounding: Rounding) -> Fixed {
+        Fixed(round_div(self.0 * bps as i128, BPS, rounding))
     }
 
     /// Product with a whole number.
@@ -217,6 +244,11 @@ impl Fixed {
     pub fn div_int(self, n: i64) -> Fixed {
         assert!(n != 0, "fixed-point division by zero");
         Fixed(self.0 / n as i128)
+    }
+
+    /// Quotient by a whole number, rounded as `rounding` says. Panics on zero, which callers rule out.
+    pub fn div_int_rounded(self, n: i64, rounding: Rounding) -> Fixed {
+        Fixed(round_div(self.0, n as i128, rounding))
     }
 
     /// `self` relative to `base` in whole basis points, truncated, saturating at the `i64` range.
@@ -263,6 +295,16 @@ impl Fixed {
     }
 }
 
+/// `n / d`, rounded as `rounding` says. Panics on a zero `d`, which callers rule out first.
+fn round_div(n: i128, d: i128, rounding: Rounding) -> i128 {
+    assert!(d != 0, "fixed-point division by zero");
+    let (n, d) = if d < 0 { (-n, -d) } else { (n, d) };
+    match rounding {
+        Rounding::Down => n.div_euclid(d),
+        Rounding::Up => -(-n).div_euclid(d),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +334,30 @@ mod tests {
         assert_eq!(f("1000").mul_bps(25), f("2.5"));
         assert_eq!(Fixed::from_bps(1), f("0.0001"));
         assert_eq!((f("101") - f("100")).bps_of(f("100")), 100);
+    }
+
+    #[test]
+    fn rounded_arithmetic_rounds_the_exact_result_once_in_the_direction_asked() {
+        let (third, two_thirds) = (f("0.333333333"), f("0.666666667"));
+        assert_eq!(f("1").mul_div(f("1"), f("3"), Rounding::Down), third);
+        assert_eq!(f("1").mul_div(f("1"), f("3"), Rounding::Up), f("0.333333334"));
+        assert_eq!(f("-1").mul_div(f("1"), f("3"), Rounding::Down), f("-0.333333334"));
+        assert_eq!(f("-1").mul_div(f("1"), f("3"), Rounding::Up), -third);
+        // A negative divisor flips the sign of the result, not the direction.
+        assert_eq!(f("1").mul_div(f("1"), f("-3"), Rounding::Down), f("-0.333333334"));
+        assert_eq!(f("2").mul_div(f("1"), f("3"), Rounding::Up), two_thirds);
+        // Exact results are not moved.
+        assert_eq!(f("1.5").mul_div(f("4"), f("3"), Rounding::Up), f("2"));
+        assert_eq!(f("1.1").mul_rounded(f("0.000000001"), Rounding::Down), Fixed::from_raw(1));
+        assert_eq!(f("1.1").mul_rounded(f("0.000000001"), Rounding::Up), Fixed::from_raw(2));
+        assert_eq!(f("-1.1").mul_rounded(f("0.000000001"), Rounding::Down), Fixed::from_raw(-2));
+        assert_eq!(f("-1.1").mul_rounded(f("0.000000001"), Rounding::Up), Fixed::from_raw(-1));
+        assert_eq!(Fixed::from_raw(9).mul_bps_rounded(1_000, Rounding::Up), Fixed::from_raw(1));
+        assert_eq!(Fixed::from_raw(-9).mul_bps_rounded(1_000, Rounding::Down), Fixed::from_raw(-1));
+        assert_eq!(Fixed::from_raw(9).mul_bps_rounded(1_000, Rounding::Down), Fixed::ZERO);
+        assert_eq!(f("1").div_int_rounded(3, Rounding::Up), f("0.333333334"));
+        assert_eq!(f("-1").div_int_rounded(3, Rounding::Up), -third);
+        assert_eq!(f("-1").div_int_rounded(3, Rounding::Down), f("-0.333333334"));
     }
 
     #[test]

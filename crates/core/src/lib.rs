@@ -13,7 +13,9 @@
 //! - RWA markets keep venue hours; nothing fills while a market is closed.
 //! - Rules are versioned, and a log activates each version at a recorded seq. From `V3`, orders,
 //!   cancels, and withdrawals are authorised as the log's client auth records: by the account's
-//!   EIP-712 signature, next nonce, and expiry, or, in dev logs only, unsigned.
+//!   EIP-712 signature, next nonce, and expiry, or, in dev logs only, unsigned. From `V5`, every
+//!   rounding in position accounting favours the house, so no sequence of fills realises more than
+//!   its exact PnL.
 
 pub mod account;
 mod admin;

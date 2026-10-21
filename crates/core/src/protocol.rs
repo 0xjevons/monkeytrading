@@ -34,11 +34,15 @@ pub enum ProtocolVersion {
     /// Schedules may carry dated closures and special sessions, and a house capital move of zero
     /// records its reference without moving cash.
     V4,
+    /// Position accounting rounds in the house's favour: an averaged entry is the exact average of
+    /// the held entry and the fill price, rounded once, up for a long and down for a short; realised
+    /// and unrealised PnL round down; and the profit fee and a financing charge round up.
+    V5,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V4;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V5;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

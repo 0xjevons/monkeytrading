@@ -243,7 +243,10 @@ impl Engine {
                     Some((id, mid)) if id == market_id => mid,
                     _ => market.mark.unwrap_or(pos.entry),
                 };
-                (equity + pos.unrealised(mark), margin + market.spec.margin_for(pos.qty.abs().mul(mark)))
+                (
+                    equity + pos.unrealised(mark, self.protocol_version),
+                    margin + market.spec.margin_for(pos.qty.abs().mul(mark)),
+                )
             })
     }
 
