@@ -62,16 +62,16 @@ def simulate_stage(stage: str, args) -> None:
     RESULTS.mkdir(exist_ok=True)
     started = time.time()
     if stage == "per-market":
-        scenario = replace(base, paths=args.paths or 2000, batch_paths=500)
+        scenario = replace(base, paths=args.paths or 2000, batch_paths=args.batch_paths or 500)
         rows = experiments.per_market(scenario, markets, bars, flow, args.workers)
         experiments.write_rows(RESULTS / "per_market_sweep.csv", rows)
     elif stage == "joint":
-        scenario = replace(base, paths=args.paths or 2000, batch_paths=100)
+        scenario = replace(base, paths=args.paths or 2000, batch_paths=args.batch_paths or 100)
         sweep = read_rows(RESULTS / "per_market_sweep.csv")
         for key, rows in experiments.joint(scenario, markets, bars, flow, sweep, args.workers).items():
             experiments.write_rows(RESULTS / f"joint_{key}.csv", rows)
     elif stage == "sensitivity":
-        scenario = replace(base, paths=args.paths or 1000, batch_paths=100)
+        scenario = replace(base, paths=args.paths or 1000, batch_paths=args.batch_paths or 100)
         rows = read_rows(RESULTS / "joint_p_ever_tail.csv")
         chosen = experiments.chosen_level(rows, "p_ever_tail", SENSITIVITY_TARGET) or rows[0]
         floors = np.array([json.loads(chosen["market_floors"])[s] for s in markets.symbols])
@@ -97,6 +97,7 @@ def main() -> None:
         sim.add_argument("--workers", type=int, default=8)
         sim.add_argument("--paths", type=int, help="paths per run; defaults per stage")
         sim.add_argument("--seed", type=int, default=1)
+        sim.add_argument("--batch-paths", type=int, help="paths per worker job; smaller uses less memory")
     sub.add_parser("report", help="write results/report.md from the stage outputs")
     args = parser.parse_args()
 

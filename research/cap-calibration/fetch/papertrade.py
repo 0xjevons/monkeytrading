@@ -4,7 +4,7 @@ Writes one gzipped JSON-lines file per 1000-block chunk under `<out>/logs/`, eac
 `[block, tx_index, log_index, topics, data]`, and block timestamps every `ANCHOR_STEP` blocks to
 `<out>/block_times.csv`. A chunk is written only from a well-formed response, so a re-run resumes
 where the last one stopped. `<out>/manifest.json` records the range, the endpoints, and a
-cross-check of a sample of chunks against a second endpoint.
+cross-check of a sample of chunks fetched again.
 
 Run through `run.py fetch-papertrade`.
 """
@@ -87,15 +87,23 @@ def write_chunk(out: Path, start: int, rows: list) -> None:
     tmp.rename(path)
 
 
-def worker(url: str, todo: list, lock: threading.Lock, out: Path, failures: dict) -> None:
+def worker(url: str, todo: list, pending: list, lock: threading.Lock, out: Path, failures: dict) -> None:
+    """Fetches chunks from `todo` until every chunk is written. A failed chunk goes back on `todo`
+    for any endpoint to take, and the failing endpoint backs off; `pending` holds the count of
+    chunks not yet written, so a worker waits rather than exits while another holds one."""
     backoff = PACE_S
     while True:
         with lock:
-            if not todo:
+            if pending[0] == 0:
                 return
-            start = todo.pop()
+            start = todo.pop() if todo else None
+        if start is None:
+            time.sleep(PACE_S)
+            continue
         try:
             write_chunk(out, start, get_logs(url, start))
+            with lock:
+                pending[0] -= 1
             backoff = PACE_S
         except Exception as exc:  # rate limits and upstream errors: hand the chunk back and slow down
             with lock:
@@ -118,7 +126,8 @@ def block_time(start: int) -> int:
 
 
 def cross_check(out: Path, starts: list, sample: int) -> list:
-    """Re-fetches a random sample of chunks from a different endpoint and compares log counts."""
+    """Re-fetches a random sample of chunks, each from an endpoint chosen at random, and compares
+    log counts."""
     checks = []
     for start in random.Random(0).sample(starts, min(sample, len(starts))):
         with gzip.open(chunk_path(out, start), "rt") as fh:
@@ -147,7 +156,8 @@ def fetch(out: Path, to_block: int | None) -> None:
 
     lock = threading.Lock()
     failures: dict = {}
-    threads = [threading.Thread(target=worker, args=(url, todo, lock, out, failures)) for url in ENDPOINTS]
+    pending = [len(todo)]
+    threads = [threading.Thread(target=worker, args=(url, todo, pending, lock, out, failures)) for url in ENDPOINTS]
     for thread in threads:
         thread.start()
     for thread in threads:

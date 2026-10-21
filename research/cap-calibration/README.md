@@ -49,8 +49,8 @@ losses mint the PAPER token, 100 per $1 while the LP is below $2M. It lists BTC 
 `fetch/papertrade.py` pulls every event log of the Exchange proxy
 `0x6cd5661646289fb6e65ea5c032310fded797d0a2` from its creation block 47,854,719 to block
 49,108,718 (2026-10-21 05:25 UTC) from six public HyperEVM RPC endpoints, 1,254 chunks of 1,000
-blocks, and block timestamps every 10,000 blocks. 25 randomly chosen chunks fetched again from
-another endpoint matched their stored log counts. The raw pull is 212 MB and gitignored.
+blocks, and block timestamps every 10,000 blocks. 25 randomly chosen chunks, fetched again from an
+endpoint chosen at random, matched their stored log counts. The raw pull is 212 MB and gitignored.
 
 The Exchange's source is not verified on the explorer, so `derive/papertrade.py` infers the event
 layouts from the logs and checks them:
@@ -190,6 +190,8 @@ together at each risk level with the floors chosen per target, and the sensitivi
 - **Ten days of behaviour.** The papertrade data covers 10.6 days of a new venue: two BTC/ETH
   markets at 1000:1, crypto-native users, and a launch spike. Holds, leverage, and long share on
   RWA markets, at lower leverage and with closures, are assumptions carried over from it.
+- **Fixed holds.** Each hold class settles at one hold, 1, 4, 16, or 48 hours; papertrade's
+  notional-weighted mean holds within the classes are 1.4, 3.7, 13.7, and 53.6 hours.
 - **Volume.** The flow level assumes this engine draws papertrade's margin. Fees scale with it, so
   the `flow x0.25` and `flow x4` rows bound the effect.
 - **Two years of hourly history.** The tails come from 102 weeks (late 2024 to late 2026), which
@@ -221,10 +223,12 @@ cd research/cap-calibration
 /tmp/cap-venv/bin/python -I run.py all          # per-market, joint, sensitivity, then results/report.md
 ```
 
-`all` reruns everything from the committed `data/derived/`; it takes a few hours on 10 workers
-(`--workers`). Stages run alone with `per-market`, `joint`, `sensitivity`, and `report`. Every
-run is seeded (`--seed`, default 1), and `results/manifest_<stage>.json` records the scenario,
-the seed, and the hashes of the derived files it read.
+`all` reruns everything from the committed `data/derived/`; it takes a few hours on 4 to 10
+workers (`--workers`), and `--batch-paths` trades memory for speed. Stages run alone with
+`per-market`, `joint`, `sensitivity`, and `report`. Each batch of paths is seeded from `--seed`
+(default 1) and its index, so the same seed and batch size reproduce a run exactly;
+`results/manifest_<stage>.json` records the scenario, including both, and the hashes of the
+derived files it read.
 
 To rebuild the data: `fetch-papertrade` (resumes; `--to-block` pins the end), `fetch-markets`,
 `derive-papertrade`, `derive-markets`. Yahoo serves hourly bars for the last 730 days only, so a
