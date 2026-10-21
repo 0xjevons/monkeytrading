@@ -87,8 +87,9 @@ verifies its checkpoints.
 - `src/tls/tests/mod.rs` — the API end to end over TLS: key pinning, limits, caps, and the harness
 - `src/tls/tests/stream.rs` — the stream end to end over TLS: the subscriber and message caps
 - `src/limits.rs` — request rate limits, connection caps, and the stream subscriber cap
-- `src/config/mod.rs` — the node config schema and validation
+- `src/config/mod.rs` — the node config schema and loading
 - `src/config/tests.rs` — config loading and validation tests
+- `src/config/validation.rs` — the checks a parsed config must also pass
 - `src/custody.rs` — the custody adapter (mock only so far)
 - `src/feeds/mod.rs` — the feed index and the mock feed
 - `src/feeds/venue/mod.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect

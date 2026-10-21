@@ -2,6 +2,7 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::clock::Clock;
 use crate::clock::test_clock::TestClock;
+use crate::config::RateLimit;
 use crate::history::{HistoryEvent, INDEX_FILE, account_of};
 use crate::log::{LogEntry, MANIFEST, Manifest, Offset, SegmentedLog, read_all, segment_seq};
 use crate::sequencer::replay;
@@ -273,8 +275,12 @@ async fn serve_with(node: &TestSequencer, dir: &Path, manifest: watch::Receiver<
     .await
 }
 
-/// Serves the API with only `history` behind it, so it outlives any sequencer.
+/// Serves the API with only `history` behind it, so it outlives any sequencer. Its per-client rate
+/// lets one client page a long log an event at a time.
 async fn serve_history(history: Reader) -> SocketAddr {
+    let mut api = dev_config().api;
+    let ample = NonZeroU32::new(1_000_000).unwrap();
+    api.per_ip = RateLimit { per_second: ample, burst: ample };
     serve_state(ApiState {
         tx: mpsc::channel(1).0,
         stream: broadcast::channel(1).0,
@@ -285,7 +291,7 @@ async fn serve_history(history: Reader) -> SocketAddr {
         log_dir: PathBuf::new(),
         manifest: watch::channel(Manifest::default()).1,
         backfills: Arc::new(Semaphore::new(MAX_BACKFILLS)),
-        limits: Arc::new(ApiLimits::new(&dev_config().api)),
+        limits: Arc::new(ApiLimits::new(&api)),
         history,
     })
     .await
