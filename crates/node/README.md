@@ -57,7 +57,8 @@ verifies its checkpoints.
 - `src/admin/tls.rs` — the TLS connection to a node, pinned to its attested key
 - `src/admin/tests.rs` — `engine admin` tests: key sources, commands, signing, and pins
 - `src/node.rs` — startup, task supervision, and shutdown
-- `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, and log replay
+- `src/sequencer/mod.rs` — the sequencer, stream messages, and checkpoints
+- `src/sequencer/replay.rs` — log replay, which recovery and `engine replay` share
 - `src/sequencer/required.rs` — client auth, the operator, protocol activation, and genesis, which
   wait for trusted time, and the genesis commands
 - `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use engine_core::command::AdminCommand;
+use engine_core::protocol::ProtocolVersion;
 
 use crate::clock::test_clock::TestClock;
 use crate::log::{Manifest, SegmentedLog, segment_seq};
