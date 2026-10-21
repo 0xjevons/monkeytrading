@@ -8,8 +8,8 @@
 
 use alloy_dyn_abi::TypedData;
 use alloy_primitives::hex;
-use engine_core::command::{CancelRequest, OrderKind, OrderRequest, WithdrawalRequest};
-use engine_core::eip712::{self, Signature, cancel_hash, order_hash, withdrawal_hash};
+use engine_core::command::{AdminCommand, CancelRequest, OrderKind, OrderRequest, WithdrawalRequest};
+use engine_core::eip712::{self, Signature, admin_hash, cancel_hash, order_hash, withdrawal_hash};
 use engine_core::types::{AccountId, Millis};
 use k256::ecdsa::SigningKey;
 use serde::Deserialize;
@@ -93,4 +93,44 @@ fn the_engine_reproduces_each_vector_signature_from_its_request_body() {
         assert_eq!(typed["domain"]["verifyingContract"], vectors.vault.to_string());
         assert_eq!(typed["message"], message, "{} with nonce {}", vector.kind, vector.nonce);
     }
+}
+
+#[test]
+fn an_admin_command_signs_as_its_json_and_hashes_as_a_wallet_hashes_it() {
+    let vectors: Vectors = serde_json::from_str(VECTORS).unwrap();
+    let command = AdminCommand::SetReduceOnly { market: None, reduce_only: true };
+    // The JSON the operator signs and a wallet shows. Changing how a command encodes changes what
+    // every logged signature covers, so a replay would no longer verify it.
+    let json = r#"{"action":"set_reduce_only","market":null,"reduce_only":true}"#;
+    assert_eq!(serde_json::to_string(&command).unwrap(), json);
+    let typed = json!({
+        "types": {
+            "EIP712Domain": [
+                { "name": "name", "type": "string" },
+                { "name": "version", "type": "string" },
+                { "name": "chainId", "type": "uint256" },
+                { "name": "verifyingContract", "type": "address" },
+            ],
+            "AdminRequest": [
+                { "name": "nonce", "type": "uint64" },
+                { "name": "expiresAt", "type": "int64" },
+                { "name": "command", "type": "string" },
+            ],
+        },
+        "primaryType": "AdminRequest",
+        "domain": {
+            "name": eip712::DOMAIN_NAME,
+            "version": eip712::DOMAIN_VERSION,
+            "chainId": vectors.chain_id,
+            "verifyingContract": vectors.vault.to_string(),
+        },
+        "message": { "nonce": 3, "expiresAt": 1_792_540_800_000i64, "command": json },
+    });
+    let wallet: TypedData = serde_json::from_value(typed).unwrap();
+    let domain = eip712::domain(vectors.chain_id, vectors.vault);
+    assert_eq!(wallet.eip712_signing_hash().unwrap(), admin_hash(&domain, &command, 3, 1_792_540_800_000));
+    assert_ne!(
+        admin_hash(&domain, &command, 4, 1_792_540_800_000),
+        admin_hash(&domain, &command, 3, 1_792_540_800_000)
+    );
 }

@@ -33,6 +33,7 @@ rand.workspace = true
 rcgen.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true
+rustls-webpki.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
@@ -51,6 +52,5 @@ webpki-roots.workspace = true
 [dev-dependencies]
 chrono.workspace = true
 chrono-tz.workspace = true
-rustls-webpki.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
 tower.workspace = true

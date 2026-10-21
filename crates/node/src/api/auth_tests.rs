@@ -317,6 +317,7 @@ impl Node {
             stream,
             attestation,
             auth,
+            operator: dev_config().operator().unwrap(),
             mock_custody: true,
             clock,
             log_dir: dir.clone(),

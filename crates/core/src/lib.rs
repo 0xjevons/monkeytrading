@@ -17,7 +17,9 @@
 //!   cancels, and withdrawals are authorised as the log's client auth records: by the account's
 //!   EIP-712 signature, next nonce, and expiry, or, in dev logs only, unsigned. From `V5`, every
 //!   rounding in position accounting favours the house, so no sequence of fills realises more than
-//!   its exact PnL.
+//!   its exact PnL. From `V8`, the operator signs admin commands as clients sign requests, with the
+//!   key the log records, once anything is credited, and one command makes every market
+//!   reduce-only.
 //! - Accounts hold USD. From `V7`, a market may be quoted in another currency: it accrues PnL in it,
 //!   converts to USD at its FX market's index, and has no price while that FX market has none.
 

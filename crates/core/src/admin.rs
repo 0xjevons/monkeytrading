@@ -1,13 +1,17 @@
 //! Operator commands and stress levels.
 //!
 //! Every admin action is a sequenced command, so the public log shows each parameter change, each
-//! listing, and each stress override. The operator can raise a market's stress level but never
-//! push it below what the automatic triggers set.
+//! listing, and each stress override. From `V8` the operator signs its commands (listings,
+//! parameters, benchmark rates, stress floors, and reduce-only) once anything is credited, and the
+//! log carries each signature; client auth, the operator, and protocol activation stay commands
+//! only the node sequences. The operator can raise a market's stress level but never
+//! push it below what the automatic triggers set, and from `V8` neither a reduce-only mode nor a
+//! spread stops a trade that reduces or closes a position in an open market with a price.
 
 use crate::Fixed;
-use crate::command::AdminCommand;
+use crate::command::{AdminCommand, AdminRequest};
 use crate::engine::{Engine, MarketState};
-use crate::event::Event;
+use crate::event::{Event, Reject};
 use crate::fixed::Rounding;
 use crate::market::MarketSpec;
 use crate::params::{MAX_BENCHMARK_BPS, StressLevel};
@@ -20,20 +24,26 @@ impl Engine {
     /// margin table may rise. From `V7`, a listing of a market others convert at also marks it and
     /// them as a price update does.
     /// Error cases:
-    /// - `SetParams` with parameters that fail `ProtocolParams::validate`
+    /// - `SetParams` with parameters that fail `ProtocolParams::validate`, or from `V8` that fail
+    ///   `ProtocolParams::check_closing_spread`
     /// - `UpsertMarket` with a spec that fails `MarketSpec::validate` or `check_quote_currency`, or with
     ///   dated closures or special sessions before `V4`
     /// - `SetBenchmarkRate` outside ±10000 bps a year
     /// - `SetStressFloor` before parameters are set, at a level that does not exist, or for an
     ///   unknown market
-    /// - `SetReduceOnly` for an unknown market
+    /// - `SetReduceOnly` for an unknown market, or for every market before `V8`
     /// - `SetClientAuth` once client auth is recorded
-    /// - `ActivateProtocol` for a version no newer than the one in force, or for `V3` or later
-    ///   before client auth is recorded
+    /// - `SetOperator` once the operator is recorded
+    /// - `ActivateProtocol` for a version no newer than the one in force, for `V3` or later before
+    ///   client auth is recorded, or for `V8` or later before the operator is recorded or while the
+    ///   parameters in force fail `ProtocolParams::check_closing_spread`
     pub(crate) fn admin(&mut self, cmd: &AdminCommand, events: &mut Vec<Event>) -> Result<(), String> {
         match cmd {
             AdminCommand::SetParams(params) => {
                 params.validate()?;
+                if self.protocol_version >= ProtocolVersion::V8 {
+                    params.check_closing_spread()?;
+                }
                 self.next_rollover = Some(params.rollover.next_after(self.now));
                 self.params = Some(params.clone());
                 self.restress_all(events);
@@ -92,14 +102,26 @@ impl Engine {
                 }
                 self.restress_all(events);
             }
-            AdminCommand::SetReduceOnly { market, reduce_only } => {
-                self.markets.get_mut(market).ok_or("unknown market")?.reduce_only = *reduce_only;
+            AdminCommand::SetReduceOnly { market: Some(id), reduce_only } => {
+                self.markets.get_mut(id).ok_or("unknown market")?.reduce_only = *reduce_only;
+            }
+            AdminCommand::SetReduceOnly { market: None, reduce_only } => {
+                if self.protocol_version < ProtocolVersion::V8 {
+                    return Err("reduce-only for every market needs protocol V8".into());
+                }
+                self.global_reduce_only = *reduce_only;
             }
             AdminCommand::SetClientAuth(auth) => {
                 if self.client_auth.is_some() {
                     return Err("client auth is already recorded".into());
                 }
                 self.client_auth = Some(auth.clone());
+            }
+            AdminCommand::SetOperator(operator) => {
+                if self.operator.is_some() {
+                    return Err("the operator is already recorded".into());
+                }
+                self.operator = Some(*operator);
             }
             AdminCommand::ActivateProtocol { version } => {
                 if *version <= self.protocol_version {
@@ -108,10 +130,49 @@ impl Engine {
                 if *version >= ProtocolVersion::V3 && self.client_auth.is_none() {
                     return Err(format!("protocol {version:?} needs client auth recorded first"));
                 }
+                if *version >= ProtocolVersion::V8 && self.operator.is_none() {
+                    return Err(format!("protocol {version:?} needs the operator recorded first"));
+                }
+                if *version >= ProtocolVersion::V8
+                    && let Some(params) = &self.params
+                {
+                    params.check_closing_spread()?;
+                }
                 self.protocol_version = *version;
             }
         }
         Ok(())
+    }
+
+    /// Applies an admin command the node sequences unsigned: client auth, the operator, and protocol
+    /// activation at any time, and genesis, which credits its house capital last.
+    /// Error cases:
+    /// - from `V8`, an operator command once any deposit or house capital is credited
+    /// - any error case of `admin`
+    pub(crate) fn unsigned_admin(&mut self, cmd: &AdminCommand, events: &mut Vec<Event>) -> Result<(), String> {
+        if self.protocol_version >= ProtocolVersion::V8 && cmd.is_operator_command() && !self.credited_refs.is_empty() {
+            return Err("from protocol V8 the operator signs this command once funds are credited".into());
+        }
+        self.admin(cmd, events)
+    }
+
+    /// Applies an admin command the operator signed. A command whose signature and nonce pass uses
+    /// the nonce even if it is then refused, so it cannot be replayed from the log.
+    /// Error cases:
+    /// - before `V8`; the nonce is not used
+    /// - a signature that is not the recorded operator's over this command, a nonce other than the
+    ///   operator's next, or an expiry passed or too far ahead (see `Engine::authorise_admin`)
+    /// - a command only the node sequences: `SetClientAuth`, `SetOperator`, or `ActivateProtocol`
+    /// - any error case of `admin`
+    pub(crate) fn signed_admin(&mut self, req: &AdminRequest, events: &mut Vec<Event>) -> Result<(), String> {
+        if self.protocol_version < ProtocolVersion::V8 {
+            return Err("signed admin commands need protocol V8".into());
+        }
+        self.authorise_admin(&req.command, &req.auth).map_err(|reject| auth_failure(&reject))?;
+        if !req.command.is_operator_command() {
+            return Err("the operator may not send this command".into());
+        }
+        self.admin(&req.command, events)
     }
 
     /// Recomputes a market's automatic stress level from the latest index, then its effective
@@ -192,6 +253,18 @@ impl Engine {
         for (market_id, market) in &mut self.markets {
             set_stress_level(*market_id, market, global_floor, max_level, events);
         }
+    }
+}
+
+/// The reason an admin command fails its signature, nonce, or expiry check.
+fn auth_failure(reject: &Reject) -> String {
+    match reject {
+        Reject::InvalidSignature => "invalid signature".into(),
+        Reject::InvalidNonce { expected } => format!("invalid nonce: expected {expected}"),
+        Reject::Expired { expires_at } => format!("expired at {expires_at}"),
+        Reject::ExpiryTooFar { latest } => format!("expiry after the latest allowed, {latest}"),
+        // `authorise_admin` refuses only for the reasons above.
+        other => serde_json::to_string(other).expect("rejections serialise"),
     }
 }
 

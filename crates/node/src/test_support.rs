@@ -187,6 +187,7 @@ pub fn sequencer_config(dir: &Path, manifest: watch::Sender<Manifest>) -> Sequen
         clock: Arc::new(SystemClock),
         max_drift: Duration::from_secs(10),
         client_auth: ClientAuth::Unsigned,
+        operator: dev_config().operator().expect("the dev operator parses"),
     }
 }
 

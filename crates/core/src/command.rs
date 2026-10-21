@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::Fixed;
-use crate::auth::{ClientAuth, RequestAuth};
+use crate::auth::{ClientAuth, Operator, RequestAuth};
 use crate::market::MarketSpec;
 use crate::params::ProtocolParams;
 use crate::price::SourceQuote;
@@ -53,6 +53,10 @@ pub enum Command {
         auth: Option<RequestAuth>,
     },
     Admin(AdminCommand),
+    /// An admin command the operator signed, from `V8`. From `V8`, an unsigned `Admin` operator
+    /// command is refused once any deposit or house capital is credited. Boxed: admin commands are
+    /// rare, and inline this one would grow every command.
+    SignedAdmin(Box<AdminRequest>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,17 +96,29 @@ pub enum AdminCommand {
         market: Option<MarketId>,
         level: usize,
     },
-    /// Stops new risk in a market. Reducing trades stay allowed.
+    /// Stops new risk in one market, or from `V8` in every market, listed now or later, if
+    /// `market` is `None`. Reducing and closing trades stay allowed in every mode.
     SetReduceOnly {
-        market: MarketId,
+        market: Option<MarketId>,
         reduce_only: bool,
     },
     /// Records how client requests are authorised from `V3`. A log records it once.
     SetClientAuth(ClientAuth),
+    /// Records the operator whose signed admin commands apply from `V8`. A log records it once.
+    SetOperator(Operator),
     /// Applies `version`'s rules from this seq on. Versions only move forward.
     ActivateProtocol {
         version: ProtocolVersion,
     },
+}
+
+/// An admin command with the operator's signature, nonce, and expiry, as `engine admin` signs and
+/// posts it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRequest {
+    pub command: AdminCommand,
+    pub auth: RequestAuth,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -150,4 +166,21 @@ pub struct WithdrawalRequest {
     /// The account's signature, nonce, and expiry, where the log's rules require them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<RequestAuth>,
+}
+
+impl AdminCommand {
+    /// Whether the operator may sign this command: listings, parameters, benchmark rates, stress
+    /// floors, and reduce-only. The node alone sequences the others, from its config and build.
+    pub fn is_operator_command(&self) -> bool {
+        match self {
+            AdminCommand::SetParams(_)
+            | AdminCommand::UpsertMarket(_)
+            | AdminCommand::SetBenchmarkRate { .. }
+            | AdminCommand::SetStressFloor { .. }
+            | AdminCommand::SetReduceOnly { .. } => true,
+            AdminCommand::SetClientAuth(_) | AdminCommand::SetOperator(_) | AdminCommand::ActivateProtocol { .. } => {
+                false
+            }
+        }
+    }
 }

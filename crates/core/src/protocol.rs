@@ -14,7 +14,9 @@
 //! 3. Skip new engine state from serialization while it holds its default
 //!    (`skip_serializing_if`), so roots before activation do not change. A request type that
 //!    changes gets new typed structs under a new `eip712::DOMAIN_VERSION`, chosen by protocol
-//!    version, and the earlier ones stay so earlier signatures still verify.
+//!    version, and the earlier ones stay so earlier signatures still verify. The operator signs
+//!    an admin command as its JSON, so a field added to anything an admin command carries is
+//!    skipped while it holds its default too, or logged signatures stop verifying.
 //! 4. Write and commit the version's reference log, as `crates/core/README.md` ("Adding a protocol
 //!    version") describes. Every earlier reference log must still replay to its roots.
 
@@ -48,11 +50,16 @@ pub enum ProtocolVersion {
     /// so a USD-JPY listing in USD is refused. Every other rule acts only through such a listing,
     /// which earlier versions refuse, so USD markets run as before.
     V7,
+    /// Admin commands arrive signed by the `Operator` the log records, with the operator's next
+    /// nonce and an expiry; once any deposit or house capital is credited, an unsigned operator
+    /// command is refused. One command makes every market reduce-only, and no parameters may let
+    /// stress and toxicity spreads price a closing trade at the price itself.
+    V8,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V7;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V8;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

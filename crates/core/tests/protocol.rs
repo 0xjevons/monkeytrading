@@ -164,7 +164,7 @@ fn invalid_admin_commands_change_nothing() {
         AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 20_000 },
         AdminCommand::SetStressFloor { market: None, level: 5 },
         AdminCommand::SetStressFloor { market: Some(99), level: 1 },
-        AdminCommand::SetReduceOnly { market: 99, reduce_only: true },
+        AdminCommand::SetReduceOnly { market: Some(99), reduce_only: true },
     ];
     let root = h.engine.state_root();
     for cmd in rejected {

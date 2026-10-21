@@ -27,7 +27,9 @@ impl NodeConfig {
     ///   that is not `host:port`
     /// - `history.retention` is zero, or too long to count in milliseconds
     /// - the custody section does not match its provider (see `validate_custody`)
-    /// - genesis parameters or a market spec fail validation
+    /// - `operator.public_key` or `custody.vault` does not parse
+    /// - genesis parameters fail validation or let spreads refuse a close, or a market spec fails
+    ///   validation
     /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
     ///   engine would refuse, or genesis lists a market id twice
     /// - a genesis market fails `MarketSpec::check_fx_market` against the markets listed before it
@@ -87,7 +89,10 @@ impl NodeConfig {
         }
         self.history.retention_ms().context("history.retention")?;
         self.validate_custody()?;
+        self.operator()?;
         self.genesis.params.validate().map_err(anyhow::Error::msg).context("genesis.params")?;
+        // Genesis runs under the latest rules, which refuse these.
+        self.genesis.params.check_closing_spread().map_err(anyhow::Error::msg).context("genesis.params")?;
         // Genesis reruns on every boot until it completes, so a command the engine would refuse
         // fails here, before anything reaches the log.
         // Zero records the genesis credit and moves nothing; any other amount must be one the engine

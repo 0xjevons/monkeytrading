@@ -29,7 +29,7 @@ governor = { version = "0.10", default-features = false, features = ["std", "das
 hex = "0.4"
 http-body-util = "0.1"
 humantime-serde = "1"
-hyper = { version = "1", features = ["http1", "server"] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 proptest = { version = "1.12", default-features = false, features = ["std"] }

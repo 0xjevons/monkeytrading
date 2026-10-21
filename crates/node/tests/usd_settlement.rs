@@ -59,8 +59,8 @@ struct DevNode {
 }
 
 impl DevNode {
-    /// Boots as a fresh dev node does at `START`: records its client auth, activates the latest
-    /// protocol, and sequences the committed dev genesis.
+    /// Boots as a fresh dev node does at `START`: records its client auth and operator, activates the
+    /// latest protocol, and sequences the committed dev genesis.
     fn genesis() -> Self {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/dev.toml");
         let config = NodeConfig::load(&path).expect("the dev config loads");
@@ -68,6 +68,7 @@ impl DevNode {
         let auth = config.client_auth().expect("the dev config's client auth");
         let boot = [
             Command::Admin(AdminCommand::SetClientAuth(auth)),
+            Command::Admin(AdminCommand::SetOperator(config.operator().expect("the dev config's operator"))),
             Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }),
         ];
         for cmd in boot.into_iter().chain(genesis_commands(&config.genesis)) {

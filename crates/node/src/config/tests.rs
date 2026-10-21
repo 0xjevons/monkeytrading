@@ -58,6 +58,27 @@ fn signed_requests_take_their_domain_from_the_custody_chain_and_vault() {
 }
 
 #[test]
+fn the_operator_is_its_public_keys_address_under_the_custody_chain_and_vault() {
+    let dev = std::fs::read_to_string(DEV).unwrap();
+    let operator = toml::from_str::<NodeConfig>(&dev).unwrap().operator().unwrap();
+    // The address of the local test key 0x4242…42.
+    let address: AccountId = "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025".parse().unwrap();
+    assert_eq!(operator, Operator { address, chain_id: 31_337, vault: AccountId([0; 20]) });
+    let uncompressed = dev.split("public_key = \"0x04").nth(1).unwrap().split('"').next().unwrap();
+    let compressed = format!("0x03{}", &uncompressed[..64]);
+    let text = dev.replace(&format!("0x04{uncompressed}"), &compressed);
+    assert_eq!(toml::from_str::<NodeConfig>(&text).unwrap().operator().unwrap(), operator);
+
+    let private_key = "0x4242424242424242424242424242424242424242424242424242424242424242";
+    let off_curve = format!("0x04{}", "00".repeat(64));
+    for bad in [private_key, off_curve.as_str(), "operator"] {
+        let text = dev.replace(&format!("0x04{uncompressed}"), bad);
+        let err = toml::from_str::<NodeConfig>(&text).unwrap().validate().unwrap_err();
+        assert!(err.to_string().contains("operator.public_key"), "{bad}: {err:#}");
+    }
+}
+
+#[test]
 fn genesis_values_the_engine_would_refuse_fail_the_boot() {
     let dev = std::fs::read_to_string(DEV).unwrap();
     let capital = |amount: &str| dev.replace("house_capital = \"10000000\"", &format!("house_capital = \"{amount}\""));
@@ -357,4 +378,14 @@ fn assert_validation_fails(text: &str, expected: &str) {
     let cfg: NodeConfig = toml::from_str(text).unwrap();
     let err = format!("{:#}", cfg.validate().unwrap_err());
     assert!(err.contains(expected), "{err}");
+}
+
+#[test]
+fn genesis_stress_and_toxicity_spreads_that_reach_the_price_fail_the_boot() {
+    let mut cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(DEV).unwrap()).unwrap();
+    cfg.validate().unwrap();
+    let top = cfg.genesis.params.stress_levels.len() - 1;
+    cfg.genesis.params.stress_levels[top].min_spread_bps = 10_000;
+    let err = cfg.validate().unwrap_err();
+    assert!(format!("{err:#}").contains("reach the price"), "{err:#}");
 }

@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{AAPL, BTC, ETH, Harness, acct, f, fills, market, ny, params, rejection, us_equities};
+use common::{AAPL, BTC, ETH, Harness, acct, f, fills, market, ny, operator, params, rejection, us_equities};
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::{Event, Reject};
@@ -258,6 +258,7 @@ fn a_listing_before_any_parameters_is_applied_without_a_close_out_check() {
     let btc = market(BTC, "BTC-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000);
     let cmds = [
         AdminCommand::SetClientAuth(ClientAuth::Unsigned),
+        AdminCommand::SetOperator(operator()),
         AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST },
         AdminCommand::UpsertMarket(btc),
     ];

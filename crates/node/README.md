@@ -32,6 +32,10 @@ verifies its checkpoints.
 - Account history: every event that names an account, indexed in SQLite from the log and paged
   newest first by a `<seq>:<index>` cursor, with a stated retention; it survives restarts and
   rebuilds from the log
+- `engine admin` to sign an admin command with the operator's key, read from a file or
+  `OPERATOR_KEY`, and submit it over TLS pinned to the node's attested key; the node holds only the
+  operator's public key, recorded in the log, and refuses a request before the log unless it carries
+  the operator's signature, next nonce, and an unexpired expiry
 - Supervised tasks: any task stopping stops the node, and SIGTERM drains to a final checkpoint
 - Live crypto prices from Coinbase, Kraken, and Bitstamp over WebSocket: one supervised task per
   venue, quotes stamped with the venue's own time, and reconnects with backoff
@@ -45,12 +49,15 @@ verifies its checkpoints.
 
 ## Repository Structure
 
-- `src/main.rs` — the `engine` binary: `run` and `replay`
+- `src/main.rs` — the `engine` binary: `run`, `replay`, and `admin`
 - `src/lib.rs` — module index
+- `src/admin/mod.rs` — `engine admin`: the operator key, the commands it signs, and submission
+- `src/admin/tls.rs` — the TLS connection to a node, pinned to its attested key
+- `src/admin/tests.rs` — `engine admin` tests: key sources, commands, signing, and pins
 - `src/node.rs` — startup, task supervision, and shutdown
 - `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, and log replay
-- `src/sequencer/required.rs` — protocol activation and genesis, which wait for trusted time, and
-  the genesis commands
+- `src/sequencer/required.rs` — client auth, the operator, protocol activation, and genesis, which
+  wait for trusted time, and the genesis commands
 - `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must
   look at, and house NAV below zero
 - `src/sequencer/tests.rs` — sequencer, activation, genesis restart, and replay tests
@@ -63,6 +70,9 @@ verifies its checkpoints.
 - `src/log/checked.rs` — reads a completed segment in chunks checked against its listing
 - `src/log/tests.rs` — log format, segment, and reader tests
 - `src/api/mod.rs` — REST routes, request signature checks, and the request span
+- `src/api/admin.rs` — the operator's admin route, checked before it is sequenced
+- `src/api/admin_tests.rs` — admin route tests, and the operator channel dev scenario through
+  `engine admin`
 - `src/api/stream/mod.rs` — the WebSocket stream: backfill from disk, then live, under the
   subscriber cap, reading what the subscriber sends
 - `src/api/stream/tests.rs` — feed, backfill, and subscriber tests
@@ -176,6 +186,19 @@ cargo run -p engine-node -- run --config <copy of config/dev.toml>
 # Verify a node's log directory, a downloaded archive, or a single log file
 cargo run -p engine-node -- replay --log data/dev/log
 
+# Sign and submit admin commands as the operator, over TLS pinned to the attested key (hex). The key
+# is read from --key-file, OPERATOR_KEY_FILE, or OPERATOR_KEY; config/dev.toml names the public key
+# of the local test key 0x4242…42 (32 bytes of 0x42). A market or parameters file holds the keys of a
+# [[genesis.markets]] entry or of [genesis.params] at its top level, without the table header.
+export OPERATOR_KEY=0x4242424242424242424242424242424242424242424242424242424242424242
+PIN=$(curl -sk $API/v1/attestation | jq -r .tls_public_key_sha256)
+cargo run -p engine-node -- admin --pin $PIN set-reduce-only true             # every market
+cargo run -p engine-node -- admin --pin $PIN set-reduce-only false --market 2
+cargo run -p engine-node -- admin --pin $PIN set-stress-floor 1 --market 1
+cargo run -p engine-node -- admin --pin $PIN set-benchmark-rate SOFR 430
+cargo run -p engine-node -- admin --pin $PIN upsert-market market.toml        # no table header
+cargo run -p engine-node -- admin --pin $PIN set-params params.toml           # no table header
+
 # Download the archive: the manifest, then each segment it lists (`--retry` waits out a 429)
 curl -kf --retry 5 --create-dirs -o archive/manifest.jsonl https://127.0.0.1:8080/v1/archive/manifest.jsonl
 jq -r '.file' archive/manifest.jsonl |
@@ -204,8 +227,8 @@ outside its threat model.
 Endpoints: `GET /v1/health`, `GET /v1/attestation`, `GET /v1/markets`, `GET /v1/house`,
 `GET /v1/accounts/{address}`, `GET /v1/accounts/{address}/nonce`,
 `GET /v1/accounts/{address}/history`, `POST /v1/orders`, `POST /v1/orders/cancel`,
-`POST /v1/withdrawals` (mock custody only until withdrawals are paid on-chain), `POST /v1/dev/deposit`
-(mock custody only), `GET /v1/stream` (WebSocket), and
+`POST /v1/withdrawals` (mock custody only until withdrawals are paid on-chain), `POST /v1/admin`
+(the operator's), `POST /v1/dev/deposit` (mock custody only), `GET /v1/stream` (WebSocket), and
 `GET /v1/archive/{file}` (`manifest.jsonl` or a segment it lists).
 A client over its rate gets 429 with `Retry-After`, a body over `api.max_body_bytes` gets 413, a
 body not received within `api.read_timeout` gets 408, and a subscriber over `api.max_subscribers`
@@ -284,9 +307,35 @@ refuses, inside its own transaction, a schema this code did not create. Removing
 the node is stopped rebuilds the index from the log's segments. Commands logged before events were
 recorded add nothing to history.
 
+`engine admin` reads the node config (`--config`, or `CONFIG_PATH`) for the operator's public key
+and the custody chain id and vault, refuses a key that is not the operator's, takes the operator's
+next nonce from `GET /v1/accounts/{operator address}/nonce`, and posts
+`{ "command": <admin command>, "auth": { "nonce", "expires_at", "signature" } }` to
+`POST /v1/admin` on `--node` (default `https://127.0.0.1:8080`). It connects over TLS 1.3 only when
+the node's certificate key hashes to `--pin`, the attestation's `tls_public_key_sha256`, so a client
+that has checked the quote reaches the attested enclave. The signature is EIP-712 over the
+command's JSON, its nonce, and an expiry two and a half minutes ahead, under the same domain as
+client requests. It prints the signed request and the events the engine produced, and fails when
+the engine answers `admin_rejected`. The node refuses a command only it sequences (client auth, the
+operator, protocol activation) with 400, a signature that is not the operator's with 401, an
+expired request with 400, and a nonce other than the operator's next with 409, and none of these
+reaches the log. The operator may list a market or replace its spec and calendar, replace the
+protocol parameters, set a benchmark rate, set a stress floor, which raises a market's stress level
+but never lowers it below the automatic one, and make one market or every market reduce-only, where
+new risk is refused and trades that reduce or close a position still fill. The engine also refuses
+parameters whose stress and toxicity spreads would price a closing trade at the price itself. Once
+any deposit or house capital is credited, the engine refuses an unsigned operator command, so only
+genesis, which credits its house capital last, runs unsigned. The first start under protocol `V8`
+records `operator.public_key`, with the custody chain id and vault, in the log; changing it needs a
+fresh log, and `engine replay` prints the operator a log records.
+
 ## Configuration
 
-`CONFIG_PATH`: path to the node config file, used when `run` is given no config flag.
+`CONFIG_PATH`: path to the node config file, used when `run` or `admin` is given no config flag.
+
+`OPERATOR_KEY`: the operator's private key in hex, for `admin` when no `--key-file` is given.
+
+`OPERATOR_KEY_FILE`: a file holding the operator's private key in hex, for `admin`.
 
 ## Testing
 

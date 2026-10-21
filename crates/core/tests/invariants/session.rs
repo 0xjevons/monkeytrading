@@ -5,6 +5,7 @@ use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest};
 use engine_core::market::{FinancingSpec, MarketSpec, PriceRules, Tier};
 use engine_core::params::{ProtocolParams, ToxicityParams};
 use engine_core::price::SourceQuote;
+use engine_core::protocol::ProtocolVersion;
 use engine_core::session::Schedule;
 use engine_core::types::{AccountId, AssetClass, MarketId, Millis, Side};
 use engine_core::{Engine, Fixed};
@@ -16,7 +17,7 @@ use proptest::prop_oneof;
 use proptest::sample::select;
 use proptest::strategy::{Just, Strategy};
 
-use crate::common::{AAPL, BTC, DE40, ETH, EURUSD, UNLISTED, USDJPY, acct, market, params, us_equities};
+use crate::common::{AAPL, BTC, Client, DE40, ETH, EURUSD, UNLISTED, USDJPY, acct, market, params, us_equities};
 
 /// A market id only generated listings use.
 const NEW_MARKET: MarketId = 10;
@@ -100,7 +101,8 @@ enum Stamp {
     Exact(Millis),
 }
 
-/// The command a step sends, with relative prices resolved against the engine's current marks.
+/// The command a step sends, with relative prices resolved against the engine's current marks, and
+/// from `V8` admin commands signed by the operator with its next nonce.
 pub(crate) fn command(action: &Action, engine: &Engine, now: Millis) -> Command {
     match action {
         Action::Tick => Command::Tick,
@@ -157,6 +159,10 @@ pub(crate) fn command(action: &Action, engine: &Engine, now: Millis) -> Command 
         }
         Action::Cancel { account, order_id } => {
             Command::CancelOrder { account: *account, order_id: *order_id, auth: None }
+        }
+        Action::Admin(cmd) if engine.protocol_version() >= ProtocolVersion::V8 => {
+            let operator = Client { expires_at: now + 60_000, ..Client::operator() };
+            operator.admin(engine.next_request_nonce(operator.account), cmd.clone())
         }
         Action::Admin(cmd) => Command::Admin(cmd.clone()),
     }
@@ -271,7 +277,7 @@ fn admin() -> impl Strategy<Value = AdminCommand> {
             annual_bps
         }),
         (option::of(market_id()), level).prop_map(|(market, level)| AdminCommand::SetStressFloor { market, level }),
-        (market_id(), any::<bool>())
+        (option::of(market_id()), any::<bool>())
             .prop_map(|(market, reduce_only)| AdminCommand::SetReduceOnly { market, reduce_only }),
         params_change().prop_map(AdminCommand::SetParams),
         listing().prop_map(AdminCommand::UpsertMarket),

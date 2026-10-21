@@ -35,6 +35,7 @@ use crate::limits::ApiLimits;
 use crate::log::Manifest;
 use crate::sequencer::{Request, StreamMsg};
 use crate::tee::{Attestation, EnclaveKey, MockAttestor, attest_key};
+use crate::test_support::dev_config;
 
 const V4: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const V6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
@@ -332,6 +333,7 @@ impl TestNode {
             stream: stream.clone(),
             attestation: Arc::new(attestation.clone()),
             auth: ClientAuth::Unsigned,
+            operator: dev_config().operator().unwrap(),
             clock: now_ms,
             mock_custody: true,
             log_dir: PathBuf::new(),

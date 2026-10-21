@@ -55,8 +55,8 @@ pub fn init_logging(level: &str) -> anyhow::Result<()> {
 /// - operator rotation is enabled
 /// - `feeds.provider = "venues"` without `[feeds.venues]`, or the TLS config cannot be built
 /// - generating the TLS key, attesting the keys, opening the history index (including one the log
-///   does not match), recovering the log (including a log that records another client auth),
-///   connecting custody, or binding the listener fails
+///   does not match), recovering the log (including a log that records another client auth or
+///   operator), connecting custody, or binding the listener fails
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
 pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.operator.rotation_enabled {
@@ -95,6 +95,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
 
     let vault: AccountId = cfg.custody.vault.parse().context("custody.vault")?;
     let client_auth = cfg.client_auth()?;
+    let operator = cfg.operator()?;
     let (stream_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
     let (withdrawals_tx, withdrawals_rx) = mpsc::unbounded_channel();
     let (manifest_tx, manifest_rx) = watch::channel(Manifest::default());
@@ -109,6 +110,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         clock: clock.clone(),
         max_drift: cfg.time.max_drift,
         client_auth: client_auth.clone(),
+        operator,
     };
     let mut seq = Sequencer::recover_from(log, seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
@@ -180,6 +182,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         stream: stream_tx,
         attestation,
         auth: client_auth,
+        operator,
         mock_custody,
         clock: now_ms,
         log_dir: cfg.node.log_dir.clone(),

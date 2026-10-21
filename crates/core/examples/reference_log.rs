@@ -16,7 +16,8 @@ use anyhow::anyhow;
 use chrono::NaiveDate;
 use common::reference::{ReferenceEntry, root_hex};
 use common::{
-    AAPL, BTC, Client, DE40, ETH, EURUSD, Harness, UNLISTED, USDJPY, acct, de40, f, market, ny, params, us_equities,
+    AAPL, BTC, Client, DE40, ETH, EURUSD, Harness, OPERATOR_SEED, UNLISTED, USDJPY, acct, de40, f, market, ny,
+    operator, params, us_equities,
 };
 use engine_core::Engine;
 use engine_core::auth::MAX_EXPIRY_AHEAD_MS;
@@ -81,8 +82,9 @@ fn main() -> anyhow::Result<()> {
 /// rollover, with a rejection of each kind along the way. Then, under `V6`, close-outs after a
 /// margin-table rise, a close-out level rise, and a rollover's financing, house cap floors at a
 /// drawn-down NAV, and a close-out just after a session close that skips the closed market. Then,
-/// under `V7`, USD settlement of markets quoted in euros and yen. Every client request is signed by
-/// its account's key unless the comment says otherwise.
+/// under `V7`, USD settlement of markets quoted in euros and yen. Then, under `V8`, operator commands
+/// signed and refused for each reason, and every market reduce-only. Every client request is signed
+/// by its account's key unless the comment says otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -142,10 +144,10 @@ fn session() -> Vec<Sequenced> {
     h.price(ETH, "3060");
 
     // Reduce-only: new risk refused in a reduce-only market, a reducing order allowed.
-    h.admin(AdminCommand::SetReduceOnly { market: ETH, reduce_only: true });
+    h.admin(AdminCommand::SetReduceOnly { market: Some(ETH), reduce_only: true });
     h.market_order(b, ETH, Side::Sell, "1", "3060");
     h.cmd(Command::PlaceOrder(reducing(b, ETH, Side::Buy, "0.5", "3060")));
-    h.admin(AdminCommand::SetReduceOnly { market: ETH, reduce_only: false });
+    h.admin(AdminCommand::SetReduceOnly { market: Some(ETH), reduce_only: false });
 
     // Stress: an operator floor, a fill paying its spread, then a divergence trigger and cooldown.
     h.admin(AdminCommand::SetStressFloor { market: Some(BTC), level: 1 });
@@ -237,7 +239,7 @@ fn session() -> Vec<Sequenced> {
     h.price(SOL, "150");
     h.market_order(a, SOL, Side::Buy, "100", "150");
     h.cmd(Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 10_001 }));
-    h.cmd(Command::Admin(AdminCommand::SetReduceOnly { market: UNLISTED, reduce_only: true }));
+    h.cmd(Command::Admin(AdminCommand::SetReduceOnly { market: Some(UNLISTED), reduce_only: true }));
     // An exchange holiday on Thursday keeps AAPL shut through its session hours.
     let Schedule::Weekly { tz, windows, .. } = us_equities() else { unreachable!("US equities keep weekly hours") };
     let holiday = NaiveDate::from_ymd_opt(2026, 10, 22).expect("a real date");
@@ -417,6 +419,34 @@ fn session() -> Vec<Sequenced> {
     h.market_order(b, USDJPY, Side::Buy, "10000", "151");
     h.advance_to(ny(2026, 10, 26, 18, 30));
     h.cmd(Command::Tick);
+
+    // `V8` activates once the operator is recorded. An unsigned operator command is refused now that
+    // funds are credited; a signed one applies, and one signed by another key, a reused nonce, an
+    // expired command, one expiring too far ahead, a node-only command, and spreads that would price
+    // a close at the price itself are refused. With every market reduce-only, an open is refused and
+    // a close fills until it lifts.
+    h.admin(AdminCommand::SetOperator(operator()));
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V8 });
+    let floor = AdminCommand::SetStressFloor { market: Some(ETH), level: 1 };
+    h.cmd(Command::Admin(floor.clone()));
+    let by = |seed, expires_at| Client { expires_at, ..Client::new(seed) };
+    h.cmd(by(7, h.ts + 60_000).admin(0, floor.clone()));
+    h.operator_admin(floor.clone());
+    h.cmd(by(OPERATOR_SEED, h.ts + 60_000).admin(0, floor.clone()));
+    h.cmd(by(OPERATOR_SEED, h.ts - 1).admin(1, floor.clone()));
+    h.cmd(by(OPERATOR_SEED, h.ts + MAX_EXPIRY_AHEAD_MS + 1).admin(2, floor));
+    h.cmd(by(OPERATOR_SEED, h.ts + 60_000).admin(3, AdminCommand::ActivateProtocol { version: ProtocolVersion::V8 }));
+    let mut wide = params();
+    wide.stress_levels[1].min_spread_bps = 9_998;
+    h.operate(AdminCommand::SetParams(wide));
+    let o = h.signer(17);
+    h.deposit(o, "10000");
+    h.price(BTC, "92000");
+    h.market_order(o, BTC, Side::Buy, "0.01", "92000");
+    h.operator_admin(AdminCommand::SetReduceOnly { market: None, reduce_only: true });
+    h.market_order(o, BTC, Side::Buy, "0.01", "92000");
+    h.market_order(o, BTC, Side::Sell, "0.01", "92000");
+    h.operator_admin(AdminCommand::SetReduceOnly { market: None, reduce_only: false });
     h.log
 }
 
