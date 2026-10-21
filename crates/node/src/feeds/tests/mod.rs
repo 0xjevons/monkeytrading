@@ -18,11 +18,12 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::clock::now_ms;
 use crate::config::Venue;
 use crate::feeds::tests::fake::{
-    WAIT, accept, bitstamp_book, capture_alerts, coinbase_levels, fast, kraken_book, listen, next_alert, next_prices,
-    quote, send, spawn_feed, stream,
+    WAIT, accept, bitstamp_book, coinbase_levels, fast, kraken_book, listen, next_alert, next_prices, quote, send,
+    spawn_feed, stream,
 };
 use crate::feeds::venue::{Book, Timing, to_quote};
 use crate::feeds::{bitstamp, kraken};
+use crate::test_support::{Alert, capture_alerts};
 
 const MARKETS: [(MarketId, &str); 2] = [(1, "BTC/USD"), (2, "ETH/USD")];
 
@@ -293,7 +294,7 @@ async fn a_symbol_that_goes_quiet_again_alerts_again() {
         }
     });
 
-    let silent_eth = |alert: &fake::Alert| alert["alert"] == "venue_symbol_silent" && alert["symbol"] == "ETH/USD";
+    let silent_eth = |alert: &Alert| alert["alert"] == "venue_symbol_silent" && alert["symbol"] == "ETH/USD";
     assert!(silent_eth(&next_alert(&mut alerts).await));
     eth_quoting.store(true, Ordering::Relaxed);
     let eth_sequenced = async { while next_prices(&mut rx).await.0 != 2 {} };
