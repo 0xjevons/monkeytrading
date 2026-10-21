@@ -1,4 +1,5 @@
-//! Shared test harness: scratch directories, the committed dev config, and a running sequencer.
+//! Shared test harness: scratch directories, the committed dev config, a running sequencer, and a
+//! history index following it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,12 +11,16 @@ use engine_core::event::{CancelReason, Event, Fill, Reject};
 use engine_core::price::PriceError;
 use engine_core::types::{AccountId, Side};
 use engine_core::{Engine, Fixed};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use futures_util::FutureExt;
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
+use crate::api::{Feed, MAX_BACKFILLS};
 use crate::clock::{Clock, SystemClock};
-use crate::config::NodeConfig;
-use crate::log::{LogReader, Manifest, Offset};
+use crate::config::{HistorySection, NodeConfig};
+use crate::history::{History, HistoryEvent, Reader};
+use crate::log::{LogEntry, LogReader, Manifest, Offset, SegmentedLog};
 use crate::sequencer::{Request, Sequencer, SequencerConfig, SignedWithdrawal, StreamMsg};
 use crate::tee::EnclaveKey;
 use crate::trusted_time::Sample;
@@ -25,6 +30,8 @@ pub const DEV_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/
 pub const SEGMENT_COMMANDS: u64 = 4;
 pub const CHECKPOINT_EVERY: u64 = 3;
 pub const TRADER: AccountId = AccountId([7; 20]);
+/// Long enough that no test event leaves the history index.
+pub const RETENTION: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
 /// A sequencer task running on a log directory, with the ends of its channels.
 pub struct TestSequencer {
@@ -40,17 +47,22 @@ impl TestSequencer {
     /// Recovers a sequencer from `dir`, sequences the dev genesis if the log is empty, and runs it.
     /// The stream channel holds `stream_capacity` messages.
     pub fn start(dir: &Path, stream_capacity: usize) -> Self {
+        Self::start_at(dir, stream_capacity, Arc::new(SystemClock))
+    }
+
+    /// As `start`, stamping commands on `clock`, which trusted time admits.
+    pub fn start_at(dir: &Path, stream_capacity: usize, clock: Arc<dyn Clock>) -> Self {
         let (stream, _) = broadcast::channel(stream_capacity);
         let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
         let (manifest_tx, manifest) = watch::channel(Manifest::default());
         let key = Arc::new(EnclaveKey::generate());
-        let mut seq = Sequencer::recover(sequencer_config(dir, manifest_tx), key, stream.clone(), withdrawals_tx)
-            .expect("sequencer recovers");
+        let cfg = SequencerConfig { clock: clock.clone(), ..sequencer_config(dir, manifest_tx) };
+        let mut seq = Sequencer::recover(cfg, key, stream.clone(), withdrawals_tx).expect("sequencer recovers");
         if seq.needs_genesis() {
             seq.genesis(&dev_config().genesis).expect("dev genesis");
         }
-        // Trusted time admits stamps on the system clock, so the queued genesis goes in now.
-        seq.trust(trusted_now()).expect("dev genesis");
+        // Trusted time admits stamps on `clock`, so the queued genesis goes in now.
+        seq.trust(sample_around(clock.as_ref())).expect("dev genesis");
         let (tx, rx) = mpsc::channel(64);
         let task = tokio::spawn(seq.run(rx));
         Self { tx, stream, manifest, withdrawals, task }
@@ -90,6 +102,63 @@ impl TestSequencer {
             self.submit(Command::Tick).await;
         }
     }
+}
+
+/// A history index following a `TestSequencer`'s log: its reader, where it resumed, and its task.
+pub struct TestHistory {
+    pub reader: Reader,
+    pub resume_at: Offset,
+    task: JoinHandle<anyhow::Result<()>>,
+}
+
+impl TestHistory {
+    /// Opens the index in `index` against the log `node` writes in `dir`, and runs it, letting
+    /// readers in once it has taken the log's last command now.
+    /// Error cases:
+    /// - the index does not match the log (see `History::open`)
+    pub async fn start(node: &TestSequencer, dir: &Path, index: &Path) -> anyhow::Result<Self> {
+        let tip = node.next_seq().await.checked_sub(1);
+        Self::start_with_tip(node, dir, index, tip)
+    }
+
+    /// As `start`, but readers are let in once the index has taken `tip`.
+    /// Error cases:
+    /// - the index does not match the log (see `History::open`)
+    pub fn start_with_tip(node: &TestSequencer, dir: &Path, index: &Path, tip: Option<u64>) -> anyhow::Result<Self> {
+        let cfg = HistorySection { dir: index.to_owned(), retention: RETENTION };
+        let mut history = History::open(&cfg, &SegmentedLog::open(dir)?.entries)?;
+        history.catch_up_to(tip);
+        let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
+        let (reader, resume_at) = (history.reader(), history.resume_at());
+        let feed =
+            Feed::new(node.stream.subscribe(), dir.to_owned(), node.manifest.clone(), backfills, Some(resume_at));
+        Ok(Self { reader, resume_at, task: tokio::spawn(history.run(feed)) })
+    }
+
+    /// The task's result once it has taken the whole log, which it ends with after the sequencer
+    /// stops.
+    /// Error cases:
+    /// - the history task failed (see `History::run`)
+    pub async fn finish(self) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(10), self.task).await.expect("the history task ends in time").expect("history task")
+    }
+}
+
+/// Polls `read` once, so that it takes one of `permits` and starts blocking work that cannot finish
+/// yet, then drops it: the blocking work must keep the permit until `release` lets it end. It
+/// releases before asserting, so a failure never leaves the work blocked.
+pub async fn assert_a_dropped_read_keeps_its_permit(permits: &Semaphore, read: impl Future, release: impl FnOnce()) {
+    let free = permits.available_permits();
+    let mut read = Box::pin(read);
+    let waiting = (&mut read).now_or_never().is_none();
+    drop(read);
+    let held = free - permits.available_permits();
+    release();
+    assert!(waiting, "the read waits on its blocking work");
+    assert_eq!(held, 1, "the blocking work still holds the permit");
+    let every = u32::try_from(free).expect("few permits");
+    let back = timeout(Duration::from_secs(10), permits.acquire_many(every)).await;
+    drop(back.expect("the permit comes back once the work ends").expect("the semaphore is open"));
 }
 
 /// An empty directory for one test, named after it.
@@ -147,6 +216,28 @@ pub fn log_messages(dir: &Path, from: Offset) -> Vec<String> {
     std::iter::from_fn(|| reader.next_entry().expect("log reads"))
         .map(|(offset, entry)| serde_json::to_string(&StreamMsg::new(offset, entry)).expect("message encodes"))
         .collect()
+}
+
+/// Every event in the log in `dir` whose JSON names `account`, newest first, as history serves it.
+pub fn logged_history(dir: &Path, account: AccountId) -> Vec<HistoryEvent> {
+    let entries = SegmentedLog::open(dir).expect("log opens").entries;
+    let mut events: Vec<HistoryEvent> = entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            LogEntry::Command(command) => Some(command),
+            _ => None,
+        })
+        .flat_map(|command| {
+            let (seq, ts) = (command.sequenced.seq, command.sequenced.ts);
+            command.events.into_iter().flatten().enumerate().map(move |(index, event)| {
+                let cursor = Offset { seq, index: u32::try_from(index).expect("few events per command") };
+                HistoryEvent { cursor, ts, event }
+            })
+        })
+        .filter(|e| serde_json::to_value(&e.event).expect("event encodes")["account"] == account.to_string())
+        .collect();
+    events.reverse();
+    events
 }
 
 /// One event of each kind, and an order rejection for each reason. The matches stop compiling when

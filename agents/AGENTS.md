@@ -22,7 +22,8 @@ an index: load only the rule whose hint matches the current action.
 - **crates/node/** — `engine-node`, binary `engine` (`main.rs` over `lib.rs`). Contains the
   sequencer, the public log with signed checkpoints (segmented, with a public archive), `engine
   replay`, the REST API and the resumable WebSocket stream (TLS from an attested in-enclave key,
-  with rate limits and connection caps), TEE attestation (configfs-tsm for TDX and SEV-SNP), the
+  with rate limits and connection caps), the account history index (SQLite, derived from the log),
+  TEE attestation (configfs-tsm for TDX and SEV-SNP), the
   trusted time check against Roughtime servers, the custody adapter (mock only so far), and price
   feeds: live crypto venue WebSockets (`feeds/`, one adapter per venue) and a mock.
   `tests/reference/` holds the node-format reference log per protocol version, with events, written
@@ -81,8 +82,8 @@ Run from the repo root:
 - Run a local node: `cargo run -p engine-node -- run --config config/dev.toml` (or set
   `CONFIG_PATH`); the API is served over TLS on `https://127.0.0.1:8080` with a self-signed
   certificate (`curl -k`, or pin the attested key), its limits come from `[api]`, the log goes to
-  segment files and a manifest in `data/dev/log/` (gitignored), and the log level comes from
-  `[logging].level`
+  segment files and a manifest in `data/dev/log/` and the history index to `data/dev/history/`
+  (both gitignored), and the log level comes from `[logging].level`
 - Verify a published log: `cargo run -p engine-node -- replay --log <path>`, where `<path>` is a
   log directory, a downloaded archive, or a single log file
 

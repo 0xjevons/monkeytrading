@@ -7,6 +7,7 @@ pub mod config;
 pub use config::NodeConfig;
 mod custody;
 mod feeds;
+mod history;
 mod limits;
 pub mod log;
 mod node;

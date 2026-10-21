@@ -1,10 +1,11 @@
 //! Client API: REST for actions and reads, a WebSocket that streams the public log (every
-//! sequenced command with its events, every signed checkpoint, every signed withdrawal), and the
-//! log archive. Every request passes the limits in `limits`.
+//! sequenced command with its events, every signed checkpoint, every signed withdrawal), the log
+//! archive, and account history. Every request passes the limits in `limits`.
 
 mod archive;
+mod history;
 mod stream;
-pub(crate) use stream::MAX_BACKFILLS;
+pub(crate) use stream::{Feed, MAX_BACKFILLS};
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -33,6 +34,7 @@ use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, debug, info_span};
 
 use crate::clock::now_ms;
+use crate::history::Reader;
 use crate::limits::{ApiLimits, limit_client, read_body};
 use crate::log::Manifest;
 use crate::sequencer::{self, StreamMsg};
@@ -43,6 +45,8 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 #[derive(Debug)]
 pub enum ApiError {
     Unavailable,
+    /// The history index is still taking the commands the log held at startup.
+    CatchingUp,
     NotFound,
     BadRequest(String),
     /// The node failed to serve the request; the cause is logged where it happened.
@@ -78,6 +82,7 @@ pub struct ApiState {
     /// Permits for stream subscribers reading from disk.
     pub backfills: Arc<Semaphore>,
     pub limits: Arc<ApiLimits>,
+    pub history: Reader,
 }
 
 #[derive(Serialize)]
@@ -134,6 +139,7 @@ impl IntoResponse for ApiError {
                 return (StatusCode::TOO_MANY_REQUESTS, [(RETRY_AFTER, secs.max(1).to_string())], body).into_response();
             }
             ApiError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "engine unavailable".to_owned()),
+            ApiError::CatchingUp => (StatusCode::SERVICE_UNAVAILABLE, "history is catching up with the log".to_owned()),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_owned()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_owned()),
@@ -249,6 +255,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/house", get(house))
         .route("/v1/accounts/{address}", get(account))
         .route("/v1/accounts/{address}/nonce", get(nonce))
+        .route("/v1/accounts/{address}/history", get(history::history))
         .route("/v1/orders", post(place_order))
         .route("/v1/orders/cancel", post(cancel_order))
         .route("/v1/withdrawals", post(withdraw))

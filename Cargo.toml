@@ -34,6 +34,7 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 proptest = { version = "1.12", default-features = false, features = ["std"] }
 rand = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 # TLS for the API and venue feeds with ring as the only crypto provider, so no OpenSSL or aws-lc build.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["alloc"] }

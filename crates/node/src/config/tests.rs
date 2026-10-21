@@ -148,6 +148,25 @@ fn a_server_address_must_be_host_and_port() {
 }
 
 #[test]
+fn a_history_retention_of_zero_or_beyond_millisecond_range_is_refused() {
+    let dev = std::fs::read_to_string(DEV).unwrap();
+    for (retention, refused) in [
+        ("0s", Some("must be non-zero")),
+        ("300000000years", Some("too long")),
+        ("1ms", None),
+        ("292000000years", None),
+    ] {
+        let text = dev.replace("retention = \"365d\"", &format!("retention = \"{retention}\""));
+        assert_ne!(text, dev, "the replacement must change the config");
+        let checked = toml::from_str::<NodeConfig>(&text).unwrap().validate();
+        match refused {
+            Some(cause) => assert!(format!("{:#}", checked.unwrap_err()).contains(cause), "{retention}"),
+            None => checked.unwrap(),
+        }
+    }
+}
+
+#[test]
 fn a_zero_tick_is_refused() {
     let text = std::fs::read_to_string(DEV).unwrap().replace("tick = \"250ms\"", "tick = \"0s\"");
     let cfg: NodeConfig = toml::from_str(&text).unwrap();

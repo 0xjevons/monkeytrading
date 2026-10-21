@@ -151,6 +151,21 @@ impl Sequencer {
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
         let log = SegmentedLog::open(cfg.log_dir)?;
+        Self::recover_from(log, cfg, key, stream, withdrawals)
+    }
+
+    /// As `recover`, from `log`, the log already read, so that a check of it before recovery sees
+    /// exactly what recovery replays.
+    /// Error cases:
+    /// - the log fails replay (see `replay`), or records a client auth other than the config's
+    /// - the log cannot be opened for appending, or written
+    pub fn recover_from(
+        log: SegmentedLog,
+        cfg: SequencerConfig<'_>,
+        key: Arc<EnclaveKey>,
+        stream: broadcast::Sender<Arc<StreamMsg>>,
+        withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
+    ) -> anyhow::Result<Self> {
         let Replayed { engine, commands, checkpoints, unsigned, .. } = replay(&log.entries)?;
         // A config naming another client auth, and so another chain or vault, is the wrong one for
         // this log: refuse before anything is written or signed under it.

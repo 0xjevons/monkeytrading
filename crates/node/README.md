@@ -4,8 +4,9 @@
 
 The node that runs `engine-core` inside a TEE (an Intel TDX or AMD SEV-SNP confidential VM). It
 sequences every command into a public, append-only log, signs state-root checkpoints with an
-attested enclave key, serves the client API, streams the log live, and talks to custody and price
-feeds. The same binary replays a published log and verifies its checkpoints.
+attested enclave key, serves the client API, streams the log live, indexes each account's history
+from the log, and talks to custody and price feeds. The same binary replays a published log and
+verifies its checkpoints.
 
 ## Features
 
@@ -28,6 +29,9 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - Rate limits on requests per client IP and per account and on new connections per client IP,
   caps on request size, connections, and stream subscribers, and read timeouts, all set in `[api]`
 - `engine replay` to verify a published log, or a downloaded archive, against the open-source engine
+- Account history: every event that names an account, indexed in SQLite from the log and paged
+  newest first by a `<seq>:<index>` cursor, with a stated retention; it survives restarts and
+  rebuilds from the log
 - Supervised tasks: any task stopping stops the node, and SIGTERM drains to a final checkpoint
 - Live crypto prices from Coinbase, Kraken, and Bitstamp over WebSocket: one supervised task per
   venue, quotes stamped with the venue's own time, and reconnects with backoff
@@ -55,8 +59,16 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/api/archive.rs` — the archive routes: the manifest and completed segments
 - `src/api/auth_tests.rs` — signed-request API tests: signatures, nonces, expiries, refused
   accounts, and racing requests
-- `src/api/tests.rs` — API tests, including the resumable stream and archive dev scenario, and
-  `Retry-After`
+- `src/api/history.rs` — the account history route: its parameters and limits
+- `src/api/tests.rs` — API tests, including the dev scenarios of the resumable stream and archive,
+  and of account history, and `Retry-After`
+- `src/history/mod.rs` — the history index: which events name an account, the startup check
+  against the log, and the supervised task that follows the log into the index
+- `src/history/store.rs` — the index's SQLite schema, its writer, and its page reader
+- `src/history/tests/mod.rs` — history index tests: pages, filters, retention, following the log,
+  and restarts
+- `src/history/tests/recovery.rs` — startup checks against the log, readiness to serve, and
+  failures
 - `src/test_support.rs` — the shared test harness
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
 - `src/trusted_time/mod.rs` — the trusted time task: queries the Roughtime servers, backs off
@@ -75,8 +87,9 @@ feeds. The same binary replays a published log and verifies its checkpoints.
 - `src/tls/tests/mod.rs` — the API end to end over TLS: key pinning, limits, caps, and the harness
 - `src/tls/tests/stream.rs` — the stream end to end over TLS: the subscriber and message caps
 - `src/limits.rs` — request rate limits, connection caps, and the stream subscriber cap
-- `src/config/mod.rs` — the node config schema and validation
+- `src/config/mod.rs` — the node config schema and loading
 - `src/config/tests.rs` — config loading and validation tests
+- `src/config/validation.rs` — the checks a parsed config must also pass
 - `src/custody.rs` — the custody adapter (mock only so far)
 - `src/feeds/mod.rs` — the feed index and the mock feed
 - `src/feeds/venue/mod.rs` — the venue task: connect, subscribe, sequence quotes, alert, reconnect
@@ -134,9 +147,10 @@ jq -r '.file' archive/manifest.jsonl |
 ```
 
 Endpoints: `GET /v1/health`, `GET /v1/attestation`, `GET /v1/markets`, `GET /v1/house`,
-`GET /v1/accounts/{address}`, `GET /v1/accounts/{address}/nonce`, `POST /v1/orders`,
-`POST /v1/orders/cancel`, `POST /v1/withdrawals`, `POST /v1/dev/deposit` (mock custody only),
-`GET /v1/stream` (WebSocket), and `GET /v1/archive/{file}` (`manifest.jsonl` or a segment it lists).
+`GET /v1/accounts/{address}`, `GET /v1/accounts/{address}/nonce`,
+`GET /v1/accounts/{address}/history`, `POST /v1/orders`, `POST /v1/orders/cancel`,
+`POST /v1/withdrawals`, `POST /v1/dev/deposit` (mock custody only), `GET /v1/stream` (WebSocket), and
+`GET /v1/archive/{file}` (`manifest.jsonl` or a segment it lists).
 A client over its rate gets 429 with `Retry-After`, a body over `api.max_body_bytes` gets 413, a
 body not received within `api.read_timeout` gets 408, and a subscriber over `api.max_subscribers`
 gets 503. A connection over a connection cap or over its client's connection rate is closed before
@@ -178,7 +192,41 @@ the nonce. Two requests that race for one nonce are both sequenced, and the engi
 second with `invalid_nonce`.
 
 The first start records `auth`, and under `eip712` the custody chain id and vault, in the log;
-changing any of them needs a fresh log.
+changing any of them needs a fresh log, and with it a fresh `history.dir`, both removed while the
+node is stopped.
+
+`/v1/accounts/{address}/history` returns `{"events": [...], "next": ...}`: the account's events,
+newest first. Each event carries its `cursor`, `<seq>:<index>`, which is the seq of the command that
+produced it and its index among that command's events; then `ts`, the command's sequenced time; then
+the event's own fields. `?before=<cursor>` and `?after=<cursor>` bound the page, both exclusive.
+Passing a page's `next` as `before` gives the next, older page, until `next` is null. `?kind=` takes
+one event `type`: `deposited`, `deposit_rejected`, `withdrawal_approved`, `withdrawal_rejected`,
+`order_accepted`, `order_rejected`, `order_cancelled`, `fill`, `close_out`, `bad_debt`, or
+`financing`. `?limit=` is 1 to 200, 50 by default. A page is one search of a SQLite index that reads
+at most `limit + 1` entries, and at most 16 pages are read at once. Until the index has taken every
+command the log held when the node started, the route answers 503 (`history is catching up with the
+log`). History is public, like the log.
+
+The history index is a SQLite file in `history.dir`, derived from the log alone. A supervised task
+follows the log as a stream subscriber does, from disk and then live, and writes on its own thread,
+so the sequencer never waits for it; once caught up, history trails the log by the commands queued
+for the writer, and reads from disk whatever it falls behind the live log by. Each write stores the
+account events of a batch of commands, keyed by cursor, and the last command taken, in one
+transaction. Events whose command is older than `history.retention`, counted back from the newest
+command in the index, leave it; the log keeps them. After `history.retention` changes, the index
+takes the log again from its start, which leaves it as a fresh index under the new retention would
+be; until that pass passes its old newest command, the startup check stays on that command. The node
+reads its log once at startup, and before recovery replays that read and writes anything, the index
+checks that it holds the newest command the index has taken, unchanged, and resumes after the last
+command it took. If the log ends before that newest command or holds another one there, the log was
+rolled back, truncated, or replaced, and the node refuses to start (`history_recovery_failed`) with
+the log as it found it. The check compares that one command, so a log forged to end with it passes;
+a host able to forge the log can rewrite the index as well. A power loss can also leave the index
+ahead of the log, since neither syncs every write. SQLite opens the file in defensive mode, with
+triggers and views off, its schema untrusted, and cell sizes checked, and every write and read
+refuses, inside its own transaction, a schema this code did not create. Removing `history.dir` while
+the node is stopped rebuilds the index from the log's segments. Commands logged before events were
+recorded add nothing to history.
 
 ## Configuration
 

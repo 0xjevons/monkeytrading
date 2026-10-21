@@ -95,7 +95,8 @@ cargo test --workspace
 cargo run -p engine-node -- run --config config/dev.toml
 ```
 
-In another terminal, credit a test account and buy 0.25 BTC at the live price:
+In another terminal, credit a test account, buy 0.25 BTC at the live price, and read the account
+and its history:
 
 ```bash
 API=https://localhost:8080
@@ -106,6 +107,7 @@ PRICE=$(curl -sk $API/v1/markets | jq -r '.[] | select(.symbol == "BTC-USD") | .
 curl -sk -X POST $API/v1/orders -H 'content-type: application/json' \
   -d "{\"account\":\"$ACCOUNT\",\"client_id\":1,\"market\":1,\"side\":\"buy\",\"qty\":\"0.25\",\"kind\":{\"kind\":\"market\",\"quoted\":\"$PRICE\"}}"
 curl -sk $API/v1/accounts/$ACCOUNT
+curl -sk "$API/v1/accounts/$ACCOUNT/history?limit=10"
 ```
 
 `-k` only skips the CA check that a self-signed certificate cannot pass. What makes a connection
@@ -128,8 +130,9 @@ cargo run -p engine-node -- replay --log data/dev/log
 The local configuration accepts unsigned requests (`auth = "none"`). With `auth = "eip712"`, each
 order, cancel, and withdrawal must carry its account's EIP-712 signature, its next nonce, and an
 expiry at most five minutes ahead, and replay checks every one. The first start records this
-setting in the log, so changing it later needs a fresh log. The node's full API is described in
-[`crates/node/README.md`](crates/node/README.md).
+setting in the log, so changing it later needs a fresh log: with the node stopped, remove both
+`data/dev/log` and `data/dev/history`, the account history index built from it. The node's full API
+is described in [`crates/node/README.md`](crates/node/README.md).
 
 ## Repository layout
 
