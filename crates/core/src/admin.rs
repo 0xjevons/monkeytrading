@@ -250,7 +250,7 @@ impl Engine {
         let Some(params) = &self.params else { return };
         let max_level = params.stress_levels.len() - 1;
         let global_floor = self.global_stress_floor;
-        for (market_id, market) in &mut self.markets {
+        for (market_id, market) in self.markets.iter_mut() {
             set_stress_level(*market_id, market, global_floor, max_level, events);
         }
     }

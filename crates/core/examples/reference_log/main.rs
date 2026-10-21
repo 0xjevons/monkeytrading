@@ -4,8 +4,9 @@
 //!
 //! `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`
 
-#[path = "../tests/common/mod.rs"]
+#[path = "../../tests/common/mod.rs"]
 mod common;
+mod helpers;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -21,14 +22,14 @@ use common::{
 };
 use engine_core::Engine;
 use engine_core::auth::MAX_EXPIRY_AHEAD_MS;
-use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
-use engine_core::event::Event;
+use engine_core::command::{AdminCommand, Command, OrderKind, Sequenced};
 use engine_core::market::{MarketSpec, QuoteCurrency, Tier};
 use engine_core::params::{ProtocolParams, ToxicityParams};
 use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 use engine_core::protocol::ProtocolVersion;
 use engine_core::session::{Period, Schedule};
-use engine_core::types::{AccountId, AssetClass, MarketId, OrderId, Side};
+use engine_core::types::{AssetClass, MarketId, Side};
+use helpers::{accepted, event_kind, reducing, small_buy};
 
 /// A market the session lists with two margin bands.
 const SOL: MarketId = 10;
@@ -83,8 +84,10 @@ fn main() -> anyhow::Result<()> {
 /// margin-table rise, a close-out level rise, and a rollover's financing, house cap floors at a
 /// drawn-down NAV, and a close-out just after a session close that skips the closed market. Then,
 /// under `V7`, USD settlement of markets quoted in euros and yen. Then, under `V8`, operator commands
-/// signed and refused for each reason, and every market reduce-only. Every client request is signed
-/// by its account's key unless the comment says otherwise.
+/// signed and refused for each reason, and every market reduce-only. Then, under `V9`, the state
+/// tree: a new account's deposit, resting order and cancel, a dollar round trip, a euro position, and
+/// a marked markout. Every client request is signed by its account's key unless the comment says
+/// otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -447,54 +450,23 @@ fn session() -> Vec<Sequenced> {
     h.market_order(o, BTC, Side::Buy, "0.01", "92000");
     h.market_order(o, BTC, Side::Sell, "0.01", "92000");
     h.operator_admin(AdminCommand::SetReduceOnly { market: None, reduce_only: false });
+
+    // V9 activates at this seq, and the state root becomes the root of the state tree: the first
+    // root hashes every leaf, and each later one the leaves its command changed. A new account is
+    // credited, rests an order and cancels it, holds a euro position, opens and closes a dollar one,
+    // and its first fill's markout is marked and leaves the queue.
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V9 });
+    let late = h.signer(18);
+    h.deposit(late, "50000");
+    h.price(BTC, "80000");
+    let resting = accepted(&h.order(late, BTC, Side::Buy, "0.01", OrderKind::Limit { price: f("70000") }));
+    h.cmd(Command::CancelOrder { account: late, order_id: resting, auth: None });
+    h.market_order(late, BTC, Side::Buy, "0.02", "80000");
+    h.price(EURUSD, "1.1");
+    h.price(DE40, "20000");
+    h.market_order(late, DE40, Side::Buy, "1", "20000");
+    h.advance(2_000);
+    h.price(BTC, "80100");
+    h.market_order(late, BTC, Side::Sell, "0.02", "80100");
     h.log
-}
-
-/// A reduce-only market order quoted at `quoted`.
-fn reducing(account: AccountId, market: MarketId, side: Side, qty: &str, quoted: &str) -> OrderRequest {
-    OrderRequest {
-        account,
-        client_id: 8,
-        market,
-        side,
-        qty: f(qty),
-        kind: OrderKind::Market { quoted: f(quoted), max_slippage_bps: None },
-        reduce_only: true,
-        auth: None,
-    }
-}
-
-/// A 0.01 BTC market buy for `account`, quoted at the session's first BTC mid, unsigned.
-fn small_buy(account: AccountId) -> OrderRequest {
-    OrderRequest {
-        account,
-        client_id: 9,
-        market: BTC,
-        side: Side::Buy,
-        qty: f("0.01"),
-        kind: OrderKind::Market { quoted: f("100000.123456789"), max_slippage_bps: None },
-        reduce_only: false,
-        auth: None,
-    }
-}
-
-/// The order id an `OrderAccepted` among `events` carries; panics if there is none.
-fn accepted(events: &[Event]) -> OrderId {
-    events
-        .iter()
-        .find_map(|e| match e {
-            Event::OrderAccepted { order_id, .. } => Some(*order_id),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("expected an accepted order, got {events:?}"))
-}
-
-/// The event's `type` tag, plus the rejection kind where there is one.
-fn event_kind(event: &Event) -> String {
-    let json = serde_json::to_value(event).expect("events serialise");
-    let kind = json["type"].as_str().unwrap_or_default().to_owned();
-    match json["reason"]["kind"].as_str() {
-        Some(reason) => format!("{kind}:{reason}"),
-        None => kind,
-    }
 }

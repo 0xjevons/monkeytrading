@@ -26,6 +26,7 @@ use engine_core::command::{CancelRequest, Command, OrderRequest, WithdrawalReque
 use engine_core::eip712::{B256, Eip712Domain, cancel_hash, order_hash, withdrawal_hash};
 use engine_core::event::{Event, Reject};
 use engine_core::market::MarketSpec;
+use engine_core::merkle::AccountProof;
 use engine_core::types::{AccountId, MarketId, Millis, OrderId};
 use engine_core::{Engine, Fixed};
 use serde::{Deserialize, Serialize};
@@ -277,6 +278,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/accounts/{address}", get(account))
         .route("/v1/accounts/{address}/nonce", get(nonce))
         .route("/v1/accounts/{address}/history", get(history::history))
+        .route("/v1/accounts/{address}/proof", get(proof))
         .route("/v1/orders", post(place_order))
         .route("/v1/orders/cancel", post(cancel_order))
         .route("/v1/withdrawals", post(withdraw))
@@ -375,6 +377,19 @@ async fn nonce(State(s): State<ApiState>, Path(address): Path<String>) -> ApiRes
     Ok(Json(NonceView { next_nonce }))
 }
 
+/// The proof of the account's balance and positions, and of its positions' marks, against the
+/// state root of the last checkpoint.
+/// Error cases:
+/// - the address is malformed
+/// - no checkpoint under protocol `V9` holds the account
+/// - the sequencer has stopped
+async fn proof(State(s): State<ApiState>, Path(address): Path<String>) -> ApiResult<AccountProof> {
+    let id: AccountId = address.parse().map_err(|e| ApiError::BadRequest(format!("{e}")))?;
+    Span::current().record("id", display(id));
+    let proof = s.query(move |e| e.account_proof(id)).await?;
+    proof.map(Json).ok_or(ApiError::NotFound)
+}
+
 /// Places an order and returns the events it produced.
 /// Error cases:
 /// - the request is not authorised for its account
@@ -433,5 +448,7 @@ async fn dev_deposit(State(s): State<ApiState>, Json(b): Json<AmountBody>) -> Ap
 mod admin_tests;
 #[cfg(test)]
 mod auth_tests;
+#[cfg(test)]
+mod proof_tests;
 #[cfg(test)]
 mod tests;

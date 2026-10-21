@@ -22,6 +22,9 @@
 //!   reduce-only.
 //! - Accounts hold USD. From `V7`, a market may be quoted in another currency: it accrues PnL in it,
 //!   converts to USD at its FX market's index, and has no price while that FX market has none.
+//! - From `V9`, the state root is a sparse Merkle tree over accounts, positions, markets, and the
+//!   rest of the state, so a checkpoint rehashes only what changed, and an account's balance and
+//!   positions can be proven against a posted root.
 
 pub mod account;
 mod admin;
@@ -37,8 +40,10 @@ pub mod fixed;
 pub use fixed::Fixed;
 mod funds;
 pub mod market;
+pub mod merkle;
 pub mod params;
 pub mod price;
 pub mod protocol;
 pub mod session;
+mod tracked;
 pub mod types;

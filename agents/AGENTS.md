@@ -13,23 +13,24 @@ an index: load only the rule whose hint matches the current action.
   size and stress spreads, margin and close-out, the profit fee, overnight financing, trading
   sessions, house exposure caps, toxicity scoring, signed client requests (EIP-712, per-account
   nonces, and expiries), USD settlement of markets quoted in other currencies, admin commands signed
-  by the operator key the log records, and protocol versions. It does no IO and uses no clocks,
+  by the operator key the log records, protocol versions, and the state tree (a keccak-256 sparse
+  Merkle tree over the state, with account proofs, in `merkle/`). It does no IO and uses no clocks,
   randomness, or floats. `impl Engine` is split by area (`engine.rs`, `execution.rs`, `closeout.rs`,
   `funds.rs`, `admin.rs`, `auth.rs`). Unit tests sit inline; protocol tests are in `tests/` by area,
   with the shared harness in `tests/common/`. `tests/reference/` holds one reference log per
-  protocol version, written once by `examples/reference_log.rs` and replayed to its roots by
+  protocol version, written once by `examples/reference_log/` and replayed to its roots by
   `tests/reference_logs.rs`; `tests/invariants/` holds the property tests. Its `README.md` lists
   every file.
 - **crates/node/** — `engine-node`, binary `engine` (`main.rs` over `lib.rs`). Contains the
   sequencer, the public log with signed checkpoints (segmented, with a public archive), `engine
   replay`, `engine admin` (the operator's signing client), the REST API with the operator's admin
-  route and the resumable WebSocket stream (TLS from an attested in-enclave key, with rate limits
-  and connection caps), the account history index (SQLite, derived from the log), TEE attestation
-  (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime servers, the custody
-  adapter (mock, or EVM vault deposits over alloy), and price feeds: live crypto venue WebSockets
-  (`feeds/`, one adapter per venue) and a mock. `tests/reference/` holds the node-format reference
-  log per protocol version, with events, written once by `examples/reference_log.rs`. Its
-  `README.md` lists every file.
+  route and account proofs, and the resumable WebSocket stream (TLS from an attested in-enclave key,
+  with rate limits and connection caps), the account history index (SQLite, derived from the log),
+  TEE attestation (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime
+  servers, the custody adapter (mock, or EVM vault deposits over alloy), and price feeds: live
+  crypto venue WebSockets (`feeds/`, one adapter per venue) and a mock. `tests/reference/` holds the
+  node-format reference log per protocol version, with events, written once by
+  `examples/reference_log.rs`. Its `README.md` lists every file.
 - **contracts/** — Foundry project for the custody vault. `src/Vault.sol` takes USDC deposits of
   10 to 1e9 USDC for the caller's trading account (`deposit`), for a named one (`depositFor`), or
   for the house, under one deposit id sequence; `test/` holds unit, fuzz, and invariant tests, with

@@ -43,10 +43,10 @@ impl Engine {
 
     /// Writes off a flat account's negative balance against the house.
     pub(crate) fn settle_bad_debt(&mut self, account: AccountId, events: &mut Vec<Event>) {
-        let Some(acct) = self.accounts.get_mut(&account) else { return };
+        let Some(acct) = self.accounts.get(&account) else { return };
         if acct.positions.is_empty() && acct.balance.is_negative() {
             let amount = -acct.balance;
-            acct.balance = Fixed::ZERO;
+            self.accounts.get_mut(&account).expect("found above").balance = Fixed::ZERO;
             self.house_cash -= amount;
             events.push(Event::BadDebt { account, amount });
         }
