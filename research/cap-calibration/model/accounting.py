@@ -36,7 +36,8 @@ def closeout_trigger(side, balance, margin_rate, level_bps: int = CLOSEOUT_LEVEL
     Equity is `balance + side * (x - 1)` and the requirement is `margin_rate * x` at the mark
     (`engine.rs`, `equity_and_margin`); close-out starts when equity is below `level` of it
     (`closeout.rs`, `next_closeout`). A long triggers at or below the returned price, a short at or
-    above it.
+    above it. For a market quoted in another currency, both sides of the comparison scale by the
+    FX ratio `g` since entry, so pass `balance / g`.
     """
     level = level_bps / 1e4
     return (1.0 - side * balance) / (1.0 - side * level * margin_rate)
@@ -51,10 +52,12 @@ def closeout_fill(side, trigger, bar_open, bar_extreme):
     return np.where(gapped, bar_open, np.where(reached, trigger, np.nan))
 
 
-def settle(side, exit_price, balance):
+def settle(side, exit_price, balance, fx_ratio=1.0):
     """Client PnL credited at exit and bad debt written off against the house: the account loses
-    at most its balance (`closeout.rs`, `settle_bad_debt`)."""
-    pnl = side * (exit_price - 1.0)
+    at most its balance (`closeout.rs`, `settle_bad_debt`). A market quoted in another currency
+    accrues PnL in that currency and converts it to USD at the FX index of the fill (#98), so its
+    PnL per unit of USD entry notional carries `fx_ratio`, the FX index at exit over at entry."""
+    pnl = side * (exit_price - 1.0) * fx_ratio
     return np.maximum(pnl, -balance), np.maximum(-pnl - balance, 0.0)
 
 

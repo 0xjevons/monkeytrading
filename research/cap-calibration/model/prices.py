@@ -25,6 +25,7 @@ class Paths:
     close: np.ndarray
     is_open: np.ndarray  # bool: the market has a bar this hour
     parkinson: np.ndarray  # the bar's Parkinson volatility, zero when closed
+    fx: np.ndarray | None = None  # USD per unit of the quote currency, relative; 1 for USD markets
 
 
 def load_bars(path: Path) -> tuple[np.ndarray, list[str]]:
@@ -77,6 +78,18 @@ def build(bars: np.ndarray, weeks: np.ndarray, hours: int, vol_scale: float = 1.
         is_open=is_open,
         parkinson=parkinson,
     )
+
+
+def select(paths: Paths, columns: np.ndarray, fx_columns: np.ndarray, fx_invert: np.ndarray) -> Paths:
+    """The markets at `columns` of `paths`, with each market's FX path: the close of its FX
+    column (USD per unit of EUR or GBP), its reciprocal for yen (the column is USD-JPY), or 1
+    for a USD market (-1)."""
+    fx = np.ones(paths.close.shape[:2] + (len(columns),))
+    for i, (col, invert) in enumerate(zip(fx_columns, fx_invert)):
+        if col >= 0:
+            fx[..., i] = 1.0 / paths.close[..., col] if invert else paths.close[..., col]
+    pick = lambda a: a[..., columns]  # noqa: E731
+    return Paths(pick(paths.open), pick(paths.high), pick(paths.low), pick(paths.close), pick(paths.is_open), pick(paths.parkinson), fx)
 
 
 def next_open_hour(is_open: np.ndarray) -> np.ndarray:

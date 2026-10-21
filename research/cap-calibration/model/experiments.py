@@ -113,7 +113,7 @@ def per_market(scenario, markets, bars, flow, workers: int) -> list[dict]:
     """Each market alone, at its own share of the flow, over the floor grid, with no total cap."""
     floors = MARKET_FLOORS[:, None]
     total = np.full(len(MARKET_FLOORS), NO_TOTAL_LIMIT)
-    tasks = [(scenario, markets.subset([i]), bars[:, [i], :], flow, floors, total) for i in range(len(markets.symbols))]
+    tasks = [(scenario, markets.subset([i]), bars, flow, floors, total) for i in range(len(markets.symbols))]
     rows = []
     for symbol, out in zip(markets.symbols, simulate.run_many(tasks, workers)):
         for lane, floor in enumerate(MARKET_FLOORS):

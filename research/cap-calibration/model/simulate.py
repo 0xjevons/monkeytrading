@@ -69,6 +69,9 @@ class Markets:
     fin_short: np.ndarray
     mix: np.ndarray  # share of margin flow
     open_hours_per_week: np.ndarray
+    columns: np.ndarray  # each market's column in the price data
+    fx_columns: np.ndarray  # the column of the FX market a market converts at; -1 for USD
+    fx_invert: np.ndarray  # yen: USD per unit is one over USD-JPY
 
     @property
     def max_leverage(self) -> np.ndarray:
@@ -84,6 +87,9 @@ class Markets:
             fin_short=self.fin_short[idx],
             mix=self.mix[idx],
             open_hours_per_week=self.open_hours_per_week[idx],
+            columns=self.columns[idx],
+            fx_columns=self.fx_columns[idx],
+            fx_invert=self.fx_invert[idx],
         )
 
 
@@ -95,6 +101,8 @@ def load_markets(genesis: dict, symbols: list[str], mix: np.ndarray, bars: np.nd
     markup = np.array([f["markup_bps"] for f in fin])
     basis = np.array([f["day_basis"] for f in fin])
     open_hours = (bars[:, :, 0] != pricing.CLOSED).sum(axis=0) / (bars.shape[0] / pricing.WEEK)
+    by_id = {m["id"]: m["symbol"] for m in genesis["markets"]}
+    quote = [m.get("quote_currency", {"currency": "usd"}) for m in specs]
     return Markets(
         symbols=list(symbols),
         margin_rate=np.array([m["margin_tiers"][0]["bps"] / 1e4 for m in specs]),
@@ -104,6 +112,9 @@ def load_markets(genesis: dict, symbols: list[str], mix: np.ndarray, bars: np.nd
         fin_short=accounting.daily_financing(-1, 1.0, bench, markup, basis),
         mix=mix,
         open_hours_per_week=open_hours,
+        columns=np.arange(len(symbols)),
+        fx_columns=np.array([symbols.index(by_id[q["fx_market"]]) if q["currency"] != "usd" else -1 for q in quote]),
+        fx_invert=np.array([q["currency"] == "jpy" for q in quote]),
     )
 
 
@@ -117,7 +128,6 @@ class Prepared:
     rollovers: np.ndarray  # rollovers up to and including each hour
     margin_rate_hour: np.ndarray  # (paths, hours, markets) margin flow per hour
     leverage: np.ndarray  # (buckets, markets)
-    trigger: np.ndarray  # (2, buckets, markets) close-out price, long then short
     first_cross: np.ndarray  # (2, buckets, paths, hours, markets) hours to the trigger; 0 = none
     pair_cash: np.ndarray  # (paths, hours, markets) house cash from pairs settling each hour
     pair_proceeds: np.ndarray
@@ -142,23 +152,30 @@ def prev_open_hour(is_open: np.ndarray) -> np.ndarray:
     return out
 
 
-def first_crossings(paths: pricing.Paths, trigger: np.ndarray, horizon: int) -> np.ndarray:
-    """Hours from each entry (at an hour's close) until the bar that reaches each trigger, within
-    `horizon` hours; 0 when it is not reached."""
-    log_close = np.log(paths.close).astype(np.float32)
-    log_low = np.log(paths.low).astype(np.float32)
-    log_high = np.log(paths.high).astype(np.float32)
-    log_trigger = np.log(trigger).astype(np.float32)  # (2, buckets, markets)
-    _, n_buckets, _ = trigger.shape
-    n_paths, hours, n_markets = log_close.shape
+def first_crossings(paths: pricing.Paths, balance: np.ndarray, margin_rate: np.ndarray, horizon: int) -> np.ndarray:
+    """Hours from each entry (at an hour's close) until the first bar in which a one-position
+    account with `balance` (buckets, markets) per unit of notional falls below the close-out
+    level, long at the bar's low and short at its high, valued in USD at the hour's FX; 0 when
+    it does not within `horizon` hours."""
+    close = paths.close.astype(np.float32)
+    low = paths.low.astype(np.float32)
+    high = paths.high.astype(np.float32)
+    fx = paths.fx.astype(np.float32)
+    half_margin = (0.5 * margin_rate).astype(np.float32)
+    n_buckets = balance.shape[0]
+    n_paths, hours, n_markets = close.shape
     out = np.zeros((2, n_buckets, n_paths, hours, n_markets), dtype=np.int16)
     for k in range(1, min(horizon, hours - 1) + 1):
-        down = log_low[:, k:] - log_close[:, :-k]
-        up = log_high[:, k:] - log_close[:, :-k]
+        g = fx[:, k:] / fx[:, :-k]
+        x_low = low[:, k:] / close[:, :-k]
+        x_high = high[:, k:] / close[:, :-k]
+        # Equity less the close-out level, before the balance, per unit of entry notional.
+        long_room = (x_low - 1) * g - half_margin * x_low * g
+        short_room = -(x_high - 1) * g - half_margin * x_high * g
         for j in range(n_buckets):
-            for side, move in ((0, down <= log_trigger[0, j]), (1, up >= log_trigger[1, j])):
+            for side, room in ((0, long_room), (1, short_room)):
                 view = out[side, j, :, : hours - k]
-                view[move & (view == 0)] = k
+                view[(room < -balance[j]) & (view == 0)] = k
     return out
 
 
@@ -166,13 +183,21 @@ def prepare(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow, 
     hours = scenario.days * 24
     n_weeks = -(-hours // pricing.WEEK)
     history = bars.shape[0] // pricing.WEEK
-    n_markets = len(markets.symbols)
+    # The markets' own price columns, and those of the FX markets they convert at.
+    needed = np.unique(np.concatenate([markets.columns, markets.fx_columns[markets.fx_columns >= 0]]))
+    position = {c: i for i, c in enumerate(needed)}
     if scenario.independent_markets:
-        weeks = np.stack([pricing.sample_weeks(rng, n_paths, n_weeks, history, scenario.block_weeks) for _ in range(n_markets)], axis=-1)
+        weeks = np.stack([pricing.sample_weeks(rng, n_paths, n_weeks, history, scenario.block_weeks) for _ in needed], axis=-1)
     else:
         weeks = pricing.sample_weeks(rng, n_paths, n_weeks, history, scenario.block_weeks)
-    drift = pricing.drift_per_open_hour(bars) if scenario.demean else None
-    paths = pricing.build(bars, weeks, hours, scenario.vol_scale, drift)
+    sub = bars[:, needed]
+    drift = pricing.drift_per_open_hour(sub) if scenario.demean else None
+    paths = pricing.select(
+        pricing.build(sub, weeks, hours, scenario.vol_scale, drift),
+        np.array([position[c] for c in markets.columns]),
+        np.array([position[c] if c >= 0 else -1 for c in markets.fx_columns]),
+        markets.fx_invert,
+    )
     next_open = pricing.next_open_hour(paths.is_open)
     prev_open = prev_open_hour(paths.is_open)
 
@@ -182,14 +207,12 @@ def prepare(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow, 
     margin_rate_hour = np.where(paths.is_open, per_open_hour, 0.0)
 
     leverage = np.stack([mapped_leverage(b, markets.max_leverage, scenario.leverage_mapping) for b in flow.bucket_leverage])
-    balance = 1.0 / leverage
-    trigger = np.stack([accounting.closeout_trigger(side, balance, markets.margin_rate) for side in (1, -1)])
     reopen = next_open[:, 1:] - np.arange(hours)[None, :, None]
     longest_wait = int(reopen[next_open[:, 1:] < hours].max(initial=1))
     horizon = max(c.hold_h for c in flow.classes) + longest_wait
-    first_cross = first_crossings(paths, trigger, horizon)
+    first_cross = first_crossings(paths, 1.0 / leverage, markets.margin_rate, horizon)
 
-    prep = Prepared(paths, next_open, prev_open, rollover_counts(hours), margin_rate_hour, leverage, trigger, first_cross, None, None, None, {}, horizon)
+    prep = Prepared(paths, next_open, prev_open, rollover_counts(hours), margin_rate_hour, leverage, first_cross, None, None, None, {}, horizon)
     pair_flows(prep, scenario, markets, flow, hours)
     return prep
 
@@ -261,13 +284,13 @@ def pair_flows(prep: Prepared, scenario: Scenario, markets: Markets, flow: Flow,
         first = np.minimum(cross_hour[0], cross_hour[1])
         closed_out = first <= exit_planned
         exit_hour = np.where(closed_out, first, exit_planned)
-        loser_long = cross_hour[0] <= cross_hour[1]
-        trig = np.where(loser_long, prep.trigger[0, j][None, None, :], prep.trigger[1, j][None, None, :])
-        side = np.where(loser_long, 1.0, -1.0)
-        bar_open = paths.open[p, np.minimum(exit_hour, hours - 1), m] / close
+        side = np.where(cross_hour[0] <= cross_hour[1], 1.0, -1.0)  # the losing leg
+        at = np.minimum(exit_hour, hours - 1)
+        g = paths.fx[p, at, m] / paths.fx
+        trig = accounting.closeout_trigger(side, balance / g, markets.margin_rate[None, None, :])
+        bar_open = paths.open[p, at, m] / close
         fill = np.where(side * (bar_open - trig) <= 0, bar_open, trig)
-        at_exit = paths.close[p, np.minimum(exit_hour, hours - 1), m] / close
-        move = np.where(closed_out, fill, at_exit) - 1.0
+        move = (np.where(closed_out, fill, paths.close[p, at, m] / close) - 1.0) * g
         settle_pairs(leg, exit_hour, move, balance)
         margin += 2 * leg * balance
         totals["notional"] += 2 * leg.sum(axis=(1, 2))
@@ -284,7 +307,8 @@ def pair_flows(prep: Prepared, scenario: Scenario, markets: Markets, flow: Flow,
                 for g in gaps:
                     entry, reopen = opens[g], opens[g + 1]
                     leg = scenario.gap_pair_share * hedged_margin[pi, mi] / 2 / balance[0, mi]
-                    move = paths.open[pi, reopen, mi] / close[pi, entry, mi] - 1.0
+                    g = paths.fx[pi, reopen, mi] / paths.fx[pi, entry, mi]
+                    move = (paths.open[pi, reopen, mi] / close[pi, entry, mi] - 1.0) * g
                     gain = abs(move)
                     loss = min(gain, balance[0, mi])
                     fee = float(accounting.profit_fee(gain))
@@ -329,17 +353,19 @@ def cohort_units(prep: Prepared, scenario: Scenario, markets: Markets, cls, side
     m = np.arange(exit_hour.shape[2])[None, None, :]
     at = np.minimum(exit_hour, hours - 1)
     entry = paths.close[:, t0:t1]
-    trig = prep.trigger[s_i, j][None, None, :]
+    entry_fx = paths.fx[:, t0:t1]
+    g = paths.fx[p, at, m] / entry_fx
+    trig = accounting.closeout_trigger(side, balance / g, markets.margin_rate[None, None, :])
     bar_open = paths.open[p, at, m] / entry
     fill = np.where(side * (bar_open - trig) <= 0, bar_open, trig)
     x = np.where(closed_out, fill, paths.close[p, at, m] / entry)
-    client, bad = accounting.settle(side, x, balance)
+    client, bad = accounting.settle(side, x, balance, g)
     fee = accounting.profit_fee(client)
     fin_rate = (markets.fin_long if side > 0 else markets.fin_short)[None, None, :]
     fin = (prep.rollovers[np.minimum(exit_hour, hours)] - prep.rollovers[t]) * fin_rate
     shortfall = np.maximum(fee + fin - balance - client, 0.0)  # financing past the balance
     valid = exit_hour < hours
-    ring = np.stack([-side / entry, np.full_like(entry, -side), -client + fee + fin - shortfall, balance + client - fee - fin + shortfall], axis=-1)
+    ring = np.stack([-side / (entry * entry_fx), -side / entry_fx, -client + fee + fin - shortfall, balance + client - fee - fin + shortfall], axis=-1)
     totals = np.stack([fee, fin, bad + shortfall, np.maximum(-client, 0.0)], axis=-1)
     return np.where(valid, exit_hour, t), ring * valid[..., None], totals * valid[..., None]
 
@@ -360,8 +386,10 @@ def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow
     market_floors = floors.T[None]  # (1, markets, lanes)
     cap_bps = markets.cap_bps[None, :, None]
 
-    q = np.zeros(shape)  # clients' net quantity, in units of entry-relative price
-    cost = np.zeros(shape)  # clients' net cost basis, USD
+    # Clients' net quantity and cost basis, each divided by the FX index at entry, so that a
+    # market's USD notional is price * FX * q and clients' unrealised PnL FX * (price * q - cost).
+    q = np.zeros(shape)
+    cost = np.zeros(shape)
     house = np.zeros(shape)  # house cash by market
     ring = np.zeros((n_paths, ring_len, n_markets, 4, n_lanes))
     totals = np.zeros((n_paths, n_markets, 4, n_lanes))
@@ -407,8 +435,9 @@ def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow
             due[...] = 0.0
 
             entry = paths.close[:, t]
-            exposure = entry[..., None] * q
-            nav = (house - (exposure - cost)).sum(axis=1)
+            fx = paths.fx[:, t]
+            exposure = (entry * fx)[..., None] * q  # USD notional at the mark
+            nav = (house - (exposure - fx[..., None] * cost)).sum(axis=1)
             cap = accounting.exposure_cap(nav[:, None, :], cap_bps, market_floors)
             total_cap = accounting.exposure_cap(nav, markets.total_cap_bps, total_floors[None])
 
@@ -466,8 +495,8 @@ def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow
                 if not mine:
                     continue
                 want = sum(wants[n] for n, _ in mine)
-                q += side * ok * (want / entry)[..., None]
-                cost += side * ok * want[..., None]
+                q += side * ok * (want / (entry * fx))[..., None]
+                cost += side * ok * (want / fx)[..., None]
                 need += (ok * sum(wants[n] / prep.leverage[cls.bucket] for n, cls in mine)[..., None]).sum(axis=1)
                 totals += ok[:, :, None, :] * sum(wants[n][..., None] * units[n][2][:, k] for n, _ in mine)[..., None]
                 for n, _ in mine:
@@ -506,8 +535,8 @@ def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow
             out["max_queue"] = np.maximum(out["max_queue"], queue)
             identity_gap = max(identity_gap, float(np.abs(vault - (idle + in_positions + queue + house.sum(axis=1))).max()))
 
-            exposure = entry[..., None] * q
-            nav = (house - (exposure - cost)).sum(axis=1)
+            exposure = (entry * fx)[..., None] * q
+            nav = (house - (exposure - fx[..., None] * cost)).sum(axis=1)
             newly = (nav < 0) & ~out["ever_negative"]
             out["first_negative_h"] = np.where(newly, t, out["first_negative_h"])
             out["ever_negative"] |= nav < 0
@@ -523,7 +552,7 @@ def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow
         out[name] = totals[:, :, channel].sum(axis=1) + prep.pair_totals[name][:, None]
     out["desired"] += prep.pair_totals["notional"][:, None]
     out["nav_end"] = nav
-    out["pnl_by_market"] = (house - (exposure - cost)).transpose(0, 2, 1)
+    out["pnl_by_market"] = (house - (exposure - fx[..., None] * cost)).transpose(0, 2, 1)
     out["refused_by_market"] = refused_by_market.transpose(0, 2, 1)
     out["desired_by_market"] = np.broadcast_to(desired_by_market[:, None, :], (n_paths, n_lanes, n_markets)).copy()
     out["identity_gap"] = np.array(identity_gap)

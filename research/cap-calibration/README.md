@@ -158,6 +158,9 @@ check them on hand cases from the engine's own tests):
   bar's open when the market gaps through it, only while the market is open (`closeout.rs`);
 - negative balance protection: a loss beyond the account's balance is bad debt against the house
   (`settle_bad_debt`);
+- USD settlement (#98): USD-JPY, Japan 225 (yen), Germany 40 (euros), and UK 100 (pounds) accrue
+  PnL in their quote currency and convert it at the engine's own USD-JPY, EUR-USD, or GBP-USD
+  price, from the same bootstrapped weeks, so their margin, close-outs, caps, and NAV are in USD;
 - each cap the larger of its genesis NAV share (`house_cap_bps`, `house_total_cap_bps`) and its
   floor; an order that would take the house's net exposure past a cap is refused (`check_risk`).
   Over an hour, the side that reduces exposure is accepted in full and the crowded side up to the

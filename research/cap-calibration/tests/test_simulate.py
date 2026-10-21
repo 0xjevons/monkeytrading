@@ -1,4 +1,5 @@
-"""The simulation's accounting on one deterministic week of one market.
+"""The simulation's accounting on one deterministic week of one market, in USD or quoted in
+another currency.
 
 The history is a single week, so every path replays it. Each hour 1 USD of margin opens a long at
 200:1 (200 of notional, a balance of 1) that the model closes an hour later.
@@ -7,20 +8,24 @@ The history is a single week, so every path replays it. Each hour 1 USD of margi
 import numpy as np
 import pytest
 
-from model import prices, simulate
+from model import accounting, prices, simulate
 from model.flow import Flow, FlowClass
 
 LEVERAGE = 200.0
 
 
-def bars(gap_at: int | None = None, gap: float = 0.0) -> np.ndarray:
-    b = np.zeros((prices.WEEK, 1, 4), dtype=np.int32)
+def bars(gap_at: int | None = None, gap: float = 0.0, fx_gap_at: int | None = None, fx_gap: float = 0.0) -> np.ndarray:
+    """One week of a flat market (column 0) and of its FX market (column 1), each with an
+    optional gap at the open of one hour."""
+    b = np.zeros((prices.WEEK, 2, 4), dtype=np.int32)
     if gap_at is not None:
         b[gap_at, 0, 0] = round(np.log1p(gap) * 1e6)
+    if fx_gap_at is not None:
+        b[fx_gap_at, 1, 0] = round(np.log1p(fx_gap) * 1e6)
     return b
 
 
-def market(fin: float = 0.0) -> simulate.Markets:
+def market(fin: float = 0.0, quoted_in_fx: bool = False) -> simulate.Markets:
     return simulate.Markets(
         symbols=["TEST"],
         margin_rate=np.array([1 / LEVERAGE]),
@@ -30,12 +35,15 @@ def market(fin: float = 0.0) -> simulate.Markets:
         fin_short=np.array([fin]),
         mix=np.array([1.0]),
         open_hours_per_week=np.array([168.0]),
+        columns=np.array([0]),
+        fx_columns=np.array([1 if quoted_in_fx else -1]),
+        fx_invert=np.array([False]),
     )
 
 
-def flow(kind: str = "directional") -> Flow:
+def flow(kind: str = "directional", hold_h: int = 1) -> Flow:
     return Flow(
-        classes=[FlowClass(kind=kind, hold_h=1, bucket=0, margin_share=1.0, mean_sqrt_hold_h=1.0, long_share=1.0)],
+        classes=[FlowClass(kind=kind, hold_h=hold_h, bucket=0, margin_share=1.0, mean_sqrt_hold_h=1.0, long_share=1.0)],
         bucket_leverage=np.array([LEVERAGE]),
         daily_margin=np.array([24.0]),
         long_share_mean=1.0,
@@ -117,3 +125,46 @@ def test_the_shortfall_is_house_cash_past_the_margin_in_positions():
     out = run(bars(gap_at=50, gap=0.01), market(), flow())
     assert out["min_cover"] == pytest.approx(-0.8, rel=1e-4)
     assert run(bars(), market(), flow())["min_cover"] >= 0.0
+
+
+def test_a_currency_move_alone_leaves_a_quoted_position_flat():
+    # Settled in its quote currency, a position carries FX risk on its PnL only, not its notional.
+    out = run(bars(fx_gap_at=50, fx_gap=0.10), market(quoted_in_fx=True), flow())
+    assert out["nav_end"] == pytest.approx(0.0, abs=1e-9)
+    assert out["fee"] == 0.0
+
+
+def test_a_quoted_gain_converts_at_the_fx_of_the_fill():
+    out = run(bars(gap_at=50, gap=0.01, fx_gap_at=50, fx_gap=0.10), market(quoted_in_fx=True), flow())
+    # The long opened at hour 49 gains 1% of 200 in the quote currency, worth 2.2 at the new FX.
+    assert out["fee"] == pytest.approx(0.22, rel=1e-4)
+    assert out["nav_end"] == pytest.approx(-1.98, rel=1e-4)
+
+
+def test_a_stronger_quote_currency_brings_a_close_out_forward():
+    # A 200:1 long that falls 0.23% in its quote currency keeps 0.27% of equity against a 0.25%
+    # close-out level. A quote currency 10% stronger in USD turns the fall into 0.253% and lifts the
+    # requirement 10%, so the same bar closes it out.
+    def paths(fx_move: float) -> prices.Paths:
+        ones = np.ones((1, 3, 1))
+        low = ones.copy()
+        low[0, 1, 0] = 1 - 0.0023
+        fx = ones.copy()
+        fx[0, 1:, 0] = 1 + fx_move
+        return prices.Paths(ones, ones, low, ones, np.ones((1, 3, 1), dtype=bool), np.zeros((1, 3, 1)), fx)
+
+    balance, margin_rate = np.array([[0.005]]), np.array([0.005])
+    assert simulate.first_crossings(paths(0.0), balance, margin_rate, 2)[0, 0, 0, 0, 0] == 0
+    assert simulate.first_crossings(paths(0.10), balance, margin_rate, 2)[0, 0, 0, 0, 0] == 1
+    # The fill price for the close-out uses the same scaled balance.
+    x = accounting.closeout_trigger(1, 0.005 / 1.1, 0.005)
+    assert 0.005 + (x - 1) * 1.1 == pytest.approx(0.5 * 0.005 * x * 1.1)
+
+
+def test_the_cap_measures_a_quoted_market_in_usd():
+    # Positions held 4 hours carry exposure into later cap checks. Valued in USD, a position opened
+    # after the currency gains 10% fills the 100 cap as it would with no currency move.
+    quoted = run(bars(fx_gap_at=10, fx_gap=0.10), market(quoted_in_fx=True), flow(hold_h=4), floor=100.0)
+    usd = run(bars(), market(), flow(hold_h=4), floor=100.0)
+    assert usd["refused"] / usd["desired"] > 0.5
+    assert quoted["refused"] == pytest.approx(usd["refused"])
