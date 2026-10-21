@@ -26,8 +26,8 @@ use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use crate::api::{Feed, MAX_BACKFILLS};
 use crate::clock::{Clock, SystemClock};
 use crate::config::{HistorySection, NodeConfig};
-use crate::history::{History, HistoryEvent, Reader};
-use crate::log::{LogEntry, LogReader, Manifest, Offset, SegmentedLog};
+use crate::history::{History, HistoryCheck, HistoryEvent, Reader};
+use crate::log::{self, LogEntry, LogReader, Manifest, Offset, SegmentedLog};
 use crate::sequencer::{Request, Sequencer, SequencerConfig, SignedWithdrawal, StreamMsg};
 use crate::tee::EnclaveKey;
 use crate::trusted_time::Sample;
@@ -127,7 +127,7 @@ impl TestHistory {
     /// Opens the index in `index` against the log `node` writes in `dir`, and runs it, letting
     /// readers in once it has taken the log's last command now.
     /// Error cases:
-    /// - the index cannot be opened, nor a fresh one in its place (see `History::open`)
+    /// - the index cannot be opened, nor a fresh one in its place (see `HistoryCheck`)
     pub async fn start(node: &TestSequencer, dir: &Path, index: &Path) -> anyhow::Result<Self> {
         let tip = node.next_seq().await.checked_sub(1);
         Self::start_with_tip(node, dir, index, tip)
@@ -135,10 +135,10 @@ impl TestHistory {
 
     /// As `start`, but readers are let in once the index has taken `tip`.
     /// Error cases:
-    /// - the index cannot be opened, nor a fresh one in its place (see `History::open`)
+    /// - the index cannot be opened, nor a fresh one in its place (see `HistoryCheck`)
     pub fn start_with_tip(node: &TestSequencer, dir: &Path, index: &Path, tip: Option<u64>) -> anyhow::Result<Self> {
         let cfg = HistorySection { dir: index.to_owned(), retention: RETENTION };
-        let mut history = History::open(&cfg, &SegmentedLog::open(dir)?.entries)?;
+        let mut history = open_history(&cfg, dir)?;
         history.catch_up_to(tip);
         let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
         let (reader, resume_at) = (history.reader(), history.resume_at());
@@ -259,16 +259,56 @@ pub fn withdraw(amount: i64) -> Command {
 
 /// Every message on disk at or after `from`, as the stream encodes them.
 pub fn log_messages(dir: &Path, from: Offset) -> Vec<String> {
-    let manifest = watch::channel(Manifest::load(dir).expect("manifest loads")).1;
-    let mut reader = LogReader::open(dir, from, manifest).expect("log opens");
+    let mut reader = LogReader::open(dir, from, published_manifest(dir)).expect("log opens");
     std::iter::from_fn(|| reader.next_entry().expect("log reads"))
         .map(|(offset, entry)| serde_json::to_string(&StreamMsg::new(offset, entry)).expect("message encodes"))
         .collect()
 }
 
+/// The manifest on disk, as a writer that has flushed everything on disk publishes it.
+pub fn published_manifest(dir: &Path) -> watch::Receiver<Manifest> {
+    let flushed = Some(Offset { seq: u64::MAX, index: u32::MAX });
+    watch::channel(Manifest { flushed, ..Manifest::load(dir).expect("manifest loads") }).1
+}
+
+/// Every entry of the log in `dir`, read as recovery reads it.
+pub fn log_entries(dir: &Path) -> Vec<LogEntry> {
+    let mut entries = Vec::new();
+    SegmentedLog::open(dir, |entry| {
+        entries.push(entry);
+        Ok(())
+    })
+    .expect("log opens");
+    entries
+}
+
+/// Every entry of the single log file at `path`.
+pub fn file_entries(path: &Path) -> Vec<LogEntry> {
+    let mut entries = Vec::new();
+    log::read_file(path, |entry| {
+        entries.push(entry);
+        Ok(())
+    })
+    .expect("log file reads");
+    entries
+}
+
+/// The history index under `cfg`, checked against the log in `dir` as recovery checks it.
+/// Error cases:
+/// - the index cannot be opened, or does not match the log (see `HistoryCheck::finish`)
+/// - the log cannot be read
+pub fn open_history(cfg: &HistorySection, dir: &Path) -> anyhow::Result<History> {
+    let mut check = HistoryCheck::open(cfg)?;
+    SegmentedLog::open(dir, |entry| {
+        check.observe(&entry);
+        Ok(())
+    })?;
+    check.finish()
+}
+
 /// Every event in the log in `dir` whose JSON names `account`, newest first, as history serves it.
 pub fn logged_history(dir: &Path, account: AccountId) -> Vec<HistoryEvent> {
-    let entries = SegmentedLog::open(dir).expect("log opens").entries;
+    let entries = log_entries(dir);
     let mut events: Vec<HistoryEvent> = entries
         .into_iter()
         .filter_map(|entry| match entry {

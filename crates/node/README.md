@@ -28,7 +28,9 @@ verifies its checkpoints.
 - TLS terminated in the enclave, with a key generated there and its hash in the attestation
 - Rate limits on requests per client IP and per account and on new connections per client IP,
   caps on request size, connections, and stream subscribers, and read timeouts, all set in `[api]`
-- `engine replay` to verify a published log, or a downloaded archive, against the open-source engine
+- `engine replay` to verify a published log, or a downloaded archive, against the open-source
+  engine, reading it a segment at a time; a missing log, or one with no command or no checkpoint,
+  fails
 - Account history: every event that names an account, indexed in SQLite from the log and paged
   newest first by a `<seq>:<index>` cursor, with a stated retention; it survives restarts, and
   rebuilds from the log when it is missing, damaged, or does not match the log
@@ -57,20 +59,26 @@ verifies its checkpoints.
 - `src/admin/tls.rs` — the TLS connection to a node, pinned to its attested key
 - `src/admin/tests.rs` — `engine admin` tests: key sources, commands, signing, and pins
 - `src/node.rs` — startup, task supervision, and shutdown
-- `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, and log replay
+- `src/sequencer/mod.rs` — the sequencer, stream messages, and checkpoints
+- `src/sequencer/replay.rs` — log replay, which recovery and `engine replay` share
 - `src/sequencer/required.rs` — client auth, the operator, protocol activation, and genesis, which
   wait for trusted time, and the genesis commands
 - `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must
   look at, and house NAV below zero
-- `src/sequencer/tests.rs` — sequencer, activation, genesis restart, and replay tests
+- `src/sequencer/tests.rs` — sequencer, activation, genesis restart, recovery, and replay tests
+- `src/sequencer/batch_tests.rs` — batching: a batch ends after `MAX_BATCH` requests of any kind
 - `src/sequencer/margin_tests.rs` — the margin and solvency dev scenario on the dev genesis (a
   close-out after the rollover's financing, and a withdrawal limited at a stale market's last
   mark), and a genesis with no house capital that trades and alerts on a house deficit
 - `src/log/mod.rs` — the JSON-lines log format, stream offsets, and the single-file reader
-- `src/log/segments.rs` — segment files, rotation, the manifest, and recovery checks
-- `src/log/reader.rs` — reads the log from any offset while it is being written
+- `src/log/segments.rs` — segment files, rotation, the manifest, and the recovery read, a segment
+  at a time, with its checks
+- `src/log/reader.rs` — reads the log from any offset while it is being written, up to the last
+  entry the writer has flushed
 - `src/log/checked.rs` — reads a completed segment in chunks checked against its listing
-- `src/log/tests.rs` — log format, segment, and reader tests
+- `src/log/tests/mod.rs` — log format, segment, and writer tests
+- `src/log/tests/reader.rs` — reader tests: offsets, following the writer, flushed entries only,
+  and the checks on what it reads
 - `src/api/mod.rs` — REST routes, request signature checks, and the request span
 - `src/api/admin.rs` — the operator's admin route, checked before it is sequenced
 - `src/api/admin_tests.rs` — admin route tests, and the operator channel dev scenario through
@@ -170,7 +178,7 @@ verifies its checkpoints.
   valued at EUR-USD's index while EUR-USD moves, then refusing orders while EUR-USD is stale
 - `tests/reference/` — one node-format reference log per protocol version, never regenerated
 - `tests/replay.rs` — replays a log the node wrote before protocol versions, kept in
-  `tests/fixtures/`
+  `tests/fixtures/`, and checks that `engine replay` fails on a log it cannot verify
 - `tests/production_genesis.rs` — loads `config/production-genesis.toml` as a dev node's genesis,
   checks the launch values and quote currencies, and steps it through weeks with holidays and early
   closes
@@ -259,11 +267,15 @@ Backfill reads up to 256 messages at a time and keeps them until the subscriber 
 checks a completed segment against the manifest in one pass the first time it reads from it, then
 checks each chunk it reads, and refuses any other segment the manifest does not list. The segment
 still being written is read from disk unchecked, and replay against the signed checkpoints is the
-check for it. While it reads a batch, a subscriber holds one of 16 permits and one 1 MiB chunk of a
-segment. If a new segment cannot be created, the current one keeps growing and the node warns
-(`log_rotation_failed`) until it can. A log written as one file before segments existed continues as
-the first segment: move it to `<log_dir>/00000000000000000000.jsonl`. Every segment is kept, since
-recovery replays the log from genesis.
+check for it. Backfill yields nothing past the last entry the sequencer has flushed, which the
+writer publishes with its manifest after each batch, so no part of a batch still being written
+reaches a subscriber from disk. While it reads a batch, a subscriber holds one of 16 permits and one
+1 MiB chunk of a segment. If a new segment cannot be created, the current one keeps growing and the
+node warns (`log_rotation_failed`) until it can. A log written as one file before segments existed
+continues as the first segment: move it to `<log_dir>/00000000000000000000.jsonl`. Every segment is
+kept, since recovery replays the log from genesis. It replays as it reads, one segment and one line
+at a time, so its memory does not grow with the log, and replays nothing of a completed segment
+before checking it against the manifest; `engine replay` reads the log the same way.
 
 With `auth = "eip712"`, each order, cancel, and withdrawal body carries
 `"auth": { "nonce": <next nonce>, "expires_at": <ms>, "signature": "0x…" }`: the account's EIP-712
@@ -301,9 +313,9 @@ so the sequencer never waits for it; once caught up, history trails the log by t
 for the writer, and reads from disk whatever it falls behind the live log by. Each write stores the
 account events of a batch of commands, keyed by cursor, and the last command taken, in one
 transaction. Events whose command is older than `history.retention`, counted back from the newest
-command in the index, leave it; the log keeps them. The node reads its log once at startup, and
-before recovery replays that read and writes anything, the index checks that the log holds the last
-command the index took, unchanged, and resumes after it. Since the index is derived from the log,
+command in the index, leave it; the log keeps them. The node reads its log once at startup,
+replaying it as it reads, and before recovery writes anything, the index checks that this read held
+the last command the index took, unchanged, and resumes after it. Since the index is derived from the log,
 an index that fails that check is discarded with a Warning (`history_index_discarded`) and rebuilt
 from the log's segments, and the route answers 503 until the rebuild has taken the log's tip. The
 log ends before that command after a power loss, since neither the log nor the index syncs every

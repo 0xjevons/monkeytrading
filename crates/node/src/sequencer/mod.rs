@@ -3,7 +3,9 @@
 //! acknowledged or published until its log entry is flushed. One task, no locks, and no queue
 //! beyond the channel: a fill costs about one engine step plus a buffered write.
 
-use std::collections::VecDeque;
+mod replay;
+pub use replay::{Replayed, replay, replay_path};
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,7 +14,6 @@ use anyhow::{Context, bail};
 use engine_core::auth::{ClientAuth, Operator};
 use engine_core::command::{Command, Sequenced};
 use engine_core::event::Event;
-use engine_core::protocol::ProtocolVersion;
 use engine_core::types::{AccountId, Millis};
 use engine_core::{Engine, Fixed};
 use serde::{Deserialize, Serialize};
@@ -20,11 +21,13 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::clock::Clock;
-use crate::log::{self, Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
+use crate::log::{Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
 use crate::sequencer::alerts::{DeficitAlert, alert_on};
+use crate::sequencer::replay::Replay;
 use crate::tee::EnclaveKey;
 use crate::trusted_time::{Sample, TimeGate};
 
+/// Most requests of any kind taken into one batch before it is flushed and answered.
 const MAX_BATCH: usize = 1024;
 /// The custody reference genesis credits house capital under, as its last command.
 const GENESIS_REF: &str = "genesis";
@@ -81,7 +84,6 @@ pub struct Sequencer {
     next_seq: u64,
     last_ts: Millis,
     last_checkpoint: Option<u64>,
-    last_offset: Option<Offset>,
     chain_id: u64,
     vault: AccountId,
     stream: broadcast::Sender<Arc<StreamMsg>>,
@@ -116,16 +118,10 @@ pub struct SequencerConfig<'a> {
     pub operator: Operator,
 }
 
-/// The result of replaying a log.
-pub struct Replayed {
-    pub engine: Engine,
-    pub commands: u64,
-    pub checkpoints: u64,
-    /// Withdrawals the last command approved that the log ends before signing, as a crash between
-    /// a command's entry and its withdrawal entry leaves: `(account, amount, nonce)`.
-    pub unsigned: Vec<(AccountId, Fixed, u64)>,
-    /// Each protocol version the log activated, with the seq it took effect at.
-    pub activations: Vec<(ProtocolVersion, u64)>,
+/// A log read from disk and replayed, before anything is written to it.
+pub struct ReplayedLog {
+    log: SegmentedLog,
+    replayed: Replayed,
 }
 
 impl StreamMsg {
@@ -147,8 +143,7 @@ impl Sequencer {
     /// TODO: the log sits on host storage, so the host could truncate it. Before serving, check the
     /// replayed root against the latest root posted on-chain.
     /// Error cases:
-    /// - the log cannot be read, or fails its manifest check (see `SegmentedLog::open`) or replay
-    ///   (see `replay`)
+    /// - the log cannot be read or replayed (see `read_log`)
     /// - the log records a client auth or an operator other than the config's
     /// - the log cannot be opened for appending, or written
     pub fn recover(
@@ -157,23 +152,36 @@ impl Sequencer {
         stream: broadcast::Sender<Arc<StreamMsg>>,
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
-        let log = SegmentedLog::open(cfg.log_dir)?;
+        let log = Self::read_log(cfg.log_dir, |_| {})?;
         Self::recover_from(log, cfg, key, stream, withdrawals)
     }
 
-    /// As `recover`, from `log`, the log already read, so that a check of it before recovery sees
-    /// exactly what recovery replays.
+    /// Reads the log in `dir` a segment at a time and replays it as it goes, handing each entry to
+    /// `observe` as well, so that a check of the log before recovery sees exactly what it replays.
     /// Error cases:
-    /// - the log fails replay (see `replay`), or records a client auth other than the config's
+    /// - the log cannot be read, or fails its manifest check (see `SegmentedLog::open`) or replay
+    ///   (see `Replay`)
+    pub fn read_log(dir: &Path, mut observe: impl FnMut(&LogEntry)) -> anyhow::Result<ReplayedLog> {
+        let mut replay = Replay::default();
+        let log = SegmentedLog::open(dir, |entry| {
+            observe(&entry);
+            replay.apply(&entry)
+        })?;
+        Ok(ReplayedLog { log, replayed: replay.finish() })
+    }
+
+    /// As `recover`, from `log`, which `read_log` read and replayed.
+    /// Error cases:
+    /// - the log records a client auth other than the config's
     /// - the log cannot be opened for appending, or written
     pub fn recover_from(
-        log: SegmentedLog,
+        log: ReplayedLog,
         cfg: SequencerConfig<'_>,
         key: Arc<EnclaveKey>,
         stream: broadcast::Sender<Arc<StreamMsg>>,
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
-        let Replayed { engine, commands, checkpoints, unsigned, .. } = replay(&log.entries)?;
+        let ReplayedLog { log, replayed: Replayed { engine, commands, checkpoints, unsigned, .. } } = log;
         // A config naming another client auth or operator, and so another chain, vault, or admin key,
         // is the wrong one for this log: refuse before anything is written or signed under it.
         if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
@@ -182,13 +190,11 @@ impl Sequencer {
         if let Some(recorded) = engine.operator().filter(|recorded| **recorded != cfg.operator) {
             bail!("the log records operator {recorded:?}, but the config gives {:?}", cfg.operator);
         }
-        let last_offset = log::last_offset(&log.entries)?;
         info!(commands, checkpoints, "recovered from log");
         let mut sequencer = Self {
             next_seq: engine.last_seq().map_or(0, |s| s + 1),
             last_ts: engine.now(),
             last_checkpoint: engine.last_seq(),
-            last_offset,
             engine,
             log: log.into_writer(cfg.segment_commands.max(1), cfg.manifest)?,
             key,
@@ -218,10 +224,10 @@ impl Sequencer {
         Ok(sequencer)
     }
 
-    /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch is
-    /// flushed before its replies, stream messages, and queries go out, and synced to storage first
-    /// when it carries a sync request. A command trusted time refuses is dropped with its reply,
-    /// which the API answers as unavailable.
+    /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch,
+    /// of at most `MAX_BATCH` requests, is flushed before its replies, stream messages, and queries
+    /// go out, and synced to storage first when it carries a sync request. A command trusted time
+    /// refuses is dropped with its reply, which the API answers as unavailable.
     /// Error cases:
     /// - the log cannot be written or synced; the node must stop rather than acknowledge
     ///   undurable commands
@@ -231,8 +237,9 @@ impl Sequencer {
         let mut queries: Vec<Query> = Vec::new();
         let mut syncs = Vec::new();
         while let Some(first) = rx.recv().await {
-            let mut next = Some(first);
+            let (mut next, mut taken) = (Some(first), 0);
             while let Some(req) = next.take() {
+                taken += 1;
                 match req {
                     Request::Submit { cmd, reply } => {
                         if let Some(events) = self.sequence(cmd)?
@@ -245,7 +252,7 @@ impl Sequencer {
                     Request::TimeSample(sample) => self.take_sample(sample)?,
                     Request::Sync(reply) => syncs.push(reply),
                 }
-                if replies.len() + queries.len() + syncs.len() < MAX_BATCH {
+                if taken < MAX_BATCH {
                     next = rx.try_recv().ok();
                 }
             }
@@ -343,9 +350,7 @@ impl Sequencer {
     /// Error cases:
     /// - the log cannot be written
     fn record(&mut self, entry: LogEntry) -> anyhow::Result<()> {
-        let offset = log::offset_of(self.last_offset, &entry)?;
-        self.log.append(&entry)?;
-        self.last_offset = Some(offset);
+        let offset = self.log.append(&entry)?;
         self.outbox.push(Arc::new(StreamMsg::new(offset, entry)));
         Ok(())
     }
@@ -406,94 +411,12 @@ impl Sequencer {
     }
 }
 
-/// Re-applies a log and checks every checkpoint root, logged event, and signed withdrawal against
-/// what the open-source engine produces. The same code serves crash recovery and third-party audit
-/// (`engine replay`).
-/// Error cases:
-/// - a command out of sequence or with time running backwards
-/// - logged events that differ from the replayed ones, or a command without logged events after
-///   one with them
-/// - a withdrawal entry that does not match the next unmatched withdrawal its command approved
-/// - a withdrawal approved by a command logged with its events, with no withdrawal entry before
-///   the next command or checkpoint
-/// - a checkpoint for a seq other than the last applied
-/// - a checkpoint root that differs from the replayed state
-pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
-    let mut engine = Engine::new();
-    let (mut commands, mut checkpoints, mut activations) = (0, 0, Vec::new());
-    // Withdrawals the last command approved that no withdrawal entry has matched yet. Entries
-    // written before events were logged have no withdrawal entries. Once a command carries its
-    // events, every later one must, and every approval must be signed.
-    let mut approved = VecDeque::new();
-    let mut logs_events = false;
-    for entry in entries {
-        match entry {
-            LogEntry::Command(c) => {
-                ensure_signed(logs_events, &approved, engine.last_seq())?;
-                let seq = c.sequenced.seq;
-                if logs_events && c.events.is_none() {
-                    bail!("seq {seq} has no logged events, though earlier commands do");
-                }
-                let version = engine.protocol_version();
-                let events = engine.apply(&c.sequenced).with_context(|| format!("applying seq {seq}"))?;
-                if engine.protocol_version() != version {
-                    activations.push((engine.protocol_version(), seq));
-                }
-                if c.events.as_ref().is_some_and(|logged| *logged != events) {
-                    bail!("events logged at seq {seq} differ from the events replay gives");
-                }
-                approved = events
-                    .into_iter()
-                    .filter_map(|e| match e {
-                        Event::WithdrawalApproved { account, amount, nonce } => Some((account, amount, nonce)),
-                        _ => None,
-                    })
-                    .collect();
-                logs_events = c.events.is_some();
-                commands += 1;
-            }
-            LogEntry::Withdrawal(w) => {
-                if approved.pop_front() != Some((w.account, w.amount, w.nonce)) {
-                    bail!("withdrawal {} nonce {} was not approved at seq {:?}", w.account, w.nonce, engine.last_seq());
-                }
-            }
-            LogEntry::Checkpoint(cp) => {
-                ensure_signed(logs_events, &approved, engine.last_seq())?;
-                if engine.last_seq() != Some(cp.seq) {
-                    bail!("checkpoint for seq {} found after seq {:?}", cp.seq, engine.last_seq());
-                }
-                let root = format!("0x{}", hex::encode(engine.state_root()));
-                if root != cp.root {
-                    bail!("state root mismatch at seq {}: log says {}, replay gives {root}", cp.seq, cp.root);
-                }
-                checkpoints += 1;
-            }
-        }
-    }
-    let unsigned = if logs_events { approved.into() } else { Vec::new() };
-    Ok(Replayed { engine, commands, checkpoints, unsigned, activations })
-}
-
-/// Checks the last command's approved withdrawals all have their signed entries.
-/// Error cases:
-/// - `must_sign` and an approval is still unmatched
-fn ensure_signed(
-    must_sign: bool,
-    approved: &VecDeque<(AccountId, Fixed, u64)>,
-    seq: Option<u64>,
-) -> anyhow::Result<()> {
-    match approved.front() {
-        Some((account, _, nonce)) if must_sign => {
-            bail!("withdrawal {account} nonce {nonce} approved at seq {seq:?} has no signed entry")
-        }
-        _ => Ok(()),
-    }
-}
-
 mod alerts;
 mod required;
 pub use required::genesis_commands;
 
+#[cfg(test)]
+mod batch_tests;
 #[cfg(test)]
 mod margin_tests;
 #[cfg(test)]

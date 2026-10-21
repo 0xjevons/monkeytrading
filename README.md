@@ -79,11 +79,12 @@ and the enclave periodically signs a root that commits to the whole state: a Mer
 accounts, markets, and the rest of the state, so each checkpoint rehashes only what changed. Any
 account can fetch a proof of its balance and positions against the last checkpoint's root and check
 it without the node. `engine replay` re-applies a log from the beginning and checks the root at
-every checkpoint against the state the published code computes; checking the signatures themselves
-arrives with [#24](https://github.com/0xjevons/monkeytrading/issues/24). Replay reads a node's log
-directory or the archive the node serves: its completed log segments, with a manifest of their seq
-ranges and SHA-256 hashes. A stream subscriber can start or resume at any message offset, and gets
-the log from disk and then live, each message once.
+every checkpoint against the state the published code computes, and fails a log it cannot find or
+that holds no checkpoint; checking the signatures themselves arrives with
+[#24](https://github.com/0xjevons/monkeytrading/issues/24). Replay reads a node's log directory or
+the archive the node serves: its completed log segments, with a manifest of their seq ranges and
+SHA-256 hashes. A stream subscriber can start or resume at any message offset, and gets the log from
+disk and then live, each message once.
 
 Every command carries the time the sequencer stamped it with. The enclave's host supplies its
 clock, so the node checks that clock against signed time from several independent

@@ -6,11 +6,12 @@ use std::time::Duration;
 use engine_core::command::{OrderKind, OrderRequest};
 use engine_core::event::Reject;
 use engine_core::price::{PriceError, SourceQuote};
+use engine_core::protocol::ProtocolVersion;
 use engine_core::types::{MarketId, Side};
 use tracing_subscriber::fmt::MakeWriter;
 
 use crate::clock::test_clock::TestClock;
-use crate::test_support::{TRADER, deposit, dev_config, sample_around, scratch_dir, sequencer_config};
+use crate::test_support::{TRADER, deposit, dev_config, log_entries, sample_around, scratch_dir, sequencer_config};
 
 const BTC: MarketId = 1;
 const ETH: MarketId = 2;
@@ -78,7 +79,7 @@ fn dev_scenario_financing_closes_out_and_a_stale_market_counts_at_its_last_mark(
 
     seq.flush().unwrap();
     drop(seq);
-    let replayed = replay(&SegmentedLog::open(&dir).unwrap().entries).unwrap();
+    let replayed = replay(&log_entries(&dir)).unwrap();
     assert_eq!(replayed.engine.protocol_version(), ProtocolVersion::LATEST);
 }
 

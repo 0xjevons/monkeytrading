@@ -26,10 +26,10 @@ use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProv
 use crate::custody::Custody;
 use crate::feeds;
 use crate::feeds::venue::{self, Timing};
-use crate::history::History;
+use crate::history::{History, HistoryCheck};
 use crate::limits::{ApiLimits, run_retain};
-use crate::log::{Manifest, SegmentedLog};
-use crate::sequencer::{Request, Sequencer, SequencerConfig};
+use crate::log::Manifest;
+use crate::sequencer::{ReplayedLog, Request, Sequencer, SequencerConfig};
 use crate::tee::{Attestor, ConfigfsTsm, EnclaveKey, MockAttestor, attest_key};
 use crate::tls::{TlsIdentity, serve};
 use crate::trusted_time;
@@ -85,13 +85,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         "enclave and TLS keys attested"
     );
 
-    // One read of the log: the history index is checked against it, and rebuilt if it does not match,
-    // before recovery replays it and writes anything, so no other copy of the log can come between
-    // the check and the replay.
-    let log = SegmentedLog::open(&cfg.node.log_dir)
-        .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
-    let mut history = History::open(&cfg.history, &log.entries)
-        .inspect_err(|e| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}"))?;
+    let (log, mut history) = read_log_and_history(&cfg)?;
 
     let vault: AccountId = cfg.custody.vault.parse().context("custody.vault")?;
     let client_auth = cfg.client_auth()?;
@@ -212,6 +206,21 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     outcome
 }
 
+/// Reads the log once, a segment at a time: recovery replays that read, and the history index is
+/// checked against it, and rebuilt if it does not match, before recovery writes anything, so no
+/// other copy of the log can come between the check and the replay.
+/// Error cases:
+/// - the history index cannot be opened, nor a fresh one in its place (see `HistoryCheck`)
+/// - the log cannot be read or replayed (see `Sequencer::read_log`)
+fn read_log_and_history(cfg: &NodeConfig) -> anyhow::Result<(ReplayedLog, History)> {
+    let history_failed = |e: &anyhow::Error| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}");
+    let mut check = HistoryCheck::open(&cfg.history).inspect_err(history_failed)?;
+    let log = Sequencer::read_log(&cfg.node.log_dir, |entry| check.observe(entry))
+        .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
+    let history = check.finish().inspect_err(history_failed)?;
+    Ok((log, history))
+}
+
 /// Sequences a `Tick` every `every`, so sessions and rollovers fire without other traffic.
 /// Error cases:
 /// - the sequencer has gone away
@@ -264,10 +273,35 @@ mod tests {
 
     use crate::config::HistorySection;
     use crate::history::INDEX_FILE;
-    use crate::log::{MANIFEST, Offset};
+    use crate::log::{LogEntry, MANIFEST, Offset};
     use crate::test_support::{
-        RETENTION, TestHistory, TestSequencer, capture_alerts, deposit, dev_config, scratch_dir,
+        RETENTION, TestHistory, TestSequencer, capture_alerts, deposit, dev_config, log_entries, open_history,
+        scratch_dir,
     };
+
+    /// Startup's one read of the log decides the history index's fate: an index that took the log's
+    /// last command resumes after it, with no alert and no rebuild.
+    #[tokio::test]
+    async fn startup_resumes_a_history_index_its_read_of_the_log_matches() {
+        let (dir, index) = (scratch_dir("node-history-resumes"), scratch_dir("node-history-resumes-index"));
+        let node = TestSequencer::start(&dir, 1024);
+        let history = TestHistory::start(&node, &dir, &index).await.unwrap();
+        node.submit(deposit(1, "dep-1")).await;
+        node.stop().await;
+        history.finish().await.unwrap();
+        let mut commands = log_entries(&dir).into_iter().filter_map(|entry| match entry {
+            LogEntry::Command(command) => Some(command.sequenced.seq),
+            _ => None,
+        });
+        let last = commands.next_back().expect("the log holds commands");
+
+        let mut cfg = dev_config();
+        (cfg.node.log_dir, cfg.history.dir, cfg.history.retention) = (dir, index, RETENTION);
+        let (_guard, mut alerts) = capture_alerts();
+        let (_, history) = read_log_and_history(&cfg).unwrap();
+        assert_eq!(history.resume_at(), Offset::start_of(last + 1));
+        assert!(alerts.try_recv().is_err(), "no alert");
+    }
 
     /// A power loss that keeps what the history index took but not the log's unsynced tail leaves
     /// the index ahead of the log. The node discards the index with a Warning alert and goes on to
@@ -287,7 +321,7 @@ mod tests {
         assert_eq!((alert["alert"].as_str(), alert["level"].as_str()), ("history_index_discarded", "WARN"));
         // What the node left is a fresh index, which takes the log from its start with no alert.
         let cfg = HistorySection { dir: index, retention: RETENTION };
-        let reopened = History::open(&cfg, &SegmentedLog::open(&kept).unwrap().entries).unwrap();
+        let reopened = open_history(&cfg, &kept).unwrap();
         assert_eq!(reopened.resume_at(), Offset::start_of(0));
         assert!(alerts.try_recv().is_err(), "one alert");
     }

@@ -84,13 +84,16 @@ async fn readers_wait_for_a_tip_the_index_has_not_taken() {
     let cfg = HistorySection { dir: index.clone(), retention: RETENTION };
     // (tip, readers let in at once)
     for (tip, at_once) in [(Some(next - 1), true), (Some(next), false), (Some(next + 1), false)] {
-        let mut history = History::open(&cfg, &entries(&dir)).unwrap();
+        let mut history = open_history(&cfg, &dir).unwrap();
         assert_eq!(history.resume_at, Offset::start_of(next));
         history.catch_up_to(tip);
         assert_eq!(*history.ready.borrow(), at_once, "tip {tip:?}");
     }
     // A fresh index on an empty log has nothing to take.
-    let mut fresh = History::open(&HistorySection { dir: index_dir("tip-fresh"), retention: RETENTION }, &[]).unwrap();
+    let mut fresh = HistoryCheck::open(&HistorySection { dir: index_dir("tip-fresh"), retention: RETENTION })
+        .unwrap()
+        .finish()
+        .unwrap();
     fresh.catch_up_to(None);
     assert!(*fresh.ready.borrow());
 }
@@ -124,7 +127,7 @@ async fn a_history_failure_names_its_cause() {
     let occupied = scratch_dir("history-causes-file");
     File::create(&occupied).unwrap();
     let cfg = HistorySection { dir: occupied.join("history"), retention: RETENTION };
-    let err = History::open(&cfg, &[]).err().expect("no directory under a file");
+    let err = HistoryCheck::open(&cfg).err().expect("no directory under a file");
     assert!(format!("{err:#}").contains("creating"), "{err:#}");
 
     // An index ahead of its log, whose write-ahead log the host replaced with a directory.
@@ -134,7 +137,7 @@ async fn a_history_failure_names_its_cause() {
     lose_log_tail(&log);
     fs::create_dir(stuck.join(format!("{INDEX_FILE}-wal"))).unwrap();
     let cfg = HistorySection { dir: stuck, retention: RETENTION };
-    let err = History::open(&cfg, &entries(&log)).err().expect("the index cannot be discarded");
+    let err = open_history(&cfg, &log).err().expect("the index cannot be discarded");
     assert!(format!("{err:#}").contains(&format!("removing {}", cfg.dir.join(INDEX_FILE).display())), "{err:#}");
 
     indexed_log(&dir, &index, 1).await;
@@ -142,13 +145,12 @@ async fn a_history_failure_names_its_cause() {
     let first = &manifest.segments[0];
     OpenOptions::new().append(true).open(dir.join(&first.file)).unwrap().write_all(b"\n").unwrap();
     let fresh = HistorySection { dir: index_dir("causes-fresh"), retention: RETENTION };
-    let mut history = History::open(&fresh, &[]).unwrap();
+    let mut history = HistoryCheck::open(&fresh).unwrap().finish().unwrap();
     history.catch_up_to(None);
     let (live, subscriber) = broadcast::channel(1);
     drop(live);
     let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
-    let manifest = watch::channel(manifest).1;
-    let feed = Feed::new(subscriber, dir.clone(), manifest, backfills, Some(history.resume_at()));
+    let feed = Feed::new(subscriber, dir.clone(), published_manifest(&dir), backfills, Some(history.resume_at()));
     let err = timeout(Duration::from_secs(10), history.run(feed)).await.unwrap().expect_err("the feed fails");
     assert!(format!("{err:#}").contains("does not match its listing"), "{err:#}");
 }

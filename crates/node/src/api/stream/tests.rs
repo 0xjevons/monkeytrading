@@ -6,14 +6,16 @@ use std::pin::Pin;
 use std::sync::mpsc;
 use std::task::{Context as TaskContext, Poll};
 
+use engine_core::Fixed;
 use engine_core::command::{Command, Sequenced};
+use engine_core::event::Event;
+use engine_core::types::AccountId;
 use futures_util::FutureExt;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-use crate::log::{CommandEntry, LogEntry, segment_seq};
-
-use crate::test_support::{TestSequencer, deposit, log_messages, scratch_dir, withdraw};
+use crate::log::{CommandEntry, LogEntry, SegmentedLog, segment_seq};
+use crate::test_support::{TestSequencer, deposit, log_entries, log_messages, scratch_dir, withdraw};
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -82,6 +84,33 @@ async fn a_live_feed_starts_at_the_next_message_and_one_that_lags_before_it_star
     let first = next_msg(&mut feed).await;
     let expected = log_messages(&dir, first.offset.next());
     assert_eq!(take(&mut feed, expected.len()).await, expected);
+}
+
+/// A batch longer than the write buffer is partly on disk while a subscriber backfills: the
+/// subscriber gets what was flushed before it, and nothing of the batch from disk.
+#[tokio::test]
+async fn a_backfill_stops_at_the_last_flush_while_a_batch_is_written() {
+    let dir = scratch_dir("feed-unflushed");
+    let (manifest_tx, manifest) = watch::channel(Manifest::default());
+    let mut writer = SegmentedLog::open(&dir, |_| Ok(())).unwrap().into_writer(1024, manifest_tx).unwrap();
+    let command = |seq, events| {
+        LogEntry::Command(CommandEntry {
+            sequenced: Sequenced { seq, ts: 0, cmd: Command::Tick },
+            events: Some(events),
+        })
+    };
+    writer.append(&command(0, Vec::new())).unwrap();
+    writer.flush().unwrap();
+    let deposits = vec![Event::Deposited { account: AccountId([1; 20]), amount: Fixed::from_int(1) }; 200];
+    writer.append(&command(1, deposits)).unwrap();
+    assert_eq!(log_entries(&dir).len(), 2, "the batch's command is on disk before it is flushed");
+
+    let (live, subscriber) = broadcast::channel(16);
+    let mut feed = Feed::new(subscriber, dir.clone(), manifest, permits(), Some(Offset::start_of(0)));
+    assert_eq!(next_msg(&mut feed).await.offset, Offset::start_of(0));
+    // With nothing more to come live, the feed ends rather than yield the unflushed command.
+    drop(live);
+    assert!(timeout(Duration::from_secs(10), feed.next()).await.unwrap().unwrap().is_none());
 }
 
 #[tokio::test]

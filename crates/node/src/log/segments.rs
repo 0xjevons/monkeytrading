@@ -3,10 +3,11 @@
 //! and starts a new one at a command once the current one holds `segment_commands` commands, so a
 //! seq's entries never straddle two segments. A completed segment is never written again; the
 //! manifest gets one line for it with its seq range, size, and SHA-256. Completed segments and the
-//! manifest are the public archive.
+//! manifest are the public archive. Recovery reads the log a segment at a time, a line at a time,
+//! and hands on nothing of a completed segment before it matches its listing.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
@@ -15,14 +16,18 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::log::{LogEntry, parse_lines};
+use crate::log::checked::{self, CheckedChunks};
+use crate::log::{LogEntry, Offset, offset_of, parse_line, read_lines};
 
 pub const MANIFEST: &str = "manifest.jsonl";
 
-/// The completed segments, oldest first.
+/// The completed segments, oldest first, and the last entry the writer has flushed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Manifest {
     pub segments: Vec<SegmentInfo>,
+    /// The offset of the last entry the writer has flushed, which readers yield nothing after;
+    /// `None` before the first. Only the writer's copy carries it: the file lists segments alone.
+    pub flushed: Option<Offset>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,11 +41,11 @@ pub struct SegmentInfo {
     pub sha256: String,
 }
 
-/// A log directory read in full, ready to resume writing.
+/// A log directory read to its end, ready to resume writing.
 pub struct SegmentedLog {
     dir: PathBuf,
-    /// Every entry, oldest first.
-    pub entries: Vec<LogEntry>,
+    /// The offset of the last entry.
+    last: Option<Offset>,
     manifest: Manifest,
     /// Bytes of the manifest file up to the end of its last whole line.
     manifest_len: u64,
@@ -58,6 +63,8 @@ pub struct LogWriter {
     manifest_file: File,
     dir_handle: File,
     open: Option<(Segment, BufWriter<File>)>,
+    /// The offset of the last entry appended.
+    last: Option<Offset>,
     /// A new segment could not be created; the current one keeps taking appends meanwhile.
     rotation_failing: bool,
 }
@@ -114,13 +121,14 @@ impl Manifest {
             .filter(|(_, line)| !line.trim_ascii().is_empty())
             .map(|(n, line)| serde_json::from_slice(line).with_context(|| format!("{} line {}", path.display(), n + 1)))
             .collect::<anyhow::Result<_>>()?;
-        Ok((Self { segments }, whole as u64))
+        Ok((Self { segments, flushed: None }, whole as u64))
     }
 }
 
 impl SegmentedLog {
-    /// Reads every segment in `dir` in order and checks completed ones against the manifest. A
-    /// missing directory is an empty log.
+    /// Reads every segment in `dir` in order, a line at a time, handing each entry to `visit`. A
+    /// completed segment is checked against its manifest listing before any of it reaches `visit`;
+    /// the segment still being written has no listing. A missing directory is an empty log.
     /// Error cases:
     /// - the directory, the manifest, or a segment cannot be read
     /// - a segment ends mid-line, holds an invalid entry, or does not start with the command for
@@ -128,7 +136,8 @@ impl SegmentedLog {
     /// - the manifest lists a missing segment, or one whose seq range, size, or hash differs
     /// - a segment other than the last is missing from the manifest, or an empty last segment is
     ///   not named for the next seq
-    pub fn open(dir: &Path) -> anyhow::Result<Self> {
+    /// - `visit` fails
+    pub fn open(dir: &Path, mut visit: impl FnMut(LogEntry) -> anyhow::Result<()>) -> anyhow::Result<Self> {
         let (manifest, manifest_len) = Manifest::read(dir)?;
         let files = list_segments(dir)?;
         ensure!(
@@ -138,33 +147,34 @@ impl SegmentedLog {
             files.len(),
             dir.display()
         );
-        let mut entries = Vec::new();
-        let mut open = None;
+        let (mut last, mut open) = (None, None);
         for (i, (first_seq, path)) in files.iter().enumerate() {
-            let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-            let parsed = parse_segment(&bytes).with_context(|| format!("segment {}", path.display()))?;
-            let segment = Segment::scan(*first_seq, &bytes, &parsed).with_context(|| format!("{}", path.display()))?;
-            match manifest.segments.get(i) {
+            let listed = manifest.segments.get(i);
+            if listed.is_none() && i + 1 < files.len() {
+                bail!("{} is followed by another segment but is not in {MANIFEST}", path.display());
+            }
+            let segment = Segment::read(*first_seq, path, listed, &mut last, &mut visit)
+                .with_context(|| format!("segment {}", path.display()))?;
+            match listed {
                 Some(listed) => ensure!(
                     segment.info() == *listed,
                     "{} does not match {MANIFEST}: on disk {:?}, listed {listed:?}",
                     path.display(),
                     segment.info()
                 ),
-                None if i + 1 == files.len() => open = Some(segment),
-                None => bail!("{} is followed by another segment but is not in {MANIFEST}", path.display()),
+                None => open = Some(segment),
             }
-            entries.extend(parsed);
         }
         if let Some(segment) = open.as_ref().filter(|s| s.commands == 0) {
-            let next_seq = entries.iter().rev().find_map(command_seq).map_or(0, |s| s + 1);
+            let next_seq = last.map_or(0, |last: Offset| last.seq + 1);
             ensure!(segment.first_seq == next_seq, "empty last segment is not named for the next seq {next_seq}");
         }
-        Ok(Self { dir: dir.to_owned(), entries, manifest, manifest_len, open })
+        Ok(Self { dir: dir.to_owned(), last, manifest, manifest_len, open })
     }
 
     /// A writer that appends to the last segment, or starts a new one at the next command if the
-    /// manifest lists the last one. It publishes the manifest on `manifest`, starting now.
+    /// manifest lists the last one. It publishes the manifest on `manifest`, starting now, with
+    /// everything read counted as flushed.
     /// Error cases:
     /// - the directory cannot be created, opened, or synced
     /// - the manifest cannot be trimmed to its whole lines, or opened for appending
@@ -201,20 +211,30 @@ impl SegmentedLog {
             }
             None => None,
         };
-        manifest.send_replace(self.manifest);
-        let rotation_failing = false;
-        Ok(LogWriter { dir: self.dir, segment_commands, manifest, manifest_file, dir_handle, open, rotation_failing })
+        manifest.send_replace(Manifest { flushed: self.last, ..self.manifest });
+        let (last, rotation_failing) = (self.last, false);
+        Ok(LogWriter {
+            dir: self.dir,
+            segment_commands,
+            manifest,
+            manifest_file,
+            dir_handle,
+            open,
+            last,
+            rotation_failing,
+        })
     }
 }
 
 impl LogWriter {
-    /// Buffers one entry as a JSON line. A command first completes the current segment if it is
-    /// full.
+    /// Buffers one entry as a JSON line, and returns its offset. A command first completes the
+    /// current segment if it is full.
     /// Error cases:
     /// - completing the current segment or starting a new one fails
     /// - a withdrawal or checkpoint comes before any command in this segment
     /// - the write to the buffer or file fails
-    pub fn append(&mut self, entry: &LogEntry) -> anyhow::Result<()> {
+    pub fn append(&mut self, entry: &LogEntry) -> anyhow::Result<Offset> {
+        let offset = offset_of(self.last, entry)?;
         if let Some(seq) = command_seq(entry)
             && self.open.as_ref().is_none_or(|(segment, _)| segment.commands >= self.segment_commands)
         {
@@ -224,19 +244,23 @@ impl LogWriter {
         let mut line = serde_json::to_vec(entry).context("encoding log entry")?;
         line.push(b'\n');
         out.write_all(&line).context("writing log entry")?;
-        segment.record(&line, entry);
-        Ok(())
+        segment.record(&line, Some(entry));
+        self.last = Some(offset);
+        Ok(offset)
     }
 
-    /// Writes buffered entries to the file. Called after each command batch: a command must be
-    /// durable before its effects are acknowledged to clients.
+    /// Writes buffered entries to the file, then publishes the last of them as flushed. Called
+    /// after each command batch: a command must be durable before its effects are acknowledged to
+    /// clients or read from disk by the stream.
     /// Error cases:
     /// - the write to the file fails
     pub fn flush(&mut self) -> anyhow::Result<()> {
-        match &mut self.open {
-            Some((_, out)) => out.flush().context("flushing log"),
-            None => Ok(()),
+        if let Some((_, out)) = &mut self.open {
+            out.flush().context("flushing log")?;
         }
+        let last = self.last;
+        self.manifest.send_modify(|published| published.flushed = last);
+        Ok(())
     }
 
     /// Flushes, then forces the open segment's data and the directory entry naming it to
@@ -314,28 +338,51 @@ impl Segment {
         Self { first_seq, last_seq: first_seq, commands: 0, bytes: 0, hasher: Sha256::new() }
     }
 
-    /// The segment named for `first_seq`, whose file holds `bytes`, parsed as `entries`.
+    /// Reads the segment named for `first_seq` at `path` a line at a time, handing each entry to
+    /// `visit`. A completed segment, `listed` in the manifest, is checked against its listing in one
+    /// pass first, then read in chunks checked against that pass, since the host can rewrite it in
+    /// between. `last` is the offset of the entry before the segment, and ends at its last entry.
     /// Error cases:
-    /// - the first entry is not the command for `first_seq`
-    fn scan(first_seq: u64, bytes: &[u8], entries: &[LogEntry]) -> anyhow::Result<Self> {
-        if let Some(first) = entries.first() {
-            ensure!(command_seq(first) == Some(first_seq), "does not start with the command for seq {first_seq}");
-        }
+    /// - the file cannot be read, or ends mid-line, which a torn write leaves
+    /// - a listed segment's size or hash differs from its listing
+    /// - a non-blank line is not a valid entry, or the first entry is not the command for
+    ///   `first_seq`
+    /// - `visit` fails
+    fn read(
+        first_seq: u64,
+        path: &Path,
+        listed: Option<&SegmentInfo>,
+        last: &mut Option<Offset>,
+        visit: &mut impl FnMut(LogEntry) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Self> {
+        let input: Box<dyn BufRead> = match listed {
+            Some(listed) => Box::new(BufReader::new(CheckedChunks::open(path, checked::check(path, listed)?, 0)?)),
+            None => Box::new(BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?)),
+        };
         let mut segment = Self::empty(first_seq);
-        segment.hasher.update(bytes);
-        segment.bytes = bytes.len() as u64;
-        for seq in entries.iter().filter_map(command_seq) {
-            segment.commands += 1;
-            segment.last_seq = seq;
-        }
+        read_lines(input, |n, line| {
+            ensure!(line.ends_with(b"\n"), "ends mid-line");
+            let entry = parse_line(n, line)?;
+            if let Some(entry) = &entry
+                && segment.commands == 0
+            {
+                ensure!(command_seq(entry) == Some(first_seq), "does not start with the command for seq {first_seq}");
+            }
+            segment.record(line, entry.as_ref());
+            let Some(entry) = entry else {
+                return Ok(());
+            };
+            *last = Some(offset_of(*last, &entry)?);
+            visit(entry)
+        })?;
         Ok(segment)
     }
 
-    /// Accounts for one line just written.
-    fn record(&mut self, line: &[u8], entry: &LogEntry) {
+    /// Accounts for one line, and the entry on it unless it is blank.
+    fn record(&mut self, line: &[u8], entry: Option<&LogEntry>) {
         self.hasher.update(line);
         self.bytes += line.len() as u64;
-        if let Some(seq) = command_seq(entry) {
+        if let Some(seq) = entry.and_then(command_seq) {
             self.commands += 1;
             self.last_seq = seq;
         }
@@ -399,14 +446,4 @@ fn command_seq(entry: &LogEntry) -> Option<u64> {
         LogEntry::Command(c) => Some(c.sequenced.seq),
         _ => None,
     }
-}
-
-/// Parses a segment file; unlike a single log file, it must end on a line break, since the writer
-/// appends to it.
-/// Error cases:
-/// - the last line has no line break, which a torn write leaves
-/// - a non-blank line is not a valid entry
-fn parse_segment(bytes: &[u8]) -> anyhow::Result<Vec<LogEntry>> {
-    ensure!(bytes.is_empty() || bytes.ends_with(b"\n"), "ends mid-line");
-    parse_lines(bytes)
 }

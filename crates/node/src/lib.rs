@@ -16,7 +16,7 @@ mod node;
 pub use node::{init_logging, run};
 mod roughtime;
 pub mod sequencer;
-pub use sequencer::replay;
+pub use sequencer::{replay, replay_path};
 mod tee;
 #[cfg(test)]
 mod test_support;

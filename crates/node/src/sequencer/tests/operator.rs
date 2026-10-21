@@ -12,7 +12,7 @@ fn a_v7_log_records_the_operator_and_activates_the_latest_version_at_its_next_se
     ];
     recover(&dir, &signed(31_337)).sequence_required("V7 activation", v7).unwrap();
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
-    let written = entries(&dir);
+    let written = log_entries(&dir);
     let cmds = commands(&written);
     assert_eq!(
         cmds[3..],
@@ -32,7 +32,7 @@ fn a_v7_log_records_the_operator_and_activates_the_latest_version_at_its_next_se
 fn a_log_recording_another_operator_refuses_to_start_and_writes_nothing() {
     let dir = scratch_dir("activation-other-operator");
     recover(&dir, &signed(31_337)).activate_protocol().unwrap();
-    let written = entries(&dir).len();
+    let written = log_entries(&dir).len();
     let operator = dev_config().operator().unwrap();
     for other in [Operator { address: AccountId([9; 20]), ..operator }, Operator { chain_id: 1, ..operator }] {
         let (stream, _) = broadcast::channel(16);
@@ -42,7 +42,7 @@ fn a_log_recording_another_operator_refuses_to_start_and_writes_nothing() {
         let err = recovered.err().unwrap();
         assert!(format!("{err:#}").contains("the log records operator"), "{err:#}");
     }
-    assert_eq!(entries(&dir).len(), written);
+    assert_eq!(log_entries(&dir).len(), written);
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn a_log_claiming_an_unsigned_operator_command_applied_after_funds_does_not_repl
     drop(seq);
 
     // As if the host rewrote the entry to say it applied.
-    let mut entries = entries(&dir);
+    let mut entries = log_entries(&dir);
     let forged = entries.iter_mut().find_map(|entry| match entry {
         LogEntry::Command(c) if c.sequenced.cmd == every_market => Some(c),
         _ => None,

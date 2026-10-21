@@ -21,10 +21,10 @@ use crate::config::EvmCustodySection;
 use crate::custody::chain::BlockLink;
 use crate::custody::cursor::Cursor;
 use crate::custody::evm::{Beneficiary, BlockRef, DepositWatcher, Finality, VaultDeposit, VaultIdentity, VaultReader};
-use crate::log::{LogEntry, Manifest, SegmentedLog};
+use crate::log::{LogEntry, Manifest};
 use crate::sequencer::{Request, Sequencer, SequencerConfig};
 use crate::tee::EnclaveKey;
-use crate::test_support::{sequencer_config, trusted_now};
+use crate::test_support::{log_entries, sequencer_config, trusted_now};
 
 pub(super) const CHAIN_ID: u64 = 42161;
 pub(super) const VAULT: Address = Address::repeat_byte(0x7a);
@@ -366,8 +366,8 @@ pub(super) fn usdc(amount: &str) -> Fixed {
 /// How many deposit and house-capital commands the log in `dir` holds.
 pub(super) fn deposit_commands(dir: &Path) -> usize {
     let deposit = |cmd: &Command| matches!(cmd, Command::Deposit { .. } | Command::HouseCapital { .. });
-    let log = SegmentedLog::open(&dir.join("log")).unwrap();
-    log.entries.iter().filter(|e| matches!(e, LogEntry::Command(c) if deposit(&c.sequenced.cmd))).count()
+    let entries = log_entries(&dir.join("log"));
+    entries.iter().filter(|e| matches!(e, LogEntry::Command(c) if deposit(&c.sequenced.cmd))).count()
 }
 
 /// Waits, in paused time, until the watcher has started `polls` polls in all.
