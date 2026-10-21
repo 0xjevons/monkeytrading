@@ -180,11 +180,11 @@ fn opening_refuses_a_segment_that_differs_from_its_manifest_entry() {
     let text = fs::read_to_string(&path).unwrap();
     fs::write(&path, text.replacen("\"ts\":0,", "\"ts\":9,", 1)).unwrap();
     let err = SegmentedLog::open(&dir, |_| Ok(())).err().unwrap();
-    assert!(format!("{err:#}").contains(&format!("does not match {MANIFEST}")), "{err:#}");
+    assert!(format!("{err:#}").contains(&format!("does not match its listing in {MANIFEST}")), "{err:#}");
 
     fs::remove_file(&path).unwrap();
     let err = SegmentedLog::open(&dir, |_| Ok(())).err().unwrap();
-    assert!(format!("{err:#}").contains(&format!("does not match {MANIFEST}")), "{err:#}");
+    assert!(format!("{err:#}").contains(&format!("does not match its listing in {MANIFEST}")), "{err:#}");
 }
 
 #[test]
@@ -298,8 +298,8 @@ fn opening_hands_on_each_segment_before_it_reads_the_next() {
 }
 
 #[test]
-fn opening_checks_a_completed_segment_before_it_reads_the_next() {
-    let dir = scratch_dir("open-checks-in-order");
+fn opening_hands_on_nothing_of_a_completed_segment_that_differs_from_its_listing() {
+    let dir = scratch_dir("open-checks-first");
     write(&dir, 2, &[cmd(0), cmd(1), cmd(2), cmd(3), cmd(4)]);
     let path = dir.join(SEG_2);
     let text = fs::read_to_string(&path).unwrap();
@@ -311,9 +311,27 @@ fn opening_checks_a_completed_segment_before_it_reads_the_next() {
     })
     .err()
     .unwrap();
-    assert!(format!("{err:#}").contains(&format!("does not match {MANIFEST}")), "{err:#}");
-    // The segment after the altered one is never read.
-    assert_eq!(seqs, [0, 1, 2, 3]);
+    assert!(format!("{err:#}").contains(&format!("does not match its listing in {MANIFEST}")), "{err:#}");
+    // Nothing of the altered segment, or after it, is handed on.
+    assert_eq!(seqs, [0, 1]);
+}
+
+#[test]
+fn opening_refuses_a_completed_segment_rewritten_while_it_is_read() {
+    let dir = scratch_dir("open-rewritten");
+    write(&dir, 2, &[cmd(0), cmd(1), cmd(2)]);
+    let path = dir.join(SEG_0);
+    let len = fs::metadata(&path).unwrap().len() as usize;
+    // Once its first entry is handed on, the segment's later chunks change under the reader.
+    let err = SegmentedLog::open(&dir, |entry| {
+        if entry == cmd(0) {
+            fs::write(&path, vec![b' '; len]).unwrap();
+        }
+        Ok(())
+    })
+    .err()
+    .unwrap();
+    assert!(format!("{err:#}").contains(&format!("does not match its listing in {MANIFEST}")), "{err:#}");
 }
 
 #[test]

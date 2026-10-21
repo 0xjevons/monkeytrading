@@ -274,8 +274,8 @@ reaches a subscriber from disk. While it reads a batch, a subscriber holds one o
 node warns (`log_rotation_failed`) until it can. A log written as one file before segments existed
 continues as the first segment: move it to `<log_dir>/00000000000000000000.jsonl`. Every segment is
 kept, since recovery replays the log from genesis. It replays as it reads, one segment and one line
-at a time, and checks each completed segment against the manifest once it has read it, so its memory
-does not grow with the log; `engine replay` reads the log the same way.
+at a time, so its memory does not grow with the log, and replays nothing of a completed segment
+before checking it against the manifest; `engine replay` reads the log the same way.
 
 With `auth = "eip712"`, each order, cancel, and withdrawal body carries
 `"auth": { "nonce": <next nonce>, "expires_at": <ms>, "signature": "0x…" }`: the account's EIP-712

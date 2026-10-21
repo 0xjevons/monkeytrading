@@ -3,10 +3,11 @@
 //! and starts a new one at a command once the current one holds `segment_commands` commands, so a
 //! seq's entries never straddle two segments. A completed segment is never written again; the
 //! manifest gets one line for it with its seq range, size, and SHA-256. Completed segments and the
-//! manifest are the public archive. Recovery reads the log a segment at a time, a line at a time.
+//! manifest are the public archive. Recovery reads the log a segment at a time, a line at a time,
+//! and hands on nothing of a completed segment before it matches its listing.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
@@ -15,6 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use crate::log::checked::{self, CheckedChunks};
 use crate::log::{LogEntry, Offset, offset_of, parse_line, read_lines};
 
 pub const MANIFEST: &str = "manifest.jsonl";
@@ -124,10 +126,9 @@ impl Manifest {
 }
 
 impl SegmentedLog {
-    /// Reads every segment in `dir` in order, a line at a time, handing each entry to `visit`, and
-    /// checks each completed segment against the manifest once it has read it. An entry reaches
-    /// `visit` before its segment is checked, so `visit` acts only in memory until this returns. A
-    /// missing directory is an empty log.
+    /// Reads every segment in `dir` in order, a line at a time, handing each entry to `visit`. A
+    /// completed segment is checked against its manifest listing before any of it reaches `visit`;
+    /// the segment still being written has no listing. A missing directory is an empty log.
     /// Error cases:
     /// - the directory, the manifest, or a segment cannot be read
     /// - a segment ends mid-line, holds an invalid entry, or does not start with the command for
@@ -148,17 +149,20 @@ impl SegmentedLog {
         );
         let (mut last, mut open) = (None, None);
         for (i, (first_seq, path)) in files.iter().enumerate() {
-            let segment = Segment::read(*first_seq, path, &mut last, &mut visit)
+            let listed = manifest.segments.get(i);
+            if listed.is_none() && i + 1 < files.len() {
+                bail!("{} is followed by another segment but is not in {MANIFEST}", path.display());
+            }
+            let segment = Segment::read(*first_seq, path, listed, &mut last, &mut visit)
                 .with_context(|| format!("segment {}", path.display()))?;
-            match manifest.segments.get(i) {
+            match listed {
                 Some(listed) => ensure!(
                     segment.info() == *listed,
                     "{} does not match {MANIFEST}: on disk {:?}, listed {listed:?}",
                     path.display(),
                     segment.info()
                 ),
-                None if i + 1 == files.len() => open = Some(segment),
-                None => bail!("{} is followed by another segment but is not in {MANIFEST}", path.display()),
+                None => open = Some(segment),
             }
         }
         if let Some(segment) = open.as_ref().filter(|s| s.commands == 0) {
@@ -335,21 +339,28 @@ impl Segment {
     }
 
     /// Reads the segment named for `first_seq` at `path` a line at a time, handing each entry to
-    /// `visit`. `last` is the offset of the entry before the segment, and ends at its last entry.
+    /// `visit`. A completed segment, `listed` in the manifest, is checked against its listing in one
+    /// pass first, then read in chunks checked against that pass, since the host can rewrite it in
+    /// between. `last` is the offset of the entry before the segment, and ends at its last entry.
     /// Error cases:
     /// - the file cannot be read, or ends mid-line, which a torn write leaves
+    /// - a listed segment's size or hash differs from its listing
     /// - a non-blank line is not a valid entry, or the first entry is not the command for
     ///   `first_seq`
     /// - `visit` fails
     fn read(
         first_seq: u64,
         path: &Path,
+        listed: Option<&SegmentInfo>,
         last: &mut Option<Offset>,
         visit: &mut impl FnMut(LogEntry) -> anyhow::Result<()>,
     ) -> anyhow::Result<Self> {
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let input: Box<dyn BufRead> = match listed {
+            Some(listed) => Box::new(BufReader::new(CheckedChunks::open(path, checked::check(path, listed)?, 0)?)),
+            None => Box::new(BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?)),
+        };
         let mut segment = Self::empty(first_seq);
-        read_lines(BufReader::new(file), |n, line| {
+        read_lines(input, |n, line| {
             ensure!(line.ends_with(b"\n"), "ends mid-line");
             let entry = parse_line(n, line)?;
             if let Some(entry) = &entry

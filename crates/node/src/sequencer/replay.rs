@@ -29,7 +29,7 @@ pub struct Replayed {
 /// and signed withdrawal against what the open-source engine produces. The same code serves crash
 /// recovery and third-party audit (`engine replay`).
 #[derive(Default)]
-pub struct Replay {
+pub(super) struct Replay {
     engine: Engine,
     commands: u64,
     checkpoints: u64,
@@ -52,7 +52,7 @@ impl Replay {
     ///   the next command or checkpoint
     /// - a checkpoint for a seq other than the last applied
     /// - a checkpoint root that differs from the replayed state
-    pub fn apply(&mut self, entry: &LogEntry) -> anyhow::Result<()> {
+    pub(super) fn apply(&mut self, entry: &LogEntry) -> anyhow::Result<()> {
         let engine = &mut self.engine;
         match entry {
             LogEntry::Command(c) => {
@@ -100,7 +100,7 @@ impl Replay {
     }
 
     /// What the entries applied so far replay to.
-    pub fn finish(self) -> Replayed {
+    pub(super) fn finish(self) -> Replayed {
         let unsigned = if self.logs_events { self.approved.into() } else { Vec::new() };
         let (engine, commands, checkpoints, activations) =
             (self.engine, self.commands, self.checkpoints, self.activations);
