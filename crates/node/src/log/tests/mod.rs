@@ -298,6 +298,25 @@ fn opening_hands_on_each_segment_before_it_reads_the_next() {
 }
 
 #[test]
+fn opening_checks_a_completed_segment_before_it_reads_the_next() {
+    let dir = scratch_dir("open-checks-in-order");
+    write(&dir, 2, &[cmd(0), cmd(1), cmd(2), cmd(3), cmd(4)]);
+    let path = dir.join(SEG_2);
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, text.replacen("\"ts\":20,", "\"ts\":29,", 1)).unwrap();
+    let mut seqs = Vec::new();
+    let err = SegmentedLog::open(&dir, |entry| {
+        seqs.extend(command_seq(&entry));
+        Ok(())
+    })
+    .err()
+    .unwrap();
+    assert!(format!("{err:#}").contains(&format!("does not match {MANIFEST}")), "{err:#}");
+    // The segment after the altered one is never read.
+    assert_eq!(seqs, [0, 1, 2, 3]);
+}
+
+#[test]
 fn a_log_file_is_handed_on_a_line_at_a_time() {
     let path = scratch_dir("file-streams").join("log.jsonl");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -354,6 +373,14 @@ fn files(dir: &Path) -> Vec<String> {
     let mut names: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     names.sort();
     names
+}
+
+/// The seq of `entry` if it is a command.
+fn command_seq(entry: &LogEntry) -> Option<u64> {
+    match entry {
+        LogEntry::Command(c) => Some(c.sequenced.seq),
+        _ => None,
+    }
 }
 
 /// `entry` as a log line.

@@ -17,7 +17,8 @@ use crate::log::{LogEntry, MANIFEST, Manifest, Offset, offset_of};
 pub struct LogReader {
     dir: PathBuf,
     from: Offset,
-    /// The writer's manifest, which completed segments are checked against.
+    /// The writer's manifest: completed segments are checked against it, and nothing after its
+    /// `flushed` offset is yielded.
     manifest: watch::Receiver<Manifest>,
     /// Segment files by first seq, as last listed.
     segments: Vec<(u64, PathBuf)>,

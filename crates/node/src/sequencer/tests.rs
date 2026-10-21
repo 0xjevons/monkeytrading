@@ -416,28 +416,35 @@ async fn a_sync_request_is_answered_after_the_commands_before_it_are_written() {
     node.stop().await;
 }
 
-#[tokio::test]
-async fn recovery_replays_the_log_a_segment_at_a_time() {
-    let dir = scratch_dir("seq-recover-streams");
-    let node = TestSequencer::start(&dir, 16);
-    for n in 0..2 * SEGMENT_COMMANDS {
-        node.submit(deposit(1, &format!("dep-{n}"))).await;
+/// Recovery and `engine replay` replay each entry as they read it: an entry replay refuses fails
+/// the read before it reaches a later segment, here one that cannot be read.
+#[test]
+fn recovery_and_engine_replay_replay_the_log_as_they_read_it() {
+    let dir = scratch_dir("seq-replay-streams");
+    let command = |seq, events| {
+        LogEntry::Command(CommandEntry {
+            sequenced: Sequenced { seq, ts: 0, cmd: Command::Tick },
+            events: Some(events),
+        })
+    };
+    let manifest = watch::channel(Manifest::default()).0;
+    let mut log = SegmentedLog::open(&dir, |_| Ok(())).unwrap().into_writer(2, manifest).unwrap();
+    // Seq 1, in the first segment, logs an event its replay does not give.
+    for seq in 0..5 {
+        let events = if seq == 1 { vec![Event::AdminApplied] } else { Vec::new() };
+        log.append(&command(seq, events)).unwrap();
     }
-    node.stop().await;
-    let (newest, logged) = (last_segment(&dir), log_entries(&dir));
-    // Removing the newest segment once the first entry is read fails recovery only if it reads that
-    // segment after replaying the ones before it.
-    let mut seen = Vec::new();
-    let err = Sequencer::read_log(&dir, |entry| {
-        if seen.is_empty() {
-            fs::remove_file(&newest).unwrap();
-        }
-        seen.push(entry.clone());
-    })
-    .err()
-    .unwrap();
-    assert!(format!("{err:#}").contains(&format!("opening {}", newest.display())), "{err:#}");
-    assert!(!seen.is_empty() && logged.starts_with(&seen) && seen.len() < logged.len(), "{} read", seen.len());
+    log.flush().unwrap();
+    drop(log);
+    let newest = last_segment(&dir);
+    fs::remove_file(&newest).unwrap();
+    fs::create_dir(&newest).unwrap();
+
+    let recovery = Sequencer::read_log(&dir, |_| {}).err().unwrap();
+    let replayed = replay_path(&dir).err().unwrap();
+    for (reader, err) in [("recovery", recovery), ("engine replay", replayed)] {
+        assert!(format!("{err:#}").contains("events logged at seq 1 differ"), "{reader}: {err:#}");
+    }
 }
 
 /// Reply-less commands keep the channel full, and a client's reply still goes out with the first

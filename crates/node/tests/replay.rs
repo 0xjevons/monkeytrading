@@ -38,8 +38,8 @@ fn replay_fails_on_a_log_it_cannot_verify() {
     fs::write(dir.join("no-checkpoint-dir/00000000000000000000.jsonl"), tick).unwrap();
     // (case, path, the cause named)
     let cases = [
-        ("a missing file", "typo.jsonl", "no log at"),
-        ("a missing directory", "typo", "no log at"),
+        ("a missing file", "typo.jsonl", "no readable log at"),
+        ("a missing directory", "typo", "no readable log at"),
         ("an empty file", "empty.jsonl", "holds no command"),
         ("an empty directory", "empty-dir", "holds no command"),
         ("a file with no checkpoint", "no-checkpoint.jsonl", "holds no checkpoint"),
@@ -60,7 +60,7 @@ fn engine_replay_exits_non_zero_on_a_missing_log() {
     let refused = run(&missing).unwrap();
     assert!(!refused.status.success(), "{refused:?}");
     assert!(!String::from_utf8_lossy(&refused.stdout).contains("verified"), "{refused:?}");
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("no log at"), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("no readable log at"), "{refused:?}");
 
     let verified = run(Path::new(V1_DEV)).unwrap();
     assert!(verified.status.success(), "{verified:?}");

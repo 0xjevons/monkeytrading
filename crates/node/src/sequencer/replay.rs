@@ -124,7 +124,7 @@ pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
 /// - the log fails its manifest check (see `SegmentedLog::open`) or replay (see `Replay::apply`)
 /// - the log holds no command, or no checkpoint
 pub fn replay_path(path: &Path) -> anyhow::Result<Replayed> {
-    let found = fs::metadata(path).with_context(|| format!("no log at {}", path.display()))?;
+    let found = fs::metadata(path).with_context(|| format!("no readable log at {}", path.display()))?;
     let mut replay = Replay::default();
     if found.is_dir() {
         SegmentedLog::open(path, |entry| replay.apply(&entry))?;
