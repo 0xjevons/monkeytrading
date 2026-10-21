@@ -25,7 +25,12 @@ this crate and reproduce the signed state roots exactly.
   resting orders filling at the gapped open
 - Markout-based toxicity scoring that widens spreads for flow that picks off stale prices
 - Deposits credited at most once per chain reference, and all external numbers bounded
-- A keccak-256 state root over the canonical state encoding
+- A keccak-256 state root: from protocol `V9`, the root of a sparse Merkle tree over accounts,
+  markets, and the rest of the state, which each root rehashes only where commands changed it;
+  before, the hash of the canonical state encoding
+- Proofs of an account's balance and positions, and of its markets' marks, against a root, laid out
+  for a Solidity verifier (keccak-256, 32-byte nodes, explicit left and right) and checked without
+  a node
 - Versioned rules: a log activates each protocol version at a recorded seq, and a log that never
   does replays under `V2`, the rules every log starts under, to its original roots
 - From protocol `V3`, client auth recorded in the log: EIP-712 signatures, per-account nonces, and
@@ -56,6 +61,13 @@ this crate and reproduce the signed state roots exactly.
 - `src/eip712.rs` — the EIP-712 domain, the request types clients and the operator sign, and signer
   recovery
 - `src/protocol.rs` — protocol versions, and how to add one
+- `src/merkle/mod.rs` — the state tree's layout and the sparse Merkle tree
+- `src/merkle/leaf.rs` — each leaf's key and value hash, and the account and market leaves
+- `src/merkle/proof.rs` — account and market proofs, and how to check them
+- `src/merkle/state.rs` — the engine's state tree: what each root rehashes, the remaining-state
+  leaf, and account proofs
+- `src/merkle/tests.rs` — tree, proof, and work tests, and the layout fixture
+- `src/tracked.rs` — maps and sets that record what changed since the last root
 - `src/fixed.rs` — `Fixed`, the 9-decimal fixed-point type used for all money
 - `src/market.rs` — market listings, tier tables, and quote currencies with their USD conversion
 - `src/params.rs` — protocol parameters, stress levels, toxicity, and the rollover clock
@@ -74,10 +86,18 @@ this crate and reproduce the signed state roots exactly.
   differs
 - `tests/invariants/` — property tests over generated sessions (`main.rs`), the session generator
   (`session.rs`), and fills at one price (`rounding.rs`)
+- `tests/invariants/state_root.rs` — incremental roots against a rebuild, with every account's
+  proof checked, under generated sessions
+- `tests/state_root.rs` — the state root from `V9`: its activation, what each root rehashes,
+  account proofs, and roots against a rebuild
 - `tests/fixtures/eip712.json` — EIP-712 test vectors: API bodies, wallet typed data, and
   signatures
-- `examples/reference_log.rs` — writes the reference log for a new protocol version
+- `tests/fixtures/merkle.json` — state tree vectors computed with Foundry's `cast`: keys, leaf ABI
+  encodings and value hashes, a root, and proofs
+- `examples/reference_log/` — writes the reference log for a new protocol version: the session
+  (`main.rs`) and the requests and event names it uses (`helpers.rs`)
 - `examples/sign_request.rs` — a client signing a request body for the API
+- `examples/verify_proof.rs` — checks an account proof from the API against a root
 
 ## Usage
 
@@ -92,6 +112,16 @@ let root = engine.state_root();
 
 The node crate (`engine-node`) stamps and logs every command before applying it; a verifier
 replays that log with the same calls.
+
+From `V9`, `Engine::account_proof` proves an account's leaf, and the leaf of each market it holds
+a position in, against the last root computed, and `AccountProof::verify` checks it against a root
+from a signed checkpoint. `src/merkle/mod.rs` and `src/merkle/leaf.rs` document the layout a
+Solidity verifier follows. To check a proof the node serves:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/accounts/<address>/proof |
+    cargo run -p engine-core --example verify_proof -- <root>
+```
 
 A client signs each request with its account key under the EIP-712 domain of the vault, with the
 account's next nonce and an expiry at most five minutes ahead:
@@ -126,6 +156,8 @@ Two suites guard replay and accounting:
   cash is conserved, and every market's aggregates match its accounts' positions. Raise `CASES` or
   change `SEED` in `tests/invariants/main.rs` to search further. The same suite generates adds,
   reductions, and flips at one price under `V5` and checks that none realises a profit.
+  Under `V9`, the same sessions check that roots computed from what changed, at random points,
+  equal a root hashed from scratch, and that every account's proof verifies against them.
 
 ### Adding a protocol version
 
@@ -148,10 +180,11 @@ listing that declares another quote currency is refused, and a USD market has no
 as before, so earlier logs replay unchanged; its log is `v7.jsonl`. `V8` adds admin commands signed
 by the operator, refuses an unsigned operator command once anything is credited, adds every-market
 reduce-only, and refuses parameters whose spreads would refuse a close; it activates the same way,
-and its log is `v8.jsonl`. For each later version:
+and its log is `v8.jsonl`. `V9` makes the state root the root of the state tree; its log is
+`v9.jsonl`. For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
-   `examples/reference_log.rs` so it activates the new version and exercises the new rules.
+   `examples/reference_log/main.rs` so it activates the new version and exercises the new rules.
 2. Write the version's log, which the generator refuses to do over an existing file:
    `cargo run -p engine-core --example reference_log -- crates/core/tests/reference/v<N>.jsonl`
 3. Write the node's log from it, with the events each command emits:

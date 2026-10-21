@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use engine_core::auth::{ClientAuth, Operator};
@@ -17,7 +17,7 @@ use engine_core::types::{AccountId, Millis};
 use engine_core::{Engine, Fixed};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tracing::{error, info, info_span, warn};
+use tracing::{debug, error, info, info_span, warn};
 
 use crate::clock::Clock;
 use crate::log::{self, Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
@@ -366,16 +366,16 @@ impl Sequencer {
         }))
     }
 
-    /// Logs and publishes a signed state root for the last applied seq.
-    ///
-    /// TODO: hashing the whole state is O(state). Replace it with an incremental Merkle root before
-    /// accounts number in the millions.
+    /// Logs and publishes a signed state root for the last applied seq. From protocol `V9` the root
+    /// rehashes only what changed since the previous checkpoint, and API proofs are taken against it.
     /// Error cases:
     /// - nothing has been applied yet
     /// - the log cannot be written
     fn checkpoint(&mut self) -> anyhow::Result<()> {
         let seq = self.engine.last_seq().context("checkpoint before any command")?;
-        let root = self.engine.state_root();
+        let (started, root) = (Instant::now(), self.engine.state_root());
+        let (elapsed_us, work) = (started.elapsed().as_micros(), self.engine.last_root_work());
+        debug!(seq, elapsed_us, leaves = work.map(|w| w.leaves), nodes = work.map(|w| w.nodes), "state root computed");
         let cp = Checkpoint {
             seq,
             root: format!("0x{}", hex::encode(root)),

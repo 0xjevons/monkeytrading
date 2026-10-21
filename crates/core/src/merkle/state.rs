@@ -1,0 +1,312 @@
+//! The engine's state tree: which leaves each root rehashes, the leaf of the engine's remaining
+//! state, and account proofs.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use alloy_primitives::B256;
+use serde::Serialize;
+use sha3::{Digest, Keccak256};
+
+use crate::Fixed;
+use crate::account::Position;
+use crate::auth::{ClientAuth, Operator};
+use crate::engine::{Engine, Markout};
+use crate::merkle::{
+    AccountLeaf, AccountProof, MarketLeaf, MarketProof, PositionProof, SparseMerkleTree, account_key,
+    credited_ref_hash, credited_ref_key, globals_key, json_hash, market_key, markout_hash, markout_key, order_hash,
+    order_key, position_hash, position_key, request_nonce_hash, request_nonce_key,
+};
+use crate::params::ProtocolParams;
+use crate::protocol::ProtocolVersion;
+use crate::types::{AccountId, MarketId, Millis, OrderId};
+
+/// The state tree as of the last root, with the account, position, and market leaves proofs need.
+#[derive(Debug, Default)]
+pub(crate) struct StateTree {
+    tree: SparseMerkleTree,
+    root: B256,
+    seq: u64,
+    accounts: BTreeMap<AccountId, AccountLeaf>,
+    positions: BTreeMap<(AccountId, MarketId), Position>,
+    markets: BTreeMap<MarketId, MarketLeaf>,
+    work: RootWork,
+}
+
+/// Changes since the last root that no tracked map records. Positions change only in `book`,
+/// and resting orders only where `place_order` rests one and `remove_order` takes one out; each
+/// records what it changed here.
+#[derive(Debug, Default)]
+pub(crate) struct Changed {
+    markouts: BTreeSet<u64>,
+    positions: BTreeSet<(AccountId, MarketId)>,
+    orders: BTreeSet<(AccountId, OrderId)>,
+}
+
+/// What computing a state root hashed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootWork {
+    /// Leaves re-encoded: those changed since the previous root, and the remaining-state leaf.
+    pub leaves: usize,
+    /// Tree nodes rehashed above the leaves whose hash changed.
+    pub nodes: usize,
+}
+
+/// The keys of entries changed since the last root.
+struct Touched {
+    accounts: BTreeSet<AccountId>,
+    markets: BTreeSet<MarketId>,
+    nonces: BTreeSet<AccountId>,
+    refs: BTreeSet<String>,
+    changed: Changed,
+}
+
+/// The engine fields no leaf of their own holds.
+#[derive(Serialize)]
+struct Globals<'a> {
+    params: &'a Option<ProtocolParams>,
+    house_cash: Fixed,
+    benchmarks: &'a BTreeMap<String, i64>,
+    global_stress_floor: usize,
+    next_order_id: OrderId,
+    next_rollover: Option<Millis>,
+    last_seq: Option<u64>,
+    now: Millis,
+    protocol_version: ProtocolVersion,
+    client_auth: &'a Option<ClientAuth>,
+    operator: &'a Option<Operator>,
+    global_reduce_only: bool,
+    markout_base: u64,
+}
+
+impl Engine {
+    /// The keccak-256 commitment to the whole state, posted on-chain at checkpoints; anyone
+    /// replaying the log must get the same root. From `V9`, the root of the state tree (`merkle`),
+    /// which rehashes only what changed since the last root; before, the hash of the canonical state
+    /// encoding.
+    pub fn state_root(&mut self) -> [u8; 32] {
+        if self.protocol_version >= ProtocolVersion::V9 {
+            return self.merkle_root().0;
+        }
+        self.clear_touched();
+        // Every field is a map, list, string, or integer, all of which serde_json encodes.
+        let bytes = serde_json::to_vec(self).expect("engine state serialises");
+        Keccak256::digest(bytes).into()
+    }
+
+    /// The root of the state tree, rehashing the leaves changed since the last root. With no tree
+    /// yet, as on `V9`'s first root, every leaf is hashed.
+    pub(crate) fn merkle_root(&mut self) -> B256 {
+        let touched = self.take_touched();
+        let Touched { accounts, markets, nonces, refs, changed: Changed { markouts, positions, orders } } =
+            match &self.tree {
+                Some(_) => touched,
+                None => self.every_key(),
+            };
+        let mut changes = BTreeMap::from([(globals_key(), Some(json_hash(&self.globals())))]);
+        let account_leaves: Vec<(AccountId, Option<AccountLeaf>)> =
+            accounts.into_iter().map(|id| (id, self.accounts.get(&id).map(AccountLeaf::of))).collect();
+        let market_leaves: Vec<(MarketId, Option<MarketLeaf>)> =
+            markets.into_iter().map(|id| (id, self.markets.get(&id).map(MarketLeaf::of))).collect();
+        changes.extend(
+            account_leaves.iter().map(|(id, leaf)| (account_key(*id), leaf.as_ref().map(AccountLeaf::value_hash))),
+        );
+        changes.extend(
+            market_leaves.iter().map(|(id, leaf)| (market_key(*id), leaf.as_ref().map(MarketLeaf::value_hash))),
+        );
+        changes.extend(
+            nonces.into_iter().map(|id| {
+                (request_nonce_key(id), self.request_nonces.get(&id).map(|nonce| request_nonce_hash(*nonce)))
+            }),
+        );
+        changes.extend(
+            refs.iter().map(|r| (credited_ref_key(r), self.credited_refs.contains(r).then(|| credited_ref_hash(r)))),
+        );
+        changes.extend(markouts.into_iter().map(|index| (markout_key(index), self.markout(index).map(markout_hash))));
+        let position_leaves: Vec<((AccountId, MarketId), Option<Position>)> = positions
+            .into_iter()
+            .map(|(id, market)| {
+                ((id, market), self.accounts.get(&id).and_then(|acct| acct.positions.get(&market)).copied())
+            })
+            .collect();
+        changes.extend(
+            position_leaves
+                .iter()
+                .map(|((id, market), pos)| (position_key(*id, *market), pos.as_ref().map(position_hash))),
+        );
+        changes.extend(orders.into_iter().map(|(id, order_id)| {
+            let order = self.accounts.get(&id).and_then(|acct| acct.orders.get(&order_id));
+            (order_key(order_id), order.map(|order| order_hash(id, order)))
+        }));
+
+        // A seq has been applied: `V9` takes effect through a sequenced `ActivateProtocol`.
+        let seq = self.last_seq.expect("a state root under V9 follows a command");
+        let state = self.tree.get_or_insert_with(StateTree::default);
+        let leaves = changes.len();
+        let nodes = state.tree.update(changes);
+        for (id, leaf) in account_leaves {
+            match leaf {
+                Some(leaf) => state.accounts.insert(id, leaf),
+                None => state.accounts.remove(&id),
+            };
+        }
+        for (id, leaf) in market_leaves {
+            match leaf {
+                Some(leaf) => state.markets.insert(id, leaf),
+                None => state.markets.remove(&id),
+            };
+        }
+        for (id, pos) in position_leaves {
+            match pos {
+                Some(pos) => state.positions.insert(id, pos),
+                None => state.positions.remove(&id),
+            };
+        }
+        state.root = state.tree.root();
+        state.seq = seq;
+        state.work = RootWork { leaves, nodes };
+        state.root
+    }
+
+    /// Clears the record of what changed since the last root, for a root that does not use it.
+    pub(crate) fn clear_touched(&mut self) {
+        self.take_touched();
+    }
+
+    /// The proof of `account`'s leaf, of each of its position leaves, and of the leaf of each
+    /// market it holds a position in, against the last state root computed. `None` before the
+    /// first root under `V9`, or for an account that root does not hold.
+    pub fn account_proof(&self, account: AccountId) -> Option<AccountProof> {
+        let state = self.tree.as_ref()?;
+        let leaf = state.accounts.get(&account)?.clone();
+        let proof = |key| state.tree.proof(key).expect("every leaf kept for proofs is in the tree");
+        let held = state.positions.range((account, MarketId::MIN)..=(account, MarketId::MAX));
+        let (positions, markets) = held
+            .map(|((_, market), position)| {
+                let siblings = proof(position_key(account, *market));
+                // Positions are only ever opened in listed markets, and listings are never removed.
+                let market_leaf = state.markets.get(market).expect("a position's market has a leaf").clone();
+                (
+                    PositionProof { market: *market, position: *position, siblings },
+                    MarketProof { market: *market, leaf: market_leaf, siblings: proof(market_key(*market)) },
+                )
+            })
+            .unzip();
+        let siblings = proof(account_key(account));
+        Some(AccountProof { seq: state.seq, root: state.root, account, leaf, siblings, positions, markets })
+    }
+
+    /// What the last state root hashed, or `None` before the first root under `V9`.
+    pub fn last_root_work(&self) -> Option<RootWork> {
+        self.tree.as_ref().map(|state| state.work)
+    }
+
+    /// Records that `account`'s position in `market` changed, for the state root.
+    pub(crate) fn record_position(&mut self, account: AccountId, market: MarketId) {
+        self.changed.positions.insert((account, market));
+    }
+
+    /// Records that `account`'s resting order `order_id` was added or removed, for the state root.
+    pub(crate) fn record_order(&mut self, account: AccountId, order_id: OrderId) {
+        self.changed.orders.insert((account, order_id));
+    }
+
+    /// Queues a markout, recording its index for the state root.
+    pub(crate) fn queue_markout(&mut self, markout: Markout) {
+        self.markouts.push_back(markout);
+        self.changed.markouts.insert(self.markout_base + self.markouts.len() as u64 - 1);
+    }
+
+    /// Takes the markout at the front of the queue, recording its index for the state root. From
+    /// `V9` the next markout's index moves up by one; earlier versions keep every index at 0, which
+    /// their encoding leaves out.
+    pub(crate) fn pop_markout(&mut self) -> Option<Markout> {
+        let markout = self.markouts.pop_front()?;
+        self.changed.markouts.insert(self.markout_base);
+        if self.protocol_version >= ProtocolVersion::V9 {
+            self.markout_base += 1;
+        }
+        Some(markout)
+    }
+
+    /// The queued markout at `index`, if it is still queued.
+    fn markout(&self, index: u64) -> Option<&Markout> {
+        let position = index.checked_sub(self.markout_base)?;
+        self.markouts.get(usize::try_from(position).ok()?)
+    }
+
+    /// The keys of everything changed since the last root, clearing the record.
+    fn take_touched(&mut self) -> Touched {
+        Touched {
+            accounts: self.accounts.take_touched(),
+            markets: self.markets.take_touched(),
+            nonces: self.request_nonces.take_touched(),
+            refs: self.credited_refs.take_touched(),
+            changed: std::mem::take(&mut self.changed),
+        }
+    }
+
+    /// The key of every entry, for a root with no tree to update.
+    fn every_key(&self) -> Touched {
+        let accounts = || self.accounts.iter();
+        Touched {
+            accounts: self.accounts.keys().copied().collect(),
+            markets: self.markets.keys().copied().collect(),
+            nonces: self.request_nonces.keys().copied().collect(),
+            refs: self.credited_refs.iter().cloned().collect(),
+            changed: Changed {
+                markouts: (self.markout_base..).take(self.markouts.len()).collect(),
+                positions: accounts()
+                    .flat_map(|(id, acct)| acct.positions.keys().map(|market| (*id, *market)))
+                    .collect(),
+                orders: accounts().flat_map(|(id, acct)| acct.orders.keys().map(|order_id| (*id, *order_id))).collect(),
+            },
+        }
+    }
+
+    /// The fields the remaining-state leaf holds.
+    fn globals(&self) -> Globals<'_> {
+        // Every field is named, so a field added to `Engine` fails to compile until a leaf holds it.
+        let Engine {
+            params,
+            markets: _,
+            accounts: _,
+            house_cash,
+            benchmarks,
+            credited_refs: _,
+            global_stress_floor,
+            next_order_id,
+            next_rollover,
+            markouts: _,
+            last_seq,
+            now,
+            protocol_version,
+            client_auth,
+            request_nonces: _,
+            operator,
+            global_reduce_only,
+            markout_base,
+            changed: _,
+            tree: _,
+        } = self;
+        Globals {
+            params,
+            house_cash: *house_cash,
+            benchmarks,
+            global_stress_floor: *global_stress_floor,
+            next_order_id: *next_order_id,
+            next_rollover: *next_rollover,
+            last_seq: *last_seq,
+            now: *now,
+            protocol_version: *protocol_version,
+            client_auth,
+            operator,
+            global_reduce_only: *global_reduce_only,
+            markout_base: *markout_base,
+        }
+    }
+}
+
+/// Whether a markout index is zero, as it stays before `V9`.
+pub(crate) fn is_zero(index: &u64) -> bool {
+    *index == 0
+}

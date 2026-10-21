@@ -5,11 +5,10 @@
 //! admin and stress in `admin.rs`, client request auth in `auth.rs`, orders and pricing in
 //! `execution.rs`, and close-outs in `closeout.rs`.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
 
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Keccak256};
 
 use crate::Fixed;
 use crate::account::{Account, Position};
@@ -17,10 +16,12 @@ use crate::auth::{ClientAuth, Operator};
 use crate::command::{Command, Sequenced};
 use crate::event::{Event, Reject};
 use crate::fixed::Rounding;
-use crate::market::MarketSpec;
+use crate::market::{MarketSpec, QuoteCurrency};
+use crate::merkle::state::{Changed, StateTree, is_zero};
 use crate::params::ProtocolParams;
 use crate::price::{Index, MAX_QUOTE_LEAD_MS, SourceQuote, compute_index};
 use crate::protocol::ProtocolVersion;
+use crate::tracked::{TrackedMap, TrackedSet};
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
 
 /// Clamp on a single markout, so one wild print cannot dominate an account's toxicity score.
@@ -37,14 +38,14 @@ pub enum SequenceError {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Engine {
     pub(crate) params: Option<ProtocolParams>,
-    pub(crate) markets: BTreeMap<MarketId, MarketState>,
-    pub(crate) accounts: BTreeMap<AccountId, Account>,
+    pub(crate) markets: TrackedMap<MarketId, MarketState>,
+    pub(crate) accounts: TrackedMap<AccountId, Account>,
     /// House cash. NAV is this minus clients' unrealised PnL.
     pub(crate) house_cash: Fixed,
     /// Annual benchmark rates in bps, keyed by name ("SOFR", ...).
     pub(crate) benchmarks: BTreeMap<String, i64>,
     /// Custody references already credited (deposits and house capital), so none applies twice.
-    pub(crate) credited_refs: BTreeSet<String>,
+    pub(crate) credited_refs: TrackedSet<String>,
     pub(crate) global_stress_floor: usize,
     pub(crate) next_order_id: OrderId,
     pub(crate) next_rollover: Option<Millis>,
@@ -61,14 +62,24 @@ pub struct Engine {
     pub(crate) client_auth: Option<ClientAuth>,
     /// Each signer's next request nonce, the accounts' and the operator's; a signer missing here
     /// is at 0.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) request_nonces: BTreeMap<AccountId, u64>,
+    #[serde(default, skip_serializing_if = "TrackedMap::is_empty")]
+    pub(crate) request_nonces: TrackedMap<AccountId, u64>,
     /// Who signs admin commands from `V8`; recorded once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) operator: Option<Operator>,
     /// Every market is reduce-only, whatever its own flag says.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) global_reduce_only: bool,
+    /// The state tree's index for the front markout: 0 before `V9`, then one more per markout.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) markout_base: u64,
+    // Not state and not encoded; an engine rebuilt without them hashes every leaf at its first root.
+    /// Markouts, positions, and resting orders changed since the last state root.
+    #[serde(skip)]
+    pub(crate) changed: Changed,
+    /// The state tree as of the last root under `V9`; absent until then.
+    #[serde(skip)]
+    pub(crate) tree: Option<StateTree>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -182,14 +193,6 @@ impl Engine {
         // After the command, so a price arriving at the horizon is the one marked against.
         self.process_markouts();
         Ok(events)
-    }
-
-    /// Keccak-256 of the canonical state encoding. Posted on-chain at checkpoints; anyone replaying
-    /// the log must get the same root.
-    pub fn state_root(&self) -> [u8; 32] {
-        // Every field is a map, list, string, or integer, all of which serde_json encodes.
-        let bytes = serde_json::to_vec(self).expect("engine state serialises");
-        Keccak256::digest(bytes).into()
     }
 
     /// Seq of the last applied command, or `None` before genesis.
@@ -354,11 +357,12 @@ impl Engine {
     /// Updates a market's open flag from its schedule, emitting the transition.
     pub(crate) fn refresh_session(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
         let now = self.now;
-        let Some(market) = self.markets.get_mut(&market_id) else { return };
+        let Some(market) = self.markets.get(&market_id) else { return };
         let open = market.spec.schedule.is_open(now);
         if open == market.open {
             return;
         }
+        let market = self.markets.get_mut(&market_id).expect("found above");
         market.open = open;
         if open {
             market.stress.move_ref = None;
@@ -468,14 +472,11 @@ impl Engine {
     /// Sets `mid` as the FX mark of every market that converts at `fx_market`'s index and that `mid`
     /// can convert, and returns those markets.
     fn mark_fx(&mut self, fx_market: MarketId, mid: Fixed) -> Vec<MarketId> {
-        let mut marked = Vec::new();
-        for (market_id, market) in &mut self.markets {
-            let currency = market.spec.quote_currency;
-            if currency.fx_market() == Some(fx_market) && currency.converts_at(mid) {
-                market.fx_mark = Some(mid);
-                marked.push(*market_id);
-            }
-        }
+        let converts = |currency: QuoteCurrency| currency.fx_market() == Some(fx_market) && currency.converts_at(mid);
+        let marked: Vec<MarketId> =
+            self.markets.iter().filter(|(_, m)| converts(m.spec.quote_currency)).map(|(id, _)| *id).collect();
+        // Only the markets it marks are taken for change, so the state root rehashes those alone.
+        marked.iter().for_each(|id| self.markets.get_mut(id).expect("found above").fx_mark = Some(mid));
         marked
     }
 
@@ -484,7 +485,7 @@ impl Engine {
         let Some(params) = &self.params else { return };
         let weight = params.toxicity.ewma_weight_bps;
         while self.markouts.front().is_some_and(|markout| markout.due <= self.now) {
-            let markout = self.markouts.pop_front().expect("front exists");
+            let markout = self.pop_markout().expect("front exists");
             let mark = self.markets.get(&markout.market).and_then(|market| market.mark);
             let (Some(mark), Some(acct)) = (mark, self.accounts.get_mut(&markout.account)) else {
                 continue;

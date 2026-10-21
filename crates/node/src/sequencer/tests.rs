@@ -4,13 +4,15 @@ use std::path::PathBuf;
 
 use engine_core::command::AdminCommand;
 
+use crate::clock::test_clock::TestClock;
 use crate::log::{Manifest, SegmentedLog, segment_seq};
 use crate::test_support::{
-    SEGMENT_COMMANDS, TRADER, TestSequencer, deposit, dev_config, log_messages, scratch_dir, sequencer_config,
-    trusted_now, withdraw,
+    SEGMENT_COMMANDS, TRADER, TestSequencer, deposit, dev_config, log_messages, sample_around, scratch_dir,
+    sequencer_config, trusted_now, withdraw,
 };
 
 const V1_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v1-dev.jsonl");
+const V3_REFERENCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference/v3.jsonl");
 
 fn tick(seq: u64) -> LogEntry {
     LogEntry::Command(CommandEntry { sequenced: Sequenced { seq, ts: 0, cmd: Command::Tick }, events: None })
@@ -277,6 +279,37 @@ fn protocol_activation_and_genesis_wait_for_trusted_time_then_go_in_order() {
     assert!(matches!(written[2], Command::Admin(AdminCommand::ActivateProtocol { .. })), "{:?}", written[2]);
     assert!(matches!(written.last(), Some(Command::HouseCapital { .. })), "{written:?}");
     assert!(!seq.needs_genesis());
+}
+
+#[test]
+fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
+    let dir = scratch_dir("activation-v3");
+    fs::create_dir_all(&dir).unwrap();
+    fs::copy(V3_REFERENCE, dir.join("00000000000000000000.jsonl")).unwrap();
+    let before = replay(&entries(&dir)).unwrap();
+    // The node records the operator at the log's next seq and activates the latest version after it.
+    let activated = before.engine.last_seq().unwrap() + 2;
+    // The log is stamped ahead of the system clock, so the host clock and trusted time agree on a
+    // time just after its last command.
+    let stamps = Arc::new(TestClock::at(before.engine.now() + 1_000));
+    let (stream, _) = broadcast::channel(16);
+    let (manifest, _) = watch::channel(Manifest::default());
+    let cfg =
+        SequencerConfig { client_auth: signed(31_337), clock: stamps.clone(), ..sequencer_config(&dir, manifest) };
+    let key = Arc::new(EnclaveKey::generate());
+    let mut seq = Sequencer::recover(cfg, key, stream, mpsc::unbounded_channel().0).unwrap();
+    seq.trust(sample_around(stamps.as_ref())).unwrap();
+    seq.activate_protocol().unwrap();
+    // The V3 checkpoints still verify under the hash of the state encoding, and the activation's
+    // checkpoint under the state tree, whose proofs hold against it.
+    let written = entries(&dir);
+    let replayed = replay(&written).unwrap();
+    assert_eq!(replayed.activations, [(ProtocolVersion::V3, 1), (ProtocolVersion::LATEST, activated)]);
+    assert!(replayed.checkpoints > before.checkpoints);
+    let Some(LogEntry::Checkpoint(last)) = written.last() else { panic!("the activation is checkpointed") };
+    let account = *replayed.engine.accounts().keys().next().unwrap();
+    let proof = replayed.engine.account_proof(account).unwrap();
+    assert_eq!((proof.seq, proof.verify(last.root.parse().unwrap())), (activated, true));
 }
 
 #[test]

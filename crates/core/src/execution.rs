@@ -112,6 +112,7 @@ impl Engine {
                 };
                 self.accounts.get_mut(&req.account).expect("validated").orders.insert(order_id, order);
                 self.markets.get_mut(&req.market).expect("validated").resting.insert(order_id, req.account);
+                self.record_order(req.account, order_id);
                 events.push(Event::OrderAccepted { account: req.account, client_id: req.client_id, order_id });
                 self.trigger_resting(req.market, events);
             }
@@ -383,8 +384,9 @@ impl Engine {
         acct.balance += realised_pnl - fee;
         self.house_cash -= realised_pnl - fee;
 
+        self.record_position(exec.account, exec.market);
         if !exec.liquidation {
-            self.markouts.push_back(Markout {
+            self.queue_markout(Markout {
                 due: markout_due,
                 account: exec.account,
                 market: exec.market,
@@ -415,6 +417,7 @@ impl Engine {
         if let Some(market) = self.markets.get_mut(&order.market) {
             market.resting.remove(&order_id);
         }
+        self.record_order(account, order_id);
         Some(order)
     }
 }

@@ -75,13 +75,15 @@ The reasoning behind each of these choices is recorded in the decision issues
 
 The engine is deterministic: given the same sequence of commands, it reaches the same state on any
 machine, to the last unit. The node streams each command it sequences, with the events it produced,
-and the enclave periodically signs a hash of the whole state. `engine replay` re-applies a log from
-the beginning and checks the hash at every checkpoint against the state the published code
-computes; checking the signatures themselves arrives with
-[#24](https://github.com/0xjevons/monkeytrading/issues/24). Replay reads a node's log directory or
-the archive the node serves: its completed log segments, with a manifest of their seq ranges and
-SHA-256 hashes. A stream subscriber can start or resume at any message offset, and gets the log
-from disk and then live, each message once.
+and the enclave periodically signs a root that commits to the whole state: a Merkle tree over
+accounts, markets, and the rest of the state, so each checkpoint rehashes only what changed. Any
+account can fetch a proof of its balance and positions against the last checkpoint's root and check
+it without the node. `engine replay` re-applies a log from the beginning and checks the root at
+every checkpoint against the state the published code computes; checking the signatures themselves
+arrives with [#24](https://github.com/0xjevons/monkeytrading/issues/24). Replay reads a node's log
+directory or the archive the node serves: its completed log segments, with a manifest of their seq
+ranges and SHA-256 hashes. A stream subscriber can start or resume at any message offset, and gets
+the log from disk and then live, each message once.
 
 Every command carries the time the sequencer stamped it with. The enclave's host supplies its
 clock, so the node checks that clock against signed time from several independent

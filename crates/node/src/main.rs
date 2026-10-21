@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Replay { log: path } => {
             init_logging("info")?;
             let entries = if path.is_dir() { log::SegmentedLog::open(&path)?.entries } else { log::read_all(&path)? };
-            let replayed = replay(&entries)?;
+            let mut replayed = replay(&entries)?;
             let activations: Vec<String> =
                 replayed.activations.iter().map(|(version, seq)| format!("{version:?} from seq {seq}")).collect();
             println!(

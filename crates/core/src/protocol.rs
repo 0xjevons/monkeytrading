@@ -11,9 +11,12 @@
 //!    fresh log.
 //! 2. Gate each changed rule on `self.protocol_version >= ProtocolVersion::Vn`, and leave the
 //!    earlier path as it is.
-//! 3. Skip new engine state from serialization while it holds its default
-//!    (`skip_serializing_if`), so roots before activation do not change. A request type that
-//!    changes gets new typed structs under a new `eip712::DOMAIN_VERSION`, chosen by protocol
+//! 3. Keep the roots of earlier versions. Before `V9` the root hashes the engine's encoding, so
+//!    skip new engine state from serialization while it holds its default (`skip_serializing_if`).
+//!    From `V9` the root hashes the state tree's leaves (`merkle`): the leaf encodings name every
+//!    field they cover and refuse to compile until new state has a leaf, so put it in one and
+//!    encode it only while it differs from its default, or under the new version. A request type
+//!    that changes gets new typed structs under a new `eip712::DOMAIN_VERSION`, chosen by protocol
 //!    version, and the earlier ones stay so earlier signatures still verify. The operator signs
 //!    an admin command as its JSON, so a field added to anything an admin command carries is
 //!    skipped while it holds its default too, or logged signatures stop verifying.
@@ -55,11 +58,14 @@ pub enum ProtocolVersion {
     /// command is refused. One command makes every market reduce-only, and no parameters may let
     /// stress and toxicity spreads price a closing trade at the price itself.
     V8,
+    /// The state root is the root of the state tree (`merkle`), which each root updates where
+    /// commands changed it, and which proves an account's leaf against a posted root.
+    V9,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V8;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V9;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

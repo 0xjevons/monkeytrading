@@ -36,6 +36,8 @@ verifies its checkpoints.
   `OPERATOR_KEY`, and submit it over TLS pinned to the node's attested key; the node holds only the
   operator's public key, recorded in the log, and refuses a request before the log unless it carries
   the operator's signature, next nonce, and an unexpired expiry
+- Proofs of an account's balance and positions, and of its positions' marks, against the last
+  checkpoint's state root, from protocol `V9`
 - Supervised tasks: any task stopping stops the node, and SIGTERM drains to a final checkpoint
 - Live crypto prices from Coinbase, Kraken, and Bitstamp over WebSocket: one supervised task per
   venue, quotes stamped with the venue's own time, and reconnects with backoff
@@ -80,6 +82,8 @@ verifies its checkpoints.
 - `src/api/auth_tests.rs` — signed-request API tests: signatures, nonces, expiries, refused
   accounts, and racing requests
 - `src/api/history.rs` — the account history route: its parameters and limits
+- `src/api/proof_tests.rs` — account proof API tests, including the state tree dev scenario: 100k
+  accounts, checkpoint work, a proof checked against its logged root, and older logs replayed
 - `src/api/tests.rs` — API tests, including the dev scenarios of the resumable stream and archive,
   and of account history, and `Retry-After`
 - `src/history/mod.rs` — the history index: which events name an account, the startup check
@@ -230,7 +234,8 @@ outside its threat model.
 
 Endpoints: `GET /v1/health`, `GET /v1/attestation`, `GET /v1/markets`, `GET /v1/house`,
 `GET /v1/accounts/{address}`, `GET /v1/accounts/{address}/nonce`,
-`GET /v1/accounts/{address}/history`, `POST /v1/orders`, `POST /v1/orders/cancel`,
+`GET /v1/accounts/{address}/history`, `GET /v1/accounts/{address}/proof`,
+`POST /v1/orders`, `POST /v1/orders/cancel`,
 `POST /v1/withdrawals` (mock custody only until withdrawals are paid on-chain), `POST /v1/admin`
 (the operator's), `POST /v1/dev/deposit` (mock custody only), `GET /v1/stream` (WebSocket), and
 `GET /v1/archive/{file}` (`manifest.jsonl` or a segment it lists).
@@ -334,6 +339,15 @@ any deposit or house capital is credited, the engine refuses an unsigned operato
 genesis, which credits its house capital last, runs unsigned. The first start under protocol `V8`
 records `operator.public_key`, with the custody chain id and vault, in the log; changing it needs a
 fresh log, and `engine replay` prints the operator a log records.
+
+`/v1/accounts/{address}/proof` returns, against the state root of the last checkpoint, whose `seq`
+and `root` it names: the account's leaf (balance, withdrawal nonce, toxicity score, and number of
+open positions) with its sibling hashes; each position (its market, qty, and entry) with its leaf's
+siblings; and the leaf and siblings of each market it holds a position in. Check `root` against that
+checkpoint's signed entry, then check the proof with `engine-core`'s `AccountProof::verify` or its
+`verify_proof` example. An account credited since the last checkpoint is not in its root yet, and
+gets 404 until the next one. Each checkpoint logs, at `debug`, how long its root took and how many
+leaves and tree nodes it hashed.
 
 ## Configuration
 

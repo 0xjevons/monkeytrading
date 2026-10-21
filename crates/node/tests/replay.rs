@@ -14,7 +14,7 @@ const V1_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v1-dev
 
 #[test]
 fn a_log_written_before_protocol_versions_replays_to_its_roots() {
-    let replayed = replay(&log::read_all(Path::new(V1_DEV)).unwrap()).unwrap();
+    let mut replayed = replay(&log::read_all(Path::new(V1_DEV)).unwrap()).unwrap();
     assert_eq!((replayed.commands, replayed.checkpoints), (63, 3));
     assert_eq!(replayed.engine.protocol_version(), ProtocolVersion::V2);
     assert!(replayed.activations.is_empty());

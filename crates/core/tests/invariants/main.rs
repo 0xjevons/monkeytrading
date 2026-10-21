@@ -10,6 +10,7 @@
 mod common;
 mod rounding;
 mod session;
+mod state_root;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};

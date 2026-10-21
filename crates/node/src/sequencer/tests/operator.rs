@@ -3,7 +3,7 @@
 use super::*;
 
 #[test]
-fn a_v7_log_records_the_operator_and_activates_v8_at_its_next_seq() {
+fn a_v7_log_records_the_operator_and_activates_the_latest_version_at_its_next_seq() {
     let dir = scratch_dir("activation-v7");
     let v7 = vec![
         Command::Admin(AdminCommand::SetClientAuth(signed(31_337))),
@@ -18,11 +18,14 @@ fn a_v7_log_records_the_operator_and_activates_v8_at_its_next_seq() {
         cmds[3..],
         [
             Command::Admin(AdminCommand::SetOperator(dev_config().operator().unwrap())),
-            Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V8 }),
+            Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }),
         ]
     );
     let replayed = replay(&written).unwrap();
-    assert_eq!(replayed.activations, [(ProtocolVersion::V3, 1), (ProtocolVersion::V7, 2), (ProtocolVersion::V8, 4)]);
+    assert_eq!(
+        replayed.activations,
+        [(ProtocolVersion::V3, 1), (ProtocolVersion::V7, 2), (ProtocolVersion::LATEST, 4)]
+    );
 }
 
 #[test]
