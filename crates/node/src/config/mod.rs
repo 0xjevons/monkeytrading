@@ -277,7 +277,7 @@ pub struct RoughtimeServer {
 #[serde(deny_unknown_fields)]
 pub struct HistorySection {
     /// Where the node keeps the account history index, which it derives from the log alone:
-    /// removing the directory rebuilds the index from the log.
+    /// removing the directory while the node is stopped rebuilds the index from the log.
     pub dir: PathBuf,
     /// How long an event stays in the index, counted back from the sequenced time of the newest
     /// command it holds. The log keeps every event regardless.
@@ -498,6 +498,17 @@ impl VenuesSection {
     }
 }
 
+impl HistorySection {
+    /// The retention in milliseconds, the unit of sequenced time.
+    /// Error cases:
+    /// - the retention is zero, which would empty the index at every write
+    /// - it is too long to count in milliseconds
+    pub fn retention_ms(&self) -> anyhow::Result<Millis> {
+        anyhow::ensure!(!self.retention.is_zero(), "must be non-zero");
+        Millis::try_from(self.retention.as_millis()).context("too long")
+    }
+}
+
 /// Whether `address` is a non-empty host, a colon, and a port number.
 fn is_host_port(address: &str) -> bool {
     address.rsplit_once(':').is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
@@ -510,17 +521,6 @@ fn public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<VerifyingKey
     let bytes = STANDARD.decode(String::deserialize(deserializer)?).map_err(D::Error::custom)?;
     let bytes: [u8; 32] = bytes.try_into().map_err(|_| D::Error::custom("an Ed25519 public key is 32 bytes"))?;
     VerifyingKey::from_bytes(&bytes).map_err(D::Error::custom)
-}
-
-impl HistorySection {
-    /// The retention in milliseconds, the unit of sequenced time.
-    /// Error cases:
-    /// - the retention is zero, which would empty the index at every write
-    /// - it is too long to count in milliseconds
-    pub fn retention_ms(&self) -> anyhow::Result<Millis> {
-        anyhow::ensure!(!self.retention.is_zero(), "must be non-zero");
-        Millis::try_from(self.retention.as_millis()).context("too long")
-    }
 }
 
 #[cfg(test)]

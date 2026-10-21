@@ -111,7 +111,7 @@ impl History {
                     logged.as_ref() == Some(&last),
                     "the history index in {} does not match the log: the log ends before seq {seq}, the last \
                      command the index took, or holds another command there. Once the log is known to be right, \
-                     remove the directory to rebuild the index",
+                     remove the directory, with the node stopped, to rebuild the index",
                     cfg.dir.display()
                 );
                 Offset::start_of(seq + 1)
@@ -122,14 +122,24 @@ impl History {
         Ok(Self { writer, reader: Reader::new(path, ready_rx), ready, ready_at: None, resume_at })
     }
 
-    /// Records `tip`, the last command in the log once recovery has written to it: readers are let
-    /// in once the index has taken it, or now when it already has.
-    pub fn catch_up_to(&mut self, tip: Option<u64>) {
+    /// Records `tip`, the last command in the log recovery replayed: readers are let in once the
+    /// index has taken it, or now when it already has. A log that ends before the last command the
+    /// index took was swapped since `open` checked it, so the index is refused.
+    /// Error cases:
+    /// - `tip` is before the last command the index took
+    pub fn catch_up_to(&mut self, tip: Option<u64>) -> anyhow::Result<()> {
+        if let Some(taken) = self.resume_at.seq.checked_sub(1) {
+            ensure!(
+                tip.is_some_and(|tip| tip >= taken),
+                "the log recovery replayed ends before seq {taken}, the last command the history index took"
+            );
+        }
         self.ready_at = tip.filter(|tip| *tip >= self.resume_at.seq);
         if self.ready_at.is_none() {
             self.ready.send_replace(true);
             info!(?tip, "history index holds the log's tip");
         }
+        Ok(())
     }
 
     /// Where the index resumes: the first command it has not taken.

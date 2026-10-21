@@ -65,7 +65,10 @@ verifies its checkpoints.
 - `src/history/mod.rs` — the history index: which events name an account, the startup check
   against the log, and the supervised task that follows the log into the index
 - `src/history/store.rs` — the index's SQLite schema, its writer, and its page reader
-- `src/history/tests.rs` — history index tests
+- `src/history/tests/mod.rs` — history index tests: pages, filters, retention, following the log,
+  and restarts
+- `src/history/tests/recovery.rs` — startup checks against the log, readiness to serve, and
+  failures
 - `src/test_support.rs` — the shared test harness
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
 - `src/trusted_time/mod.rs` — the trusted time task: queries the Roughtime servers, backs off
@@ -188,7 +191,8 @@ the nonce. Two requests that race for one nonce are both sequenced, and the engi
 second with `invalid_nonce`.
 
 The first start records `auth`, and under `eip712` the custody chain id and vault, in the log;
-changing any of them needs a fresh log.
+changing any of them needs a fresh log, and with it a fresh `history.dir`, both removed while the
+node is stopped.
 
 `/v1/accounts/{address}/history` returns `{"events": [...], "next": ...}`: the account's events,
 newest first. Each event carries its `cursor`, `<seq>:<index>`, which is the seq of the command that
@@ -212,8 +216,10 @@ its log, the index checks that the log holds the last command it took, unchanged
 it. If the log ends before that command or holds another one there, the log was rolled back or
 replaced, and the node refuses to start (`history_recovery_failed`) with the log as it found it. A
 power loss can also leave the index ahead of the log, since neither syncs every write. SQLite opens
-the file in defensive mode, with its schema untrusted and cell sizes checked, and refuses a schema
-this code did not create. Removing `history.dir` rebuilds the index from the log's segments.
+the file in defensive mode, with triggers and views off, its schema untrusted, and cell sizes
+checked, and every write and read refuses, inside its own transaction, a schema this code did not
+create. Removing `history.dir` while the node is stopped rebuilds the index from the log's
+segments.
 Commands logged before events were recorded add nothing to history.
 
 ## Configuration

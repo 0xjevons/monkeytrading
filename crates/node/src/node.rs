@@ -114,7 +114,9 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         info!(markets = cfg.genesis.markets.len(), "genesis queued for the first trusted time sample");
         seq.genesis(&cfg.genesis)?;
     }
-    history.catch_up_to(seq.last_seq());
+    history
+        .catch_up_to(seq.last_seq())
+        .inspect_err(|e| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}"))?;
 
     let (tx, rx) = mpsc::channel::<Request>(CHANNEL_CAPACITY);
     // TODO: pin the sequencer to a dedicated core once latency matters.
@@ -257,7 +259,7 @@ mod tests {
     async fn a_history_index_the_log_contradicts_stops_the_node_before_it_writes_to_the_log() {
         let (dir, index) = (scratch_dir("node-history-refused"), scratch_dir("node-history-refused-index"));
         let node = TestSequencer::start(&dir, 1024);
-        let history = TestHistory::start(&node, &dir, &index).unwrap();
+        let history = TestHistory::start(&node, &dir, &index).await.unwrap();
         node.submit(deposit(1, "dep-1")).await;
         // The log as it stands now, which a host that rolls the log back would restore.
         let older = scratch_dir("node-history-refused-older");

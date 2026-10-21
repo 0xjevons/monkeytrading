@@ -156,7 +156,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
     let clock: Arc<dyn Clock> = Arc::new(TestClock::at(last_ts.max().unwrap() + 1_000));
 
     let node = TestSequencer::start_at(&dir, 1024, clock.clone());
-    let history = TestHistory::start(&node, &dir, &index).unwrap();
+    let history = TestHistory::start(&node, &dir, &index).await.unwrap();
     node.submit(deposit(100, "dep-1")).await;
     node.submit(withdraw(40)).await;
     node.stop().await;
@@ -170,7 +170,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
 
     let segments = Manifest::load(&dir).unwrap().segments.len();
     let node = TestSequencer::start_at(&dir, 1024, clock.clone());
-    let history = TestHistory::start(&node, &dir, &index).unwrap();
+    let history = TestHistory::start(&node, &dir, &index).await.unwrap();
     for n in 0..SEGMENT_COMMANDS {
         node.submit(deposit(1, &format!("dep-rotate-{n}"))).await;
     }
@@ -186,7 +186,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
 
     fs::remove_dir_all(&index).unwrap();
     let node = TestSequencer::start_at(&dir, 1024, clock.clone());
-    let history = TestHistory::start(&node, &dir, &index).unwrap();
+    let history = TestHistory::start(&node, &dir, &index).await.unwrap();
     node.stop().await;
     history.finish().await.unwrap();
     assert_eq!(every_history_page(addr, &accounts).await, second);
@@ -196,7 +196,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
 async fn history_refuses_a_malformed_address_cursor_kind_or_limit() {
     let (dir, index) = (scratch_dir("history-params"), scratch_dir("history-params-index"));
     let node = TestSequencer::start(&dir, 16);
-    let history = TestHistory::start(&node, &dir, &index).unwrap();
+    let history = TestHistory::start(&node, &dir, &index).await.unwrap();
     node.submit(deposit(100, "dep-1")).await;
     node.stop().await;
     history.finish().await.unwrap();
@@ -215,7 +215,7 @@ async fn history_refuses_a_malformed_address_cursor_kind_or_limit() {
 async fn history_answers_503_while_catching_up_and_500_when_unreadable() {
     let (dir, index) = (scratch_dir("history-unavailable"), scratch_dir("history-unavailable-index"));
     let node = TestSequencer::start(&dir, 16);
-    let history = TestHistory::start(&node, &dir, &index).unwrap();
+    let history = TestHistory::start(&node, &dir, &index).await.unwrap();
     node.submit(deposit(100, "dep-1")).await;
     node.stop().await;
     history.finish().await.unwrap();

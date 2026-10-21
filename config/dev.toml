@@ -16,7 +16,8 @@ segment_commands = 1000
 checkpoint_every = 1000
 tick = "250ms"
 # Recorded in the log on first start, with the custody chain id and vault under
-# "eip712"; changing it needs a fresh log.
+# "eip712"; changing it needs a fresh log and history index (remove data/dev/log
+# and data/dev/history with the node stopped).
 auth = "none"
 
 # Limits on the public API, served over TLS with a key generated in the enclave. A client is its
@@ -120,7 +121,8 @@ address = "time.txryan.com:5319"
 public_key = "iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA="
 
 [history]
-# The account history index, derived from the log; removing the directory rebuilds it from the log.
+# The account history index, derived from the log; removing the directory while
+# the node is stopped rebuilds it from the log.
 dir = "data/dev/history"
 # Events older than this, counted back from the newest command, leave the index; the log keeps them.
 retention = "365d"

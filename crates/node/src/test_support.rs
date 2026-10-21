@@ -112,21 +112,22 @@ pub struct TestHistory {
 }
 
 impl TestHistory {
-    /// Opens the index in `index` against the log `node` writes in `dir`, and runs it, with readers
-    /// let in at once.
+    /// Opens the index in `index` against the log `node` writes in `dir`, and runs it, letting
+    /// readers in once it has taken the log's last command now.
     /// Error cases:
     /// - the index does not match the log (see `History::open`)
-    pub fn start(node: &TestSequencer, dir: &Path, index: &Path) -> anyhow::Result<Self> {
-        Self::start_with_tip(node, dir, index, None)
+    pub async fn start(node: &TestSequencer, dir: &Path, index: &Path) -> anyhow::Result<Self> {
+        let tip = node.next_seq().await.checked_sub(1);
+        Self::start_with_tip(node, dir, index, tip)
     }
 
     /// As `start`, but readers are let in once the index has taken `tip`.
     /// Error cases:
-    /// - the index does not match the log (see `History::open`)
+    /// - the index does not match the log (see `History::open` and `History::catch_up_to`)
     pub fn start_with_tip(node: &TestSequencer, dir: &Path, index: &Path, tip: Option<u64>) -> anyhow::Result<Self> {
         let cfg = HistorySection { dir: index.to_owned(), retention: RETENTION };
         let mut history = History::open(&cfg, dir)?;
-        history.catch_up_to(tip);
+        history.catch_up_to(tip)?;
         let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
         let (reader, resume_at) = (history.reader(), history.resume_at());
         let feed =

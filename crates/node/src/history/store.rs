@@ -1,7 +1,8 @@
 //! The history index on disk: one SQLite file. `events` holds each account event under its place in
 //! the log, `(seq, idx)`, so taking a command twice rewrites the same rows; `progress` holds the last
 //! command taken, in the same transaction as its events. The host can rewrite the file, so every
-//! connection runs SQLite in defensive mode and refuses a schema this code did not create.
+//! connection runs SQLite in defensive mode with triggers and views off, and every write and read
+//! refuses, inside its own transaction, a schema this code did not create.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, bail, ensure};
 use engine_core::types::Millis;
 use rusqlite::config::DbConfig;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, ToSql, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, ToSql, TransactionBehavior, params};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::spawn_blocking;
 use tracing::{debug, info};
@@ -62,7 +63,10 @@ type SchemaRow = (String, String, String, Option<String>);
 /// Takes commands into the index: the one connection that writes to it.
 pub(super) struct Writer {
     conn: Connection,
+    path: PathBuf,
     retention_ms: Millis,
+    /// What `SCHEMA` creates, which every write checks the file against.
+    schema: Vec<SchemaRow>,
 }
 
 /// Reads pages of the index, each on a new read-only connection.
@@ -104,8 +108,9 @@ impl Writer {
             other => bail!("{} holds history schema {other}, not {SCHEMA_VERSION}", path.display()),
         }
         tx.commit().context("committing the history schema")?;
-        check_schema(&conn, &expected_schema(), path)?;
-        Ok(Self { conn, retention_ms })
+        let schema = expected_schema();
+        check_schema(&conn, &schema, path)?;
+        Ok(Self { conn, path: path.to_owned(), retention_ms, schema })
     }
 
     /// The last command the index took, if any.
@@ -150,10 +155,12 @@ impl Writer {
         Ok(())
     }
 
-    /// In one transaction: stores the account events of the commands in `batch`, records the last
-    /// command as taken, and drops events older than the retention allows. Returns the seq of that
-    /// command, if `batch` holds one.
+    /// In one transaction, which holds the write lock from its start and first checks the schema:
+    /// stores the account events of the commands in `batch`, records the last command as taken, and
+    /// drops events older than the retention allows. Returns the seq of that command, if `batch`
+    /// holds one.
     /// Error cases:
+    /// - the file holds a schema this code did not create
     /// - the transaction fails
     /// - a seq is beyond SQLite's integer range, or an event or command cannot be encoded
     pub(super) fn write(&mut self, batch: &[Arc<StreamMsg>]) -> anyhow::Result<Option<u64>> {
@@ -167,7 +174,9 @@ impl Writer {
         let Some(last) = commands.last() else {
             return Ok(None);
         };
-        let tx = self.conn.transaction().context("starting a history write")?;
+        let tx =
+            self.conn.transaction_with_behavior(TransactionBehavior::Immediate).context("starting a history write")?;
+        check_schema(&tx, &self.schema, &self.path)?;
         {
             let mut insert = tx
                 .prepare("INSERT OR REPLACE INTO events (seq, idx, account, kind, ts, event) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
@@ -227,7 +236,10 @@ impl Reader {
 /// Error cases:
 /// - the index cannot be opened or read, holds another schema, or holds a row that does not parse
 fn read_page(path: &Path, schema: &[SchemaRow], query: &PageQuery) -> anyhow::Result<Page> {
-    let conn = open_reader(path, schema)?;
+    let mut conn = open_reader(path)?;
+    // The schema check and the page read see one snapshot of the file.
+    let conn = conn.transaction().context("starting a history read")?;
+    check_schema(&conn, schema, path)?;
     let account = &query.account.0[..];
     let (before_seq, before_idx) = bound(query.before, i64::MAX);
     let (after_seq, after_idx) = bound(query.after, -1);
@@ -255,7 +267,9 @@ fn read_page(path: &Path, schema: &[SchemaRow], query: &PageQuery) -> anyhow::Re
     let mut events = rows
         .map(|row| {
             let (seq, idx, ts, event): (i64, i64, Millis, String) = row.context("reading a history row")?;
-            let cursor = Offset { seq: u64::try_from(seq)?, index: u32::try_from(idx)? };
+            let row = || format!("history row {seq}:{idx}");
+            let cursor =
+                Offset { seq: u64::try_from(seq).with_context(row)?, index: u32::try_from(idx).with_context(row)? };
             let event = serde_json::from_str(&event).with_context(|| format!("history event {cursor}"))?;
             Ok(HistoryEvent { cursor, ts, event })
         })
@@ -269,25 +283,27 @@ fn read_page(path: &Path, schema: &[SchemaRow], query: &PageQuery) -> anyhow::Re
     Ok(Page { events, next })
 }
 
-/// A read-only connection to the index at `path`, hardened, once the file holds exactly `schema`.
+/// A read-only connection to the index at `path`, hardened.
 /// Error cases:
-/// - the file cannot be opened, a protection cannot be set, or it holds another schema
-fn open_reader(path: &Path, schema: &[SchemaRow]) -> anyhow::Result<Connection> {
+/// - the file cannot be opened, or a protection cannot be set
+fn open_reader(path: &Path) -> anyhow::Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags).with_context(|| format!("opening {}", path.display()))?;
     harden(&conn)?;
     conn.busy_timeout(BUSY_TIMEOUT).context("setting the busy timeout")?;
-    check_schema(&conn, schema, path)?;
     Ok(conn)
 }
 
 /// Sets what every connection to the host's file runs with: defensive mode, which refuses SQL that
-/// could corrupt the file; schema SQL, such as a trigger, kept from calling functions with side
-/// effects; and cell sizes checked as pages are read.
+/// could corrupt the file; no triggers or views, which this schema has none of, so none the host
+/// adds can run; schema SQL kept from calling functions with side effects; and cell sizes checked as
+/// pages are read.
 /// Error cases:
 /// - SQLite refuses a setting
 fn harden(conn: &Connection) -> anyhow::Result<()> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true).context("enabling defensive mode")?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false).context("disabling triggers")?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false).context("disabling views")?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false).context("distrusting the schema")?;
     conn.pragma_update(None, "cell_size_check", true).context("enabling cell size checks")
 }
@@ -329,8 +345,12 @@ fn bound(cursor: Option<Offset>, absent: i64) -> (i64, i64) {
 mod tests {
     use super::*;
 
+    use engine_core::Fixed;
+    use engine_core::command::{Command, Sequenced};
+    use engine_core::event::Event;
     use engine_core::types::AccountId;
 
+    use crate::log::LogEntry;
     use crate::test_support::{assert_a_dropped_read_keeps_its_permit, scratch_dir};
 
     /// A schema the host altered is refused when the writer opens the file and when a reader opens
@@ -356,13 +376,39 @@ mod tests {
         }
     }
 
+    /// A schema the host changes while the node runs stops the writer's next write, which then
+    /// changes nothing; the trigger it added never runs.
+    #[test]
+    fn a_schema_changed_while_the_writer_runs_stops_its_next_write() {
+        let path = scratch_dir("history-schema-live").join("history.sqlite");
+        let mut writer = Writer::open(&path, i64::MAX).unwrap();
+        let deposit = |seq| {
+            let events = vec![Event::Deposited { account: AccountId([1; 20]), amount: Fixed::from_int(1) }];
+            let sequenced = Sequenced { seq, ts: 0, cmd: Command::Tick };
+            Arc::new(StreamMsg::new(
+                Offset::start_of(seq),
+                LogEntry::Command(CommandEntry { sequenced, events: Some(events) }),
+            ))
+        };
+        writer.write(&[deposit(1)]).unwrap();
+        let wipe = "CREATE TRIGGER wipe AFTER INSERT ON events BEGIN DELETE FROM events; END";
+        Connection::open(&path).unwrap().execute_batch(wipe).unwrap();
+        let err = writer.write(&[deposit(2)]).expect_err("refused");
+        assert!(format!("{err:#}").contains("did not create"), "{err:#}");
+        assert_eq!(writer.last_command().unwrap().unwrap().sequenced.seq, 1);
+        let rows: i64 = writer.conn.query_row("SELECT count(*) FROM events", [], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 1, "the first write's event is still there");
+    }
+
     #[test]
     fn every_connection_to_the_index_runs_defensive_with_an_untrusted_schema() {
         let path = scratch_dir("history-defensive").join("history.sqlite");
         let writer = Writer::open(&path, 1).unwrap();
-        let reader = open_reader(&path, &expected_schema()).unwrap();
+        let reader = open_reader(&path).unwrap();
         for (side, conn) in [("writer", &writer.conn), ("reader", &reader)] {
             assert!(conn.db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE).unwrap(), "{side}");
+            assert!(!conn.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER).unwrap(), "{side}");
+            assert!(!conn.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW).unwrap(), "{side}");
             assert!(!conn.db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA).unwrap(), "{side}");
             let checked: bool = conn.pragma_query_value(None, "cell_size_check", |row| row.get(0)).unwrap();
             assert!(checked, "{side}");
