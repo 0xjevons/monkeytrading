@@ -47,6 +47,11 @@ this crate and reproduce the signed state roots exactly.
 - One command that makes every market reduce-only, including markets listed later; trades that
   reduce or close a position fill in every reduce-only mode, and from `V8` parameters whose stress
   and toxicity spreads would reach the price are refused
+- From protocol `V10`, spreads and margin round in the house's favour: every spread charge rounds up
+  for the trader paying it, buying or selling, and every margin requirement rounds up, from a
+  position's notional to the close-out level
+- Products and quotients that never overflow while the result fits, whatever the position size or
+  price ratio
 
 ## Repository Structure
 
@@ -68,7 +73,8 @@ this crate and reproduce the signed state roots exactly.
   leaf, and account proofs
 - `src/merkle/tests.rs` — tree, proof, and work tests, and the layout fixture
 - `src/tracked.rs` — maps and sets that record what changed since the last root
-- `src/fixed.rs` — `Fixed`, the 9-decimal fixed-point type used for all money
+- `src/fixed/` — `Fixed`, the 9-decimal fixed-point type used for all money (`mod.rs`), and its
+  unit tests (`tests.rs`)
 - `src/market.rs` — market listings, tier tables, and quote currencies with their USD conversion
 - `src/params.rs` — protocol parameters, stress levels, toxicity, and the rollover clock
 - `src/price.rs` — venue quotes and the reference index
@@ -77,15 +83,16 @@ this crate and reproduce the signed state roots exactly.
 - `src/account.rs` — accounts, netted positions, and resting orders
 - `src/command.rs` / `src/event.rs` — engine inputs and outputs
 - `src/types.rs` — ids, sides, and asset classes
-- `tests/` — protocol tests through `Engine::apply`, with a shared harness and the reference-log
-  format in `tests/common/`; `tests/operator.rs` covers signed admin commands and every-market
-  reduce-only
+- `tests/` — protocol tests through `Engine::apply`, with a shared harness, its signing client
+  (`client.rs`), and the reference-log format in `tests/common/`; `tests/operator.rs` covers signed
+  admin commands and every-market reduce-only
 - `tests/reference/` — one reference log per protocol version: each line is a sequenced command and
   the state root after it
 - `tests/reference_logs.rs` — replays every reference log and fails at the first seq whose root
   differs
 - `tests/invariants/` — property tests over generated sessions (`main.rs`), the session generator
-  (`session.rs`), and fills at one price (`rounding.rs`)
+  (`session.rs`), fills at one price (`rounding.rs`), and spreads and margin against their exact
+  amounts (`charges.rs`)
 - `tests/invariants/state_root.rs` — incremental roots against a rebuild, with every account's
   proof checked, under generated sessions
 - `tests/state_root.rs` — the state root from `V9`: its activation, what each root rehashes,
@@ -95,7 +102,7 @@ this crate and reproduce the signed state roots exactly.
 - `tests/fixtures/merkle.json` — state tree vectors computed with Foundry's `cast`: keys, leaf ABI
   encodings and value hashes, a root, and proofs
 - `examples/reference_log/` — writes the reference log for a new protocol version: the session
-  (`main.rs`) and the requests and event names it uses (`helpers.rs`)
+  (`main.rs`), the requests and event names it uses (`helpers.rs`), and its `V10` part (`v10.rs`)
 - `examples/sign_request.rs` — a client signing a request body for the API
 - `examples/verify_proof.rs` — checks an account proof from the API against a root
 
@@ -155,7 +162,9 @@ Two suites guard replay and accounting:
   values inside and outside the input bounds, and checks after every command that nothing panicked,
   cash is conserved, and every market's aggregates match its accounts' positions. Raise `CASES` or
   change `SEED` in `tests/invariants/main.rs` to search further. The same suite generates adds,
-  reductions, and flips at one price under `V5` and checks that none realises a profit.
+  reductions, and flips at one price under `V5` and checks that none realises a profit, and fills
+  in random spread and margin bands under `V10` and checks that none pays less spread or posts
+  less margin than the exact amount.
   Under `V9`, the same sessions check that roots computed from what changed, at random points,
   equal a root hashed from scratch, and that every account's proof verifies against them.
 
@@ -181,7 +190,8 @@ as before, so earlier logs replay unchanged; its log is `v7.jsonl`. `V8` adds ad
 by the operator, refuses an unsigned operator command once anything is credited, adds every-market
 reduce-only, and refuses parameters whose spreads would refuse a close; it activates the same way,
 and its log is `v8.jsonl`. `V9` makes the state root the root of the state tree; its log is
-`v9.jsonl`. For each later version:
+`v9.jsonl`. `V10` rounds spreads and margin in the house's favour; its log is `v10.jsonl`. For each
+later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log/main.rs` so it activates the new version and exercises the new rules.

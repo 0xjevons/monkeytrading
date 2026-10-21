@@ -61,11 +61,16 @@ pub enum ProtocolVersion {
     /// The state root is the root of the state tree (`merkle`), which each root updates where
     /// commands changed it, and which proves an account's leaf against a posted root.
     V9,
+    /// Spreads and margin round in the house's favour: every spread charge rounds up for the trader
+    /// paying it, from the size spread's notional and band charges to its share per unit, stopping a
+    /// unit short of the price so a trade the truncated spread lets fill still fills; and every
+    /// margin requirement rounds up, from the position's notional to the close-out level.
+    V10,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V9;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V10;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

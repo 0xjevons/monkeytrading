@@ -7,6 +7,7 @@
 #[path = "../../tests/common/mod.rs"]
 mod common;
 mod helpers;
+mod v10;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -86,8 +87,8 @@ fn main() -> anyhow::Result<()> {
 /// under `V7`, USD settlement of markets quoted in euros and yen. Then, under `V8`, operator commands
 /// signed and refused for each reason, and every market reduce-only. Then, under `V9`, the state
 /// tree: a new account's deposit, resting order and cancel, a dollar round trip, a euro position, and
-/// a marked markout. Every client request is signed by its account's key unless the comment says
-/// otherwise.
+/// a marked markout. Then, under `V10`, spreads, a margin requirement, and close-out levels that
+/// round up. Every client request is signed by its account's key unless the comment says otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -468,5 +469,6 @@ fn session() -> Vec<Sequenced> {
     h.advance(2_000);
     h.price(BTC, "80100");
     h.market_order(late, BTC, Side::Sell, "0.02", "80100");
+    v10::session(&mut h);
     h.log
 }

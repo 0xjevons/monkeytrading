@@ -150,9 +150,10 @@ impl MarketSpec {
         Ok(())
     }
 
-    /// Margin required for a position of `notional` (either sign).
-    pub fn margin_for(&self, notional: Fixed) -> Fixed {
-        staircase(&self.margin_tiers, Fixed::ZERO, notional.abs())
+    /// Margin required for a position of `notional` (either sign), each band's charge rounded as
+    /// `rounding` says.
+    pub fn margin_for(&self, notional: Fixed, rounding: Rounding) -> Fixed {
+        staircase(&self.margin_tiers, Fixed::ZERO, notional.abs(), rounding)
     }
 
     /// Checks this listing's quote currency against the FX pairs, given the symbol of each market
@@ -276,8 +277,8 @@ fn validate_tiers(name: &str, tiers: &[Tier], min_bps: i64) -> Result<(), String
 }
 
 /// Cost of moving from notional `from` to `to` (`from <= to`) through banded rates: each band's bps
-/// applies to the slice of `[from, to]` inside it.
-pub fn staircase(tiers: &[Tier], from: Fixed, to: Fixed) -> Fixed {
+/// applies to the slice of `[from, to]` inside it, and each band's charge rounds as `rounding` says.
+pub fn staircase(tiers: &[Tier], from: Fixed, to: Fixed, rounding: Rounding) -> Fixed {
     if to <= from {
         return Fixed::ZERO;
     }
@@ -288,7 +289,7 @@ pub fn staircase(tiers: &[Tier], from: Fixed, to: Fixed) -> Fixed {
         .map(|(t, lo)| {
             let start = from.max(lo);
             let end = t.up_to.map_or(to, |hi| to.min(hi));
-            if end > start { (end - start).mul_bps(t.bps) } else { Fixed::ZERO }
+            if end > start { (end - start).mul_bps_rounded(t.bps, rounding) } else { Fixed::ZERO }
         })
         .sum()
 }
@@ -312,22 +313,34 @@ mod tests {
     #[test]
     fn staircase_charges_each_slice_at_its_band_rate() {
         let t = tiers();
-        assert_eq!(staircase(&t, f(0), f(500_000)), f(0));
+        let cost = |from, to| staircase(&t, from, to, Rounding::TowardZero);
+        assert_eq!(cost(f(0), f(500_000)), f(0));
         // 1m..2m at 2bps.
-        assert_eq!(staircase(&t, f(0), f(2_000_000)), f(200));
+        assert_eq!(cost(f(0), f(2_000_000)), f(200));
         // 1m..5m at 2bps = 800, 5m..6m at 5bps = 500.
-        assert_eq!(staircase(&t, f(0), f(6_000_000)), f(1_300));
-        assert_eq!(staircase(&t, f(4_000_000), f(6_000_000)), f(700));
+        assert_eq!(cost(f(0), f(6_000_000)), f(1_300));
+        assert_eq!(cost(f(4_000_000), f(6_000_000)), f(700));
         // A shrinking move costs nothing.
-        assert_eq!(staircase(&t, f(6_000_000), f(4_000_000)), f(0));
+        assert_eq!(cost(f(6_000_000), f(4_000_000)), f(0));
+    }
+
+    #[test]
+    fn staircase_rounds_each_band_charge_as_asked() {
+        let t = tiers();
+        // One unit of precision either side of 5m charges a fraction of a unit in each band, which
+        // truncates to nothing and rounds up to one unit per band. An exact charge does not move.
+        let (from, to) = (f(4_999_999) + "0.999999999".parse().unwrap(), f(5_000_000) + Fixed::from_raw(1));
+        assert_eq!(staircase(&t, from, to, Rounding::TowardZero), Fixed::ZERO);
+        assert_eq!(staircase(&t, from, to, Rounding::Up), Fixed::from_raw(2));
+        let half = f(1_000_000) + "0.5".parse().unwrap();
+        assert_eq!(staircase(&t, f(0), half, Rounding::Up), "0.0001".parse().unwrap());
     }
 
     #[test]
     fn splitting_does_not_avoid_size_spread() {
         let t = tiers();
-        let whole = staircase(&t, f(0), f(6_000_000));
-        let split = staircase(&t, f(0), f(3_000_000)) + staircase(&t, f(3_000_000), f(6_000_000));
-        assert_eq!(whole, split);
+        let cost = |from, to| staircase(&t, from, to, Rounding::TowardZero);
+        assert_eq!(cost(f(0), f(6_000_000)), cost(f(0), f(3_000_000)) + cost(f(3_000_000), f(6_000_000)));
     }
 
     #[test]

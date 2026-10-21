@@ -4,21 +4,23 @@
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
 
+mod client;
+pub use client::*;
 pub mod reference;
 
 use std::collections::BTreeMap;
 
 use chrono::TimeZone;
 use engine_core::auth::{ClientAuth, Operator, RequestAuth};
-use engine_core::command::{AdminCommand, AdminRequest, Command, OrderKind, OrderRequest, Sequenced};
-use engine_core::eip712::{self, B256, Eip712Domain, admin_hash, cancel_hash, order_hash, withdrawal_hash};
+use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
+use engine_core::eip712::{self, B256, cancel_hash, order_hash, withdrawal_hash};
 use engine_core::event::{Event, Fill, Reject};
 use engine_core::market::{FinancingSpec, MarketSpec, PriceRules, QuoteCurrency, Tier};
 use engine_core::params::{ProtocolParams, Rollover, StressLevel, StressTrigger, ToxicityParams, ToxicityTier};
 use engine_core::price::SourceQuote;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::session::Schedule;
-use engine_core::types::{AccountId, AssetClass, MarketId, Millis, OrderId, Side};
+use engine_core::types::{AccountId, AssetClass, MarketId, Millis, Side};
 use engine_core::{Engine, Fixed};
 use k256::ecdsa::SigningKey;
 
@@ -112,6 +114,20 @@ impl Harness {
         h.admin(AdminCommand::SetOperator(operator()));
         h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V8 });
         h.genesis();
+        h
+    }
+
+    /// `v8` taking unsigned requests, then `V9`, whose state root is the state tree's.
+    pub fn v9() -> Self {
+        let mut h = Harness::v8(ClientAuth::Unsigned);
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V9 });
+        h
+    }
+
+    /// `v9`, then `V10`, which rounds spreads and margin in the house's favour.
+    pub fn v10() -> Self {
+        let mut h = Harness::v9();
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V10 });
         h
     }
 
@@ -314,60 +330,6 @@ impl Harness {
         let balances: Fixed = self.engine.accounts().values().map(|a| a.balance).sum();
         let expected = self.deposits + self.house_capital - withdrawn;
         assert_eq!(balances + self.engine.house_cash(), expected);
-    }
-}
-
-/// A client key, the account it controls, and the domain it signs under.
-pub struct Client {
-    pub key: SigningKey,
-    pub account: AccountId,
-    pub domain: Eip712Domain,
-    /// The expiry every request this client signs carries.
-    pub expires_at: Millis,
-}
-
-impl Client {
-    /// A distinct key per `seed`, signing under the signed harness's domain, with requests that
-    /// expire a minute after the harness starts.
-    pub fn new(seed: u8) -> Self {
-        let key = SigningKey::from_slice(&[seed; 32]).expect("a valid scalar");
-        let account = eip712::address(key.verifying_key());
-        Client { key, account, domain: eip712::domain(CHAIN_ID, VAULT), expires_at: start() + 60_000 }
-    }
-
-    /// `req` with this key's signature over it and `nonce`, whatever account it names.
-    pub fn order(&self, nonce: u64, mut req: OrderRequest) -> Command {
-        let hash = order_hash(&self.domain, &req, nonce, self.expires_at);
-        req.auth = Some(self.auth(nonce, hash));
-        Command::PlaceOrder(req)
-    }
-
-    /// The operator key the `V8` harness records.
-    pub fn operator() -> Self {
-        Client::new(OPERATOR_SEED)
-    }
-
-    /// `command` with this key's signature over it and `nonce`, as the operator sends it.
-    pub fn admin(&self, nonce: u64, command: AdminCommand) -> Command {
-        let hash = admin_hash(&self.domain, &command, nonce, self.expires_at);
-        Command::SignedAdmin(Box::new(AdminRequest { command, auth: self.auth(nonce, hash) }))
-    }
-
-    /// A signed cancel of `order_id` for this account.
-    pub fn cancel(&self, nonce: u64, order_id: OrderId) -> Command {
-        let hash = cancel_hash(&self.domain, self.account, order_id, nonce, self.expires_at);
-        Command::CancelOrder { account: self.account, order_id, auth: Some(self.auth(nonce, hash)) }
-    }
-
-    /// A signed withdrawal of `amount` for this account.
-    pub fn withdraw(&self, nonce: u64, amount: &str) -> Command {
-        let hash = withdrawal_hash(&self.domain, self.account, f(amount), nonce, self.expires_at);
-        Command::Withdraw { account: self.account, amount: f(amount), auth: Some(self.auth(nonce, hash)) }
-    }
-
-    /// This key's signature over `hash`, with `nonce` and this client's expiry.
-    fn auth(&self, nonce: u64, hash: B256) -> RequestAuth {
-        RequestAuth { nonce, expires_at: self.expires_at, signature: eip712::sign(&self.key, &hash) }
     }
 }
 

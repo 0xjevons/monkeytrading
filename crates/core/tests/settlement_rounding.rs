@@ -117,7 +117,7 @@ fn the_minimum_notional_and_the_size_spread_round_toward_the_house() {
         let fill = fills(&events)[0].clone();
         let cost = |low: Rounding, high: Rounding, back: Rounding| {
             let usd = |contracts: i64, round| euros.to_usd(notional.mul_int(contracts), Some(fx), round);
-            let slice = staircase(&spec.spread_tiers, usd(held, low), usd(held + 1, high));
+            let slice = staircase(&spec.spread_tiers, usd(held, low), usd(held + 1, high), Rounding::TowardZero);
             euros.from_usd(slice, Some(fx), back)
         };
         let charged = cost(Rounding::Down, Rounding::Up, Rounding::Up);

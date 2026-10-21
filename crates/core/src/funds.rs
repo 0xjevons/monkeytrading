@@ -148,3 +148,40 @@ impl Engine {
         Some(market.usd_at_mark(amount, Rounding::Up))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::MarketState;
+    use crate::market::MarketSpec;
+    use crate::types::Side;
+
+    #[test]
+    fn financing_whose_notional_times_its_rate_passes_i128_is_charged_exactly() {
+        // 1e16 units marked at 1e9 is 1e34 of raw notional: at 200% a year its raw product with the
+        // rate, 2e38, is past `i128::MAX`, though a day's financing is near 5.5e22. Charges round up
+        // and the credit toward zero.
+        let cases = [
+            (10_000, 10_000, Side::Buy, "54794520547945205479452.054794521"),
+            (-10_000, 10_000, Side::Sell, "54794520547945205479452.054794521"),
+            (-10_000, -10_000, Side::Buy, "-54794520547945205479452.05479452"),
+        ];
+        for (benchmark_bps, markup_bps, side, daily) in cases {
+            let spec: MarketSpec = serde_json::from_value(serde_json::json!({
+                "id": 1, "symbol": "BIG", "asset_class": "crypto", "schedule": { "kind": "always_open" },
+                "margin_tiers": [{ "bps": 1_000 }], "spread_tiers": [{ "bps": 0 }],
+                "price_rules": { "max_age_ms": 1_000, "max_divergence_bps": 50, "min_sources": 2 },
+                "max_slippage_bps": 20, "house_cap_bps": 5_000,
+                "financing": { "benchmark": "SOFR", "markup_bps": markup_bps, "day_basis": 365 },
+            }))
+            .expect("a valid listing");
+            let mut market = MarketState::new(spec);
+            market.mark = Some(Fixed::MAX_INPUT);
+            let mut engine = Engine { protocol_version: ProtocolVersion::V5, ..Engine::default() };
+            engine.markets.insert(1, market);
+            engine.benchmarks.insert("SOFR".into(), benchmark_bps);
+            let position = Position { qty: side.signed(Fixed::from_int(10_000_000_000_000_000)), entry: Fixed::ONE };
+            assert_eq!(engine.daily_financing(1, position), Some(daily.parse().unwrap()), "{side:?} {benchmark_bps}");
+        }
+    }
+}

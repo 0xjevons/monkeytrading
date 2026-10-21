@@ -6,6 +6,7 @@
 //! refusal of out-of-range amounts, order numbers, and quotes, and under `V6` a close-out that no
 //! price triggered, so the checks cannot pass vacuously.
 
+mod charges;
 #[path = "../common/mod.rs"]
 mod common;
 mod rounding;
@@ -16,7 +17,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{HOUSE_CAPITAL, Harness, acct};
-use engine_core::auth::ClientAuth;
 use engine_core::command::Command;
 use engine_core::event::{Event, Reject};
 use engine_core::protocol::ProtocolVersion;
@@ -36,7 +36,7 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
     // checked.
     let reached: RefCell<BTreeMap<ProtocolVersion, BTreeSet<&str>>> = RefCell::default();
     let result = TestRunner::new(config()).run(&session(), |session| {
-        for genesis in [Harness::new(), Harness::v6(), Harness::fx(), Harness::v8(ClientAuth::Unsigned)] {
+        for genesis in [Harness::new(), Harness::v6(), Harness::fx(), Harness::v10()] {
             let mut h = funded(genesis, &session);
             let version = h.engine.protocol_version();
             let mut inflow = h.deposits + Fixed::from_int(HOUSE_CAPITAL);
