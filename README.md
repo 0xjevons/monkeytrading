@@ -33,6 +33,11 @@ Losing trades pay nothing. Winning trades pay a fixed share of the profit they r
 positions held over the daily rollover pay or receive financing at a benchmark interest rate plus
 or minus a markup.
 
+Accounts are kept in US dollars. A market quoted in another currency, such as Germany 40 in euros
+or Japan 225 in yen, accrues profit and loss in that currency and converts it to dollars at the
+engine's own price for the currency pair, the same way for margin, exposure, and financing. While
+that currency pair has no price, neither does the market, and nothing trades in it.
+
 Margin is shared across an account's positions. When equity falls below half of the margin
 requirement, the largest losing position that can trade is closed first, and so on until the
 account recovers; a position in a market that is closed or has no fresh price waits until that

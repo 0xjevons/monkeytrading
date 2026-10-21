@@ -34,7 +34,7 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
     // checked.
     let reached: RefCell<BTreeMap<ProtocolVersion, BTreeSet<&str>>> = RefCell::default();
     let result = TestRunner::new(config()).run(&session(), |session| {
-        for genesis in [Harness::new(), Harness::v6()] {
+        for genesis in [Harness::new(), Harness::v6(), Harness::fx()] {
             let mut h = funded(genesis, &session);
             let version = h.engine.protocol_version();
             let mut inflow = h.deposits + Fixed::from_int(HOUSE_CAPITAL);
@@ -82,10 +82,12 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
         "admin rejected",
     ];
     let reached = reached.into_inner();
-    let missed: Vec<(ProtocolVersion, &str)> = [ProtocolVersion::V2, ProtocolVersion::V6]
+    let missed: Vec<(ProtocolVersion, &str)> = [ProtocolVersion::V2, ProtocolVersion::V6, ProtocolVersion::V7]
         .into_iter()
         .flat_map(|version| expected.iter().map(move |path| (version, *path)))
         .chain([(ProtocolVersion::V6, "close-out without a price")])
+        // Only `V7` lists markets quoted in another currency.
+        .chain([(ProtocolVersion::V7, "fill converted to USD"), (ProtocolVersion::V7, "no FX price")])
         .filter(|(version, path)| !reached.get(version).is_some_and(|paths| paths.contains(path)))
         .collect();
     assert!(missed.is_empty(), "generated sessions never reach {missed:?}");
@@ -162,12 +164,14 @@ fn path(event: &Event) -> &'static str {
         Event::HouseCapitalMoved { .. } => "house capital",
         Event::Fill(fill) if fill.liquidation => "liquidation",
         Event::Fill(fill) if fill.profit_fee.is_positive() => "fill with profit fee",
+        Event::Fill(fill) if fill.fx_index.is_some() => "fill converted to USD",
         Event::Fill(_) => "fill",
         Event::BadDebt { .. } => "bad debt",
         Event::Financing { .. } => "financing",
         Event::OrderRejected { reason: Reject::InvalidOrder { reason }, .. } if reason.ends_with("out of range") => {
             "order out of range"
         }
+        Event::OrderRejected { reason: Reject::NoFxPrice { .. }, .. } => "no FX price",
         Event::PricesRejected { reason, .. } if reason.starts_with("malformed") => "malformed quote",
         Event::PricesRejected { reason, .. } if reason.ends_with("ahead of the sequenced time") => {
             "quote stamped ahead"

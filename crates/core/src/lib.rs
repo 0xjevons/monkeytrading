@@ -18,6 +18,8 @@
 //!   EIP-712 signature, next nonce, and expiry, or, in dev logs only, unsigned. From `V5`, every
 //!   rounding in position accounting favours the house, so no sequence of fills realises more than
 //!   its exact PnL.
+//! - Accounts hold USD. From `V7`, a market may be quoted in another currency: it accrues PnL in it,
+//!   converts to USD at its FX market's index, and has no price while that FX market has none.
 
 pub mod account;
 mod admin;

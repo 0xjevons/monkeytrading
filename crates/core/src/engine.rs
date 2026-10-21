@@ -1,9 +1,9 @@
 //! The engine state machine: `apply(sequenced command) -> events`.
 //!
 //! Single-threaded and deterministic. Time comes only from the sequencer's stamp. This file holds
-//! the state, dispatch, time, and prices; funds and financing live in `funds.rs`, admin and stress
-//! in `admin.rs`, client request auth in `auth.rs`, orders and pricing in `execution.rs`, and
-//! close-outs in `closeout.rs`.
+//! the state, dispatch, time, prices, and USD valuation; funds and financing live in `funds.rs`,
+//! admin and stress in `admin.rs`, client request auth in `auth.rs`, orders and pricing in
+//! `execution.rs`, and close-outs in `closeout.rs`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
@@ -15,10 +15,11 @@ use crate::Fixed;
 use crate::account::{Account, Position};
 use crate::auth::ClientAuth;
 use crate::command::{Command, Sequenced};
-use crate::event::Event;
+use crate::event::{Event, Reject};
+use crate::fixed::Rounding;
 use crate::market::MarketSpec;
 use crate::params::ProtocolParams;
-use crate::price::{MAX_QUOTE_LEAD_MS, SourceQuote, compute_index};
+use crate::price::{Index, MAX_QUOTE_LEAD_MS, SourceQuote, compute_index};
 use crate::protocol::ProtocolVersion;
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
 
@@ -69,8 +70,13 @@ pub struct MarketState {
     pub quotes: BTreeMap<String, SourceQuote>,
     pub open: bool,
     pub reduce_only: bool,
-    /// Last valid index mid. Positions are marked here, including while the market is closed.
+    /// Last index mid marked while the market and its FX market had a price. Positions are marked
+    /// here, including while the market is closed or its FX market has no price.
     pub mark: Option<Fixed>,
+    /// Last index of the FX market that could convert this market's quote currency: what its
+    /// positions are valued at in USD. `None` for a USD market, and left out of the encoding then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fx_mark: Option<Fixed>,
     /// Sum of client position qty; the house holds the opposite.
     pub client_qty: Fixed,
     /// Sum of client `entry * qty`, so unrealised PnL is O(1) per market.
@@ -109,11 +115,17 @@ impl MarketState {
             open: false,
             reduce_only: false,
             mark: None,
+            fx_mark: None,
             client_qty: Fixed::ZERO,
             client_cost: Fixed::ZERO,
             stress: StressState::default(),
             resting: BTreeMap::new(),
         }
+    }
+
+    /// `amount` in this market's quote currency, in USD at its FX mark, rounded as `rounding` says.
+    pub fn usd_at_mark(&self, amount: Fixed, rounding: Rounding) -> Fixed {
+        self.spec.quote_currency.to_usd(amount, self.fx_mark, rounding)
     }
 }
 
@@ -225,19 +237,28 @@ impl Engine {
         self.house_cash
     }
 
-    /// House cash minus clients' unrealised PnL at current marks.
+    /// House cash minus clients' unrealised PnL at current marks, in USD. Clients' PnL rounds up, so
+    /// NAV, and every cap set from it, rounds down.
     pub fn house_nav(&self) -> Fixed {
         let client_upnl: Fixed = self
             .markets
             .values()
-            .filter_map(|market| market.mark.map(|mark| mark.mul(market.client_qty) - market.client_cost))
+            .filter_map(|market| {
+                let upnl = |mark: Fixed| mark.mul(market.client_qty) - market.client_cost;
+                market.mark.map(|mark| market.usd_at_mark(upnl(mark), Rounding::Up))
+            })
             .sum();
         self.house_cash - client_upnl
     }
 
-    /// Sum over markets of the house's absolute net notional.
+    /// Sum over markets of the house's absolute net notional, in USD, each rounded up.
     pub fn house_gross_exposure(&self) -> Fixed {
-        self.markets.values().filter_map(|market| market.mark.map(|mark| market.client_qty.abs().mul(mark))).sum()
+        self.markets
+            .values()
+            .filter_map(|market| {
+                market.mark.map(|mark| market.usd_at_mark(market.client_qty.abs().mul(mark), Rounding::Up))
+            })
+            .sum()
     }
 
     /// The cap on the house's absolute net notional in `spec`'s market at house NAV `nav`: its share
@@ -252,31 +273,60 @@ impl Engine {
         self.floored(nav.mul_bps(params.house_total_cap_bps), params.house_total_cap_floor)
     }
 
-    /// (equity, margin requirement) at current marks, optionally overriding one market's mark.
-    pub fn equity_and_margin(&self, acct: &Account, mark_override: Option<(MarketId, Fixed)>) -> (Fixed, Fixed) {
+    /// (equity, margin requirement) in USD at current marks, optionally overriding one market's mark
+    /// and FX index.
+    pub fn equity_and_margin(
+        &self,
+        acct: &Account,
+        mark_override: Option<(MarketId, Fixed, Option<Fixed>)>,
+    ) -> (Fixed, Fixed) {
         self.equity_and_margin_at(acct, |market_id, market, pos| match mark_override {
-            Some((id, mid)) if id == market_id => mid,
-            _ => market.mark.unwrap_or(pos.entry),
+            Some((id, mid, fx)) if id == market_id => (mid, fx),
+            _ => (market.mark.unwrap_or(pos.entry), market.fx_mark),
         })
     }
 
-    /// (equity, margin requirement) with each position valued at `price_of(market id, market,
-    /// position)`.
+    /// (equity, margin requirement) in USD with each position valued at the price and FX index
+    /// `price_of(market id, market, position)` gives: PnL converts rounded down and notional rounded
+    /// up.
     pub(crate) fn equity_and_margin_at(
         &self,
         acct: &Account,
-        price_of: impl Fn(MarketId, &MarketState, &Position) -> Fixed,
+        price_of: impl Fn(MarketId, &MarketState, &Position) -> (Fixed, Option<Fixed>),
     ) -> (Fixed, Fixed) {
         acct.positions
             .iter()
             .filter_map(|(market_id, pos)| self.markets.get(market_id).map(|market| (*market_id, pos, market)))
             .fold((acct.balance, Fixed::ZERO), |(equity, margin), (market_id, pos, market)| {
-                let price = price_of(market_id, market, pos);
-                (
-                    equity + pos.unrealised(price, self.protocol_version),
-                    margin + market.spec.margin_for(pos.qty.abs().mul(price)),
-                )
+                let (price, fx) = price_of(market_id, market, pos);
+                let usd = |amount, rounding| market.spec.quote_currency.to_usd(amount, fx, rounding);
+                let notional = usd(pos.qty.abs().mul(price), Rounding::Up);
+                let pnl = usd(pos.unrealised(price, self.protocol_version), Rounding::Down);
+                (equity + pnl, margin + market.spec.margin_for(notional))
             })
+    }
+
+    /// The FX index a fill in `market_id` converts at now: its FX market's live index, or `None` for
+    /// a USD market.
+    /// Error cases:
+    /// - the FX market's schedule is closed at the sequenced time, or it has no valid index, or one
+    ///   that cannot convert the currency
+    /// - the market has no FX mark yet, so a position in it could not be valued
+    pub(crate) fn live_fx(&self, market_id: MarketId) -> Result<Option<Fixed>, Reject> {
+        let market = &self.markets[&market_id];
+        let currency = market.spec.quote_currency;
+        let Some(fx_market) = currency.fx_market() else { return Ok(None) };
+        // Listing checks the FX market is listed, and no market is ever removed.
+        let fx = self.markets.get(&fx_market).expect("an FX market is listed before markets that use it");
+        let no_price = Reject::NoFxPrice { fx_market };
+        // The schedule, not the stored flag, which only the FX market's own commands refresh.
+        if !fx.spec.schedule.is_open(self.now) || market.fx_mark.is_none() {
+            return Err(no_price);
+        }
+        match compute_index(&fx.quotes, &fx.spec.price_rules, self.now) {
+            Ok(index) if currency.converts_at(index.mid) => Ok(Some(index.mid)),
+            _ => Err(no_price),
+        }
     }
 
     /// Updates a market's open flag from its schedule, emitting the transition.
@@ -309,9 +359,8 @@ impl Engine {
         }
     }
 
-    /// Stores venue quotes, then, if the market is open and priced, marks it, updates stress,
-    /// triggers resting orders, and checks close-outs. Malformed quotes, and quotes stamped more than
-    /// `MAX_QUOTE_LEAD_MS` after the sequenced time, are refused one by one.
+    /// Stores venue quotes, then marks the market from them (`reprice`). Malformed quotes, and quotes
+    /// stamped more than `MAX_QUOTE_LEAD_MS` after the sequenced time, are refused one by one.
     fn on_prices(&mut self, market_id: MarketId, quotes: &[SourceQuote], events: &mut Vec<Event>) {
         let now = self.now;
         let Some(market) = self.markets.get_mut(&market_id) else {
@@ -336,16 +385,76 @@ impl Engine {
                 market.quotes.insert(quote.source.clone(), quote.clone());
             }
         }
+        self.reprice(market_id, events);
+    }
+
+    /// Marks a market from its stored quotes, as a price update does: if it is open with a valid
+    /// index, gives that index to the markets that convert at it as their FX mark, and marks the
+    /// market and each of those that is open with a price from its own quotes. Only once every mark
+    /// is set does each marked market update its stress and trigger its resting orders, and
+    /// close-outs run in every market whose value moved.
+    pub(crate) fn reprice(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
+        let now = self.now;
         self.refresh_session(market_id, events);
         let market = &self.markets[&market_id];
         if !market.open || self.params.is_none() {
             return;
         }
-        let Ok(index) = compute_index(&market.quotes, &market.spec.price_rules, self.now) else { return };
+        let Ok(index) = compute_index(&market.quotes, &market.spec.price_rules, now) else { return };
+        let dependents: Vec<MarketId> =
+            self.mark_fx(market_id, index.mid).into_iter().filter(|id| *id != market_id).collect();
+        let mut marked = Vec::new();
+        if self.set_mark(market_id, index) {
+            marked.push((market_id, index));
+        }
+        for &dependent in &dependents {
+            self.refresh_session(dependent, events);
+            let market = &self.markets[&dependent];
+            let live =
+                if market.open { compute_index(&market.quotes, &market.spec.price_rules, now).ok() } else { None };
+            if let Some(index) = live
+                && self.set_mark(dependent, index)
+            {
+                marked.push((dependent, index));
+            }
+        }
+        for (id, index) in &marked {
+            self.update_stress(*id, index.mid, index.divergence_bps, events);
+        }
+        for (id, _) in &marked {
+            self.trigger_resting(*id, events);
+        }
+        if marked.first().is_some_and(|(id, _)| *id == market_id) {
+            self.check_closeouts(market_id, events);
+        }
+        // A new FX mark moves the USD value of every market that took it, marked or not.
+        for dependent in dependents {
+            self.check_closeouts(dependent, events);
+        }
+    }
+
+    /// Marks a market at `index`, its live index, and returns true, unless its FX market has no
+    /// price: then it has none either, keeps its last mark, and this returns false.
+    fn set_mark(&mut self, market_id: MarketId, index: Index) -> bool {
+        if self.live_fx(market_id).is_err() {
+            return false;
+        }
         self.markets.get_mut(&market_id).expect("market exists").mark = Some(index.mid);
-        self.update_stress(market_id, index.mid, index.divergence_bps, events);
-        self.trigger_resting(market_id, events);
-        self.check_closeouts(market_id, events);
+        true
+    }
+
+    /// Sets `mid` as the FX mark of every market that converts at `fx_market`'s index and that `mid`
+    /// can convert, and returns those markets.
+    fn mark_fx(&mut self, fx_market: MarketId, mid: Fixed) -> Vec<MarketId> {
+        let mut marked = Vec::new();
+        for (market_id, market) in &mut self.markets {
+            let currency = market.spec.quote_currency;
+            if currency.fx_market() == Some(fx_market) && currency.converts_at(mid) {
+                market.fx_mark = Some(mid);
+                marked.push(*market_id);
+            }
+        }
+        marked
     }
 
     /// Marks every fill whose horizon has passed and folds the markout into its account's score.

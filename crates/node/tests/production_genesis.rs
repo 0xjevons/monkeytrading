@@ -12,6 +12,7 @@ use chrono_tz::Tz;
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::event::Event;
+use engine_core::market::QuoteCurrency;
 use engine_core::params::ProtocolParams;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::session::{Period, Schedule};
@@ -112,6 +113,23 @@ fn the_production_genesis_applies_the_launch_decisions() {
                 "{symbol}"
             ),
         }
+    }
+}
+
+#[test]
+fn the_launch_markets_quoted_outside_usd_convert_at_their_pairs() {
+    let production = production_genesis("quote-currencies");
+    let quoted: BTreeMap<&str, QuoteCurrency> =
+        production.markets.iter().map(|m| (m.symbol.as_str(), m.quote_currency)).collect();
+    let (eur, gbp, jpy) = (
+        QuoteCurrency::Eur { fx_market: 10 },
+        QuoteCurrency::Gbp { fx_market: 11 },
+        QuoteCurrency::Jpy { fx_market: 12 },
+    );
+    let expected = [("USD-JPY", jpy), ("DE40", eur), ("UK100", gbp), ("JP225", jpy)];
+    for (symbol, currency) in quoted {
+        let want = expected.iter().find(|(s, _)| *s == symbol).map_or(QuoteCurrency::Usd, |(_, c)| *c);
+        assert_eq!(currency, want, "{symbol}");
     }
 }
 

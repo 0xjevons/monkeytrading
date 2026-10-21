@@ -16,7 +16,7 @@ use proptest::prop_oneof;
 use proptest::sample::select;
 use proptest::strategy::{Just, Strategy};
 
-use crate::common::{AAPL, BTC, ETH, UNLISTED, acct, market, params, us_equities};
+use crate::common::{AAPL, BTC, DE40, ETH, EURUSD, UNLISTED, USDJPY, acct, market, params, us_equities};
 
 /// A market id only generated listings use.
 const NEW_MARKET: MarketId = 10;
@@ -168,6 +168,9 @@ fn reference(engine: &Engine, market: MarketId) -> Fixed {
         BTC => 100_000,
         ETH => 3_000,
         AAPL => 200,
+        DE40 => 20_000,
+        USDJPY => 150,
+        EURUSD => 1,
         _ => 100,
     };
     engine.markets().get(&market).and_then(|m| m.mark).unwrap_or(Fixed::from_int(typical))
@@ -296,9 +299,10 @@ fn params_change() -> impl Strategy<Value = ProtocolParams> {
     ]
 }
 
-/// A 24/7 listing of a harness market or a new one, with one field changed.
+/// A 24/7 USD listing of a harness market or a new one, with one field changed. Listing Germany 40
+/// in USD changes its quote currency, which only a market nobody holds may do.
 fn listing() -> impl Strategy<Value = MarketSpec> {
-    let id = || select(vec![BTC, ETH, AAPL, NEW_MARKET]);
+    let id = || select(vec![BTC, ETH, AAPL, DE40, NEW_MARKET]);
     let listed = |id| market(id, "GEN", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000);
     prop_oneof![
         id().prop_map(move |id| MarketSpec { schedule: us_equities(), ..listed(id) }),
@@ -395,7 +399,7 @@ fn account() -> impl Strategy<Value = AccountId> {
 
 /// A listed market, mostly a 24/7 one, or an unlisted id.
 fn market_id() -> impl Strategy<Value = MarketId> {
-    prop_oneof![16 => select(vec![BTC, ETH]), 4 => Just(AAPL), 1 => Just(UNLISTED)]
+    prop_oneof![16 => select(vec![BTC, ETH]), 4 => Just(AAPL), 8 => select(vec![EURUSD, USDJPY, DE40]), 1 => Just(UNLISTED)]
 }
 
 /// Either side.

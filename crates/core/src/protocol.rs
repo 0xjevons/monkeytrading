@@ -43,11 +43,16 @@ pub enum ProtocolVersion {
     /// change, close out only markets inside their trading session, and value a market that can
     /// trade at the index they fill at.
     V6,
+    /// A market may be quoted in EUR, GBP, or JPY, converted to USD at an FX market's index
+    /// (`MarketSpec::quote_currency`), and an FX pair's own listing is quoted in its second currency,
+    /// so a USD-JPY listing in USD is refused. Every other rule acts only through such a listing,
+    /// which earlier versions refuse, so USD markets run as before.
+    V7,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V6;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V7;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

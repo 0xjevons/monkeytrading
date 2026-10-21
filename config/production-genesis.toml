@@ -23,10 +23,9 @@
 #   index currency, as dev.toml's EUR-USD uses ESTR, with that rate's day basis.
 # - Margin and spread bands and house caps are in USD notional. USD-JPY,
 #   Germany 40, UK 100 and Japan 225 are quoted in JPY, EUR, GBP and JPY at
-#   their venues; their profit and loss accrues in the quote currency and
-#   converts to USD at the engine's EUR-USD, GBP-USD and USD-JPY prices once
-#   USD settlement (#70) lands. Until then the engine treats their prices as
-#   USD.
+#   their venues (quote_currency). Their profit and loss accrues in that
+#   currency and converts to USD at the engine's own USD-JPY, EUR-USD and
+#   GBP-USD prices, which are listed before them.
 # - Benchmark rates are not set here. The daily benchmark rates feature (#33)
 #   sequences them; until then a benchmark with no rate counts as zero.
 # - house_capital is 0: the house starts with no capital and builds it from
@@ -293,6 +292,7 @@ closures = [
 id = 12
 symbol = "USD-JPY"
 asset_class = "fx"
+quote_currency = { currency = "jpy", fx_market = 12 }
 max_slippage_bps = 5
 house_cap_bps = 5000
 margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 300 }]
@@ -460,6 +460,7 @@ closures = [
 id = 23
 symbol = "DE40"
 asset_class = "index"
+quote_currency = { currency = "eur", fx_market = 10 }
 max_slippage_bps = 10
 house_cap_bps = 5000
 margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]
@@ -643,6 +644,7 @@ special_sessions = [
 id = 24
 symbol = "UK100"
 asset_class = "index"
+quote_currency = { currency = "gbp", fx_market = 11 }
 max_slippage_bps = 10
 house_cap_bps = 5000
 margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]
@@ -684,6 +686,7 @@ closures = [
 id = 25
 symbol = "JP225"
 asset_class = "index"
+quote_currency = { currency = "jpy", fx_market = 12 }
 max_slippage_bps = 10
 house_cap_bps = 5000
 margin_tiers = [{ up_to = "5000000", bps = 50 }, { up_to = "25000000", bps = 100 }, { bps = 500 }]

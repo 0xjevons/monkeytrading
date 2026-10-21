@@ -350,6 +350,7 @@ impl NodeConfig {
     /// - genesis parameters or a market spec fail validation
     /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
     ///   engine would refuse, or genesis lists a market id twice
+    /// - a genesis market fails `MarketSpec::check_fx_market` against the markets listed before it
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg: NodeConfig = toml::from_str(&text)

@@ -1,10 +1,10 @@
 //! Account close-out and negative balance protection.
 //!
 //! Margin is shared across an account's positions. When equity falls below the close-out level of
-//! the margin requirement, the largest losing position that can trade right now is closed, and so
-//! on until the account is back above the level; positions in markets that cannot trade wait until
-//! they price again. A loss beyond the account's balance is written off against the house once the
-//! account is flat.
+//! the margin requirement, the largest losing position in USD that can trade right now is closed,
+//! and so on until the account is back above the level; positions in markets that cannot trade wait
+//! until they price again. A loss beyond the account's balance is written off against the house once
+//! the account is flat.
 //!
 //! A price update checks the accounts holding its market. From `V6`, financing and parameter or
 //! listing changes check accounts too, only a market inside its trading session can trade, and a
@@ -17,6 +17,7 @@ use crate::account::{Account, Position};
 use crate::engine::Engine;
 use crate::event::Event;
 use crate::execution::{Exec, PriceGuard};
+use crate::fixed::Rounding;
 use crate::price::compute_index;
 use crate::protocol::ProtocolVersion;
 use crate::types::{AccountId, MarketId, Side};
@@ -97,13 +98,13 @@ impl Engine {
         let acct = self.accounts.get(&account)?;
         let at_index = self.protocol_version >= ProtocolVersion::V6;
         // The index each held market could fill at now, for those that can trade.
-        let tradeable = || -> BTreeMap<MarketId, Fixed> {
+        let tradeable = || -> BTreeMap<MarketId, (Fixed, Option<Fixed>)> {
             acct.positions.keys().filter_map(|id| self.tradeable_index(*id).map(|index| (*id, index))).collect()
         };
         let (indexes, (equity, margin)) = if at_index {
             let indexes = tradeable();
             let valued = self.equity_and_margin_at(acct, |market_id, market, pos| {
-                indexes.get(&market_id).copied().unwrap_or(market.mark.unwrap_or(pos.entry))
+                indexes.get(&market_id).copied().unwrap_or((market.mark.unwrap_or(pos.entry), market.fx_mark))
             });
             (Some(indexes), valued)
         } else {
@@ -116,23 +117,28 @@ impl Engine {
         acct.positions
             .iter()
             .filter_map(|(market_id, pos)| {
-                let index = *indexes.get(market_id)?;
-                let price = if at_index { index } else { self.markets[market_id].mark? };
-                Some((pos.unrealised(price, self.protocol_version), *market_id, *pos))
+                let (index, live_fx) = *indexes.get(market_id)?;
+                let market = &self.markets[market_id];
+                let (price, fx) = if at_index { (index, live_fx) } else { (market.mark?, market.fx_mark) };
+                let pnl =
+                    market.spec.quote_currency.to_usd(pos.unrealised(price, self.protocol_version), fx, Rounding::Down);
+                Some((pnl, *market_id, *pos))
             })
             .min_by_key(|(upnl, market_id, _)| (*upnl, *market_id))
             .map(|(_, market_id, pos)| (market_id, pos, equity, margin))
     }
 
-    /// The index a fill in `market_id` would take now, or `None` unless the market is open with a
-    /// valid index. From `V6`, the market must also be inside its session now, as its open flag
-    /// changes only when its session is refreshed, and a close-out can run before that.
-    fn tradeable_index(&self, market_id: MarketId) -> Option<Fixed> {
+    /// The index a fill in `market_id` would take now, with the FX index it would convert at, or
+    /// `None` unless the market is open with a valid index and an FX price when it is quoted in
+    /// another currency than USD. From `V6`, the market must also be inside its session now, as its
+    /// open flag changes only when its session is refreshed, and a close-out can run before that.
+    fn tradeable_index(&self, market_id: MarketId) -> Option<(Fixed, Option<Fixed>)> {
         let market = &self.markets[&market_id];
         let in_session = self.protocol_version < ProtocolVersion::V6 || market.spec.schedule.is_open(self.now);
         if !market.open || !in_session {
             return None;
         }
-        compute_index(&market.quotes, &market.spec.price_rules, self.now).ok().map(|index| index.mid)
+        let mid = compute_index(&market.quotes, &market.spec.price_rules, self.now).ok()?.mid;
+        Some((mid, self.live_fx(market_id).ok()?))
     }
 }

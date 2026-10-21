@@ -6,7 +6,8 @@
 //! - the size spread, charged only on the slice of the trade that grows the account's absolute
 //!   position through the market's size bands.
 //!
-//! Normal trades therefore fill at the mid.
+//! Normal trades therefore fill at the mid. A market quoted in another currency than USD fills only
+//! while its FX market has a price, and its realised PnL converts to USD at that FX index.
 
 use crate::Fixed;
 use crate::account::RestingOrder;
@@ -53,6 +54,8 @@ struct Priced {
     delta: Fixed,
     price: Fixed,
     mid: Fixed,
+    /// The FX index the fill converts to USD at; `None` for a USD market.
+    fx: Option<Fixed>,
     spread_bps: i64,
     increases: bool,
 }
@@ -134,12 +137,12 @@ impl Engine {
         }
     }
 
-    /// Fills resting orders whose trigger the live price has reached. While a market is closed
-    /// nothing triggers, so the first fresh price after the open fills everything that gapped
-    /// through, at that price.
+    /// Fills resting orders whose trigger the live price has reached. While a market is closed, or
+    /// its FX market has no price, nothing triggers, so the first fresh price after that fills
+    /// everything that gapped through, at that price.
     pub(crate) fn trigger_resting(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
         let market = &self.markets[&market_id];
-        if !market.open {
+        if !market.open || self.live_fx(market_id).is_err() {
             return;
         }
         let Ok(index) = compute_index(&market.quotes, &market.spec.price_rules, self.now) else { return };
@@ -151,7 +154,7 @@ impl Engine {
 
     /// Prices and risk-checks one fill, then books it. Nothing is mutated on error.
     /// Error cases:
-    /// - the market is closed, or has no valid index
+    /// - the market is closed, or has no valid index, or its FX market has no price
     /// - reduce-only with no opposite position, or new risk in a reduce-only market
     /// - new risk below the market's minimum order notional
     /// - a spread at this size that reaches the price itself
@@ -249,9 +252,10 @@ impl Engine {
         }
     }
 
-    /// The live price for a fill and the slice of it that adds risk.
+    /// The live price for a fill and the slice of it that adds risk. Notional bounds are in USD; the
+    /// conversions round so the minimum and the size spread are never less than exact.
     /// Error cases:
-    /// - the market is closed, or has no valid index
+    /// - the market is closed, or has no valid index, or its FX market has no price
     /// - reduce-only with no opposite position, or new risk in a reduce-only market
     /// - new risk below the market's minimum order notional
     /// - a spread at this size that reaches the price itself
@@ -265,6 +269,9 @@ impl Engine {
         let mid = compute_index(&market.quotes, &market.spec.price_rules, self.now)
             .map_err(|error| Reject::NoPrice { error })?
             .mid;
+        let fx = self.live_fx(exec.market)?;
+        let currency = market.spec.quote_currency;
+        let usd = |amount, rounding| currency.to_usd(amount, fx, rounding);
         let acct = &self.accounts[&exec.account];
         let pos = acct.position(exec.market);
 
@@ -282,13 +289,15 @@ impl Engine {
         if increases && market.reduce_only {
             return Err(Reject::ReduceOnly);
         }
-        if increases && qty.mul(mid) < market.spec.min_order_notional {
+        if increases && usd(qty.mul(mid), Rounding::Down) < market.spec.min_order_notional {
             return Err(Reject::InvalidOrder { reason: "below minimum order notional".into() });
         }
 
         let stress = &params.stress_levels[market.stress.level];
-        let size_cost = staircase(&market.spec.spread_tiers, grow_from.mul(mid), grow_to.mul(mid))
-            .mul_bps(stress.size_spread_multiplier_bps);
+        // Widening the slice outwards can only add to its cost.
+        let (from, to) = (usd(grow_from.mul(mid), Rounding::Down), usd(grow_to.mul(mid), Rounding::Up));
+        let size_cost_usd = staircase(&market.spec.spread_tiers, from, to).mul_bps(stress.size_spread_multiplier_bps);
+        let size_cost = currency.from_usd(size_cost_usd, fx, Rounding::Up);
         let toxicity_bps = if exec.liquidation { 0 } else { params.toxicity_spread_bps(acct.toxicity_bps) };
         // Per-unit adjustment; dividing the size cost by qty (not by notional) keeps full precision.
         let adjust = mid.mul_bps(stress.min_spread_bps + toxicity_bps) + size_cost.div(qty);
@@ -311,32 +320,36 @@ impl Engine {
                 }
             }
         }
-        Ok(Priced { qty, delta, price, mid, spread_bps: adjust.bps_of(mid), increases })
+        Ok(Priced { qty, delta, price, mid, fx, spread_bps: adjust.bps_of(mid), increases })
     }
 
-    /// Checks a fill that adds risk against the account's margin and the house's exposure caps.
+    /// Checks a fill that adds risk against the account's margin and the house's exposure caps, in
+    /// USD: realised PnL converts rounded down, and exposure rounded up.
     /// Error cases:
     /// - the account's equity after the fill would be below its margin requirement
     /// - the fill would push the house's net exposure past the market cap or the total cap
     fn check_risk(&self, exec: &Exec, priced: &Priced) -> Result<(), Reject> {
         let params = self.params.as_ref().expect("callers check params are set");
         let market = &self.markets[&exec.market];
+        let usd = |amount, rounding| market.spec.quote_currency.to_usd(amount, priced.fx, rounding);
 
         let mut sim = self.accounts[&exec.account].clone();
         let version = self.protocol_version;
         let realised = sim.positions.entry(exec.market).or_default().apply(priced.delta, priced.price, version);
+        let realised = usd(realised, Rounding::Down);
         sim.balance += realised - profit_fee(realised, params.profit_fee_bps, version);
-        let (equity, required) = self.equity_and_margin(&sim, Some((exec.market, priced.mid)));
+        let (equity, required) = self.equity_and_margin(&sim, Some((exec.market, priced.mid, priced.fx)));
         if equity < required {
             return Err(Reject::InsufficientMargin { equity, required });
         }
 
         let nav = self.house_nav();
-        let before = market.client_qty.abs().mul(priced.mid);
-        let after = (market.client_qty + priced.delta).abs().mul(priced.mid);
+        let before = usd(market.client_qty.abs().mul(priced.mid), Rounding::Up);
+        let after = usd((market.client_qty + priced.delta).abs().mul(priced.mid), Rounding::Up);
         if after > before {
-            // `house_gross_exposure` values this market at its mark; swap that term for `after`.
-            let at_mark = market.mark.map_or(Fixed::ZERO, |mark| market.client_qty.abs().mul(mark));
+            // `house_gross_exposure` values this market at its marks; swap that term for `after`.
+            let exposure = |mark: Fixed| market.usd_at_mark(market.client_qty.abs().mul(mark), Rounding::Up);
+            let at_mark = market.mark.map_or(Fixed::ZERO, exposure);
             let total_after = self.house_gross_exposure() - at_mark + after;
             if after > self.market_cap(&market.spec, nav) || total_after > self.total_cap(params, nav) {
                 return Err(Reject::HouseCapacity);
@@ -345,8 +358,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Books a priced fill: the position, the market aggregates, realised PnL and the profit fee
-    /// against house cash, and a markout to score the flow later.
+    /// Books a priced fill: the position, the market aggregates, realised PnL in USD (rounded down)
+    /// and the profit fee against house cash, and a markout to score the flow later.
     fn book(&mut self, exec: &Exec, priced: Priced) -> Fill {
         let params = self.params.as_ref().expect("callers check params are set");
         let fee_bps = params.profit_fee_bps;
@@ -358,7 +371,8 @@ impl Engine {
         let pos = acct.positions.entry(exec.market).or_default();
         market.client_qty -= pos.qty;
         market.client_cost -= pos.cost();
-        let realised_pnl = pos.apply(priced.delta, priced.price, version);
+        let realised = pos.apply(priced.delta, priced.price, version);
+        let realised_pnl = market.spec.quote_currency.to_usd(realised, priced.fx, Rounding::Down);
         market.client_qty += pos.qty;
         market.client_cost += pos.cost();
         let position = pos.qty;
@@ -388,6 +402,7 @@ impl Engine {
             index: priced.mid,
             spread_bps: priced.spread_bps,
             realised_pnl,
+            fx_index: priced.fx,
             profit_fee: fee,
             position,
             liquidation: exec.liquidation,

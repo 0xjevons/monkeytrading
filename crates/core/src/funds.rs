@@ -125,10 +125,11 @@ impl Engine {
         }
     }
 
-    /// One day's financing on `pos`, positive when the account pays, or `None` when the market has
-    /// no mark to value it at. A benchmark with no published rate counts as zero. From `V5` the
+    /// One day's financing on `pos` in USD, positive when the account pays, or `None` when the market
+    /// has no mark to value it at. A benchmark with no published rate counts as zero. From `V5` the
     /// amount rounds up, so a charge rounds against the account and a credit toward zero; before
-    /// `V5` it truncates.
+    /// `V5` it truncates. A market quoted in another currency converts the amount to USD rounded up,
+    /// the same way.
     fn daily_financing(&self, market_id: MarketId, pos: Position) -> Option<Fixed> {
         let market = self.markets.get(&market_id)?;
         let mark = market.mark?;
@@ -136,12 +137,14 @@ impl Engine {
         let benchmark = self.benchmarks.get(&financing.benchmark).copied().unwrap_or(0);
         let annual_bps =
             if pos.qty.is_positive() { benchmark + financing.markup_bps } else { financing.markup_bps - benchmark };
-        if self.protocol_version < ProtocolVersion::V5 {
-            return Some(pos.qty.abs().mul(mark).mul_bps(annual_bps).div_int(financing.day_basis));
-        }
-        // Each step rounds the amount up: the notional up for a charge and down for a credit, then the
-        // rate and the day count, so it is the exact amount rounded up or one unit above it.
-        let notional = pos.qty.abs().mul_rounded(mark, if annual_bps >= 0 { Rounding::Up } else { Rounding::Down });
-        Some(notional.mul_bps_rounded(annual_bps, Rounding::Up).div_int_rounded(financing.day_basis, Rounding::Up))
+        let amount = if self.protocol_version < ProtocolVersion::V5 {
+            pos.qty.abs().mul(mark).mul_bps(annual_bps).div_int(financing.day_basis)
+        } else {
+            // Each step rounds the amount up: the notional up for a charge and down for a credit, then
+            // the rate and the day count, so it is the exact amount rounded up or one unit above it.
+            let notional = pos.qty.abs().mul_rounded(mark, if annual_bps >= 0 { Rounding::Up } else { Rounding::Down });
+            notional.mul_bps_rounded(annual_bps, Rounding::Up).div_int_rounded(financing.day_basis, Rounding::Up)
+        };
+        Some(market.usd_at_mark(amount, Rounding::Up))
     }
 }

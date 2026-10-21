@@ -16,6 +16,8 @@ this crate and reproduce the signed state roots exactly.
 - Zero spread at normal size, fixed-bps size spreads on position growth, widened under stress
 - Indicative quotes with bounded slippage: orders are declined only when the bound is exceeded
 - A flat fee on realised profit only, and daily CFD financing at a benchmark rate plus markup
+- USD accounts: markets quoted in euros, pounds, or yen accrue PnL in that currency and convert it to
+  USD at the engine's own index for the FX market, and have no price while that FX market has none
 - Tiered margin, account close-out largest loser first among markets that can trade, and negative
   balance protection; from protocol `V6`, close-outs also follow financing and parameter or listing
   changes, skip a market outside its session, and value a market that can trade at its live index
@@ -37,7 +39,7 @@ this crate and reproduce the signed state roots exactly.
 ## Repository Structure
 
 - `src/lib.rs` — module index and the protocol summary
-- `src/engine.rs` — engine state, command dispatch, sessions, prices, and markouts
+- `src/engine.rs` — engine state, command dispatch, sessions, prices, markouts, and USD valuation
 - `src/execution.rs` — order placement, triggers, pricing, risk checks, and booking fills
 - `src/closeout.rs` — account close-out and bad-debt write-off
 - `src/funds.rs` — deposits, withdrawals, house capital, and overnight financing
@@ -47,7 +49,7 @@ this crate and reproduce the signed state roots exactly.
 - `src/eip712.rs` — the EIP-712 domain, the request types clients sign, and signer recovery
 - `src/protocol.rs` — protocol versions, and how to add one
 - `src/fixed.rs` — `Fixed`, the 9-decimal fixed-point type used for all money
-- `src/market.rs` — market listings and tier tables
+- `src/market.rs` — market listings, tier tables, and quote currencies with their USD conversion
 - `src/params.rs` — protocol parameters, stress levels, toxicity, and the rollover clock
 - `src/price.rs` — venue quotes and the reference index
 - `src/session.rs` — weekly trading windows, holidays, dated closures such as early closes, and
@@ -126,8 +128,12 @@ log is `v3.jsonl`. `V4` lets schedules carry dated closures and special sessions
 house capital move record its reference; it activates the same way, and its log is `v4.jsonl`. `V5`
 rounds position accounting in the house's favour; its log is `v5.jsonl`. `V6` adds dollar floors
 under the house exposure caps, close-out checks after financing and parameter or listing changes,
-and a session check and live-index valuation on every close-out; its log is `v6.jsonl`. For each
-later version:
+and a session check and live-index valuation on every close-out; its log is `v6.jsonl`. `V7` adds
+markets quoted in another currency than USD (`MarketSpec::quote_currency`): their PnL, margin, house
+exposure, and financing convert to USD at an FX market's index, rounding toward the house on top of
+`V5`'s rounding, and they have no price while that FX market has none. Before `V7` activates, a
+listing that declares another quote currency is refused, and a USD market has no FX mark and
+encodes as before, so earlier logs replay unchanged; its log is `v7.jsonl`. For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log.rs` so it activates the new version and exercises the new rules.
