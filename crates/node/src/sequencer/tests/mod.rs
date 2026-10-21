@@ -257,12 +257,20 @@ fn an_existing_v1_log_activates_at_its_next_seq_and_still_verifies() {
     fs::create_dir_all(&dir).unwrap();
     // A log written as one file before segments existed continues as the first segment.
     fs::copy(V1_DEV, dir.join("00000000000000000000.jsonl")).unwrap();
-    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
-    // The original 63 commands and 3 checkpoints, then client auth, the operator, and the
-    // activation, with the scheduled checkpoint after the third and the activation's own.
+    let before = replay(&log_entries(&dir)).unwrap().engine.params().cloned().expect("the log sets parameters");
+    let mut seq = recover(&dir, &signed(31_337));
+    let weighting = dev_config().genesis.params.toxicity.notional.unwrap();
+    seq.carry_toxicity_notional(weighting).unwrap();
+    seq.activate_protocol().unwrap();
+    // The original 63 commands and 3 checkpoints, then the config's notional weighting and its
+    // checkpoint, then client auth, the operator, and the activation, with the scheduled checkpoint
+    // after the operator and the activation's own.
     let replayed = replay(&log_entries(&dir)).unwrap();
-    assert_eq!((replayed.commands, replayed.checkpoints), (66, 5));
-    assert_eq!(replayed.activations, [(ProtocolVersion::LATEST, 65)]);
+    assert_eq!((replayed.commands, replayed.checkpoints), (67, 6));
+    assert_eq!(replayed.activations, [(ProtocolVersion::LATEST, 66)]);
+    let mut carried = before;
+    carried.toxicity.notional = Some(weighting);
+    assert_eq!(replayed.engine.params(), Some(&carried));
 }
 
 #[test]
@@ -287,8 +295,9 @@ fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
     fs::create_dir_all(&dir).unwrap();
     fs::copy(V3_REFERENCE, dir.join("00000000000000000000.jsonl")).unwrap();
     let before = replay(&log_entries(&dir)).unwrap();
-    // The node records the operator at the log's next seq and activates the latest version after it.
-    let activated = before.engine.last_seq().unwrap() + 2;
+    // As the node does, the log's parameters take the config's notional weighting at its next seq;
+    // the operator follows, and the latest version after it.
+    let activated = before.engine.last_seq().unwrap() + 3;
     // The log is stamped ahead of the system clock, so the host clock and trusted time agree on a
     // time just after its last command.
     let stamps = Arc::new(TestClock::at(before.engine.now() + 1_000));
@@ -299,6 +308,7 @@ fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
     let key = Arc::new(EnclaveKey::generate());
     let mut seq = Sequencer::recover(cfg, key, stream, mpsc::unbounded_channel().0).unwrap();
     seq.trust(sample_around(stamps.as_ref())).unwrap();
+    seq.carry_toxicity_notional(dev_config().genesis.params.toxicity.notional.unwrap()).unwrap();
     seq.activate_protocol().unwrap();
     // The V3 checkpoints still verify under the hash of the state encoding, and the activation's
     // checkpoint under the state tree, whose proofs hold against it.
@@ -467,3 +477,4 @@ fn commands(entries: &[LogEntry]) -> Vec<Command> {
 
 mod genesis;
 mod operator;
+mod toxicity;

@@ -19,7 +19,8 @@
 //!   rounding in position accounting favours the house, so no sequence of fills realises more than
 //!   its exact PnL. From `V8`, the operator signs admin commands as clients sign requests, with the
 //!   key the log records, once anything is credited, and one command makes every market
-//!   reduce-only.
+//!   reduce-only. From `V11`, a toxicity score is the notional-weighted average of its account's
+//!   markouts, to nine decimals of a bp, each scored only at an index valid when it is scored.
 //! - Accounts hold USD. From `V7`, a market may be quoted in another currency: it accrues PnL in it,
 //!   converts to USD at its FX market's index, and has no price while that FX market has none.
 //! - From `V9`, the state root is a sparse Merkle tree over accounts, positions, markets, and the
@@ -42,6 +43,7 @@ pub mod fixed;
 pub use fixed::Fixed;
 mod funds;
 pub mod market;
+mod markouts;
 pub mod merkle;
 pub mod params;
 pub mod price;

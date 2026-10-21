@@ -72,6 +72,9 @@ impl TestSequencer {
         let key = Arc::new(EnclaveKey::generate());
         let cfg = SequencerConfig { clock: clock.clone(), ..sequencer_config(dir, manifest_tx) };
         let mut seq = Sequencer::recover(cfg, key, stream.clone(), withdrawals_tx).expect("sequencer recovers");
+        // As the node does, parameters an older log set take the config's notional weighting first.
+        let weighting = dev_config().genesis.params.toxicity.notional.expect("the dev config weighs by notional");
+        seq.carry_toxicity_notional(weighting).expect("toxicity notional");
         seq.activate_protocol().expect("protocol activation");
         if seq.needs_genesis() {
             seq.genesis(&dev_config().genesis).expect("dev genesis");

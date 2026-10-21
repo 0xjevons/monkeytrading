@@ -1,6 +1,7 @@
 //! The state root under generated sessions. From `V9`, a root computed from what changed since the
 //! previous one, at random points in the session, equals the root of the same state hashed from
-//! scratch, and every account's proof verifies against it.
+//! scratch, and every account's proof verifies against it. The sessions run under the latest
+//! version, so every rule that changes state reaches the tree.
 
 use engine_core::Engine;
 use engine_core::command::{AdminCommand, Command};
@@ -22,7 +23,7 @@ fn incremental_roots_match_a_rebuild_and_every_account_proves_against_them() {
         // The FX markets are listed, so sessions also move FX marks and euro and yen positions.
         let mut genesis = Harness::fx();
         genesis.admin(AdminCommand::SetOperator(operator()));
-        genesis.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V9 });
+        genesis.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST });
         let mut h = funded(genesis, &session);
         check(&mut h.engine)?;
         for (step, root) in session.steps.into_iter().zip(roots) {
@@ -47,7 +48,7 @@ fn incremental_roots_match_a_rebuild_and_every_account_proves_against_them() {
 // ── Helpers ──
 
 /// Fails unless the engine's root equals a rebuild's, and every account's proof verifies against it
-/// with the account's balance and positions.
+/// with the account's balance, toxicity score, and positions.
 /// Error cases:
 /// - the incremental root differs from the root of the state hashed from scratch
 /// - an account has no proof, or one that does not verify or does not match the account
@@ -61,6 +62,7 @@ fn check(engine: &mut Engine) -> Result<(), TestCaseError> {
         let proof = engine.account_proof(*id).ok_or_else(|| TestCaseError::fail(format!("no proof for {id}")))?;
         if !proof.verify(B256::from(root))
             || proof.leaf.balance != account.balance
+            || proof.leaf.toxicity_score() != account.toxicity_score()
             || !proof.positions.iter().map(|held| (&held.market, &held.position)).eq(&account.positions)
         {
             return Err(TestCaseError::fail(format!("the proof for {id} does not hold its account")));

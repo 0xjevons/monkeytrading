@@ -1,7 +1,7 @@
 //! Accounting invariants under generated sessions. Each case sequences random client, feed,
 //! custody, and operator commands, with values inside and outside the engine's input bounds, under
 //! `V2`, the rules every log starts under, and again under `V6`, under `V7` with markets quoted in
-//! other currencies, and under `V10`. It checks after every command that
+//! other currencies, and under `V11`, the latest. It checks after every command that
 //! it did not panic, that cash is conserved, and that each market's aggregates match its accounts'
 //! positions. Under each version the same sessions must reach every path that moves cash and the
 //! refusal of out-of-range amounts, order numbers, and quotes, and under `V6` a close-out that no
@@ -13,6 +13,7 @@ mod common;
 mod rounding;
 mod session;
 mod state_root;
+mod toxicity;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,7 +38,7 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
     // checked.
     let reached: RefCell<BTreeMap<ProtocolVersion, BTreeSet<&str>>> = RefCell::default();
     let result = TestRunner::new(config()).run(&session(), |session| {
-        for genesis in [Harness::new(), Harness::v6(), Harness::fx(), Harness::v10()] {
+        for genesis in [Harness::new(), Harness::v6(), Harness::fx(), Harness::v11()] {
             let mut h = funded(genesis, &session);
             let version = h.engine.protocol_version();
             let mut inflow = h.deposits + Fixed::from_int(HOUSE_CAPITAL);
@@ -86,7 +87,7 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
     ];
     let reached = reached.into_inner();
     let missed: Vec<(ProtocolVersion, &str)> =
-        [ProtocolVersion::V2, ProtocolVersion::V6, ProtocolVersion::V7, ProtocolVersion::V10]
+        [ProtocolVersion::V2, ProtocolVersion::V6, ProtocolVersion::V7, ProtocolVersion::V11]
             .into_iter()
             .flat_map(|version| expected.iter().map(move |path| (version, *path)))
             .chain([(ProtocolVersion::V6, "close-out without a price")])

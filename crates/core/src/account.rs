@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::Fixed;
 use crate::command::OrderKind;
 use crate::fixed::Rounding;
+use crate::params::NotionalWeighting;
 use crate::protocol::ProtocolVersion;
 use crate::types::{MarketId, OrderId, Side};
 
@@ -91,8 +92,18 @@ pub struct Account {
     pub balance: Fixed,
     pub positions: BTreeMap<MarketId, Position>,
     pub orders: BTreeMap<OrderId, RestingOrder>,
-    /// EWMA of fill markouts in bps; see `ToxicityParams`.
+    /// EWMA of fill markouts in whole bps; see `ToxicityParams`. From `V11` it is the score rounded
+    /// down, and `toxicity_fraction` holds the rest.
     pub toxicity_bps: i64,
+    /// From `V11`, the part of the score above `toxicity_bps`, in `[0, 1)` bps. Left out of the
+    /// encoding while zero.
+    #[serde(default, skip_serializing_if = "Fixed::is_zero")]
+    pub toxicity_fraction: Fixed,
+    /// From `V11`, the fill notional of history behind the score, its prior included, at most the
+    /// memory (`NotionalWeighting`). Zero, and left out of the encoding, until a `V11` markout scores
+    /// the account.
+    #[serde(default, skip_serializing_if = "Fixed::is_zero")]
+    pub toxicity_history: Fixed,
     pub withdrawal_nonce: u64,
 }
 
@@ -100,6 +111,31 @@ impl Account {
     /// The account's position in `market`, flat if it has none.
     pub fn position(&self, market: MarketId) -> Position {
         self.positions.get(&market).copied().unwrap_or_default()
+    }
+
+    /// The toxicity score in bps: whole bps before `V11`, and to nine decimals from it.
+    pub fn toxicity_score(&self) -> Fixed {
+        Fixed::from_int(self.toxicity_bps) + self.toxicity_fraction
+    }
+
+    /// The history behind the score under `weighting`: what `V11` markouts recorded, or else a whole
+    /// memory for a score from before `V11`, and the prior for an account with no score yet.
+    pub(crate) fn toxicity_history_under(&self, weighting: &NotionalWeighting) -> Fixed {
+        if !self.toxicity_history.is_zero() {
+            self.toxicity_history
+        } else if !self.toxicity_score().is_zero() {
+            weighting.memory
+        } else {
+            weighting.prior
+        }
+    }
+
+    /// Stores `score` as its whole bps, rounded down, and the fraction of a bp above them.
+    pub(crate) fn set_toxicity_score(&mut self, score: Fixed) {
+        let whole = score.raw().div_euclid(Fixed::ONE.raw());
+        // A score is a weighted average of markouts clamped to ±1000 bps.
+        self.toxicity_bps = i64::try_from(whole).expect("a score is within ±1000 bps");
+        self.toxicity_fraction = score - Fixed::from_int(self.toxicity_bps);
     }
 }
 
@@ -204,6 +240,21 @@ mod tests {
             prop_assert_eq!(held.unrealised(mark, V5), close(held, mark, V5));
             Ok(())
         });
+    }
+
+    #[test]
+    fn a_toxicity_score_splits_into_whole_bps_rounded_down_and_a_fraction() {
+        let cases = [("25", 25, "0"), ("4.999999999", 4, "0.999999999"), ("-0.5", -1, "0.5"), ("-3", -3, "0")];
+        for (score, whole, fraction) in cases {
+            let mut acct = Account::default();
+            acct.set_toxicity_score(f(score));
+            assert_eq!((acct.toxicity_bps, acct.toxicity_fraction), (whole, f(fraction)), "{score}");
+            assert_eq!(acct.toxicity_score(), f(score));
+        }
+        // A whole score encodes as before `V11`.
+        let mut acct = Account::default();
+        acct.set_toxicity_score(f("7"));
+        assert!(!serde_json::to_string(&acct).unwrap().contains("toxicity_fraction"));
     }
 
     // ── Helpers ──

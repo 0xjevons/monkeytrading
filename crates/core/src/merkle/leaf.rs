@@ -1,7 +1,10 @@
 //! The key and value hash of each kind of leaf. Amounts and prices are `int128` in `Fixed`'s raw
 //! units (9 decimals). Value hashes, in Solidity terms:
 //! - **Account:** `keccak256(abi.encode(AccountLeaf))`, the struct below, where `openPositions`
-//!   counts the account's position leaves.
+//!   counts the account's position leaves; from `V11`, once a markout has scored the account, or its
+//!   score carries a fraction of a bp, `keccak256(abi.encode(AccountLeaf, int128 toxicityFraction,
+//!   int128 toxicityHistory))`, with the fraction above `toxicityBps` and the fill notional of history
+//!   behind the score.
 //! - **Position:** `keccak256(abi.encode(PositionLeaf))`, one per open position, keyed by its
 //!   account and market.
 //! - **Market:** `keccak256(abi.encode(MarketLeaf))`, with `marked` false and `mark` 0 before the
@@ -96,6 +99,14 @@ pub struct AccountLeaf {
     pub toxicity_bps: i64,
     /// How many positions the account holds, each in a leaf of its own.
     pub open_positions: u32,
+    /// From `V11`, the toxicity score's fraction of a bp above `toxicity_bps`. Left out of the
+    /// encoding while zero.
+    #[serde(default, skip_serializing_if = "Fixed::is_zero")]
+    pub toxicity_fraction: Fixed,
+    /// From `V11`, the fill notional of history behind the toxicity score. Left out of the encoding
+    /// while zero; with the fraction, out of the hash while both are.
+    #[serde(default, skip_serializing_if = "Fixed::is_zero")]
+    pub toxicity_history: Fixed,
 }
 
 /// A market as its leaf holds it.
@@ -136,14 +147,29 @@ impl AccountLeaf {
     /// The leaf of `account`.
     pub(crate) fn of(account: &Account) -> Self {
         // Every field is named, so a field added to `Account` fails to compile until a leaf holds it.
-        let Account { balance, positions, orders: _, toxicity_bps, withdrawal_nonce } = account;
+        let Account {
+            balance,
+            positions,
+            orders: _,
+            toxicity_bps,
+            toxicity_fraction,
+            toxicity_history,
+            withdrawal_nonce,
+        } = account;
         AccountLeaf {
             balance: *balance,
             withdrawal_nonce: *withdrawal_nonce,
             toxicity_bps: *toxicity_bps,
             // Positions are keyed by `u32` market ids, so their count fits a `u32`.
             open_positions: u32::try_from(positions.len()).expect("one position per market id"),
+            toxicity_fraction: *toxicity_fraction,
+            toxicity_history: *toxicity_history,
         }
+    }
+
+    /// The toxicity score the leaf holds, in bps.
+    pub fn toxicity_score(&self) -> Fixed {
+        Fixed::from_int(self.toxicity_bps) + self.toxicity_fraction
     }
 
     /// The leaf's value hash.
@@ -154,7 +180,11 @@ impl AccountLeaf {
             toxicityBps: self.toxicity_bps,
             openPositions: self.open_positions,
         };
-        keccak(&[&leaf.abi_encode()])
+        if self.toxicity_fraction.is_zero() && self.toxicity_history.is_zero() {
+            return keccak(&[&leaf.abi_encode()]);
+        }
+        let scored = (self.toxicity_fraction.raw(), self.toxicity_history.raw());
+        keccak(&[&leaf.abi_encode(), &scored.abi_encode()])
     }
 }
 

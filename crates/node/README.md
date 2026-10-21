@@ -22,7 +22,8 @@ verifies its checkpoints.
 - REST API for orders, cancels, withdrawals, and reads, plus a WebSocket stream of the log
 - Orders, cancels, and withdrawals signed by the account (EIP-712), checked before they are
   sequenced; `auth = "none"` trusts the account field and runs only with the mock TEE and custody
-- The latest protocol version and the client auth activated at boot, at the log's next seq
+- The latest protocol version and the client auth activated at boot, at the log's next seq, after
+  giving parameters a log set before `V11` the config's toxicity notional weighting
 - Stream offsets of `<seq>:<index>`: a subscriber starts or resumes at any offset, reads the log
   from disk, then goes live, getting each message once; one that falls behind resumes from disk
 - Segmented log: completed segments and a manifest of their seq ranges and SHA-256 hashes are a
@@ -374,8 +375,8 @@ fresh log, and `engine replay` prints the operator a log records. A node whose `
 encoding: the repository publishes those keys' private keys for local nodes.
 
 `/v1/accounts/{address}/proof` returns, against the state root of the last checkpoint, whose `seq`
-and `root` it names: the account's leaf (balance, withdrawal nonce, toxicity score, and number of
-open positions) with its sibling hashes; each position (its market, qty, and entry) with its leaf's
+and `root` it names: the account's leaf (balance, withdrawal nonce, toxicity score with, from `V11`,
+its fraction of a bp and the notional of history behind it, and number of open positions) with its sibling hashes; each position (its market, qty, and entry) with its leaf's
 siblings; and the leaf and siblings of each market it holds a position in. Check `root` against that
 checkpoint's signed entry, then check the proof with `engine-core`'s `AccountProof::verify` or its
 `verify_proof` example. An account credited since the last checkpoint is not in its root yet, and

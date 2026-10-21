@@ -25,7 +25,7 @@ impl Engine {
     /// them as a price update does.
     /// Error cases:
     /// - `SetParams` with parameters that fail `ProtocolParams::validate`, or from `V8` that fail
-    ///   `ProtocolParams::check_closing_spread`
+    ///   `ProtocolParams::check_closing_spread`, or from `V11` `ProtocolParams::check_notional_weighting`
     /// - `UpsertMarket` with a spec that fails `MarketSpec::validate` or `check_quote_currency`, or with
     ///   dated closures or special sessions before `V4`
     /// - `SetBenchmarkRate` outside ±10000 bps a year
@@ -36,13 +36,19 @@ impl Engine {
     /// - `SetOperator` once the operator is recorded
     /// - `ActivateProtocol` for a version no newer than the one in force, for `V3` or later before
     ///   client auth is recorded, or for `V8` or later before the operator is recorded or while the
-    ///   parameters in force fail `ProtocolParams::check_closing_spread`
+    ///   parameters in force fail `ProtocolParams::check_closing_spread`, or for `V11` or later while
+    ///   they fail `ProtocolParams::check_notional_weighting`
+    /// - `SetToxicityNotional` before parameters are set, over parameters that already weigh markouts
+    ///   by notional, or with weighting that fails `NotionalWeighting::validate`
     pub(crate) fn admin(&mut self, cmd: &AdminCommand, events: &mut Vec<Event>) -> Result<(), String> {
         match cmd {
             AdminCommand::SetParams(params) => {
                 params.validate()?;
                 if self.protocol_version >= ProtocolVersion::V8 {
                     params.check_closing_spread()?;
+                }
+                if self.protocol_version >= ProtocolVersion::V11 {
+                    params.check_notional_weighting()?;
                 }
                 self.next_rollover = Some(params.rollover.next_after(self.now));
                 self.params = Some(params.clone());
@@ -117,6 +123,14 @@ impl Engine {
                 }
                 self.client_auth = Some(auth.clone());
             }
+            AdminCommand::SetToxicityNotional(weighting) => {
+                let params = self.params.as_mut().ok_or("protocol params not set")?;
+                if params.toxicity.notional.is_some() {
+                    return Err("the parameters in force already weigh markouts by notional".into());
+                }
+                weighting.validate()?;
+                params.toxicity.notional = Some(*weighting);
+            }
             AdminCommand::SetOperator(operator) => {
                 if self.operator.is_some() {
                     return Err("the operator is already recorded".into());
@@ -138,14 +152,25 @@ impl Engine {
                 {
                     params.check_closing_spread()?;
                 }
+                if *version >= ProtocolVersion::V11
+                    && let Some(params) = &self.params
+                {
+                    params.check_notional_weighting()?;
+                }
+                // Markouts queued before `V11` carry no notional, so they would move no score, and they
+                // are in fill order rather than the due order `V11` keeps.
+                if self.protocol_version < ProtocolVersion::V11 && *version >= ProtocolVersion::V11 {
+                    while self.pop_markout().is_some() {}
+                }
                 self.protocol_version = *version;
             }
         }
         Ok(())
     }
 
-    /// Applies an admin command the node sequences unsigned: client auth, the operator, and protocol
-    /// activation at any time, and genesis, which credits its house capital last.
+    /// Applies an admin command the node sequences unsigned: client auth, the operator, toxicity
+    /// notional weighting, and protocol activation at any time, and genesis, which credits its house
+    /// capital last.
     /// Error cases:
     /// - from `V8`, an operator command once any deposit or house capital is credited
     /// - any error case of `admin`
@@ -162,7 +187,8 @@ impl Engine {
     /// - before `V8`; the nonce is not used
     /// - a signature that is not the recorded operator's over this command, a nonce other than the
     ///   operator's next, or an expiry passed or too far ahead (see `Engine::authorise_admin`)
-    /// - a command only the node sequences: `SetClientAuth`, `SetOperator`, or `ActivateProtocol`
+    /// - a command only the node sequences: `SetClientAuth`, `SetOperator`, `SetToxicityNotional`, or
+    ///   `ActivateProtocol`
     /// - any error case of `admin`
     pub(crate) fn signed_admin(&mut self, req: &AdminRequest, events: &mut Vec<Event>) -> Result<(), String> {
         if self.protocol_version < ProtocolVersion::V8 {

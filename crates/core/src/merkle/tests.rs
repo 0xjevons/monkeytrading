@@ -9,7 +9,8 @@ use crate::account::Position;
 use crate::types::{AccountId, MarketId};
 
 /// An account leaf, its two position leaves, and three market leaves, with their keys, value
-/// hashes, ABI encodings, the root of the tree holding the six, and each leaf's proof, all
+/// hashes, ABI encodings, the root of the tree holding the six, and each leaf's proof; and an
+/// account leaf scored under `V11`, with a fraction of a bp and history behind its score; all
 /// computed with Foundry's `cast` from the layout in the module docs.
 const FIXTURE: &str = include_str!("../../tests/fixtures/merkle.json");
 
@@ -21,6 +22,8 @@ struct Fixture {
     account_leaf: AccountLeaf,
     account_value_hash: B256,
     account_siblings: Vec<B256>,
+    scored_account_leaf: AccountLeaf,
+    scored_account_value_hash: B256,
     positions: Vec<FixturePosition>,
     markets: Vec<FixtureMarket>,
     root: B256,
@@ -51,6 +54,7 @@ fn keys_leaves_the_root_and_proofs_match_an_evm_toolchain() {
     let fixture: Fixture = serde_json::from_str(FIXTURE).unwrap();
     assert_eq!(account_key(fixture.account), fixture.account_key);
     assert_eq!(fixture.account_leaf.value_hash(), fixture.account_value_hash);
+    assert_eq!(fixture.scored_account_leaf.value_hash(), fixture.scored_account_value_hash);
     let mut leaves = vec![(fixture.account_key, fixture.account_value_hash)];
     for p in &fixture.positions {
         assert_eq!(position_key(fixture.account, p.market), p.key, "position in {}", p.market);

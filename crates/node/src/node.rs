@@ -113,8 +113,11 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     let custody = Custody::connect(&cfg.custody, seq.last_seq())
         .inspect_err(|e| error!(alert = "custody_connect_failed", "refusing to serve: {e:#}"))?;
     // Protocol activation and genesis wait, like any command, for a stamp trusted time admits;
-    // with no sample yet, they are queued.
-    seq.activate_protocol()
+    // with no sample yet, they are queued. Parameters an older log set take the config's toxicity
+    // notional weighting first, which the latest version needs.
+    let weighting = cfg.genesis.params.toxicity.notional.context("genesis.params.toxicity.notional")?;
+    seq.carry_toxicity_notional(weighting)
+        .and_then(|()| seq.activate_protocol())
         .inspect_err(|e| error!(alert = "protocol_activation_failed", "refusing to serve: {e:#}"))?;
     if seq.needs_genesis() {
         info!(markets = cfg.genesis.markets.len(), "genesis queued for the first trusted time sample");

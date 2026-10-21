@@ -132,7 +132,7 @@ impl Engine {
     /// `None` unless the market is open with a valid index and an FX price when it is quoted in
     /// another currency than USD. From `V6`, the market must also be inside its session now, as its
     /// open flag changes only when its session is refreshed, and a close-out can run before that.
-    fn tradeable_index(&self, market_id: MarketId) -> Option<(Fixed, Option<Fixed>)> {
+    pub(crate) fn tradeable_index(&self, market_id: MarketId) -> Option<(Fixed, Option<Fixed>)> {
         let market = &self.markets[&market_id];
         let in_session = self.protocol_version < ProtocolVersion::V6 || market.spec.schedule.is_open(self.now);
         if !market.open || !in_session {

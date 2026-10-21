@@ -52,12 +52,18 @@ this crate and reproduce the signed state roots exactly.
   every margin requirement rounds up, from a position's notional to the close-out level
 - Products and quotients that never overflow while the result fits, whatever the position size or
   price ratio
+- From protocol `V11`, a toxicity score carries nine decimals of a bp and is the notional-weighted
+  average of the account's markouts, from a neutral prior and over at most a memory of fill
+  notional, so dust cannot reset a score and no single fill sets one; each markout is scored only at
+  an index valid when it is scored, within one horizon of falling due
 
 ## Repository Structure
 
 - `src/lib.rs` — module index and the protocol summary
-- `src/engine.rs` — engine state, command dispatch, sessions, prices, markouts, and USD valuation
+- `src/engine.rs` — engine state, command dispatch, sessions, prices, and USD valuation
 - `src/execution.rs` — order placement, triggers, pricing, risk checks, and booking fills
+- `src/markouts.rs` — each fill's markout, queued and then marked against the index after its
+  horizon, and toxicity scores
 - `src/closeout.rs` — account close-out and bad-debt write-off
 - `src/funds.rs` — deposits, withdrawals, house capital, and overnight financing
 - `src/admin.rs` — operator commands, signed admin commands, and stress levels
@@ -85,14 +91,14 @@ this crate and reproduce the signed state roots exactly.
 - `src/types.rs` — ids, sides, and asset classes
 - `tests/` — protocol tests through `Engine::apply`, with a shared harness, its signing client
   (`client.rs`), and the reference-log format in `tests/common/`; `tests/operator.rs` covers signed
-  admin commands and every-market reduce-only
+  admin commands and every-market reduce-only, and `tests/toxicity.rs` toxicity scoring
 - `tests/reference/` — one reference log per protocol version: each line is a sequenced command and
   the state root after it
 - `tests/reference_logs.rs` — replays every reference log and fails at the first seq whose root
   differs
 - `tests/invariants/` — property tests over generated sessions (`main.rs`), the session generator
-  (`session.rs`), fills at one price (`rounding.rs`), and spreads and margin against their exact
-  amounts (`charges.rs`)
+  (`session.rs`), fills at one price (`rounding.rs`), spreads and margin against their exact
+  amounts (`charges.rs`), and toxicity scores against their markouts (`toxicity.rs`)
 - `tests/invariants/state_root.rs` — incremental roots against a rebuild, with every account's
   proof checked, under generated sessions
 - `tests/state_root.rs` — the state root from `V9`: its activation, what each root rehashes,
@@ -158,13 +164,16 @@ Two suites guard replay and accounting:
   aarch64 Linux, and `scripts/check-reference-logs.sh` fails a branch that changes, renames, or
   deletes a committed log.
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
-  under `V2`, `V6`, `V7` with markets quoted in other currencies, and `V10`. Each mixes client, feed, custody, and operator commands, with
-  values inside and outside the input bounds, and checks after every command that nothing panicked,
-  cash is conserved, and every market's aggregates match its accounts' positions. Raise `CASES` or
-  change `SEED` in `tests/invariants/main.rs` to search further. The same suite generates adds,
-  reductions, and flips at one price under `V5` and checks that none realises a profit, and fills
-  in random spread and margin bands under `V10` and checks that none pays less spread or posts
-  less margin than the exact amount.
+  under `V2`, `V6`, `V7` with markets quoted in other currencies, and `V11`. Each mixes client,
+  feed, custody, and operator commands, with values inside and outside the input bounds, and checks
+  after every command that nothing panicked, cash is conserved, and every market's aggregates match
+  its accounts' positions. Raise `CASES` or change `SEED` in `tests/invariants/main.rs` to search
+  further. The same suite generates adds, reductions, and flips at one price under `V5` and checks
+  that none realises a profit; fills in random spread and margin bands under `V11` and checks that
+  none pays less spread or posts less margin than the exact amount; and fills of any size from dust
+  up, each marked out at a moved index or after a window without one, under `V11`, and checks that
+  the toxicity score stays within a millionth of a bp of the exact notional-weighted average of its
+  markouts.
   Under `V9`, the same sessions check that roots computed from what changed, at random points,
   equal a root hashed from scratch, and that every account's proof verifies against them.
 
@@ -190,8 +199,9 @@ as before, so earlier logs replay unchanged; its log is `v7.jsonl`. `V8` adds ad
 by the operator, refuses an unsigned operator command once anything is credited, adds every-market
 reduce-only, and refuses parameters whose spreads would refuse a close; it activates the same way,
 and its log is `v8.jsonl`. `V9` makes the state root the root of the state tree; its log is
-`v9.jsonl`. `V10` rounds spreads and margin in the house's favour; its log is `v10.jsonl`. For each
-later version:
+`v9.jsonl`. `V10` rounds spreads and margin in the house's favour; its log is `v10.jsonl`. `V11`
+makes a toxicity score the notional-weighted average of its markouts, to nine decimals, each scored
+only at a valid index; its log is `v11.jsonl`. For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log/main.rs` so it activates the new version and exercises the new rules.
