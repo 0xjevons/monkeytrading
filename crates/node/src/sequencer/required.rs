@@ -2,14 +2,16 @@
 //! activation, and genesis. Like any command, they wait for a stamp trusted time admits.
 
 use anyhow::bail;
+use engine_core::Engine;
+use engine_core::auth::{ClientAuth, Operator};
 use engine_core::command::{AdminCommand, Command};
-use engine_core::event::Event;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::types::Millis;
 use tracing::info;
 
 use crate::config::Genesis;
-use crate::sequencer::{GENESIS_REF, Sequencer};
+use crate::sequencer::Sequencer;
+use crate::sequencer::genesis::{GENESIS_REF, check_genesis, genesis_commands, rejection};
 
 impl Sequencer {
     /// The seq of the last command in the log, if any.
@@ -17,8 +19,9 @@ impl Sequencer {
         self.engine.last_seq()
     }
 
-    /// Whether genesis has yet to finish: its last command, the house capital credit, is not in
-    /// the log. Genesis commands are safe to repeat, so a genesis cut short runs again in full.
+    /// Whether genesis has yet to run: its last command, the house capital credit, is not in the
+    /// log. Recovery refuses a log that started genesis without closing it, so such a log holds no
+    /// more than protocol activation.
     pub fn needs_genesis(&self) -> bool {
         !self.engine.is_credited(GENESIS_REF)
     }
@@ -31,16 +34,7 @@ impl Sequencer {
     /// - the engine rejects any of them
     /// - the log cannot be written
     pub fn activate_protocol(&mut self) -> anyhow::Result<()> {
-        let mut cmds = Vec::new();
-        if self.engine.client_auth().is_none() {
-            cmds.push(Command::Admin(AdminCommand::SetClientAuth(self.client_auth.clone())));
-        }
-        if self.engine.operator().is_none() {
-            cmds.push(Command::Admin(AdminCommand::SetOperator(self.operator)));
-        }
-        if self.engine.protocol_version() < ProtocolVersion::LATEST {
-            cmds.push(Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }));
-        }
+        let cmds = activation_commands(&self.engine, &self.client_auth, self.operator);
         if cmds.is_empty() {
             return Ok(());
         }
@@ -48,12 +42,16 @@ impl Sequencer {
         self.sequence_required("protocol activation", cmds)
     }
 
-    /// Sequences the genesis config as ordinary admin commands, then checkpoints, once trusted time
-    /// admits a stamp (see `sequence_required`).
+    /// Checks that the engine accepts every genesis command, then sequences them as ordinary admin
+    /// commands and checkpoints, once trusted time admits a stamp (see `sequence_required`). A
+    /// genesis the engine would reject queues and writes nothing. The check runs under the latest
+    /// rules, so callers activate the protocol first, as `run` does.
     /// Error cases:
-    /// - the engine rejects any genesis command
+    /// - the engine would reject a genesis command (see `check_genesis`)
+    /// - the engine rejects one when it is sequenced
     /// - the log cannot be written
     pub fn genesis(&mut self, genesis: &Genesis) -> anyhow::Result<()> {
+        check_genesis(&self.client_auth, self.operator, genesis)?;
         self.sequence_required("genesis", genesis_commands(genesis))
     }
 
@@ -92,9 +90,7 @@ impl Sequencer {
             info!(what, commands = cmds.len(), "sequencing required commands");
             for cmd in cmds {
                 let events = self.stamp(ts, cmd)?;
-                if let Some(Event::AdminRejected { reason }) =
-                    events.iter().find(|e| matches!(e, Event::AdminRejected { .. }))
-                {
+                if let Some(reason) = rejection(&events) {
                     bail!("{what}: rejected: {reason}");
                 }
             }
@@ -104,14 +100,18 @@ impl Sequencer {
     }
 }
 
-/// The commands that sequence `genesis` into an empty log, in order. The last is the house capital
-/// credit under `GENESIS_REF`, a zero one included, which marks genesis done.
-pub fn genesis_commands(genesis: &Genesis) -> Vec<Command> {
-    let mut cmds = vec![Command::Admin(AdminCommand::SetParams(genesis.params.clone()))];
-    cmds.extend(genesis.benchmarks.iter().map(|b| {
-        Command::Admin(AdminCommand::SetBenchmarkRate { benchmark: b.name.clone(), annual_bps: b.annual_bps })
-    }));
-    cmds.extend(genesis.markets.iter().map(|m| Command::Admin(AdminCommand::UpsertMarket(m.clone()))));
-    cmds.push(Command::HouseCapital { amount: genesis.house_capital, chain_ref: GENESIS_REF.into() });
+/// The commands that record `client_auth` and `operator` and activate the latest protocol version,
+/// whichever `engine` lacks.
+pub(super) fn activation_commands(engine: &Engine, client_auth: &ClientAuth, operator: Operator) -> Vec<Command> {
+    let mut cmds = Vec::new();
+    if engine.client_auth().is_none() {
+        cmds.push(Command::Admin(AdminCommand::SetClientAuth(client_auth.clone())));
+    }
+    if engine.operator().is_none() {
+        cmds.push(Command::Admin(AdminCommand::SetOperator(operator)));
+    }
+    if engine.protocol_version() < ProtocolVersion::LATEST {
+        cmds.push(Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }));
+    }
     cmds
 }

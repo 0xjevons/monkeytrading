@@ -183,19 +183,6 @@ async fn a_genesis_held_back_by_a_skewed_clock_goes_in_ahead_of_the_first_admitt
     assert!(matches!(before_tick, LogEntry::Checkpoint(cp) if cp.seq == last_genesis), "{before_tick:?}");
 }
 
-#[tokio::test]
-async fn a_genesis_the_engine_rejects_stops_the_sequencer_on_the_first_sample() {
-    let clock = Arc::new(TestClock::default());
-    let servers = honest_servers(&clock).await;
-    let mut cfg = scenario_config(servers.iter().map(server_config).collect());
-    // Config validation refuses this rate at load; the sequencer still fails closed on it.
-    cfg.genesis.benchmarks[0].annual_bps = 20_000;
-    let node = Node::boot("rejected", clock.clone(), cfg, true).await;
-    node.until_forwarded(1).await;
-    let err = node.fail().await;
-    assert!(format!("{err:#}").contains("genesis: rejected: benchmark rate 20000bps out of range"), "{err:#}");
-}
-
 // ── Helpers ──
 
 impl Node {
@@ -284,15 +271,6 @@ impl Node {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
         entries
-    }
-
-    /// Stops the node, whose sequencer must have failed, and returns its error.
-    async fn fail(mut self) -> anyhow::Error {
-        self.stop_feeding().await;
-        drop(self.tx);
-        let outcome = timeout(WAIT, self.sequencer).await.expect("sequencer stopped").unwrap();
-        let _ = std::fs::remove_dir_all(&self.dir);
-        outcome.expect_err("the sequencer failed")
     }
 }
 

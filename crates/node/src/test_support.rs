@@ -14,6 +14,8 @@ use engine_core::price::PriceError;
 use engine_core::types::{AccountId, Side};
 use engine_core::{Engine, Fixed};
 use futures_util::FutureExt;
+use k256::ecdsa::SigningKey;
+use rand::rngs::OsRng;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -33,6 +35,7 @@ use crate::tee::EnclaveKey;
 use crate::trusted_time::Sample;
 
 pub const DEV_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/dev.toml");
+pub const ANVIL_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/anvil.toml");
 /// Small, so a short test crosses several segment boundaries.
 pub const SEGMENT_COMMANDS: u64 = 4;
 pub const CHECKPOINT_EVERY: u64 = 3;
@@ -213,6 +216,12 @@ pub fn scratch_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("engine-node-test-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+/// An operator public key nobody has published: the uncompressed SEC1 hex of a fresh random key.
+pub fn own_operator_key() -> String {
+    let key = SigningKey::random(&mut OsRng);
+    format!("0x{}", hex::encode(key.verifying_key().to_encoded_point(false).as_bytes()))
 }
 
 /// The committed dev config.

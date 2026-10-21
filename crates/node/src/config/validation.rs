@@ -1,26 +1,31 @@
 //! The checks a node config must pass once it parses: values that would fail silently or at the
 //! wrong moment.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
-use engine_core::Fixed;
-use engine_core::params::MAX_BENCHMARK_BPS;
 use tokio_tungstenite::tungstenite::http::Uri;
-use tracing_subscriber::EnvFilter;
+use tracing::level_filters::LevelFilter;
+use tracing::subscriber::with_default;
+use tracing::{Level, enabled};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::{EnvFilter, registry};
 
 use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProvider, VenuesSection};
+use crate::sequencer::genesis::check_genesis;
 use crate::trusted_time::NO_SAMPLE_GRACE;
 
 impl NodeConfig {
     /// Checks values that parse but would fail silently or at the wrong moment.
     /// Error cases:
-    /// - `logging.level` is not a valid filter directive
+    /// - `logging.level` is not a valid filter directive, or one that disables the node's errors
     /// - `node.tick`, `node.checkpoint_every`, `node.segment_commands`, `feeds.interval`,
     ///   `time.max_drift`, `time.interval`, or an `api` timeout is zero, or `time.interval` plus
     ///   twice `time.max_drift` is not under 60s
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
+    /// - `tee.provider` is not `mock` and `operator.public_key` is a published test key (see
+    ///   `refuse_test_keys`)
     /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
     ///   no longer than `feeds.interval`
     /// - `time.servers` has fewer than two servers, lists a public key twice, or has an address
@@ -28,13 +33,15 @@ impl NodeConfig {
     /// - `history.retention` is zero, or too long to count in milliseconds
     /// - the custody section does not match its provider (see `validate_custody`)
     /// - `operator.public_key` or `custody.vault` does not parse
-    /// - genesis parameters fail validation or let spreads refuse a close, or a market spec fails
-    ///   validation
-    /// - genesis house capital is negative or above `Fixed::MAX_INPUT`, a benchmark rate is one the
-    ///   engine would refuse, or genesis lists a market id twice
-    /// - a genesis market fails `MarketSpec::check_fx_market` against the markets listed before it
+    /// - genesis lists a market id, a market symbol, or a benchmark name twice
+    /// - the engine would reject a genesis command (see `check_genesis`)
     pub(super) fn validate(&self) -> anyhow::Result<()> {
-        EnvFilter::try_new(&self.logging.level).context("logging.level")?;
+        let filter = EnvFilter::try_new(&self.logging.level).context("logging.level")?;
+        // A word that is not a level, such as "warning", parses as a target and hides every alert.
+        ensure!(
+            enables_node_errors(&self.logging.level, filter),
+            "logging.level must enable at least \"error\" for engine_node and every module in it"
+        );
         if self.node.tick.is_zero()
             || self.node.checkpoint_every == 0
             || self.node.segment_commands == 0
@@ -66,6 +73,7 @@ impl NodeConfig {
         {
             anyhow::bail!("node.auth = \"none\" needs tee.provider and custody.provider both \"mock\"");
         }
+        self.refuse_test_keys()?;
         if self.time.max_drift.is_zero() || self.time.interval.is_zero() {
             anyhow::bail!("time.max_drift and time.interval must be non-zero");
         }
@@ -89,37 +97,20 @@ impl NodeConfig {
         }
         self.history.retention_ms().context("history.retention")?;
         self.validate_custody()?;
-        self.operator()?;
-        self.genesis.params.validate().map_err(anyhow::Error::msg).context("genesis.params")?;
-        // Genesis runs under the latest rules, which refuse these.
-        self.genesis.params.check_closing_spread().map_err(anyhow::Error::msg).context("genesis.params")?;
-        // Genesis reruns on every boot until it completes, so a command the engine would refuse
-        // fails here, before anything reaches the log.
-        // Zero records the genesis credit and moves nothing; any other amount must be one the engine
-        // accepts.
-        if self.genesis.house_capital != Fixed::ZERO && !self.genesis.house_capital.is_valid_input() {
-            anyhow::bail!("genesis.house_capital must be zero, or above zero and at most {}", Fixed::MAX_INPUT);
+        // The engine replaces a market or benchmark rate set twice, so a repeated id or name would
+        // silently drop the earlier entry, and a repeated symbol would name two markets.
+        let markets = &self.genesis.markets;
+        if let Some(id) = repeated(markets.iter().map(|m| m.id)) {
+            bail!("genesis lists market {id} twice");
         }
-        // A repeated id would silently replace the earlier listing.
-        let mut ids = BTreeSet::new();
-        if let Some(m) = self.genesis.markets.iter().find(|m| !ids.insert(m.id)) {
-            anyhow::bail!("genesis lists market {} twice", m.id);
+        if let Some(symbol) = repeated(markets.iter().map(|m| m.symbol.as_str())) {
+            bail!("genesis lists market symbol {symbol} twice");
         }
-        if let Some(b) =
-            self.genesis.benchmarks.iter().find(|b| !(-MAX_BENCHMARK_BPS..=MAX_BENCHMARK_BPS).contains(&b.annual_bps))
-        {
-            anyhow::bail!("genesis benchmark {} is outside ±{MAX_BENCHMARK_BPS} bps", b.name);
+        if let Some(name) = repeated(self.genesis.benchmarks.iter().map(|b| b.name.as_str())) {
+            bail!("genesis lists benchmark {name} twice");
         }
-        let mut listed = BTreeMap::new();
-        for m in &self.genesis.markets {
-            m.validate().map_err(anyhow::Error::msg).with_context(|| format!("market {}", m.symbol))?;
-            // A market quoted outside USD converts at its pair's market, listed before it.
-            m.check_fx_market(|id| listed.get(&id).copied())
-                .map_err(anyhow::Error::msg)
-                .with_context(|| format!("market {}", m.symbol))?;
-            listed.insert(m.id, m.symbol.as_str());
-        }
-        Ok(())
+        // Genesis is all or nothing, so a command the engine would refuse fails the load.
+        check_genesis(&self.client_auth()?, self.operator()?, &self.genesis)
     }
 }
 
@@ -157,6 +148,31 @@ impl VenuesSection {
         }
         Ok(())
     }
+}
+
+/// Whether `filter`, parsed from `level`, enables error events from every module of the node, as
+/// every Critical alert is one: it enables them for the crate, and no static directive in `level`
+/// turns off a target inside it.
+fn enables_node_errors(level: &str, filter: EnvFilter) -> bool {
+    let turns_off_a_module =
+        level.split(',').filter_map(|directive| directive.rsplit_once('=')).any(|(spec, level)| {
+            let (target, selector) = spec.split_once('[').unwrap_or((spec, ""));
+            let target = target.trim();
+            // A target matches every event target it prefixes, so `engine_node:` reaches every module.
+            let in_node = "engine_node::".starts_with(target) || target.starts_with("engine_node::");
+            // A span name or a field value makes a directive dynamic: it can enable events in its
+            // scope, never disable what the static directives enable.
+            let (span, fields) = selector.split_once('{').unwrap_or((selector.trim_end_matches(']'), ""));
+            let dynamic = !span.trim().is_empty() || fields.contains('=');
+            in_node && !dynamic && level.trim().parse::<LevelFilter>().is_ok_and(|level| level == LevelFilter::OFF)
+        });
+    !turns_off_a_module && with_default(registry().with(filter), || enabled!(target: "engine_node", Level::ERROR))
+}
+
+/// The first item `items` repeats, if any.
+fn repeated<T: Ord + Copy>(items: impl IntoIterator<Item = T>) -> Option<T> {
+    let mut seen = BTreeSet::new();
+    items.into_iter().find(|item| !seen.insert(*item))
 }
 
 /// Whether `address` is a non-empty host, a colon, and a port number.

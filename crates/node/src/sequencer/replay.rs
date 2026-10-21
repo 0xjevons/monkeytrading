@@ -12,6 +12,7 @@ use engine_core::types::AccountId;
 use engine_core::{Engine, Fixed};
 
 use crate::log::{self, LogEntry, SegmentedLog};
+use crate::sequencer::GenesisProgress;
 
 /// The result of replaying a log.
 pub struct Replayed {
@@ -23,6 +24,8 @@ pub struct Replayed {
     pub unsigned: Vec<(AccountId, Fixed, u64)>,
     /// Each protocol version the log activated, with the seq it took effect at.
     pub activations: Vec<(ProtocolVersion, u64)>,
+    /// How far the log got through genesis.
+    pub genesis: GenesisProgress,
 }
 
 /// Re-applies a log entry by entry, as it is read, and checks every checkpoint root, logged event,
@@ -39,6 +42,7 @@ pub(super) struct Replay {
     /// events, every later one must, and every approval must be signed.
     approved: VecDeque<(AccountId, Fixed, u64)>,
     logs_events: bool,
+    genesis: GenesisProgress,
 }
 
 impl Replay {
@@ -63,6 +67,7 @@ impl Replay {
                 }
                 let version = engine.protocol_version();
                 let events = engine.apply(&c.sequenced).with_context(|| format!("applying seq {seq}"))?;
+                self.genesis.command(&c.sequenced, &events);
                 if engine.protocol_version() != version {
                     self.activations.push((engine.protocol_version(), seq));
                 }
@@ -94,6 +99,7 @@ impl Replay {
                     bail!("state root mismatch at seq {}: log says {}, replay gives {root}", cp.seq, cp.root);
                 }
                 self.checkpoints += 1;
+                self.genesis.checkpoint();
             }
         }
         Ok(())
@@ -102,9 +108,9 @@ impl Replay {
     /// What the entries applied so far replay to.
     pub(super) fn finish(self) -> Replayed {
         let unsigned = if self.logs_events { self.approved.into() } else { Vec::new() };
-        let (engine, commands, checkpoints, activations) =
-            (self.engine, self.commands, self.checkpoints, self.activations);
-        Replayed { engine, commands, checkpoints, unsigned, activations }
+        let (engine, commands, checkpoints, activations, genesis) =
+            (self.engine, self.commands, self.checkpoints, self.activations, self.genesis);
+        Replayed { engine, commands, checkpoints, unsigned, activations, genesis }
     }
 }
 
