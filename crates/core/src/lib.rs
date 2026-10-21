@@ -31,6 +31,9 @@
 //! - From `V12`, each command first processes every index that changed without a price update, so
 //!   every fill and check uses the index the quotes give at its sequenced time, and a venue quote
 //!   stamped ahead of that time counts at once.
+//! - From `V13`, an open, priced market's stress level is re-evaluated before every fill and after
+//!   every command, over a trailing move window, with divergence triggers scaled to each market's
+//!   bound.
 
 pub mod account;
 mod admin;
@@ -53,5 +56,6 @@ pub mod params;
 pub mod price;
 pub mod protocol;
 pub mod session;
+mod stress;
 mod tracked;
 pub mod types;

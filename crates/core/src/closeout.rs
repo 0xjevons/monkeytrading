@@ -82,7 +82,7 @@ impl Engine {
                 guard: PriceGuard::None,
                 liquidation: true,
             };
-            match self.execute(exec) {
+            match self.execute(exec, events) {
                 Ok(fill) => self.after_fill(fill, events),
                 Err(_) => break,
             }

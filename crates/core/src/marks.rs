@@ -117,8 +117,8 @@ impl Engine {
     /// markets that convert at it, and each market in `indices`, and each other one whose FX mark
     /// moved and that has a price from its own quotes, takes its mark, unless its FX market has no
     /// price. Each step runs over every market before the next: only once every mark is set does
-    /// each marked market update its stress, then trigger its resting orders, and then close-outs
-    /// run in every market whose value moved.
+    /// each marked market update its stress (before `V13`), then trigger its resting orders, and
+    /// then close-outs run in every market whose value moved.
     fn process_indices(&mut self, indices: &[(MarketId, Index)], events: &mut Vec<Event>) {
         let ids: Vec<MarketId> = indices.iter().map(|(id, _)| *id).collect();
         // The markets each index converts, apart from the FX market itself: those outside `indices`
@@ -151,8 +151,11 @@ impl Engine {
                 }
             }
         }
-        for (id, index) in &marked {
-            self.update_stress(*id, index.mid, index.divergence_bps, events);
+        // From V13 each fill and the end of each command re-evaluate stress instead.
+        if self.protocol_version < ProtocolVersion::V13 {
+            for (id, index) in &marked {
+                self.update_stress(*id, index.mid, index.divergence_bps, events);
+            }
         }
         for (id, _) in &marked {
             self.trigger_resting(*id, events);

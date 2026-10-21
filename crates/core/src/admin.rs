@@ -1,4 +1,4 @@
-//! Operator commands and stress levels.
+//! Operator commands.
 //!
 //! Every admin action is a sequenced command, so the public log shows each parameter change, each
 //! listing, and each stress override. From `V8` the operator signs its commands (listings,
@@ -8,13 +8,11 @@
 //! push it below what the automatic triggers set, and from `V8` neither a reduce-only mode nor a
 //! spread stops a trade that reduces or closes a position in an open market with a price.
 
-use crate::Fixed;
 use crate::command::{AdminCommand, AdminRequest};
 use crate::engine::{Engine, MarketState};
 use crate::event::{Event, Reject};
-use crate::fixed::Rounding;
 use crate::market::MarketSpec;
-use crate::params::{MAX_BENCHMARK_BPS, StressLevel};
+use crate::params::MAX_BENCHMARK_BPS;
 use crate::protocol::ProtocolVersion;
 use crate::types::MarketId;
 
@@ -22,12 +20,17 @@ impl Engine {
     /// Applies an operator command. From `V6`, new parameters check every account for close-out, as
     /// the close-out level may rise, and a listing checks every account holding the market, as its
     /// margin table may rise. From `V7`, a listing of a market others convert at also marks it and
-    /// them as a price update does.
+    /// them as a price update does. Activating `V13` turns the absolute divergence triggers in force
+    /// into shares of the widest listed bound; a market already listed with a zero bound reaches a
+    /// share above zero only once relisted with a positive one.
     /// Error cases:
-    /// - `SetParams` with parameters that fail `ProtocolParams::validate`, or from `V8` that fail
-    ///   `ProtocolParams::check_closing_spread`, or from `V11` `ProtocolParams::check_notional_weighting`
-    /// - `UpsertMarket` with a spec that fails `MarketSpec::validate` or `check_quote_currency`, or with
-    ///   dated closures or special sessions before `V4`
+    /// - `SetParams` with parameters that fail `ProtocolParams::validate_for` the version in force,
+    ///   from `V8` that fail `ProtocolParams::check_closing_spread`, from `V13` that fail
+    ///   `ProtocolParams::check_notional_weighting`, or from `V13` with a divergence share a listed
+    ///   market can never reach
+    /// - `UpsertMarket` with a spec that fails `MarketSpec::validate` or `check_quote_currency`, with
+    ///   dated closures or special sessions before `V4`, or from `V13` with a bound no divergence
+    ///   share in force can be reached at
     /// - `SetBenchmarkRate` outside ±10000 bps a year
     /// - `SetStressFloor` before parameters are set, at a level that does not exist, or for an
     ///   unknown market
@@ -43,12 +46,15 @@ impl Engine {
     pub(crate) fn admin(&mut self, cmd: &AdminCommand, events: &mut Vec<Event>) -> Result<(), String> {
         match cmd {
             AdminCommand::SetParams(params) => {
-                params.validate()?;
+                params.validate_for(self.protocol_version)?;
                 if self.protocol_version >= ProtocolVersion::V8 {
                     params.check_closing_spread()?;
                 }
                 if self.protocol_version >= ProtocolVersion::V11 {
                     params.check_notional_weighting()?;
+                }
+                if self.protocol_version >= ProtocolVersion::V13 {
+                    self.markets.values().try_for_each(|market| params.check_divergence_reachable(&market.spec))?;
                 }
                 self.next_rollover = Some(params.rollover.next_after(self.now));
                 self.params = Some(params.clone());
@@ -66,6 +72,9 @@ impl Engine {
                     return Err(format!("dated closures and special sessions need protocol {:?}", ProtocolVersion::V4));
                 }
                 self.check_quote_currency(spec)?;
+                if let Some(params) = self.params.as_ref().filter(|_| self.protocol_version >= ProtocolVersion::V13) {
+                    params.check_divergence_reachable(spec)?;
+                }
                 let currency_changed =
                     self.markets.get(&spec.id).is_some_and(|market| market.spec.quote_currency != spec.quote_currency);
                 match self.markets.get_mut(&spec.id) {
@@ -171,6 +180,12 @@ impl Engine {
                 if self.protocol_version < ProtocolVersion::V11 && *version >= ProtocolVersion::V11 {
                     while self.pop_markout().is_some() {}
                 }
+                if self.protocol_version < ProtocolVersion::V13 && *version >= ProtocolVersion::V13 {
+                    let widest = self.markets.values().map(|market| market.spec.price_rules.max_divergence_bps).max();
+                    if let Some(params) = self.params.as_mut() {
+                        params.share_divergence_triggers(widest.unwrap_or(0));
+                    }
+                }
                 self.protocol_version = *version;
             }
         }
@@ -210,41 +225,6 @@ impl Engine {
         self.admin(&req.command, events)
     }
 
-    /// Recomputes a market's automatic stress level from the latest index, then its effective
-    /// level. A raised automatic level steps down only after the cooldown.
-    pub(crate) fn update_stress(
-        &mut self,
-        market_id: MarketId,
-        mid: Fixed,
-        divergence_bps: i64,
-        events: &mut Vec<Event>,
-    ) {
-        let cap = self.market_cap(&self.markets[&market_id].spec, self.house_nav());
-        let now = self.now;
-        let global_floor = self.global_stress_floor;
-        let params = self.params.as_ref().expect("callers check params are set");
-        let market = self.markets.get_mut(&market_id).expect("callers pass a listed market");
-
-        let move_bps = match market.stress.move_ref {
-            Some((t, p)) if now - t < params.stress_move_window_ms => (mid - p).abs().bps_of(p),
-            _ => {
-                market.stress.move_ref = Some((now, mid));
-                0
-            }
-        };
-        let exposure = market.usd_at_mark(market.client_qty.abs().mul(mid), Rounding::Up);
-        let util_bps = if cap.is_positive() { exposure.bps_of(cap) } else { i64::MAX };
-        let target = auto_stress_target(&params.stress_levels, divergence_bps, move_bps, util_bps);
-
-        let stress = &mut market.stress;
-        if target > stress.auto || (target < stress.auto && now - stress.auto_since >= params.stress_cooldown_ms) {
-            stress.auto = target;
-            stress.auto_since = now;
-        }
-        let max_level = params.stress_levels.len() - 1;
-        set_stress_level(market_id, market, global_floor, max_level, events);
-    }
-
     /// Checks a listing's quote currency against the protocol version and the markets already listed.
     /// Before `V7` every market is quoted in USD, whatever its symbol.
     /// Error cases:
@@ -279,16 +259,6 @@ impl Engine {
         }
         Ok(())
     }
-
-    /// Recomputes every market's effective stress level after a floor or parameter change.
-    fn restress_all(&mut self, events: &mut Vec<Event>) {
-        let Some(params) = &self.params else { return };
-        let max_level = params.stress_levels.len() - 1;
-        let global_floor = self.global_stress_floor;
-        for (market_id, market) in self.markets.iter_mut() {
-            set_stress_level(*market_id, market, global_floor, max_level, events);
-        }
-    }
 }
 
 /// The reason an admin command fails its signature, nonce, or expiry check.
@@ -300,39 +270,5 @@ fn auth_failure(reject: &Reject) -> String {
         Reject::ExpiryTooFar { latest } => format!("expiry after the latest allowed, {latest}"),
         // `authorise_admin` refuses only for the reasons above.
         other => serde_json::to_string(other).expect("rejections serialise"),
-    }
-}
-
-/// The highest stress level whose trigger any current reading meets, or 0.
-fn auto_stress_target(levels: &[StressLevel], divergence_bps: i64, move_bps: i64, util_bps: i64) -> usize {
-    levels
-        .iter()
-        .enumerate()
-        .skip(1)
-        .rev()
-        .find(|(_, level)| {
-            level.trigger.as_ref().is_some_and(|t| {
-                t.divergence_bps.is_some_and(|x| divergence_bps >= x)
-                    || t.move_bps.is_some_and(|x| move_bps >= x)
-                    || t.utilisation_bps.is_some_and(|x| util_bps >= x)
-            })
-        })
-        .map_or(0, |(i, _)| i)
-}
-
-/// Sets a market's effective stress level to the highest of its automatic level and both floors,
-/// capped at the top level, emitting a change.
-fn set_stress_level(
-    market_id: MarketId,
-    market: &mut MarketState,
-    global_floor: usize,
-    max_level: usize,
-    events: &mut Vec<Event>,
-) {
-    let stress = &mut market.stress;
-    let level = stress.auto.max(stress.floor).max(global_floor).min(max_level);
-    if level != stress.level {
-        stress.level = level;
-        events.push(Event::StressChanged { market: market_id, level });
     }
 }

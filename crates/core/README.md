@@ -60,18 +60,25 @@ this crate and reproduce the signed state roots exactly.
   changes without a price update, at an open, when a quote ages out, or when its FX market gains a
   price, sets the mark and stress and fills resting orders and close-outs before any order,
   rollover, or check uses it, and a venue quote stamped ahead counts at once
+- From protocol `V13`, stress follows its inputs: each open, priced market's automatic level is
+  re-evaluated before every fill and after every command, a fast move counts within a trailing
+  window, and a divergence trigger is a share of each market's divergence bound, so every market
+  with a positive bound can reach every level; activating `V13` turns absolute divergence triggers
+  into shares of the widest listed bound
 
 ## Repository Structure
 
 - `src/lib.rs` — module index and the protocol summary
 - `src/engine.rs` — engine state, command dispatch, sessions, and USD valuation
 - `src/marks.rs` — venue prices, and marking a market and the markets that convert at its index
-- `src/execution.rs` — order placement, triggers, pricing, risk checks, and booking fills
+- `src/execution/` — order placement, triggers, pricing, risk checks, and booking fills (`mod.rs`),
+  and its unit tests (`tests.rs`)
 - `src/markouts.rs` — each fill's markout, queued and then marked against the index after its
   horizon, and toxicity scores
 - `src/closeout.rs` — account close-out and bad-debt write-off
 - `src/funds.rs` — deposits, withdrawals, house capital, and overnight financing
-- `src/admin.rs` — operator commands, signed admin commands, and stress levels
+- `src/admin.rs` — operator commands and signed admin commands
+- `src/stress.rs` — stress levels: the automatic triggers, the move window, and the floors
 - `src/auth.rs` — client auth, the operator record, request signatures and nonces, and the checks
   every client request and signed admin command pass
 - `src/eip712.rs` — the EIP-712 domain, the request types clients and the operator sign, and signer
@@ -97,7 +104,9 @@ this crate and reproduce the signed state roots exactly.
 - `tests/` — protocol tests through `Engine::apply`, with a shared harness, its signing client
   (`client.rs`), and the reference-log format in `tests/common/`; `tests/operator.rs` covers signed
   admin commands and every-market reduce-only, `tests/toxicity.rs` toxicity scoring, and
-  `tests/quote_timing.rs` indices that change without a price update and venue quotes stamped ahead
+  `tests/quote_timing.rs` indices that change without a price update and venue quotes stamped ahead,
+  `tests/stress.rs` stress levels from `V13`, and `tests/stress_activation.rs` the activation of
+  `V13` over earlier divergence triggers and move references
 - `tests/reference/` — one reference log per protocol version: each line is a sequenced command and
   the state root after it
 - `tests/reference_logs.rs` — replays every reference log and fails at the first seq whose root
@@ -114,8 +123,8 @@ this crate and reproduce the signed state roots exactly.
 - `tests/fixtures/merkle.json` — state tree vectors computed with Foundry's `cast`: keys, leaf ABI
   encodings and value hashes, a root, and proofs
 - `examples/reference_log/` — writes the reference log for a new protocol version: the session
-  (`main.rs`), the requests and event names it uses (`helpers.rs`), and its `V10` and `V12` parts
-  (`v10.rs`, `v12.rs`)
+  (`main.rs`), the requests and event names it uses (`helpers.rs`), its `V10` and `V12` parts
+  (`v10.rs`, `v12.rs`), and its `V13` part (`stress.rs`)
 - `examples/sign_request.rs` — a client signing a request body for the API
 - `examples/verify_proof.rs` — checks an account proof from the API against a root
 
@@ -171,8 +180,8 @@ Two suites guard replay and accounting:
   aarch64 Linux, and `scripts/check-reference-logs.sh` fails a branch that changes, renames, or
   deletes a committed log.
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
-  under `V2`, `V6`, `V7` with markets quoted in other currencies, `V11`, and `V12` with those
-  markets and signed operator commands. Each mixes client, feed, custody, and operator commands,
+  under `V2`, `V6`, `V7` with markets quoted in other currencies, `V13`, and `V12` and `V13` with
+  those markets and signed operator commands, where `V13` must reach a stress change. Each mixes client, feed, custody, and operator commands,
   with values inside and outside the input bounds, and checks after every command that nothing
   panicked, cash is conserved, and every market's aggregates match its accounts' positions. Under
   `V12` it also checks that every market has processed the index it can deal at, holds no quote
@@ -212,8 +221,8 @@ and its log is `v8.jsonl`. `V9` makes the state root the root of the state tree;
 `v9.jsonl`. `V10` rounds spreads and margin in the house's favour; its log is `v10.jsonl`. `V11`
 makes a toxicity score the notional-weighted average of its markouts, to nine decimals, each scored
 only at a valid index; its log is `v11.jsonl`. `V12` brings every market to its sequenced time before
-each command and counts a quote stamped ahead at once; its log is `v12.jsonl`. For each later
-version:
+each command and counts a quote stamped ahead at once; its log is `v12.jsonl`. `V13` makes stress
+follow its inputs; its log is `v13.jsonl`. For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log/main.rs` so it activates the new version and exercises the new rules.

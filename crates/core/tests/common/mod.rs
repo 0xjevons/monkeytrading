@@ -7,6 +7,7 @@
 mod client;
 pub use client::*;
 pub mod reference;
+pub mod stress;
 
 use std::collections::BTreeMap;
 
@@ -146,6 +147,14 @@ impl Harness {
     pub fn v12() -> Self {
         let mut h = Harness::v11();
         h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V12 });
+        h
+    }
+
+    /// `v12`, then `V13`, which re-evaluates stress before every fill and after every command, and on
+    /// activation turns the harness parameters' divergence trigger into a share of the market bound.
+    pub fn v13() -> Self {
+        let mut h = Harness::v12();
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V13 });
         h
     }
 
@@ -393,6 +402,7 @@ pub fn params() -> ProtocolParams {
                     divergence_bps: Some(10),
                     move_bps: Some(200),
                     utilisation_bps: Some(8_000),
+                    divergence_share_bps: None,
                 }),
             },
         ],
@@ -424,7 +434,7 @@ pub fn market(id: MarketId, symbol: &str, class: AssetClass, schedule: Schedule,
             Tier { up_to: Some(Fixed::from_int(5_000_000)), bps: 2 },
             Tier { up_to: None, bps: 5 },
         ],
-        price_rules: PriceRules { max_age_ms: 1_000, max_divergence_bps: 50, min_sources: 2 },
+        price_rules: PriceRules { max_age_ms: 1_000, max_divergence_bps: stress::MAX_DIVERGENCE_BPS, min_sources: 2 },
         max_slippage_bps: 20,
         financing: FinancingSpec { benchmark: "SOFR".into(), markup_bps: 250, day_basis: 365 },
         house_cap_bps: 5_000,

@@ -3,7 +3,7 @@
 //! it, each market opens and closes on its venue's hours through weeks with holidays and early
 //! closes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -12,8 +12,9 @@ use chrono_tz::Tz;
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::event::Event;
-use engine_core::market::QuoteCurrency;
+use engine_core::market::{MarketSpec, QuoteCurrency};
 use engine_core::params::ProtocolParams;
+use engine_core::price::SourceQuote;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::session::{Period, Schedule};
 use engine_core::types::{AssetClass, MarketId, Millis};
@@ -51,7 +52,7 @@ type Week = Vec<(&'static [MarketId], Tz, Vec<(String, bool)>)>;
 #[test]
 fn a_dev_node_loads_the_production_genesis_and_every_market_validates() {
     let genesis = production_genesis("validates");
-    genesis.params.validate().unwrap();
+    genesis.params.validate_for(ProtocolVersion::LATEST).unwrap();
     for market in &genesis.markets {
         market.validate().unwrap_or_else(|e| panic!("{}: {e}", market.symbol));
     }
@@ -130,6 +131,24 @@ fn the_launch_markets_quoted_outside_usd_convert_at_their_pairs() {
     for (symbol, currency) in quoted {
         let want = expected.iter().find(|(s, _)| *s == symbol).map_or(QuoteCurrency::Usd, |(_, c)| *c);
         assert_eq!(currency, want, "{symbol}");
+    }
+}
+
+#[test]
+fn every_launch_market_can_reach_each_divergence_level() {
+    let dev = NodeConfig::load(Path::new(DEV)).unwrap().genesis;
+    let production = production_genesis("divergence-levels");
+    let levels: BTreeSet<usize> = (0..production.params.stress_levels.len())
+        .filter(|level| {
+            let trigger = production.params.stress_levels[*level].trigger.as_ref();
+            trigger.is_some_and(|t| t.divergence_share_bps.is_some())
+        })
+        .collect();
+    assert_eq!(levels, BTreeSet::from([1, 2]));
+    for genesis in [&dev, &production] {
+        for (symbol, reached) in divergence_levels(&production.params, &genesis.markets) {
+            assert!(levels.is_subset(&reached), "{symbol}: reaches {reached:?}");
+        }
     }
 }
 
@@ -403,6 +422,51 @@ fn overnight(days: &[&str], open: &str, close: &str) -> Vec<(String, bool)> {
 /// Opens and closes written out.
 fn listed(transitions: &[(&str, bool)]) -> Vec<(String, bool)> {
     transitions.iter().map(|(local, open)| (local.to_string(), *open)).collect()
+}
+
+/// The stress levels each of `markets` reaches under the latest protocol version and `params`, all
+/// listed 24/7 with house capital and no positions, as two venues diverge around a flat index of 1
+/// from zero up to the market's bound, in listing order, so each FX market is priced before the
+/// markets that convert at it.
+fn divergence_levels(params: &ProtocolParams, markets: &[MarketSpec]) -> Vec<(String, BTreeSet<usize>)> {
+    let mut engine = Engine::new();
+    let operator = NodeConfig::load(Path::new(DEV)).unwrap().operator().unwrap();
+    let activation = [
+        Command::Admin(AdminCommand::SetClientAuth(ClientAuth::Unsigned)),
+        Command::Admin(AdminCommand::SetOperator(operator)),
+        Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST }),
+        Command::Admin(AdminCommand::SetParams(params.clone())),
+    ];
+    let listings = markets.iter().map(|market| {
+        Command::Admin(AdminCommand::UpsertMarket(MarketSpec { schedule: Schedule::AlwaysOpen, ..market.clone() }))
+    });
+    let capital = Command::HouseCapital { amount: Fixed::from_int(10_000_000), chain_ref: "capital".into() };
+    activation.into_iter().chain(listings).chain([capital]).for_each(|cmd| apply_at_zero(&mut engine, cmd));
+    // An index of 1 converts every launch currency, so a market quoted in one has a price.
+    let center = Fixed::ONE;
+    let quote = |source: &str, mid| SourceQuote { source: source.into(), mid, ts: 0 };
+    markets
+        .iter()
+        .map(|market| {
+            let reached = (0..=market.price_rules.max_divergence_bps)
+                .map(|bps| {
+                    let half = Fixed::from_bps(bps).div_int(2);
+                    let quotes = vec![quote("a", center - half), quote("b", center + half)];
+                    apply_at_zero(&mut engine, Command::Prices { market: market.id, quotes });
+                    engine.markets()[&market.id].stress.level
+                })
+                .collect();
+            (market.symbol.clone(), reached)
+        })
+        .collect()
+}
+
+/// Applies `cmd` as the engine's next seq at time zero; panics if the engine refuses it.
+fn apply_at_zero(engine: &mut Engine, cmd: Command) {
+    let seq = engine.last_seq().map_or(0, |seq| seq + 1);
+    let events = engine.apply(&Sequenced { seq, ts: 0, cmd }).unwrap();
+    let refused = |e: &Event| matches!(e, Event::AdminRejected { .. } | Event::PricesRejected { .. });
+    assert!(!events.iter().any(refused), "{events:?}");
 }
 
 /// The production genesis as a dev node loads it, through a config file named for `test` so tests

@@ -78,11 +78,16 @@ pub enum ProtocolVersion {
     /// check. A venue quote stamped ahead of the sequenced time counts at once, as stamped at the
     /// sequenced time.
     V12,
+    /// Stress follows its inputs: an open, priced market's automatic level is re-evaluated before
+    /// every fill and after every command, the fast-move trigger measures moves over a trailing
+    /// window, and a divergence trigger is a share of each market's divergence bound. Activation
+    /// turns absolute divergence triggers into shares of the widest listed bound.
+    V13,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V12;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V13;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

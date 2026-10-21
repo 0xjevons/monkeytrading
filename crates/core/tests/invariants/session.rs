@@ -17,6 +17,7 @@ use proptest::prop_oneof;
 use proptest::sample::select;
 use proptest::strategy::{Just, Strategy};
 
+use crate::common::stress::with_divergence_shares;
 use crate::common::{AAPL, BTC, Client, DE40, ETH, EURUSD, UNLISTED, USDJPY, acct, market, params, us_equities};
 
 /// A market id only generated listings use.
@@ -101,8 +102,9 @@ enum Stamp {
     Exact(Millis),
 }
 
-/// The command a step sends, with relative prices resolved against the engine's current marks, and
-/// from `V8` admin commands signed by the operator with its next nonce.
+/// The command a step sends, with relative prices resolved against the engine's current marks, from
+/// `V8` admin commands signed by the operator with its next nonce, and from `V13` new parameters
+/// with divergence triggers as shares.
 pub(crate) fn command(action: &Action, engine: &Engine, now: Millis) -> Command {
     match action {
         Action::Tick => Command::Tick,
@@ -161,8 +163,15 @@ pub(crate) fn command(action: &Action, engine: &Engine, now: Millis) -> Command 
             Command::CancelOrder { account: *account, order_id: *order_id, auth: None }
         }
         Action::Admin(cmd) if engine.protocol_version() >= ProtocolVersion::V8 => {
+            // From V13 a divergence trigger is a share of each market's bound.
+            let cmd = match cmd {
+                AdminCommand::SetParams(params) if engine.protocol_version() >= ProtocolVersion::V13 => {
+                    AdminCommand::SetParams(with_divergence_shares(params.clone()))
+                }
+                cmd => cmd.clone(),
+            };
             let operator = Client { expires_at: now + 60_000, ..Client::operator() };
-            operator.admin(engine.next_request_nonce(operator.account), cmd.clone())
+            operator.admin(engine.next_request_nonce(operator.account), cmd)
         }
         Action::Admin(cmd) => Command::Admin(cmd.clone()),
     }

@@ -153,6 +153,13 @@ fn a_listing_or_parameters_come_from_toml_and_are_validated_before_signing() {
     let wide = write("wide.toml", &toml::to_string(&wide).unwrap());
     let err = action(&["set-params", &wide]).command().unwrap_err();
     assert!(format!("{err:#}").contains("reach the price"), "{err:#}");
+    // The latest version takes a divergence trigger only as a share of each market's bound.
+    let absolute = toml::to_string(&dev_config().genesis.params)
+        .unwrap()
+        .replace("divergence_share_bps = 6000", "divergence_bps = 15");
+    let absolute = write("absolute.toml", &absolute);
+    let err = action(&["set-params", &absolute]).command().unwrap_err();
+    assert!(format!("{err:#}").contains("divergence_share_bps"), "{err:#}");
 
     let invalid = write("invalid.toml", &SOL.replace("house_cap_bps = 1000", "house_cap_bps = 0"));
     let mistyped = write("mistyped.toml", &SOL.replace("house_cap_bps", "house_capp_bps"));

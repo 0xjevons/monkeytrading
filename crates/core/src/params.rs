@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Fixed;
 use crate::fixed::Rounding;
+use crate::market::MarketSpec;
 use crate::protocol::ProtocolVersion;
 use crate::types::Millis;
 
@@ -33,7 +34,10 @@ pub struct ProtocolParams {
     pub house_total_cap_bps: i64,
     /// Index 0 is normal conditions. Higher levels widen spreads.
     pub stress_levels: Vec<StressLevel>,
-    /// Window over which the stress engine measures a market's price move.
+    /// Window over which the stress engine measures a market's price move: before `V13`, from the
+    /// first price of each window in turn; from `V13`, over the trailing window, which reaches back
+    /// at least this far and less than a tenth of it further, or of the previous window for a while
+    /// after it shortens.
     pub stress_move_window_ms: i64,
     /// Minimum time at a raised stress level before it can step back down.
     pub stress_cooldown_ms: i64,
@@ -61,6 +65,8 @@ pub struct StressLevel {
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StressTrigger {
+    /// Venue divergence in bps of the index, before `V13`. Above a market's `max_divergence_bps` it
+    /// can never fire there, since the market then has no price.
     #[serde(default)]
     pub divergence_bps: Option<i64>,
     #[serde(default)]
@@ -68,6 +74,10 @@ pub struct StressTrigger {
     /// House net exposure in the market as a share of its cap.
     #[serde(default)]
     pub utilisation_bps: Option<i64>,
+    /// From `V13`, venue divergence as a share of the market's `max_divergence_bps`, so a share of
+    /// up to 10_000, the bound itself, is reachable in every market.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divergence_share_bps: Option<i64>,
 }
 
 /// Markout-based flow scoring. Each fill is marked against the index `horizon_ms` later; the
@@ -123,7 +133,8 @@ impl ProtocolParams {
     /// - a total house cap outside 1..=100000 bps, or a total cap floor below zero or above
     ///   `Fixed::MAX_INPUT`
     /// - no stress levels, a trigger on level 0, a multiplier outside 0..=100000 bps, a minimum
-    ///   spread outside 0..=10000 bps, or a negative trigger threshold
+    ///   spread outside 0..=10000 bps, a negative trigger threshold, or a divergence share above
+    ///   10000 bps
     /// - a non-positive move window, or a negative cooldown
     /// - a toxicity horizon outside 1..=3600000 ms, an EWMA weight outside 1..=10000 bps, tiers
     ///   not strictly ascending, or an extra spread outside 0..=10000 bps
@@ -152,9 +163,13 @@ impl ProtocolParams {
         let bad_level = |l: &StressLevel| {
             !(0..=MAX_MULTIPLE_BPS).contains(&l.size_spread_multiplier_bps)
                 || !rate.contains(&l.min_spread_bps)
-                || l.trigger
-                    .as_ref()
-                    .is_some_and(|t| [t.divergence_bps, t.move_bps, t.utilisation_bps].iter().flatten().any(|x| *x < 0))
+                || l.trigger.as_ref().is_some_and(|t| {
+                    [t.divergence_bps, t.move_bps, t.utilisation_bps, t.divergence_share_bps]
+                        .iter()
+                        .flatten()
+                        .any(|x| *x < 0)
+                        || t.divergence_share_bps.is_some_and(|x| x > MAX_RATE_BPS)
+                })
         };
         if self.stress_levels.iter().any(bad_level) {
             return Err("stress level out of range".into());
@@ -205,6 +220,55 @@ impl ProtocolParams {
             return Err(format!("toxicity needs notional weighting from protocol {:?}", ProtocolVersion::V11));
         }
         Ok(())
+    }
+
+    /// Checks the parameters as `validate` does, and that each divergence trigger takes the form
+    /// `version` evaluates: absolute bps before `V13`, and from `V13` a share of each market's bound.
+    /// Error cases:
+    /// - any case `validate` refuses
+    /// - a divergence share before `V13`, or an absolute divergence from `V13`
+    pub fn validate_for(&self, version: ProtocolVersion) -> Result<(), String> {
+        self.validate()?;
+        let mut triggers = self.stress_levels.iter().filter_map(|level| level.trigger.as_ref());
+        if version >= ProtocolVersion::V13 {
+            if triggers.any(|t| t.divergence_bps.is_some()) {
+                return Err("from protocol V13 a divergence trigger is divergence_share_bps".into());
+            }
+        } else if triggers.any(|t| t.divergence_share_bps.is_some()) {
+            return Err(format!("divergence_share_bps needs protocol {:?}", ProtocolVersion::V13));
+        }
+        Ok(())
+    }
+
+    /// Checks every divergence share can fire in `spec`'s market. A market with a zero divergence
+    /// bound prices only while its venues agree, so its share is always zero.
+    /// Error cases:
+    /// - a divergence share above zero, with `spec`'s divergence bound at zero
+    pub fn check_divergence_reachable(&self, spec: &MarketSpec) -> Result<(), String> {
+        let positive_share = self
+            .stress_levels
+            .iter()
+            .filter_map(|level| level.trigger.as_ref())
+            .any(|t| t.divergence_share_bps.is_some_and(|share| share > 0));
+        if positive_share && spec.price_rules.max_divergence_bps == 0 {
+            return Err(format!(
+                "a divergence share above zero can never fire in {}, whose bound is zero",
+                spec.symbol
+            ));
+        }
+        Ok(())
+    }
+
+    /// Turns each absolute divergence trigger into the same share of `widest_bound`, at most the
+    /// bound itself: the form `V13` takes. Markets at the widest bound keep their thresholds and
+    /// narrower ones scale down; the share truncates, so it fires no later than the threshold did.
+    pub fn share_divergence_triggers(&mut self, widest_bound: i64) {
+        for trigger in self.stress_levels.iter_mut().filter_map(|level| level.trigger.as_mut()) {
+            if let Some(bps) = trigger.divergence_bps.take() {
+                let share = bps.saturating_mul(MAX_RATE_BPS) / widest_bound.max(1);
+                trigger.divergence_share_bps = Some(share.min(MAX_RATE_BPS));
+            }
+        }
     }
 
     /// Extra spread for an account with this toxicity score: the highest tier it reaches.
