@@ -256,11 +256,15 @@ fn sequencer_outcome(joined: Result<anyhow::Result<()>, JoinError>) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::net;
+    use std::collections::BTreeMap;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::{iter, net};
 
     use crate::config::HistorySection;
-    use crate::log::Offset;
+    use crate::history::INDEX_FILE;
+    use crate::log::{MANIFEST, Offset};
     use crate::test_support::{
         RETENTION, TestHistory, TestSequencer, capture_alerts, deposit, dev_config, scratch_dir,
     };
@@ -270,21 +274,7 @@ mod tests {
     /// start: here as far as binding the API, whose port the test holds.
     #[tokio::test]
     async fn a_history_index_ahead_of_its_log_is_discarded_and_the_node_starts() {
-        let (dir, index) = (scratch_dir("node-history-ahead"), scratch_dir("node-history-ahead-index"));
-        let node = TestSequencer::start(&dir, 1024);
-        let history = TestHistory::start(&node, &dir, &index).await.unwrap();
-        node.submit(deposit(1, "dep-1")).await;
-        // The log as the disk keeps it when the power fails now.
-        let kept = scratch_dir("node-history-ahead-kept");
-        fs::create_dir_all(&kept).unwrap();
-        for file in fs::read_dir(&dir).unwrap() {
-            let file = file.unwrap();
-            fs::copy(file.path(), kept.join(file.file_name())).unwrap();
-        }
-        node.submit(deposit(1, "dep-2")).await;
-        node.stop().await;
-        history.finish().await.unwrap();
-
+        let (kept, index) = index_ahead_of_log("node-history-ahead").await;
         let held = net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut cfg = dev_config();
         (cfg.node.log_dir, cfg.history.dir) = (kept.clone(), index.clone());
@@ -300,5 +290,58 @@ mod tests {
         let reopened = History::open(&cfg, &SegmentedLog::open(&kept).unwrap().entries).unwrap();
         assert_eq!(reopened.resume_at(), Offset::start_of(0));
         assert!(alerts.try_recv().is_err(), "one alert");
+    }
+
+    /// An index the node must discard but cannot remove, beside a write-ahead log the host replaced
+    /// with a directory, stops the node with a Critical alert before recovery writes to the log.
+    #[tokio::test]
+    async fn a_history_index_the_node_cannot_discard_stops_it_before_it_writes_to_the_log() {
+        let (kept, index) = index_ahead_of_log("node-history-stuck").await;
+        fs::create_dir(index.join(format!("{INDEX_FILE}-wal"))).unwrap();
+        // A listing a crash cut short, which recovery trims.
+        let mut manifest = OpenOptions::new().append(true).open(kept.join(MANIFEST)).unwrap();
+        manifest.write_all(br#"{"file":"#).unwrap();
+        let before = files(&kept);
+
+        let mut cfg = dev_config();
+        (cfg.node.log_dir, cfg.history.dir) = (kept.clone(), index);
+        cfg.node.listen = "127.0.0.1:0".parse().unwrap();
+        let (_guard, mut alerts) = capture_alerts();
+        let refused = timeout(Duration::from_secs(10), run(cfg)).await.expect("the node stops in time");
+        let err = refused.expect_err("the index cannot be discarded");
+        assert!(format!("{err:#}").contains("removing"), "{err:#}");
+        let levels: Vec<_> = iter::from_fn(|| alerts.try_recv().ok())
+            .map(|alert| (alert["alert"].clone(), alert["level"].clone()))
+            .collect();
+        let expected = [("history_index_discarded", "WARN"), ("history_recovery_failed", "ERROR")];
+        assert_eq!(levels, expected.map(|(alert, level)| (alert.to_owned(), level.to_owned())));
+        assert_eq!(files(&kept), before, "the log is as it was found");
+    }
+
+    // ── Helpers ──
+
+    /// A log in a new directory named after `name`, as the disk keeps it when the power fails after
+    /// its first deposit, and an index that took a second deposit the log then lost.
+    async fn index_ahead_of_log(name: &str) -> (PathBuf, PathBuf) {
+        let (dir, index) = (scratch_dir(name), scratch_dir(&format!("{name}-index")));
+        let node = TestSequencer::start(&dir, 1024);
+        let history = TestHistory::start(&node, &dir, &index).await.unwrap();
+        node.submit(deposit(1, "dep-1")).await;
+        let kept = scratch_dir(&format!("{name}-kept"));
+        fs::create_dir_all(&kept).unwrap();
+        for file in fs::read_dir(&dir).unwrap() {
+            let file = file.unwrap();
+            fs::copy(file.path(), kept.join(file.file_name())).unwrap();
+        }
+        node.submit(deposit(1, "dep-2")).await;
+        node.stop().await;
+        history.finish().await.unwrap();
+        (kept, index)
+    }
+
+    /// Every file in `dir` and its bytes.
+    fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        let names = fs::read_dir(dir).unwrap().map(|file| file.unwrap().file_name().into_string().unwrap());
+        names.map(|name| (name.clone(), fs::read(dir.join(name)).unwrap())).collect()
     }
 }

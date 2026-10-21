@@ -116,8 +116,8 @@ async fn a_reopened_index_serves_what_a_rebuild_under_its_retention_would() {
     }
 }
 
-/// A history failure carries its cause: an unusable index directory, and a damaged log segment the
-/// feed meets while catching up.
+/// A history failure carries its cause: an unusable index directory, an index the node must discard
+/// but cannot remove, and a damaged log segment the feed meets while catching up.
 #[tokio::test]
 async fn a_history_failure_names_its_cause() {
     let (dir, index) = (scratch_dir("history-causes"), index_dir("causes"));
@@ -126,6 +126,16 @@ async fn a_history_failure_names_its_cause() {
     let cfg = HistorySection { dir: occupied.join("history"), retention: RETENTION };
     let err = History::open(&cfg, &[]).err().expect("no directory under a file");
     assert!(format!("{err:#}").contains("creating"), "{err:#}");
+
+    // An index ahead of its log, whose write-ahead log the host replaced with a directory.
+    let (log, stuck) = (scratch_dir("history-causes-stuck-log"), index_dir("causes-stuck"));
+    deposit_log(&log, 10);
+    index_to_end(&log, &stuck, RETENTION).await;
+    lose_log_tail(&log);
+    fs::create_dir(stuck.join(format!("{INDEX_FILE}-wal"))).unwrap();
+    let cfg = HistorySection { dir: stuck, retention: RETENTION };
+    let err = History::open(&cfg, &entries(&log)).err().expect("the index cannot be discarded");
+    assert!(format!("{err:#}").contains(&format!("removing {}", cfg.dir.join(INDEX_FILE).display())), "{err:#}");
 
     indexed_log(&dir, &index, 1).await;
     let manifest = Manifest::load(&dir).unwrap();
