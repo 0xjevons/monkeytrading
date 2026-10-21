@@ -208,22 +208,24 @@ log`). History is public, like the log.
 
 The history index is a SQLite file in `history.dir`, derived from the log alone. A supervised task
 follows the log as a stream subscriber does, from disk and then live, and writes on its own thread,
-so the sequencer never waits for it; once caught up, history trails the log by the batch being
-written. Each write stores the account events of a batch of commands, keyed by cursor, and the last
-command taken, in one transaction. Events whose command is older than `history.retention`, counted
-back from the newest command in the index, leave it; the log keeps them. After `history.retention`
-changes, the index takes the log again from its start, which leaves it as a fresh index under the
-new retention would be; until that pass passes its old newest command, the startup check stays on
-that command. The node reads its log once at startup, and before recovery replays that read and
-writes anything, the index checks that it holds the newest command the index has taken, unchanged,
-and resumes after the last command it took. If the log ends before that newest command or holds
-another one there, the log was rolled back or replaced, and the node refuses to start
-(`history_recovery_failed`) with the log as it found it. A power loss can also leave the index ahead
-of the log, since neither syncs every write. SQLite opens the file in defensive mode, with triggers
-and views off, its schema untrusted, and cell sizes checked, and every write and read refuses,
-inside its own transaction, a schema this code did not create. Removing `history.dir` while the node
-is stopped rebuilds the index from the log's segments. Commands logged before events were recorded
-add nothing to history.
+so the sequencer never waits for it; once caught up, history trails the log by the commands queued
+for the writer, and reads from disk whatever it falls behind the live log by. Each write stores the
+account events of a batch of commands, keyed by cursor, and the last command taken, in one
+transaction. Events whose command is older than `history.retention`, counted back from the newest
+command in the index, leave it; the log keeps them. After `history.retention` changes, the index
+takes the log again from its start, which leaves it as a fresh index under the new retention would
+be; until that pass passes its old newest command, the startup check stays on that command. The node
+reads its log once at startup, and before recovery replays that read and writes anything, the index
+checks that it holds the newest command the index has taken, unchanged, and resumes after the last
+command it took. If the log ends before that newest command or holds another one there, the log was
+rolled back, truncated, or replaced, and the node refuses to start (`history_recovery_failed`) with
+the log as it found it. The check compares that one command, so a log forged to end with it passes;
+a host able to forge the log can rewrite the index as well. A power loss can also leave the index
+ahead of the log, since neither syncs every write. SQLite opens the file in defensive mode, with
+triggers and views off, its schema untrusted, and cell sizes checked, and every write and read
+refuses, inside its own transaction, a schema this code did not create. Removing `history.dir` while
+the node is stopped rebuilds the index from the log's segments. Commands logged before events were
+recorded add nothing to history.
 
 ## Configuration
 

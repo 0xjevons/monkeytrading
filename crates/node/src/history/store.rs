@@ -133,8 +133,9 @@ impl Writer {
             .context("reading history progress")?;
         let progress = row
             .map(|(command, high_water, retention_ms)| {
-                let command = serde_json::from_str(&command).context("history progress")?;
-                let high_water = serde_json::from_str(&high_water).context("history progress")?;
+                let command = serde_json::from_str(&command).context("history progress: the last command taken")?;
+                let high_water =
+                    serde_json::from_str(&high_water).context("history progress: the newest command taken")?;
                 anyhow::Ok(Progress { command, high_water, retention_ms })
             })
             .transpose()?;

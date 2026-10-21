@@ -176,23 +176,54 @@ async fn a_history_failure_names_its_cause() {
     assert!(format!("{err:#}").contains("does not match its listing"), "{err:#}");
 }
 
+/// An index the host corrupted, or that SQLite cannot use, fails with its cause: each kind of bad
+/// row, a progress value that does not decode, a file that is not SQLite or is gone, and no
+/// write-ahead log.
 #[tokio::test]
-async fn an_index_that_does_not_parse_fails_with_its_cause() {
-    let (dir, index) = (scratch_dir("history-corrupt"), index_dir("corrupt"));
-    indexed_log(&dir, &index, 1).await;
-    let edit = Connection::open(file(&index)).unwrap();
-    edit.execute_batch("UPDATE events SET event = 'not json'").unwrap();
-    let query = PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 10 };
-    let err = Reader::new(file(&index), ready()).page(query).await.expect_err("an unreadable event");
-    assert!(format!("{err:#}").contains("history event"), "{err:#}");
+async fn an_unusable_index_fails_with_its_cause() {
+    let (dir, built) = (scratch_dir("history-corrupt"), index_dir("corrupt"));
+    indexed_log(&dir, &built, 1).await;
+    let query = || PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 10 };
+    // (case, what the host changes, whether a read or the open meets it, the cause named)
+    let cases = [
+        ("an event that does not parse", "UPDATE events SET event = 'not json'", false, "history event"),
+        ("an event time that is not a number", "UPDATE events SET ts = 'x'", false, "reading a history row"),
+        ("a seq out of range", "UPDATE events SET seq = -1", false, "history row -1:0"),
+        ("an index out of range", "UPDATE events SET seq = 5, idx = -1", false, "history row 5:-1"),
+        ("a last command that does not parse", "UPDATE progress SET command = 'x'", true, "the last command taken"),
+        (
+            "a newest command that does not parse",
+            "UPDATE progress SET high_water = 'x'",
+            true,
+            "the newest command taken",
+        ),
+        (
+            "a retention that is not a number",
+            "UPDATE progress SET retention_ms = 'x'",
+            true,
+            "reading history progress",
+        ),
+    ];
+    for (n, (case, change, at_open, cause)) in cases.into_iter().enumerate() {
+        let index = index_dir(&format!("corrupt-{n}"));
+        fs::create_dir_all(&index).unwrap();
+        for file in fs::read_dir(&built).unwrap() {
+            let file = file.unwrap();
+            fs::copy(file.path(), index.join(file.file_name())).unwrap();
+        }
+        Connection::open(file(&index)).unwrap().execute_batch(change).unwrap();
+        let err = if at_open {
+            let cfg = HistorySection { dir: index.clone(), retention: RETENTION };
+            History::open(&cfg, &entries(&dir)).err().expect(case)
+        } else {
+            Reader::new(file(&index), ready()).page(query()).await.expect_err(case)
+        };
+        assert!(format!("{err:#}").contains(cause), "{case}: {err:#}");
+    }
 
-    edit.execute_batch("UPDATE progress SET command = 'not json'").unwrap();
-    let node = TestSequencer::start(&dir, 16);
-    let err = TestHistory::start(&node, &dir, &index).await.err().expect("unreadable progress");
-    assert!(format!("{err:#}").contains("history progress"), "{err:#}");
-
-    let err = Writer::open(Path::new(":memory:"), 1).err().expect("no write-ahead log");
-    assert!(format!("{err:#}").contains("cannot use a write-ahead log"), "{err:#}");
+    let gone = file(&index_dir("corrupt-gone"));
+    let err = Reader::new(gone, ready()).page(query()).await.expect_err("no index file");
+    assert!(format!("{err:#}").contains("opening"), "{err:#}");
 
     let junk = file(&index_dir("corrupt-junk"));
     fs::create_dir_all(junk.parent().unwrap()).unwrap();
@@ -200,16 +231,8 @@ async fn an_index_that_does_not_parse_fails_with_its_cause() {
     let err = Writer::open(&junk, 1).err().expect("not a database");
     assert!(format!("{err:#}").contains("not a database"), "{err:#}");
 
-    let (dir, index) = (scratch_dir("history-corrupt-row"), index_dir("corrupt-row"));
-    indexed_log(&dir, &index, 1).await;
-    Connection::open(file(&index)).unwrap().execute_batch("UPDATE events SET seq = -1").unwrap();
-    let query = PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 10 };
-    let err = Reader::new(file(&index), ready()).page(query).await.expect_err("a row out of range");
-    assert!(format!("{err:#}").contains("history row -1:0"), "{err:#}");
-    Connection::open(file(&index)).unwrap().execute_batch("UPDATE events SET seq = 5, idx = -1").unwrap();
-    let query = PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 10 };
-    let err = Reader::new(file(&index), ready()).page(query).await.expect_err("an index out of range");
-    assert!(format!("{err:#}").contains("history row 5:-1"), "{err:#}");
+    let err = Writer::open(Path::new(":memory:"), 1).err().expect("no write-ahead log");
+    assert!(format!("{err:#}").contains("cannot use a write-ahead log"), "{err:#}");
 }
 
 /// A change of retention makes the index take the log again from its start, and the startup check

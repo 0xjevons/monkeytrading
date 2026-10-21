@@ -7,9 +7,12 @@
 //!
 //! TODO: the index sits on host disk, which the host can rewrite between runs and during one. SQLite
 //! reads it in defensive mode and refuses a schema this code did not create, which bounds what a
-//! rewritten file can make it run, but the rows themselves are unchecked. Each event served names
-//! its place in the log, where anyone can check it; keeping the index in enclave memory or on an
-//! integrity-protected volume would bound them.
+//! rewritten file can make it run, but the rows themselves are unchecked. The startup check compares
+//! one command, the newest the index has taken, so it catches a log rolled back, truncated, or
+//! replaced by another, but not one forged to end with that same command; a host able to forge the
+//! log can rewrite the index anyway. Each event served names its place in the log, where anyone can
+//! check it; keeping the index in enclave memory or on an integrity-protected volume would bound
+//! both.
 
 mod store;
 pub use store::Reader;
@@ -91,8 +94,9 @@ pub struct History {
 impl History {
     /// Opens the index in `cfg.dir`, creating it if missing, and checks it against `entries`, the log
     /// recovery replays next. An index that has taken commands must find the newest of them there,
-    /// unchanged: otherwise it was built from another log, or the log has lost commands since, and
-    /// serving it would mix the two. An index pruned under another retention than `cfg` gives takes
+    /// unchanged: otherwise the log was rolled back, truncated, or replaced by another, and serving
+    /// the index would mix two logs. A log forged to end with that same command passes; see the
+    /// module's TODO. An index pruned under another retention than `cfg` gives takes
     /// the log again from its start, which leaves it as a fresh index under the new retention would
     /// be. Call it before recovery writes to the log, so a refusal leaves the log as it was found.
     /// Error cases:
