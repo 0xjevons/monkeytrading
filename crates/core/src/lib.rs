@@ -3,13 +3,15 @@
 //!
 //! The protocol:
 //! - The house takes the other side of every trade. There is no order book and there are no
-//!   external LPs. House exposure is capped per market and in total as a fraction of house NAV.
+//!   external LPs. House exposure is capped per market and in total as a fraction of house NAV,
+//!   from `V6` with a fixed dollar floor under each cap.
 //! - Fills happen at once at a multi-venue index mid. Normal size pays no spread. Very large
 //!   positions pay fixed-bps size spreads, which widen under stress.
 //! - Losers pay nothing; winners pay a flat fee on realised profit. Positions held overnight pay
 //!   or receive CFD financing.
 //! - Margin is shared across the account at professional-client leverage, with close-out at 50% and
-//!   negative balance protection.
+//!   negative balance protection. From `V6`, close-outs also follow financing and parameter or
+//!   listing changes.
 //! - RWA markets keep venue hours; nothing fills while a market is closed.
 //! - Rules are versioned, and a log activates each version at a recorded seq. From `V3`, orders,
 //!   cancels, and withdrawals are authorised as the log's client auth records: by the account's

@@ -20,7 +20,7 @@ use engine_core::Engine;
 use engine_core::auth::MAX_EXPIRY_AHEAD_MS;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::Event;
-use engine_core::market::Tier;
+use engine_core::market::{MarketSpec, Tier};
 use engine_core::params::{ProtocolParams, ToxicityParams};
 use engine_core::price::{MAX_QUOTE_LEAD_MS, SourceQuote};
 use engine_core::protocol::ProtocolVersion;
@@ -29,6 +29,10 @@ use engine_core::types::{AccountId, AssetClass, MarketId, OrderId, Side};
 
 /// A market the session lists with two margin bands.
 const SOL: MarketId = 10;
+/// A market the session lists for the margin and solvency rules of protocol `V6`.
+const GOLD: MarketId = 11;
+/// A second market for the `V6` rules, whose margin table rises.
+const OIL: MarketId = 12;
 
 /// Writes the session to the path given as the only argument, then prints how often each event
 /// kind occurred, so the author can check the session still reaches every path.
@@ -72,8 +76,10 @@ fn main() -> anyhow::Result<()> {
 /// rollovers over longs and a short, a two-position close-out with bad debt, two-band margin, an
 /// exchange holiday, a zero house capital move, an early close and a special session, admin changes,
 /// venue quotes stamped ahead of the sequenced time, and dust adds to a long and a short held over a
-/// rollover, with a rejection of each kind along the way.
-/// Every client request is signed by its account's key unless the comment says otherwise.
+/// rollover, with a rejection of each kind along the way. Then, under `V6`, close-outs after a
+/// margin-table rise, a close-out level rise, and a rollover's financing, house cap floors at a
+/// drawn-down NAV, and a close-out just after a session close that skips the closed market. Every
+/// client request is signed by its account's key unless the comment says otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -306,6 +312,63 @@ fn session() -> Vec<Sequenced> {
     h.price(SOL, "150.500000001");
     h.market_order(long, SOL, Side::Sell, "10.000000003", "150.500000001");
     h.market_order(short, SOL, Side::Buy, "10.000000003", "150.500000001");
+
+    // V6 activates at this seq: margin after every change, on two new 24/7 markets with traders of
+    // their own.
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V6 });
+    let (g, k, m, n) = (h.signer(12), h.signer(13), h.signer(14), h.signer(15));
+    for (account, amount) in [(g, "10000"), (k, "1000"), (m, "1100"), (n, "4000")] {
+        h.deposit(account, amount);
+    }
+    let commodity =
+        |id, symbol, margin_bps| market(id, symbol, AssetClass::Commodity, Schedule::AlwaysOpen, margin_bps);
+    h.admin(AdminCommand::UpsertMarket(commodity(GOLD, "XAU-USD", 1_000)));
+    h.admin(AdminCommand::UpsertMarket(commodity(OIL, "WTI-USD", 1_000)));
+    h.advance(100);
+    h.price(GOLD, "2600");
+    h.price(OIL, "70");
+    // OIL's margin rises from 10% to 50%: `g` falls below the close-out level, and closing OIL, its
+    // larger loser, lifts it back above.
+    h.market_order(g, GOLD, Side::Buy, "20", "2600");
+    h.market_order(g, OIL, Side::Buy, "500", "70");
+    h.price(GOLD, "2580");
+    h.price(OIL, "69");
+    h.admin(AdminCommand::UpsertMarket(commodity(OIL, "WTI-USD", 5_000)));
+    // A close-out level of 100% closes `k`, whose equity of 924 is below its 972.8 of margin.
+    h.market_order(k, GOLD, Side::Buy, "3.8", "2580");
+    h.price(GOLD, "2560");
+    let fee = ProtocolParams { profit_fee_bps: 1_500, ..params() };
+    h.admin(AdminCommand::SetParams(ProtocolParams { closeout_level_bps: 10_000, ..fee.clone() }));
+    h.admin(AdminCommand::SetParams(fee.clone()));
+    // `m` sits 0.9 above the close-out level half a second before Sunday's 22:00 London rollover, and
+    // a day's financing on 9,622 at 680bps a year takes it below.
+    h.market_order(m, GOLD, Side::Buy, "4", "2560");
+    h.advance_to(ny(2026, 10, 25, 17, 59) + 59_500);
+    h.price(GOLD, "2405.5");
+    h.advance(600);
+    h.cmd(Command::Tick);
+
+    // House NAV drawn down to 100,000 caps GOLD at a 50,000 share, but a 100,000 floor takes the cap
+    // past the 48,110 the house already holds: `d` adds 50,515.5 and is refused one more.
+    let surplus = h.engine.house_nav() - f("100000");
+    h.cmd(Command::HouseCapital { amount: -surplus, chain_ref: "0xcap:4".into() });
+    let floored = MarketSpec { house_cap_floor: f("100000"), ..commodity(GOLD, "XAU-USD", 1_000) };
+    h.admin(AdminCommand::UpsertMarket(floored));
+    h.admin(AdminCommand::SetParams(ProtocolParams { house_total_cap_floor: f("10000000"), ..fee }));
+    h.market_order(d, GOLD, Side::Buy, "21", "2405.5");
+    h.market_order(d, GOLD, Side::Buy, "1", "2405.5");
+
+    // Just after AAPL's 16:00 close, with its quotes still fresh, BTC's rise takes `n` below the
+    // close-out level: AAPL, the larger loser, waits for its next session, and the BTC short closes.
+    h.advance_to(ny(2026, 10, 26, 15, 59) + 59_800);
+    h.price(BTC, "80000");
+    h.price(AAPL, "230");
+    h.market_order(n, BTC, Side::Sell, "0.1", "80000");
+    h.market_order(n, AAPL, Side::Buy, "50", "230");
+    h.advance(100);
+    h.price(AAPL, "200");
+    h.advance(150);
+    h.price(BTC, "92000");
     h.log
 }
 

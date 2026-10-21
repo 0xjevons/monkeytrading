@@ -284,6 +284,7 @@ fn params_change() -> impl Strategy<Value = ProtocolParams> {
         bps().prop_map(|house_total_cap_bps| ProtocolParams { house_total_cap_bps, ..params() }),
         duration().prop_map(|stress_move_window_ms| ProtocolParams { stress_move_window_ms, ..params() }),
         duration().prop_map(|stress_cooldown_ms| ProtocolParams { stress_cooldown_ms, ..params() }),
+        amount().prop_map(|house_total_cap_floor| ProtocolParams { house_total_cap_floor, ..params() }),
         duration().prop_map(move |horizon| ProtocolParams { toxicity: toxicity(horizon, 5_000), ..params() }),
         bps().prop_map(move |weight| ProtocolParams { toxicity: toxicity(1_000, weight), ..params() }),
         (bps(), bps()).prop_map(|(multiplier_bps, min_spread_bps)| {
@@ -310,6 +311,7 @@ fn listing() -> impl Strategy<Value = MarketSpec> {
             ..listed(id)
         }),
         (id(), bps()).prop_map(move |(id, house_cap_bps)| MarketSpec { house_cap_bps, ..listed(id) }),
+        (id(), amount()).prop_map(move |(id, house_cap_floor)| MarketSpec { house_cap_floor, ..listed(id) }),
         (id(), bps()).prop_map(move |(id, max_slippage_bps)| MarketSpec { max_slippage_bps, ..listed(id) }),
         (id(), amount()).prop_map(move |(id, min_order_notional)| MarketSpec { min_order_notional, ..listed(id) }),
         (id(), duration(), prop_oneof![0usize..4, any::<usize>()], bps()).prop_map(

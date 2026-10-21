@@ -37,6 +37,8 @@ verifies its checkpoints.
   venue, quotes stamped with the venue's own time, and reconnects with backoff
 - Alerts for refused venue messages (at most one a minute per venue, counting the rest), venue
   outages, symbols with no fresh quote, and venue times well ahead of the host clock
+- A `house_deficit` alert when house NAV falls below zero, at most one a minute while it keeps
+  crossing zero
 - Mock custody and a mock price feed for local development
 
 ## Repository Structure
@@ -44,9 +46,14 @@ verifies its checkpoints.
 - `src/main.rs` — the `engine` binary: `run` and `replay`
 - `src/lib.rs` — module index
 - `src/node.rs` — startup, task supervision, and shutdown
-- `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, alerts, and log replay
+- `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, and log replay
 - `src/sequencer/required.rs` — protocol activation and genesis, which wait for trusted time
+- `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must
+  look at, and house NAV below zero
 - `src/sequencer/tests.rs` — sequencer, activation, genesis restart, and replay tests
+- `src/sequencer/margin_tests.rs` — the margin and solvency dev scenario on the dev genesis (a
+  close-out after the rollover's financing, and a withdrawal limited at a stale market's last
+  mark), and a genesis with no house capital that trades and alerts on a house deficit
 - `src/log/mod.rs` — the JSON-lines log format, stream offsets, and the single-file reader
 - `src/log/segments.rs` — segment files, rotation, the manifest, and recovery checks
 - `src/log/reader.rs` — reads the log from any offset while it is being written
@@ -112,6 +119,7 @@ verifies its checkpoints.
 - `src/feeds/tests/late.rs` — venue tasks against a sequencer that answers late: when a quote
   counts as the venue quoting, and how a connection's last quotes are settled after it ends
 - `src/feeds/tests/scenario.rs` — the dev scenario through the sequencer and engine
+- `src/throttle.rs` — holds a repeating alert to one a minute, counting the ones it held back
 - `src/clock.rs` — the wall and monotonic clocks the sequencer stamps and checks with
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
 - `tests/reference_logs.rs` — replays every committed node reference log, events included

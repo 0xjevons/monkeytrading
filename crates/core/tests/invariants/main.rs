@@ -1,9 +1,10 @@
 //! Accounting invariants under generated sessions. Each case sequences random client, feed,
 //! custody, and operator commands, with values inside and outside the engine's input bounds, under
-//! `V2`, the rules every log starts under, and again under `V5`. It checks after every command that
+//! `V2`, the rules every log starts under, and again under `V6`. It checks after every command that
 //! it did not panic, that cash is conserved, and that each market's aggregates match its accounts'
 //! positions. Under each version the same sessions must reach every path that moves cash and the
-//! refusal of out-of-range amounts, order numbers, and quotes, so the checks cannot pass vacuously.
+//! refusal of out-of-range amounts, order numbers, and quotes, and under `V6` a close-out that no
+//! price triggered, so the checks cannot pass vacuously.
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -14,6 +15,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{HOUSE_CAPITAL, Harness, acct};
+use engine_core::command::Command;
 use engine_core::event::{Event, Reject};
 use engine_core::protocol::ProtocolVersion;
 use engine_core::types::MarketId;
@@ -32,7 +34,7 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
     // checked.
     let reached: RefCell<BTreeMap<ProtocolVersion, BTreeSet<&str>>> = RefCell::default();
     let result = TestRunner::new(config()).run(&session(), |session| {
-        for genesis in [Harness::new(), Harness::v5()] {
+        for genesis in [Harness::new(), Harness::v6()] {
             let mut h = funded(genesis, &session);
             let version = h.engine.protocol_version();
             let mut inflow = h.deposits + Fixed::from_int(HOUSE_CAPITAL);
@@ -42,7 +44,13 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
                 let cmd = command(&step.action, &h.engine, h.ts);
                 // `Harness::cmd` panics if the engine refuses the sequence; a panic fails the case.
                 let events = h.cmd(cmd.clone());
-                reached.borrow_mut().entry(version).or_default().extend(events.iter().map(path));
+                let mut reached = reached.borrow_mut();
+                let paths = reached.entry(version).or_default();
+                paths.extend(events.iter().map(path));
+                if !matches!(cmd, Command::Prices { .. }) && events.iter().any(|e| matches!(e, Event::CloseOut { .. }))
+                {
+                    paths.insert("close-out without a price");
+                }
                 inflow += cash_moved(&events);
                 check(&h.engine, inflow)
                     .map_err(|e| TestCaseError::fail(format!("{version:?}, after {cmd:?}: {e}")))?;
@@ -74,9 +82,10 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
         "admin rejected",
     ];
     let reached = reached.into_inner();
-    let missed: Vec<(ProtocolVersion, &str)> = [ProtocolVersion::V2, ProtocolVersion::V5]
+    let missed: Vec<(ProtocolVersion, &str)> = [ProtocolVersion::V2, ProtocolVersion::V6]
         .into_iter()
         .flat_map(|version| expected.iter().map(move |path| (version, *path)))
+        .chain([(ProtocolVersion::V6, "close-out without a price")])
         .filter(|(version, path)| !reached.get(version).is_some_and(|paths| paths.contains(path)))
         .collect();
     assert!(missed.is_empty(), "generated sessions never reach {missed:?}");

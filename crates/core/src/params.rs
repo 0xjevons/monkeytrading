@@ -5,6 +5,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
+use crate::Fixed;
 use crate::types::Millis;
 
 /// The most any per-trade rate may be: 100%.
@@ -36,6 +37,10 @@ pub struct ProtocolParams {
     pub stress_cooldown_ms: i64,
     pub toxicity: ToxicityParams,
     pub rollover: Rollover,
+    /// From protocol `V6`, the least the total house cap may be, in USD notional, however small or
+    /// negative house NAV is. Zero means none, and is left out of the encoding.
+    #[serde(default, skip_serializing_if = "Fixed::is_zero")]
+    pub house_total_cap_floor: Fixed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +101,8 @@ impl ProtocolParams {
     /// Checks every parameter is in range.
     /// Error cases:
     /// - a profit fee outside 0..10000 bps, or a close-out level outside 1..=10000 bps
-    /// - a total house cap outside 1..=100000 bps
+    /// - a total house cap outside 1..=100000 bps, or a total cap floor below zero or above
+    ///   `Fixed::MAX_INPUT`
     /// - no stress levels, a trigger on level 0, a multiplier outside 0..=100000 bps, a minimum
     ///   spread outside 0..=10000 bps, or a negative trigger threshold
     /// - a non-positive move window, or a negative cooldown
@@ -113,6 +119,9 @@ impl ProtocolParams {
         }
         if !(1..=MAX_MULTIPLE_BPS).contains(&self.house_total_cap_bps) {
             return Err("house_total_cap_bps must be in 1..=100000".into());
+        }
+        if self.house_total_cap_floor.is_negative() || self.house_total_cap_floor > Fixed::MAX_INPUT {
+            return Err("house_total_cap_floor out of range".into());
         }
         let Some(baseline) = self.stress_levels.first() else {
             return Err("stress_levels needs at least the normal level".into());
@@ -200,6 +209,7 @@ mod tests {
             stress_cooldown_ms: 0,
             toxicity: ToxicityParams { horizon_ms: 1_000, ewma_weight_bps: 5_000, tiers: vec![] },
             rollover: rollover(chrono_tz::Europe::London, 22, 0),
+            house_total_cap_floor: Fixed::ZERO,
         }
     }
 
@@ -252,6 +262,29 @@ mod tests {
             p.toxicity.horizon_ms = horizon_ms;
             assert!(p.validate().is_err(), "{horizon_ms}");
         }
+    }
+
+    #[test]
+    fn total_cap_floor_is_from_zero_to_the_input_bound() {
+        let mut p = params();
+        for floor in [Fixed::ZERO, Fixed::from_raw(1), Fixed::MAX_INPUT] {
+            p.house_total_cap_floor = floor;
+            assert!(p.validate().is_ok(), "{floor}");
+        }
+        for floor in [Fixed::from_raw(-1), Fixed::MAX_INPUT + Fixed::from_raw(1)] {
+            p.house_total_cap_floor = floor;
+            assert!(p.validate().is_err(), "{floor}");
+        }
+    }
+
+    #[test]
+    fn a_zero_total_cap_floor_is_left_out_of_the_encoding() {
+        let mut p = params();
+        assert!(!serde_json::to_string(&p).unwrap().contains("house_total_cap_floor"));
+        p.house_total_cap_floor = Fixed::from_int(5);
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains(r#""house_total_cap_floor":"5""#), "{json}");
+        assert_eq!(serde_json::from_str::<ProtocolParams>(&json).unwrap(), p);
     }
 
     #[test]

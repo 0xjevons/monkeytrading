@@ -2,15 +2,23 @@
 //!
 //! Margin is shared across an account's positions. When equity falls below the close-out level of
 //! the margin requirement, the largest losing position that can trade right now is closed, and so
-//! on until the account is back above the level. A loss beyond the account's balance is written
-//! off against the house once the account is flat.
+//! on until the account is back above the level; positions in markets that cannot trade wait until
+//! they price again. A loss beyond the account's balance is written off against the house once the
+//! account is flat.
+//!
+//! A price update checks the accounts holding its market. From `V6`, financing and parameter or
+//! listing changes check accounts too, only a market inside its trading session can trade, and a
+//! market that can trade counts at the index a close-out would fill it at.
+
+use std::collections::BTreeMap;
 
 use crate::Fixed;
-use crate::account::Position;
+use crate::account::{Account, Position};
 use crate::engine::Engine;
 use crate::event::Event;
 use crate::execution::{Exec, PriceGuard};
 use crate::price::compute_index;
+use crate::protocol::ProtocolVersion;
 use crate::types::{AccountId, MarketId, Side};
 
 impl Engine {
@@ -20,16 +28,16 @@ impl Engine {
     /// TODO: this scans every account on each price update; index accounts by market before the
     /// account count makes the scan a cost on the sequencer path.
     pub(crate) fn check_closeouts(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
-        let level_bps = self.params.as_ref().expect("callers check params are set").closeout_level_bps;
-        let accounts: Vec<AccountId> = self
-            .accounts
-            .iter()
-            .filter(|(_, acct)| acct.positions.contains_key(&market_id))
-            .map(|(account, _)| *account)
-            .collect();
-        for account in accounts {
-            self.close_out(account, level_bps, events);
-        }
+        self.close_out_where(|acct| acct.positions.contains_key(&market_id), events);
+    }
+
+    /// Closes out every account holding any position that has fallen below the close-out level.
+    ///
+    /// TODO: this scans every account once per rollover day and once per parameter change; index
+    /// accounts by margin headroom before the account count makes the scan a cost on the sequencer
+    /// path.
+    pub(crate) fn check_all_closeouts(&mut self, events: &mut Vec<Event>) {
+        self.close_out_where(|acct| !acct.positions.is_empty(), events);
     }
 
     /// Writes off a flat account's negative balance against the house.
@@ -40,6 +48,16 @@ impl Engine {
             acct.balance = Fixed::ZERO;
             self.house_cash -= amount;
             events.push(Event::BadDebt { account, amount });
+        }
+    }
+
+    /// Closes out each account `selects`, in account order.
+    fn close_out_where(&mut self, selects: impl Fn(&Account) -> bool, events: &mut Vec<Event>) {
+        let level_bps = self.params.as_ref().expect("callers check params are set").closeout_level_bps;
+        let accounts: Vec<AccountId> =
+            self.accounts.iter().filter(|(_, acct)| selects(acct)).map(|(account, _)| *account).collect();
+        for account in accounts {
+            self.close_out(account, level_bps, events);
         }
     }
 
@@ -72,26 +90,49 @@ impl Engine {
     }
 
     /// The position to close next, with the account's equity and margin, or `None` when the
-    /// account is at or above the close-out level or nothing it holds can trade now.
+    /// account is at or above the close-out level or nothing it holds can trade now. Positions
+    /// count at their last marks; from `V6`, one in a market that can trade counts at the index it
+    /// would fill at, so the account is judged and ranked at the prices it is closed at.
     fn next_closeout(&self, account: AccountId, level_bps: i64) -> Option<(MarketId, Position, Fixed, Fixed)> {
         let acct = self.accounts.get(&account)?;
-        let (equity, margin) = self.equity_and_margin(acct, None);
+        let at_index = self.protocol_version >= ProtocolVersion::V6;
+        // The index each held market could fill at now, for those that can trade.
+        let tradeable = || -> BTreeMap<MarketId, Fixed> {
+            acct.positions.keys().filter_map(|id| self.tradeable_index(*id).map(|index| (*id, index))).collect()
+        };
+        let (indexes, (equity, margin)) = if at_index {
+            let indexes = tradeable();
+            let valued = self.equity_and_margin_at(acct, |market_id, market, pos| {
+                indexes.get(&market_id).copied().unwrap_or(market.mark.unwrap_or(pos.entry))
+            });
+            (Some(indexes), valued)
+        } else {
+            (None, self.equity_and_margin(acct, None))
+        };
         if margin.is_zero() || equity >= margin.mul_bps(level_bps) {
             return None;
         }
+        let indexes = indexes.unwrap_or_else(tradeable);
         acct.positions
             .iter()
-            .filter(|(market_id, _)| self.tradeable_now(**market_id))
             .filter_map(|(market_id, pos)| {
-                Some((pos.unrealised(self.markets[market_id].mark?, self.protocol_version), *market_id, *pos))
+                let index = *indexes.get(market_id)?;
+                let price = if at_index { index } else { self.markets[market_id].mark? };
+                Some((pos.unrealised(price, self.protocol_version), *market_id, *pos))
             })
             .min_by_key(|(upnl, market_id, _)| (*upnl, *market_id))
             .map(|(_, market_id, pos)| (market_id, pos, equity, margin))
     }
 
-    /// Whether a fill in `market_id` could happen now: open, with a valid index.
-    fn tradeable_now(&self, market_id: MarketId) -> bool {
+    /// The index a fill in `market_id` would take now, or `None` unless the market is open with a
+    /// valid index. From `V6`, the market must also be inside its session now, as its open flag
+    /// changes only when its session is refreshed, and a close-out can run before that.
+    fn tradeable_index(&self, market_id: MarketId) -> Option<Fixed> {
         let market = &self.markets[&market_id];
-        market.open && compute_index(&market.quotes, &market.spec.price_rules, self.now).is_ok()
+        let in_session = self.protocol_version < ProtocolVersion::V6 || market.spec.schedule.is_open(self.now);
+        if !market.open || !in_session {
+            return None;
+        }
+        compute_index(&market.quotes, &market.spec.price_rules, self.now).ok().map(|index| index.mid)
     }
 }

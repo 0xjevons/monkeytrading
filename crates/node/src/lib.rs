@@ -18,5 +18,6 @@ pub use sequencer::replay;
 mod tee;
 #[cfg(test)]
 mod test_support;
+mod throttle;
 mod tls;
 mod trusted_time;

@@ -268,8 +268,8 @@ impl Fixed {
         self.0.signum() as i64
     }
 
-    /// True for zero.
-    pub fn is_zero(self) -> bool {
+    /// True for zero. Takes `&self` so serde's `skip_serializing_if` can call it.
+    pub fn is_zero(&self) -> bool {
         self.0 == 0
     }
 

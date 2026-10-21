@@ -37,6 +37,10 @@ pub struct MarketSpec {
     pub house_cap_bps: i64,
     #[serde(default)]
     pub min_order_notional: Fixed,
+    /// From protocol `V6`, the least the market cap may be, in USD notional, however small or
+    /// negative house NAV is. Zero means none, and is left out of the encoding.
+    #[serde(default, skip_serializing_if = "Fixed::is_zero")]
+    pub house_cap_floor: Fixed,
 }
 
 /// A band in a tier table. `up_to: None` means unbounded and must be last.
@@ -79,7 +83,7 @@ impl MarketSpec {
     /// - `min_sources` of zero, a non-positive `max_age_ms`, or a divergence outside 0..=10000 bps
     /// - a slippage bound outside 0..=10000 bps, or a house cap outside 1..=100000 bps
     /// - a financing markup outside ±10000 bps, or a day basis other than 360 or 365
-    /// - a minimum order notional below zero or above `Fixed::MAX_INPUT`
+    /// - a minimum order notional or a house cap floor below zero or above `Fixed::MAX_INPUT`
     pub fn validate(&self) -> Result<(), String> {
         if self.symbol.is_empty() {
             return Err("symbol is empty".into());
@@ -107,6 +111,9 @@ impl MarketSpec {
         }
         if self.min_order_notional.is_negative() || self.min_order_notional > Fixed::MAX_INPUT {
             return Err("min_order_notional out of range".into());
+        }
+        if self.house_cap_floor.is_negative() || self.house_cap_floor > Fixed::MAX_INPUT {
+            return Err("house_cap_floor out of range".into());
         }
         Ok(())
     }

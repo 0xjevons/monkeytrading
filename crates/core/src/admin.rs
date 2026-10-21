@@ -13,7 +13,9 @@ use crate::protocol::ProtocolVersion;
 use crate::types::MarketId;
 
 impl Engine {
-    /// Applies an operator command.
+    /// Applies an operator command. From `V6`, new parameters check every account for close-out, as
+    /// the close-out level may rise, and a listing checks every account holding the market, as its
+    /// margin table may rise.
     /// Error cases:
     /// - `SetParams` with parameters that fail `ProtocolParams::validate`
     /// - `UpsertMarket` with a spec that fails `MarketSpec::validate`, or with dated closures or
@@ -32,6 +34,9 @@ impl Engine {
                 self.next_rollover = Some(params.rollover.next_after(self.now));
                 self.params = Some(params.clone());
                 self.restress_all(events);
+                if self.protocol_version >= ProtocolVersion::V6 {
+                    self.check_all_closeouts(events);
+                }
             }
             AdminCommand::UpsertMarket(spec) => {
                 spec.validate()?;
@@ -45,6 +50,9 @@ impl Engine {
                     }
                 }
                 self.refresh_session(spec.id, events);
+                if self.protocol_version >= ProtocolVersion::V6 && self.params.is_some() {
+                    self.check_closeouts(spec.id, events);
+                }
             }
             AdminCommand::SetBenchmarkRate { benchmark, annual_bps } => {
                 if !(-MAX_BENCHMARK_BPS..=MAX_BENCHMARK_BPS).contains(annual_bps) {
@@ -94,7 +102,7 @@ impl Engine {
         divergence_bps: i64,
         events: &mut Vec<Event>,
     ) {
-        let nav = self.house_nav();
+        let cap = self.market_cap(&self.markets[&market_id].spec, self.house_nav());
         let now = self.now;
         let global_floor = self.global_stress_floor;
         let params = self.params.as_ref().expect("callers check params are set");
@@ -107,7 +115,6 @@ impl Engine {
                 0
             }
         };
-        let cap = nav.mul_bps(market.spec.house_cap_bps);
         let util_bps = if cap.is_positive() { market.client_qty.abs().mul(mid).bps_of(cap) } else { i64::MAX };
         let target = auto_stress_target(&params.stress_levels, divergence_bps, move_bps, util_bps);
 

@@ -9,12 +9,16 @@ this crate and reproduce the signed state roots exactly.
 
 ## Features
 
-- House as counterparty to every trade, with per-market and total exposure caps against house NAV
+- House as counterparty to every trade, with per-market and total exposure caps against house NAV,
+  from protocol `V6` with a fixed dollar floor under each so trading opens from a zero or negative
+  house
 - Instant fills at the median of several venues, refused when quotes are stale or divergent
 - Zero spread at normal size, fixed-bps size spreads on position growth, widened under stress
 - Indicative quotes with bounded slippage: orders are declined only when the bound is exceeded
 - A flat fee on realised profit only, and daily CFD financing at a benchmark rate plus markup
-- Tiered margin, account close-out largest loser first, and negative balance protection
+- Tiered margin, account close-out largest loser first among markets that can trade, and negative
+  balance protection; from protocol `V6`, close-outs also follow financing and parameter or listing
+  changes, skip a market outside its session, and value a market that can trade at its live index
 - Venue trading hours for RWA markets, with holidays, early closes, and special sessions, and
   resting orders filling at the gapped open
 - Markout-based toxicity scoring that widens spreads for flow that picks off stale prices
@@ -120,7 +124,10 @@ their combined rules, which `src/protocol.rs` names `V2`; `v1.jsonl` still repla
 its quotes is stamped ahead. `V3` adds signed client requests and activates at a recorded seq; its
 log is `v3.jsonl`. `V4` lets schedules carry dated closures and special sessions, and lets a zero
 house capital move record its reference; it activates the same way, and its log is `v4.jsonl`. `V5`
-rounds position accounting in the house's favour; its log is `v5.jsonl`. For each later version:
+rounds position accounting in the house's favour; its log is `v5.jsonl`. `V6` adds dollar floors
+under the house exposure caps, close-out checks after financing and parameter or listing changes,
+and a session check and live-index valuation on every close-out; its log is `v6.jsonl`. For each
+later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log.rs` so it activates the new version and exercises the new rules.
