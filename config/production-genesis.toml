@@ -27,7 +27,8 @@
 #   currency and converts to USD at the engine's own USD-JPY, EUR-USD and
 #   GBP-USD prices, which are listed before them.
 # - Benchmark rates are not set here. The daily benchmark rates feature (#33)
-#   sequences them; until then a benchmark with no rate counts as zero.
+#   sequences them; until then a market whose benchmark has no rate accrues no
+#   financing, and each rollover records the benchmark and raises an alert.
 # - house_capital is 0: the house starts with no capital and builds it from
 #   trader losses. Genesis records a zero house capital credit, which moves no
 #   cash and marks genesis done, so the vault holds only trader deposits.
@@ -171,6 +172,8 @@ house_total_cap_bps = 20000
 # A fast move counts within this trailing window, and up to a tenth of it further back.
 stress_move_window_ms = 60000
 stress_cooldown_ms = 300000
+# Most orders one account may rest at once, across every market: 1 to 1000.
+max_resting_orders = 100
 
 [genesis.params.rollover]
 tz = "Europe/London"

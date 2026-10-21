@@ -5,7 +5,8 @@
 
 mod common;
 
-use common::{BTC, DE40, EURUSD, Harness, acct, de40, f, fills, market, ny, only_fill, rejection, us_equities};
+use common::events::{fills, only_fill, rejection};
+use common::{BTC, DE40, EURUSD, Harness, acct, de40, f, market, ny, us_equities};
 use engine_core::command::{AdminCommand, Command, OrderKind};
 use engine_core::event::{Event, Reject};
 use engine_core::market::{MarketSpec, PriceRules};

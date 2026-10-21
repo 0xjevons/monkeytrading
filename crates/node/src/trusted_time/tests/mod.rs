@@ -10,7 +10,7 @@ use crate::trusted_time::tests::logs::Logs;
 
 mod alerts;
 mod gate;
-mod logs;
+pub(crate) mod logs;
 mod sampler;
 mod scenario;
 

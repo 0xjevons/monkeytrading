@@ -3,9 +3,10 @@
 
 mod common;
 
+use common::events::{fills, rejection};
 use common::{
-    AAPL, BTC, Client, DE40, EURUSD, Harness, USDJPY, acct, de40, f, fills, market, ny, operator, params, quote,
-    rejection, start, us_equities,
+    AAPL, BTC, Client, DE40, EURUSD, Harness, USDJPY, acct, de40, f, market, ny, operator, params, quote, start,
+    us_equities,
 };
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, OrderKind, Sequenced};

@@ -34,6 +34,10 @@
 //! - From `V13`, an open, priced market's stress level is re-evaluated before every fill and after
 //!   every command, over a trailing move window, with divergence triggers scaled to each market's
 //!   bound.
+//! - From `V14`, no market accrues financing without a benchmark rate, and once any benchmark has
+//!   one no market is listed onto a benchmark without; each account's resting orders are capped, a
+//!   resting order that may add risk meets its market's minimum notional, and placing one checks
+//!   only that order against the live price.
 
 pub mod account;
 mod admin;

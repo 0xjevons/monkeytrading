@@ -3,7 +3,8 @@
 
 mod common;
 
-use common::{BTC, Harness, acct, f, market, rejection};
+use common::events::rejection;
+use common::{BTC, Harness, acct, f, market};
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::{Event, Reject};

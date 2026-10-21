@@ -3,7 +3,8 @@
 
 mod common;
 
-use common::{BTC, ETH, Harness, acct, f, fills, market, params, rejection};
+use common::events::{fills, rejection};
+use common::{BTC, ETH, Harness, acct, f, market, params};
 use engine_core::Fixed;
 use engine_core::command::{AdminCommand, Command};
 use engine_core::event::{Event, Reject};

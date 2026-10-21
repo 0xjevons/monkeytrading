@@ -3,7 +3,8 @@
 
 mod common;
 
-use common::{BTC, ETH, Harness, acct, f, fills, params, rejection};
+use common::events::{fills, rejection};
+use common::{BTC, ETH, Harness, acct, f, params};
 use engine_core::Fixed;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest};
 use engine_core::event::{CancelReason, Event, Reject};

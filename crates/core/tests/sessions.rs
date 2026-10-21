@@ -4,14 +4,22 @@
 mod common;
 
 use chrono::{TimeZone, Utc};
-use common::{AAPL, BTC, Harness, acct, f, fills, market, ny, rejection, us_equities};
+use common::events::{fills, rejection};
+use common::{AAPL, BTC, ETH, Harness, acct, f, market, ny, us_equities};
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, OrderKind, Sequenced};
 use engine_core::event::{Event, Reject};
+use engine_core::market::MarketSpec;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::session::Schedule;
-use engine_core::types::{AssetClass, Side};
+use engine_core::types::{AssetClass, MarketId, Side};
 use engine_core::{Engine, Fixed};
+
+/// Listings financed at ESTR, ESTR, and SONIA, and one whose listing names "Sofr".
+const EURO_A: MarketId = 20;
+const EURO_B: MarketId = 21;
+const STERLING: MarketId = 22;
+const GOLD: MarketId = 30;
 
 #[test]
 fn closed_markets_do_not_trade_and_stops_fill_at_the_gapped_open() {
@@ -93,6 +101,101 @@ fn financing_after_downtime_charges_every_missed_day() {
     let charges = h.cmd(Command::Tick).iter().filter(|e| matches!(e, Event::Financing { .. })).count();
     assert_eq!(charges, 3);
     h.assert_conserved(Fixed::ZERO);
+}
+
+#[test]
+fn a_market_whose_benchmark_has_no_rate_accrues_no_financing_from_v13() {
+    // Genesis sets SOFR, and a gold listing names it "Sofr".
+    let mut h = Harness::v12();
+    h.operator_admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 500 });
+    h.operator_admin(AdminCommand::UpsertMarket(listing(GOLD, "Sofr")));
+    let (gold, bitcoin) = (acct(1), acct(2));
+    h.deposit(gold, "50000");
+    h.deposit(bitcoin, "50000");
+    h.price(GOLD, "2000");
+    h.price(BTC, "100000");
+    h.market_order(gold, GOLD, Side::Buy, "1", "2000");
+    h.market_order(bitcoin, BTC, Side::Buy, "1", "100000");
+
+    // Before `V13` the missing rate counts as zero, so the gold long pays the 2.5% markup alone.
+    let ev = rollover(&mut h, 20);
+    assert!(ev.contains(&Event::Financing { account: gold, market: GOLD, amount: f("0.136986302") }), "{ev:?}");
+
+    // From `V13` the gold long accrues nothing and the rollover records the benchmark, while the
+    // bitcoin long still pays SOFR plus the markup.
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V13 });
+    let balance = h.balance(gold);
+    let ev = rollover(&mut h, 21);
+    assert!(ev.contains(&missing_rate("Sofr", &[GOLD])), "{ev:?}");
+    assert_eq!(financed(&ev), [BTC]);
+    assert!(ev.contains(&Event::Financing { account: bitcoin, market: BTC, amount: f("20.547945206") }), "{ev:?}");
+    assert_eq!(h.balance(gold), balance);
+    h.assert_conserved(Fixed::ZERO);
+}
+
+#[test]
+fn every_rollover_records_each_benchmark_with_no_rate_and_finances_only_rated_markets() {
+    // BTC, ETH, and AAPL use SOFR, the two euro listings ESTR, and sterling SONIA. They are listed
+    // before any benchmark has a rate, as the production genesis lists its markets, and then only
+    // SONIA gets one.
+    let mut h = Harness::v13();
+    for (id, benchmark) in [(EURO_A, "ESTR"), (EURO_B, "ESTR"), (STERLING, "SONIA")] {
+        h.operator_admin(AdminCommand::UpsertMarket(listing(id, benchmark)));
+    }
+    h.operator_admin(AdminCommand::SetBenchmarkRate { benchmark: "SONIA".into(), annual_bps: 400 });
+    let a = acct(1);
+    h.deposit(a, "1000000");
+    for (market, mid) in [(BTC, "100000"), (EURO_A, "1.1"), (EURO_B, "24000"), (STERLING, "1.3")] {
+        h.price(market, mid);
+        assert_eq!(fills(&h.market_order(a, market, Side::Buy, "1", mid)).len(), 1);
+    }
+    let ev = rollover(&mut h, 20);
+    let sofr = missing_rate("SOFR", &[BTC, ETH, AAPL]);
+    assert_eq!(missing_rates(&ev), [missing_rate("ESTR", &[EURO_A, EURO_B]), sofr]);
+    assert_eq!(financed(&ev), [STERLING]);
+
+    // Once SOFR has a rate, only the ESTR listings go unfinanced, recorded at each rollover missed
+    // during downtime.
+    h.operator_admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 500 });
+    let ev = rollover(&mut h, 22);
+    let estr = missing_rate("ESTR", &[EURO_A, EURO_B]);
+    assert_eq!(missing_rates(&ev), [estr.clone(), estr]);
+    assert_eq!(financed(&ev), [BTC, STERLING, BTC, STERLING]);
+
+    // Once every benchmark has a rate, every position is financed and nothing is recorded.
+    h.operator_admin(AdminCommand::SetBenchmarkRate { benchmark: "ESTR".into(), annual_bps: 300 });
+    let ev = rollover(&mut h, 23);
+    assert!(missing_rates(&ev).is_empty(), "{ev:?}");
+    assert_eq!(financed(&ev), [BTC, EURO_A, EURO_B, STERLING]);
+    h.assert_conserved(Fixed::ZERO);
+}
+
+#[test]
+fn once_a_benchmark_has_a_rate_a_listing_names_only_one_with_a_rate_from_v13() {
+    let refused = |events: Vec<Event>| {
+        assert!(
+            matches!(&events[..], [Event::AdminRejected { reason }] if reason == "benchmark Sofr has no rate"),
+            "{events:?}"
+        );
+    };
+    let mut h = Harness::v13();
+    // With no rate yet, a listing may name any benchmark.
+    h.operator_admin(AdminCommand::UpsertMarket(listing(GOLD, "Sofr")));
+    h.operator_admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 500 });
+    // Once SOFR has a rate, a new listing naming "Sofr" is refused, and so is moving BTC onto it.
+    refused(h.operate(AdminCommand::UpsertMarket(listing(EURO_A, "Sofr"))));
+    let btc = market(BTC, "BTC-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000);
+    let moved = MarketSpec { financing: listing(BTC, "Sofr").financing, ..btc.clone() };
+    refused(h.operate(AdminCommand::UpsertMarket(moved)));
+    assert_eq!(h.engine.markets()[&BTC].spec, btc);
+    // An update that keeps gold's benchmark applies, as does a listing naming one with a rate.
+    h.operator_admin(AdminCommand::UpsertMarket(MarketSpec { max_slippage_bps: 30, ..listing(GOLD, "Sofr") }));
+    h.operator_admin(AdminCommand::UpsertMarket(listing(EURO_A, "SOFR")));
+
+    // Before `V13` the same listing applies.
+    let mut h = Harness::v12();
+    h.operator_admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 500 });
+    h.operator_admin(AdminCommand::UpsertMarket(listing(EURO_A, "Sofr")));
 }
 
 #[test]
@@ -182,6 +285,42 @@ fn dated_exceptions_are_accepted_only_from_v4() {
 /// `Harness::v4` with unsigned client requests.
 fn v4() -> Harness {
     Harness::v4(ClientAuth::Unsigned)
+}
+
+/// A 24/7 listing financed at `benchmark` plus the harness markup.
+fn listing(id: MarketId, benchmark: &str) -> MarketSpec {
+    let mut spec = market(id, "GEN", AssetClass::Commodity, Schedule::AlwaysOpen, 1_000);
+    spec.financing.benchmark = benchmark.into();
+    spec
+}
+
+/// Ticks one second after the 22:00 London rollover on `day` October 2026, 21:00 UTC until the
+/// clocks go back on the 25th.
+fn rollover(h: &mut Harness, day: u32) -> Vec<Event> {
+    assert!(day < 25, "London keeps BST until 25 Oct");
+    h.advance_to(Utc.with_ymd_and_hms(2026, 10, day, 21, 0, 1).unwrap().timestamp_millis());
+    h.cmd(Command::Tick)
+}
+
+/// The record of `benchmark` having no rate for `markets`.
+fn missing_rate(benchmark: &str, markets: &[MarketId]) -> Event {
+    Event::BenchmarkRateMissing { benchmark: benchmark.into(), markets: markets.to_vec() }
+}
+
+/// The missing-rate records among `events`.
+fn missing_rates(events: &[Event]) -> Vec<Event> {
+    events.iter().filter(|e| matches!(e, Event::BenchmarkRateMissing { .. })).cloned().collect()
+}
+
+/// The market of each financing charge among `events`, in order.
+fn financed(events: &[Event]) -> Vec<MarketId> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Financing { market, .. } => Some(*market),
+            _ => None,
+        })
+        .collect()
 }
 
 /// An admin command re-listing AAPL with a 13:00 New York close on each date.

@@ -65,6 +65,11 @@ this crate and reproduce the signed state roots exactly.
   window, and a divergence trigger is a share of each market's divergence bound, so every market
   with a positive bound can reach every level; activating `V13` turns absolute divergence triggers
   into shares of the widest listed bound
+- From protocol `V14`, a market whose benchmark has no rate accrues no financing, and each rollover
+  records the benchmarks that have none; once any benchmark has a rate, a listing that names one
+  without is refused; each account rests at most `max_resting_orders` orders, a resting order that
+  may add risk meets its market's minimum notional at its own price, and placing one checks only
+  that order against the live price
 
 ## Repository Structure
 
@@ -72,7 +77,8 @@ this crate and reproduce the signed state roots exactly.
 - `src/engine.rs` — engine state, command dispatch, sessions, and USD valuation
 - `src/marks.rs` — venue prices, and marking a market and the markets that convert at its index
 - `src/execution/` — order placement, triggers, pricing, risk checks, and booking fills (`mod.rs`),
-  and its unit tests (`tests.rs`)
+- `src/execution/` — order placement, triggers, pricing, risk checks, and booking fills (`mod.rs`),
+  the checks an order passes first (`validation.rs`), and unit tests (`tests.rs`)
 - `src/markouts.rs` — each fill's markout, queued and then marked against the index after its
   horizon, and toxicity scores
 - `src/closeout.rs` — account close-out and bad-debt write-off
@@ -123,8 +129,9 @@ this crate and reproduce the signed state roots exactly.
 - `tests/fixtures/merkle.json` — state tree vectors computed with Foundry's `cast`: keys, leaf ABI
   encodings and value hashes, a root, and proofs
 - `examples/reference_log/` — writes the reference log for a new protocol version: the session
-  (`main.rs`), the requests and event names it uses (`helpers.rs`), its `V10` and `V12` parts
-  (`v10.rs`, `v12.rs`), and its `V13` part (`stress.rs`)
+- `examples/reference_log/` — writes the reference log for a new protocol version: the session
+  (`main.rs`), the requests and event names it uses (`helpers.rs`), its `V10` to `V12` parts
+  (`v10.rs`, `v11.rs`, `v12.rs`), its `V13` part (`stress.rs`), and its `V14` part (`v14.rs`)
 - `examples/sign_request.rs` — a client signing a request body for the API
 - `examples/verify_proof.rs` — checks an account proof from the API against a root
 
@@ -181,9 +188,10 @@ Two suites guard replay and accounting:
   deletes a committed log.
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
   under `V2`, `V6`, `V7` with markets quoted in other currencies, `V11`, and `V12` and `V13` with
-  those markets and signed operator commands, where `V13` must reach a stress change. Each mixes client, feed, custody, and operator commands,
+  those markets and signed operator commands, where `V13` must reach a stress change, and `V14`.
+  Each mixes client, feed, custody, and operator commands,
   with values inside and outside the input bounds, and checks after every command that nothing
-  panicked, cash is conserved, and every market's aggregates match its accounts' positions. Under
+  panicked, cash is conserved, and every market's aggregates match its accounts' positions. From
   `V12` it also checks that every market has processed the index it can deal at, holds no quote
   stamped after the sequenced time, and was filled only at that index and its FX market's. Raise
   `CASES` or change `SEED` in `tests/invariants/main.rs` to search further. The same suite generates
@@ -191,10 +199,11 @@ Two suites guard replay and accounting:
   in random spread and margin bands under `V11` and checks that none pays less spread or posts less
   margin than the exact amount; and fills of any size from dust up, each marked out at a moved index
   or after a window without one, under `V11`, and checks that the toxicity score stays within a
-  millionth of a bp of the exact notional-weighted average of its markouts.
-  Under the latest version, the same sessions check that roots computed from what changed, at
-  random points, equal a root hashed from scratch, and that every account's proof verifies against
-  them.
+  millionth of a bp of the exact notional-weighted average of its markouts. Under the latest
+  version, the same sessions check that roots computed from what changed, at random points, equal a
+  root hashed from scratch, and that every account's proof verifies against them. Under `V14` it
+  also checks that resting orders keep to the cap, that placing an order fills or cancels no other,
+  and that no market is financed at a rollover that records its benchmark as having no rate.
 
 ### Adding a protocol version
 
@@ -222,7 +231,8 @@ and its log is `v8.jsonl`. `V9` makes the state root the root of the state tree;
 makes a toxicity score the notional-weighted average of its markouts, to nine decimals, each scored
 only at a valid index; its log is `v11.jsonl`. `V12` brings every market to its sequenced time before
 each command and counts a quote stamped ahead at once; its log is `v12.jsonl`. `V13` makes stress
-follow its inputs; its log is `v13.jsonl`. For each later version:
+follow its inputs; its log is `v13.jsonl`. `V14` finances only markets whose benchmark has a rate
+and caps each account's resting orders; its log is `v14.jsonl`. For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log/main.rs` so it activates the new version and exercises the new rules.

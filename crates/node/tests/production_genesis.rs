@@ -44,6 +44,7 @@ const SYMBOLS: [&str; 37] = [
 ];
 
 const MINUTE: Millis = 60_000;
+const LAUNCH_BENCHMARKS: [&str; 5] = ["SOFR", "ESTR", "SONIA", "TONA", "AONIA"];
 
 /// Venues' markets, the venue's time zone, and its opens (`true`) and closes (`false`) in local
 /// `"YYYY-MM-DD HH:MM"` time.
@@ -88,6 +89,7 @@ fn the_production_genesis_applies_the_launch_decisions() {
             other => panic!("{symbol}: no launch market is {other:?}"),
         };
         assert_eq!(market.financing.markup_bps, markup, "{symbol}");
+        assert!(LAUNCH_BENCHMARKS.contains(&market.financing.benchmark.as_str()), "{symbol}");
         // Professional-client margin (#8): 200:1 on FX majors and major indices, less leverage on
         // everything else, and bands that rise with position notional.
         let first_band = market.margin_tiers[0].bps;

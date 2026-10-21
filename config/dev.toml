@@ -170,6 +170,8 @@ house_total_cap_floor = "2000000"
 # A fast move counts within this trailing window, and up to a tenth of it further back.
 stress_move_window_ms = 60000
 stress_cooldown_ms = 300000
+# Most orders one account may rest at once, across every market: 1 to 1000.
+max_resting_orders = 100
 
 [genesis.params.rollover]
 tz = "Europe/London"

@@ -6,10 +6,11 @@ mod common;
 
 use std::cell::RefCell;
 
+use common::events::fills;
 use common::stress::{
     BOUNDED, at_a_million_nav, bounded, diverge, divergence_only, divergence_params, with_divergence_shares,
 };
-use common::{AAPL, BTC, DE40, ETH, EURUSD, Harness, UNLISTED, acct, de40, f, fills, market, ny, params};
+use common::{AAPL, BTC, DE40, ETH, EURUSD, Harness, UNLISTED, acct, de40, f, market, ny, params};
 use engine_core::Fixed;
 use engine_core::command::{AdminCommand, Command, OrderKind};
 use engine_core::event::Event;

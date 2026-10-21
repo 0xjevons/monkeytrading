@@ -313,6 +313,8 @@ fn params_change() -> impl Strategy<Value = ProtocolParams> {
             },
             ..params()
         }),
+        prop_oneof![4 => 0usize..=4, 1 => any::<usize>()]
+            .prop_map(|max_resting_orders| ProtocolParams { max_resting_orders, ..params() }),
         (bps(), bps()).prop_map(|(multiplier_bps, min_spread_bps)| {
             let mut changed = params();
             changed.stress_levels[1].size_spread_multiplier_bps = multiplier_bps;
