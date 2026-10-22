@@ -180,7 +180,7 @@ Two suites guard replay and accounting:
   aarch64 Linux, and `scripts/check-reference-logs.sh` fails a branch that changes, renames, or
   deletes a committed log.
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
-  under `V2`, `V6`, `V7` with markets quoted in other currencies, `V13`, and `V12` and `V13` with
+  under `V2`, `V6`, `V7` with markets quoted in other currencies, `V11`, and `V12` and `V13` with
   those markets and signed operator commands, where `V13` must reach a stress change. Each mixes client, feed, custody, and operator commands,
   with values inside and outside the input bounds, and checks after every command that nothing
   panicked, cash is conserved, and every market's aggregates match its accounts' positions. Under

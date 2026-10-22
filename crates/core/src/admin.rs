@@ -25,7 +25,7 @@ impl Engine {
     /// share above zero only once relisted with a positive one.
     /// Error cases:
     /// - `SetParams` with parameters that fail `ProtocolParams::validate_for` the version in force,
-    ///   from `V8` that fail `ProtocolParams::check_closing_spread`, from `V13` that fail
+    ///   from `V8` that fail `ProtocolParams::check_closing_spread`, from `V11` that fail
     ///   `ProtocolParams::check_notional_weighting`, or from `V13` with a divergence share a listed
     ///   market can never reach
     /// - `UpsertMarket` with a spec that fails `MarketSpec::validate` or `check_quote_currency`, with

@@ -138,15 +138,15 @@ fn the_launch_markets_quoted_outside_usd_convert_at_their_pairs() {
 fn every_launch_market_can_reach_each_divergence_level() {
     let dev = NodeConfig::load(Path::new(DEV)).unwrap().genesis;
     let production = production_genesis("divergence-levels");
-    let levels: BTreeSet<usize> = (0..production.params.stress_levels.len())
-        .filter(|level| {
-            let trigger = production.params.stress_levels[*level].trigger.as_ref();
-            trigger.is_some_and(|t| t.divergence_share_bps.is_some())
-        })
-        .collect();
-    assert_eq!(levels, BTreeSet::from([1, 2]));
     for genesis in [&dev, &production] {
-        for (symbol, reached) in divergence_levels(&production.params, &genesis.markets) {
+        let levels: BTreeSet<usize> = (0..genesis.params.stress_levels.len())
+            .filter(|level| {
+                let trigger = genesis.params.stress_levels[*level].trigger.as_ref();
+                trigger.is_some_and(|t| t.divergence_share_bps.is_some())
+            })
+            .collect();
+        assert_eq!(levels, BTreeSet::from([1, 2]));
+        for (symbol, reached) in divergence_levels(&genesis.params, &genesis.markets) {
             assert!(levels.is_subset(&reached), "{symbol}: reaches {reached:?}");
         }
     }
