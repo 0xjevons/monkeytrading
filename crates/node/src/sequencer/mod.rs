@@ -1,7 +1,8 @@
 //! The sequencer owns the engine. Commands arrive over one channel, get a seq and a timestamp, and
 //! are applied in order; each then goes into the log with the events it produced. Nothing is
-//! acknowledged or published until its log entry is flushed. One task, no locks, and no queue
-//! beyond the channel: a fill costs about one engine step plus a buffered write.
+//! acknowledged or published until its log entry is written and synced to storage. One task, no
+//! locks, and no queue beyond the channel: a fill costs about one engine step plus a buffered
+//! write, and each batch of fills one data sync.
 
 mod replay;
 pub use replay::{Replayed, replay, replay_path};
@@ -118,6 +119,9 @@ pub struct SequencerConfig<'a> {
     pub operator: Operator,
     /// Where the sequencer records its metrics.
     pub metrics: Arc<Metrics>,
+    /// The commands the config's genesis sequences, which the genesis the log ran must match (see
+    /// `GenesisProgress::ensure_matches`).
+    pub genesis: Vec<Command>,
 }
 
 /// A log read from disk and replayed, before anything is written to it.
@@ -147,7 +151,7 @@ impl Sequencer {
     /// Error cases:
     /// - the log cannot be read or replayed (see `read_log`)
     /// - the log records a client auth or an operator other than the config's, or a genesis it did
-    ///   not apply in full
+    ///   not apply in full, or one other than the config's
     /// - the log cannot be opened for appending, or written
     pub fn recover(
         cfg: SequencerConfig<'_>,
@@ -176,7 +180,8 @@ impl Sequencer {
     /// As `recover`, from `log`, which `read_log` read and replayed.
     /// Error cases:
     /// - the log records a client auth or an operator other than the config's, or a genesis it did
-    ///   not apply in full (see `GenesisProgress::ensure_closed`)
+    ///   not apply in full (see `GenesisProgress::ensure_closed`), or one other than the config's
+    ///   (see `GenesisProgress::ensure_matches`)
     /// - the log cannot be opened for appending, or written
     pub fn recover_from(
         log: ReplayedLog,
@@ -196,6 +201,8 @@ impl Sequencer {
             bail!("the log records operator {recorded:?}, but the config gives {:?}", cfg.operator);
         }
         genesis.ensure_closed()?;
+        // So is one naming another genesis: the node would attest rules its engine does not run.
+        genesis.ensure_matches(&cfg.genesis)?;
         info!(commands, checkpoints, "recovered from log");
         if let Some(ts) = last_checkpoint_ts {
             cfg.metrics.last_checkpoint_seconds.set(ts as f64 / 1000.0);
@@ -235,9 +242,10 @@ impl Sequencer {
     }
 
     /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch,
-    /// of at most `MAX_BATCH` requests, is flushed before its replies, stream messages, and queries
-    /// go out, and synced to storage first when it carries a sync request. A command trusted time
-    /// refuses is dropped with its reply, which the API answers as unavailable.
+    /// of at most `MAX_BATCH` requests, is written and its data synced before its replies, stream
+    /// messages, and queries go out; one that carries a sync request also syncs the directory entry
+    /// naming its segment. A command trusted time refuses is dropped with its reply, which the API
+    /// answers as unavailable.
     /// Error cases:
     /// - the log cannot be written or synced; the node must stop rather than acknowledge
     ///   undurable commands

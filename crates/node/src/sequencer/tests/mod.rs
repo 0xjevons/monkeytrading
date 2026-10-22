@@ -8,8 +8,8 @@ use engine_core::protocol::ProtocolVersion;
 use crate::clock::test_clock::TestClock;
 use crate::log::{Manifest, segment_seq};
 use crate::test_support::{
-    SEGMENT_COMMANDS, TRADER, TestSequencer, deposit, dev_config, log_entries, log_messages, sample_around,
-    scratch_dir, sequencer_config, trusted_now, withdraw,
+    SEGMENT_COMMANDS, TRADER, TestSequencer, deposit, dev_config, finished_genesis, log_entries, log_messages,
+    sample_around, scratch_dir, sequencer_config, trusted_now, withdraw,
 };
 
 const V1_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v1-dev.jsonl");
@@ -257,8 +257,9 @@ fn an_existing_v1_log_activates_at_its_next_seq_and_still_verifies() {
     fs::create_dir_all(&dir).unwrap();
     // A log written as one file before segments existed continues as the first segment.
     fs::copy(V1_DEV, dir.join("00000000000000000000.jsonl")).unwrap();
-    let before = replay(&log_entries(&dir)).unwrap().engine.params().cloned().expect("the log sets parameters");
-    let mut seq = recover(&dir, &signed(31_337));
+    let logged = log_entries(&dir);
+    let before = replay(&logged).unwrap().engine.params().cloned().expect("the log sets parameters");
+    let mut seq = recover_with(&dir, &signed(31_337), finished_genesis(&logged)).unwrap();
     let weighting = dev_config().genesis.params.toxicity.notional.unwrap();
     seq.carry_toxicity_notional(weighting).unwrap();
     seq.activate_protocol().unwrap();
@@ -294,7 +295,8 @@ fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
     let dir = scratch_dir("activation-v3");
     fs::create_dir_all(&dir).unwrap();
     fs::copy(V3_REFERENCE, dir.join("00000000000000000000.jsonl")).unwrap();
-    let before = replay(&log_entries(&dir)).unwrap();
+    let logged = log_entries(&dir);
+    let before = replay(&logged).unwrap();
     // As the node does, the log's parameters take the config's notional weighting at its next seq;
     // the operator follows, and the latest version after it.
     let activated = before.engine.last_seq().unwrap() + 3;
@@ -303,8 +305,12 @@ fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
     let stamps = Arc::new(TestClock::at(before.engine.now() + 1_000));
     let (stream, _) = broadcast::channel(16);
     let (manifest, _) = watch::channel(Manifest::default());
-    let cfg =
-        SequencerConfig { client_auth: signed(31_337), clock: stamps.clone(), ..sequencer_config(&dir, manifest) };
+    let cfg = SequencerConfig {
+        client_auth: signed(31_337),
+        clock: stamps.clone(),
+        genesis: finished_genesis(&logged),
+        ..sequencer_config(&dir, manifest)
+    };
     let key = Arc::new(EnclaveKey::generate());
     let mut seq = Sequencer::recover(cfg, key, stream, mpsc::unbounded_channel().0).unwrap();
     seq.trust(sample_around(stamps.as_ref())).unwrap();
@@ -450,6 +456,19 @@ fn recover(dir: &Path, client_auth: &ClientAuth) -> Sequencer {
     let mut seq = try_recover(dir, client_auth).0.unwrap();
     seq.trust(trusted_now()).unwrap();
     seq
+}
+
+/// As `recover`, under a config whose genesis sequences `genesis`.
+/// Error cases:
+/// - recovery fails (see `Sequencer::recover`)
+fn recover_with(dir: &Path, client_auth: &ClientAuth, genesis: Vec<Command>) -> anyhow::Result<Sequencer> {
+    let (stream, _) = broadcast::channel(16);
+    let (withdrawals_tx, _) = mpsc::unbounded_channel();
+    let (manifest, _) = watch::channel(Manifest::default());
+    let cfg = SequencerConfig { client_auth: client_auth.clone(), genesis, ..sequencer_config(dir, manifest) };
+    let mut seq = Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, withdrawals_tx)?;
+    seq.trust(trusted_now())?;
+    Ok(seq)
 }
 
 /// `recover`'s result, and what custody would receive from it.

@@ -19,10 +19,10 @@ use crate::config::RateLimit;
 use crate::history::{HistoryEvent, INDEX_FILE, account_of};
 use crate::log::{LogEntry, MANIFEST, Manifest, Offset, SegmentedLog, segment_seq};
 use crate::sequencer::replay_path;
-use crate::tee::{EnclaveKey, MockAttestor, attest_key};
+use crate::tee::{Attestation, AttestationBundle, EnclaveKey, MockAttestor, attest_bundle};
 use crate::test_support::{
-    SEGMENT_COMMANDS, TRADER, TestHistory, TestSequencer, deposit, dev_config, file_entries, log_messages,
-    logged_history, scratch_dir, withdraw,
+    SEGMENT_COMMANDS, TRADER, TestHistory, TestSequencer, deposit, dev_config, file_entries, finished_genesis,
+    log_messages, logged_history, scratch_dir, withdraw,
 };
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -160,8 +160,10 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
         _ => None,
     });
     let clock: Arc<dyn Clock> = Arc::new(TestClock::at(last_ts.max().unwrap() + 1_000));
+    // The node resumes under the genesis the reference log finished, not the dev config's.
+    let genesis = finished_genesis(&reference);
 
-    let node = TestSequencer::start_at(&dir, 1024, clock.clone());
+    let node = TestSequencer::resume_at(&dir, 1024, clock.clone(), genesis.clone());
     let history = TestHistory::start(&node, &dir, &index).await.unwrap();
     node.submit(deposit(100, "dep-1")).await;
     node.submit(withdraw(40)).await;
@@ -175,7 +177,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
     }
 
     let segments = Manifest::load(&dir).unwrap().segments.len();
-    let node = TestSequencer::start_at(&dir, 1024, clock.clone());
+    let node = TestSequencer::resume_at(&dir, 1024, clock.clone(), genesis.clone());
     let history = TestHistory::start(&node, &dir, &index).await.unwrap();
     for n in 0..SEGMENT_COMMANDS {
         node.submit(deposit(1, &format!("dep-rotate-{n}"))).await;
@@ -191,7 +193,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
     assert_eq!(second[&TRADER].len(), first[&TRADER].len() + SEGMENT_COMMANDS as usize);
 
     fs::remove_dir_all(&index).unwrap();
-    let node = TestSequencer::start_at(&dir, 1024, clock.clone());
+    let node = TestSequencer::resume_at(&dir, 1024, clock.clone(), genesis.clone());
     let history = TestHistory::start(&node, &dir, &index).await.unwrap();
     node.stop().await;
     history.finish().await.unwrap();
@@ -290,12 +292,22 @@ async fn serve(node: &TestSequencer, dir: &Path) -> SocketAddr {
     serve_with(node, dir, node.manifest.clone()).await
 }
 
+/// A mock attestation of a fresh key's address, with zero config and TLS key hashes.
+fn mock_attestation() -> Arc<Attestation> {
+    let bundle = AttestationBundle {
+        enclave_address: EnclaveKey::generate().address(),
+        config_sha256: [0; 32],
+        tls_public_key_sha256: [0; 32],
+    };
+    Arc::new(attest_bundle(&MockAttestor, &bundle).unwrap())
+}
+
 /// Serves the API for `node`, with `dir` as its log directory and `manifest` as the writer's.
 async fn serve_with(node: &TestSequencer, dir: &Path, manifest: watch::Receiver<Manifest>) -> SocketAddr {
     serve_state(ApiState {
         tx: node.tx.clone(),
         stream: node.stream.clone(),
-        attestation: Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate(), &[0; 32]).unwrap()),
+        attestation: mock_attestation(),
         auth: ClientAuth::Unsigned,
         operator: dev_config().operator().unwrap(),
         mock_custody: true,
@@ -318,7 +330,7 @@ async fn serve_history(history: Reader) -> SocketAddr {
     serve_state(ApiState {
         tx: mpsc::channel(1).0,
         stream: broadcast::channel(1).0,
-        attestation: Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate(), &[0; 32]).unwrap()),
+        attestation: mock_attestation(),
         auth: ClientAuth::Unsigned,
         operator: dev_config().operator().unwrap(),
         mock_custody: false,
@@ -415,7 +427,7 @@ async fn get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
 /// API state over a channel no sequencer reads, so a test sees each request the API sends.
 fn api_state(mock_custody: bool) -> (ApiState, mpsc::Receiver<sequencer::Request>) {
     let (tx, rx) = mpsc::channel(1);
-    let attestation = Arc::new(attest_key(&MockAttestor, &EnclaveKey::generate(), &[0; 32]).unwrap());
+    let attestation = mock_attestation();
     let (stream, _) = broadcast::channel(1);
     let (_, manifest) = watch::channel(Manifest::default());
     let state = ApiState {
