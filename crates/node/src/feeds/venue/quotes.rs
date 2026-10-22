@@ -9,12 +9,15 @@ use engine_core::types::Millis;
 
 /// One market's quotes received and not yet sequenced: the newest the host clock has reached, and
 /// those dated ahead of it, kept by venue time until the clock reaches them. The quote taken is the
-/// one the engine would hold had each quote been sent as it arrived: one still ahead of its time
-/// gives way to any later quote, as when the venue's clock steps back, and one already reached
-/// gives way only to a quote dated at or after it. A host clock a little behind the venue then
-/// still prices from the venue, a moment late, rather than handing the engine quotes it cannot use
-/// yet. Quotes ahead are kept one per venue millisecond and at most `MAX_QUOTE_LEAD_MS` ahead,
-/// which bounds how many are held.
+/// one the engine would hold under the rules before protocol `V12` had each quote been sent as it
+/// arrived: one still ahead of its time gives way to any later quote, as when the venue's clock
+/// steps back, and one already reached gives way only to a quote dated at or after it. A host clock
+/// a little behind the venue then still prices from the venue, a moment late, rather than handing
+/// the engine quotes those rules cannot use yet. Quotes ahead are kept one per venue millisecond
+/// and at most `MAX_QUOTE_LEAD_MS` ahead, which bounds how many are held.
+///
+/// TODO: from `V12` the engine counts a quote dated ahead at once, as dated at the sequenced time,
+/// so holding one back here only delays it; send it as it arrives.
 #[derive(Debug, Default)]
 pub(super) struct Pending {
     reached: Option<SourceQuote>,

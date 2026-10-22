@@ -71,11 +71,18 @@ pub enum ProtocolVersion {
     /// (`ToxicityParams::notional`), and a markout is scored only at an index valid when it is
     /// scored, within one horizon of falling due. Markouts queue in due order.
     V11,
+    /// Each command first brings every market to its sequenced time, after storing a price
+    /// command's quotes: it refreshes every session, then processes each market whose index has
+    /// changed since it was last processed, and the priced one, as a price update does, before the
+    /// command or a rollover acts; a parameter or listing change does the same before its close-out
+    /// check. A venue quote stamped ahead of the sequenced time counts at once, as stamped at the
+    /// sequenced time.
+    V12,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V11;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V12;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {
