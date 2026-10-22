@@ -1,29 +1,31 @@
-"""The calibration runs: per-market floor sweeps, joint runs over a common risk level, and the
+"""The calibration runs: per-market floor sweeps, joint runs of candidate floor sets, and the
 sensitivities.
 
-Insolvency measures, each a probability over the 90 days:
+Insolvency measures, each the share of paths in which, over the 90 days:
 - `p_end`: house NAV is below zero at the end;
 - `p_ever`: house NAV is below zero at some hour-end;
 - `p_short`: at some hour-end house cash is below zero, so the vault holds less than clients'
   balances. What clients may withdraw at once is never more than their balances, so this bounds
   from above the chance that the vault cannot pay a withdrawal on demand;
 - `p_queue`: under the modelled withdrawals, some withdrawal waits in the #49 queue.
-The first three have a `_tail` form, read from the sample down to 20 paths and extrapolated below
-that from the worst 5% of the underlying amount (NAV at the end, the lowest NAV, the lowest house
-cash),
-which the calibration uses. `p_dip_100k` and `p_dip_1m` give the chance the lowest NAV falls
-below -$100k and -$1M.
+Each is the share the paths show; nothing is extrapolated past what they count. `p_ever` and
+`p_short` also carry their count and `_upper`, the exact one-sided 95% upper bound, which with no
+failing path is about 3 in the number of paths. `p_dip_100k` and `p_dip_1m` give the chance the
+lowest NAV falls below -$100k and -$1M.
 
 Calibration, per measure: each market alone gives a curve of the measure against its floor. A
 risk level `q` sets every market's floor to the largest tested floor at which the market alone
-stays at or below `q`, no higher than the floor at which it stops refusing orders, and zero when
-even a zero floor exceeds `q`; the total floor is the sum. The joint runs sweep `q`, and a target
-takes the largest `q` whose joint measure meets it. At the level chosen for 1%, a second joint run
-sweeps the total floor below the sum, where the total cap starts to bind.
+stays at or below `q`, every smaller floor too, no higher than the floor at which it stops
+refusing orders, and zero when even a zero floor exceeds `q`; the total floor is the sum. The
+joint run puts every level's floors, for both measures, and uniform floors on every market
+(`UNIFORM_FLOORS`) on the same paths. A target takes, of the candidates whose measure meets it,
+the one that refuses the least directional notional over the 90 days. At the choice for
+`BASE_TARGET`, a second joint run sweeps the total floor below the sum.
 """
 
 import csv
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,50 +34,58 @@ import numpy as np
 from model import simulate
 
 TARGETS = (0.01, 0.001, 0.0001)
-MEASURES = ("p_ever_tail", "p_short_tail")
+MEASURES = ("p_ever", "p_short")
 MARKET_FLOORS = np.concatenate([[0.0], np.geomspace(1e4, 1e8, 17)])
 LEVELS = (0.0, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.2, 0.3, 0.5, 1.0)  # 1.0: every market at its binding point
+UNIFORM_FLOORS = np.array([1e5, 3e5, 1e6, 3e6, 1e7])  # the same floor on every market
 TOTAL_FRACTIONS = np.array([0.25, 0.5, 0.75, 1.0])  # total floor as a share of the market floors' sum
 SCALES = np.array([0.1, 0.3, 1.0])  # sensitivity floor scales
 NO_TOTAL_LIMIT = 1e15
 
 
-def tail_probability(values: np.ndarray, threshold: float = 0.0, tail: float = 0.05) -> float:
-    """P(value < threshold): read from the sample when it holds at least 20 such paths, else
-    extrapolated from an exponential fit to the worst `tail` of the sample, never below the rate
-    the sample shows. When the fit does not apply, the observed rate, or with no path below the
-    threshold the 95% upper bound for zero events, 3 / paths."""
-    n = len(values)
-    hits = int((values < threshold).sum())
-    if hits >= 20:
-        return hits / n
-    finite = values[np.isfinite(values)]
-    if len(finite) == 0:  # no path ever opened anything: nothing can fall below zero
-        return 0.0
-    if len(finite) >= 200:
-        cut = np.quantile(finite, min(1.0, tail * n / len(finite)))  # the worst `tail` of all paths
-        excess = cut - finite[finite < cut]
-        if cut > threshold and len(excess) > 0 and excess.mean() > 0:
-            return max(hits / n, float(tail * np.exp(-(cut - threshold) / excess.mean())))
-    return max(hits, 3) / n
+def upper_bound(hits: int, n: int, confidence: float = 0.95) -> float:
+    """The exact (Clopper-Pearson) one-sided upper bound on a probability seen `hits` times in `n`
+    paths: the rate under which `hits` or fewer would happen with probability 1 - `confidence`."""
+    if hits >= n:
+        return 1.0
+    i = np.arange(hits + 1)
+    log_fact = np.concatenate([[0.0], np.cumsum(np.log(np.arange(1, n + 1)))])
+    log_choose = log_fact[n] - log_fact[i] - log_fact[n - i]
+
+    def cdf(p: float) -> float:
+        logs = log_choose + i * math.log(p) + (n - i) * math.log1p(-p)
+        top = logs.max()
+        return float(math.exp(top) * np.exp(logs - top).sum())
+
+    lo, hi = hits / n, 1.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if mid > 0 and cdf(mid) > 1 - confidence:
+            lo = mid
+        else:
+            hi = mid
+    return hi
 
 
 def lane_stats(out: dict, lane: int) -> dict:
     nav_end = out["nav_end"][:, lane]
+    n = len(nav_end)
     opened = bool(np.isfinite(out["min_nav"][:, lane]).any())  # some path had cash or exposure
-    tail = tail_probability if opened else (lambda values: 0.0)
     first_negative = out["first_negative_h"][:, lane][out["first_negative_h"][:, lane] >= 0]
     lowest_nav = np.where(np.isfinite(out["min_nav"][:, lane]), out["min_nav"][:, lane], 0.0)  # 0 where nothing opened
+    ever = int(out["ever_negative"][:, lane].sum())
+    short = int((out["min_cash"][:, lane] < 0).sum())
     return {
         "p_end": float((nav_end < 0).mean()),
-        "p_end_tail": tail(nav_end),
-        "p_ever": float(out["ever_negative"][:, lane].mean()),
-        "p_ever_tail": tail(out["min_nav"][:, lane]),
+        "p_ever": ever / n,
+        "ever_paths": ever,
+        "p_ever_upper": upper_bound(ever, n) if opened else 0.0,  # nothing open, nothing to lose
+        "p_short": short / n,
+        "short_paths": short,
+        "p_short_upper": upper_bound(short, n) if opened else 0.0,
         "p_queue": float(out["queued"][:, lane].mean()),
         "p_dip_100k": float((out["min_nav"][:, lane] < -1e5).mean()),
         "p_dip_1m": float((out["min_nav"][:, lane] < -1e6).mean()),
-        "p_short": float((out["min_cash"][:, lane] < 0).mean()),
-        "p_short_tail": tail(out["min_cash"][:, lane]),
         "refused_share": float((out["refused"][:, lane].sum() + out["refused_hedged"][:, lane].sum()) / max(out["desired"][:, lane].sum(), 1e-9)),
         "refused_share_directional": float(out["refused"][:, lane].sum() / max(out["desired_directional"][:, lane].sum(), 1e-9)),
         "refused_share_week1": float(out["refused_week1"][:, lane].sum() / max(out["desired_week1"][:, lane].sum(), 1e-9)),
@@ -154,48 +164,57 @@ def joint_rows(markets, out: dict, floors: np.ndarray, totals: np.ndarray, label
     return rows
 
 
-def joint(scenario, markets, bars, flow, sweep: list[dict], workers: int) -> dict:
-    """For each measure, all markets together at every risk level in `LEVELS`."""
-    tasks, floor_sets = [], []
+def joint(scenario, markets, bars, flow, sweep: list[dict], workers: int) -> dict[str, list[dict]]:
+    """All markets together on the same paths: each measure's floors at every level in `LEVELS`,
+    and `UNIFORM_FLOORS`. Returns the rows by family: each measure's levels, and "uniform"."""
+    families, lanes, labels = [], [], []
     for key in MEASURES:
-        floors = level_floors(sweep, markets.symbols, key)
-        floor_sets.append(floors)
-        tasks.append((replace(scenario, name=f"joint {key}"), markets, bars, flow, floors, floors.sum(axis=1)))
-    return {
-        key: joint_rows(markets, out, floors, floors.sum(axis=1), list(LEVELS))
-        for key, floors, out in zip(MEASURES, floor_sets, simulate.run_many(tasks, workers))
-    }
+        lanes.append(level_floors(sweep, markets.symbols, key))
+        families += [key] * len(LEVELS)
+        labels += list(LEVELS)
+    lanes.append(UNIFORM_FLOORS[:, None] * np.ones(len(markets.symbols)))
+    families += ["uniform"] * len(UNIFORM_FLOORS)
+    labels += UNIFORM_FLOORS.tolist()
+    floors = np.concatenate(lanes)
+    (out,) = simulate.run_many([(replace(scenario, name="joint"), markets, bars, flow, floors, floors.sum(axis=1))], workers)
+    rows = [{"family": f, **r} for f, r in zip(families, joint_rows(markets, out, floors, floors.sum(axis=1), labels))]
+    return {family: [r for r in rows if r["family"] == family] for family in dict.fromkeys(families)}
 
 
 def total_sweep(scenario, markets, bars, flow, base: dict[str, dict], workers: int) -> dict:
-    """For each measure, its base level's market floors with the total floor at `TOTAL_FRACTIONS`
-    of their sum."""
-    tasks, floor_sets = [], []
-    for key in MEASURES:
-        floors = np.array([base[key]["market_floors"][s] for s in markets.symbols])
-        lanes = np.repeat(floors[None, :], len(TOTAL_FRACTIONS), axis=0)
-        floor_sets.append((lanes, TOTAL_FRACTIONS * floors.sum()))
-        tasks.append((replace(scenario, name=f"total {key}"), markets, bars, flow, lanes, TOTAL_FRACTIONS * floors.sum()))
-    return {
-        key: joint_rows(markets, out, lanes, totals, TOTAL_FRACTIONS.tolist())
-        for key, (lanes, totals), out in zip(MEASURES, floor_sets, simulate.run_many(tasks, workers))
-    }
+    """For each measure, the floors chosen for it (`base`) with the total floor at
+    `TOTAL_FRACTIONS` of their sum, all on the same paths."""
+    floors = [market_floors(base[key], markets.symbols) for key in MEASURES]
+    lanes = np.concatenate([np.repeat(f[None, :], len(TOTAL_FRACTIONS), axis=0) for f in floors])
+    totals = np.concatenate([TOTAL_FRACTIONS * f.sum() for f in floors])
+    (out,) = simulate.run_many([(replace(scenario, name="total"), markets, bars, flow, lanes, totals)], workers)
+    rows = joint_rows(markets, out, lanes, totals, TOTAL_FRACTIONS.tolist() * len(MEASURES))
+    n = len(TOTAL_FRACTIONS)
+    return {key: rows[i * n : (i + 1) * n] for i, key in enumerate(MEASURES)}
 
 
-def chosen_level(rows: list[dict], key: str, target: float) -> dict | None:
-    """The joint row with the largest total floor whose measure meets `target`, every smaller
-    level meeting it too; None when even zero floors miss it."""
-    best = None
-    for row in sorted(rows, key=lambda r: r["total_floor"]):
-        if row[key] > target:
-            break
-        best = row
-    return best
+def market_floors(row: dict, symbols: list[str]) -> np.ndarray:
+    """A joint row's market floors, from the run or as read back from its CSV."""
+    floors = row["market_floors"]
+    floors = json.loads(floors) if isinstance(floors, str) else floors
+    return np.array([floors[s] for s in symbols])
+
+
+def candidates(families: dict[str, list[dict]], key: str) -> list[dict]:
+    """The floor sets a target for `key` chooses from: its own levels and the uniform floors."""
+    return families[key] + families.get("uniform", [])
+
+
+def chosen(rows: list[dict], key: str, target: float) -> dict | None:
+    """Of the rows whose measure meets `target`, the one that refuses the least directional
+    notional over the 90 days, the smaller total floor on a tie; None when none meets it."""
+    meeting = [r for r in rows if r[key] <= target]
+    return min(meeting, key=lambda r: (r["refused_share_directional"], r["total_floor"]), default=None)
 
 
 SENSITIVITIES = {
-    "no farming": {"hedged_share": 0.0},
-    "farming share x2": {"hedged_share": "x2"},
+    "no farming": {"hedged_scale": 0.0},
+    "farming x2": {"hedged_scale": 2.0},
     "farming decays, 30-day half-life": {"farm_half_life_days": 30.0},
     "farm pairs held through closures": {"gap_pair_share": 0.1},
     "vol x1.5": {"vol_scale": 1.5},
@@ -210,12 +229,11 @@ SENSITIVITIES = {
 }
 
 
-def sensitivity(scenario, markets, bars, flow, floors: np.ndarray, measured_hedged: float, workers: int) -> list[dict]:
+def sensitivity(scenario, markets, bars, flow, floors: np.ndarray, workers: int) -> list[dict]:
     """Every variant at `floors` scaled by `SCALES`, per-market and total together."""
     lanes = SCALES[:, None] * floors[None, :]
     names, tasks = [], []
     for name, change in {"baseline": {}, **SENSITIVITIES}.items():
-        change = {k: (min(2 * measured_hedged, 0.95) if v == "x2" else v) for k, v in change.items()}
         names.append(name)
         tasks.append((replace(scenario, name=name, **change), markets, bars, flow, lanes, lanes.sum(axis=1)))
     rows = []

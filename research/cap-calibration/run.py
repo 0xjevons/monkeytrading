@@ -1,7 +1,9 @@
 """Entry point for the cap calibration: fetch, derive, simulate, and report.
 
 Run with `python -I run.py <command>` from any directory; every path is relative to this file.
-`all` runs every simulation stage and the report from the committed derived data.
+`all` runs every simulation stage and the report from the committed derived data. Each stage's
+paths and batch size default to those of the committed results; the batch size is part of the
+random stream, so a different one gives different (equally valid) paths.
 """
 
 import argparse
@@ -19,8 +21,9 @@ RAW = ROOT / "data" / "raw"
 DERIVED = ROOT / "data" / "derived"
 RESULTS = ROOT / "results"
 STAGES = ("per-market", "joint", "sensitivity")
+DEFAULTS = {"per-market": (2000, 500), "joint": (2000, 25), "sensitivity": (1000, 25)}  # paths, batch paths
 BASE_TARGET = 0.01  # the total-floor sweep and the sensitivities start from the floors chosen for this target
-SENSITIVITY_MEASURE = "p_short_tail"  # whose choice at BASE_TARGET the sensitivities start from
+SENSITIVITY_MEASURE = "p_short"  # whose choice at BASE_TARGET the sensitivities start from
 
 
 def inputs():
@@ -32,7 +35,8 @@ def inputs():
 
     bars, symbols = prices.load_bars(DERIVED / "hourly_bars.npz")
     flow = load(DERIVED)
-    markets = simulate.load_markets(load_genesis(), symbols, load_mix(DERIVED, symbols), bars)
+    benchmarks = {r["benchmark"]: float(r["bps"]) for r in read_rows(DERIVED / "benchmarks.csv")}
+    markets = simulate.load_markets(load_genesis(), symbols, load_mix(DERIVED, symbols), bars, benchmarks)
     return np, simulate, bars, flow, markets
 
 
@@ -59,34 +63,37 @@ def simulate_stage(stage: str, args) -> None:
     from model import experiments
 
     np, simulate, bars, flow, markets = inputs()
-    base = simulate.Scenario(seed=args.seed)
+    paths, batch_paths = DEFAULTS[stage]
+    scenario = simulate.Scenario(seed=args.seed, paths=args.paths or paths, batch_paths=args.batch_paths or batch_paths)
     RESULTS.mkdir(exist_ok=True)
     started = time.time()
     if stage == "per-market":
-        scenario = replace(base, paths=args.paths or 2000, batch_paths=args.batch_paths or 500)
         rows = experiments.per_market(scenario, markets, bars, flow, args.workers)
         experiments.write_rows(RESULTS / "per_market_sweep.csv", rows)
     elif stage == "joint":
-        scenario = replace(base, paths=args.paths or 2000, batch_paths=args.batch_paths or 100)
         sweep = read_rows(RESULTS / "per_market_sweep.csv")
-        levels = experiments.joint(scenario, markets, bars, flow, sweep, args.workers)
-        for key, rows in levels.items():
-            experiments.write_rows(RESULTS / f"joint_{key}.csv", rows)
-        base_rows = {key: experiments.chosen_level(rows, key, BASE_TARGET) or rows[0] for key, rows in levels.items()}
+        families = experiments.joint(scenario, markets, bars, flow, sweep, args.workers)
+        for family, rows in families.items():
+            experiments.write_rows(RESULTS / f"joint_{family}.csv", rows)
+        base_rows = {}
+        for key in experiments.MEASURES:
+            options = experiments.candidates(families, key)
+            base_rows[key] = experiments.chosen(options, key, BASE_TARGET) or min(options, key=lambda r: r["total_floor"])
         for key, rows in experiments.total_sweep(scenario, markets, bars, flow, base_rows, args.workers).items():
             for row in rows:
+                row["base_family"] = base_rows[key]["family"]
                 row["base_level"] = base_rows[key]["level"]
             experiments.write_rows(RESULTS / f"joint_total_{key}.csv", rows)
     elif stage == "sensitivity":
-        scenario = replace(base, paths=args.paths or 1000, batch_paths=args.batch_paths or 100)
-        rows = read_rows(RESULTS / f"joint_{SENSITIVITY_MEASURE}.csv")
-        chosen = experiments.chosen_level(rows, SENSITIVITY_MEASURE, BASE_TARGET)
+        families = {f: read_rows(RESULTS / f"joint_{f}.csv") for f in (SENSITIVITY_MEASURE, "uniform")}
+        options = experiments.candidates(families, SENSITIVITY_MEASURE)
+        chosen = experiments.chosen(options, SENSITIVITY_MEASURE, BASE_TARGET)
         met = chosen is not None
-        chosen = chosen or rows[0]
-        floors = np.array([json.loads(chosen["market_floors"])[s] for s in markets.symbols])
-        measured = sum(c.margin_share for c in flow.classes if c.kind == "hedged")
-        out = experiments.sensitivity(scenario, markets, bars, flow, floors, measured, args.workers)
+        chosen = chosen or min(options, key=lambda r: r["total_floor"])
+        floors = experiments.market_floors(chosen, markets.symbols)
+        out = experiments.sensitivity(scenario, markets, bars, flow, floors, args.workers)
         for row in out:
+            row["base_family"] = chosen["family"]
             row["base_level"] = chosen["level"]
             row["base_meets_target"] = met
             row["base_measure"] = SENSITIVITY_MEASURE
@@ -105,10 +112,10 @@ def main() -> None:
     sub.add_parser("derive-markets", help="build the hourly price dataset, market statistics, and mix")
     for name in (*STAGES, "all"):
         sim = sub.add_parser(name, help=f"run the {name} stage" if name != "all" else "run every stage and the report")
-        sim.add_argument("--workers", type=int, default=8)
-        sim.add_argument("--paths", type=int, help="paths per run; defaults per stage")
+        sim.add_argument("--workers", type=int, default=4)
+        sim.add_argument("--paths", type=int, help="paths per run; defaults per stage (DEFAULTS)")
         sim.add_argument("--seed", type=int, default=1)
-        sim.add_argument("--batch-paths", type=int, help="paths per worker job; smaller uses less memory")
+        sim.add_argument("--batch-paths", type=int, help="paths per worker job, part of the random stream; defaults per stage (DEFAULTS)")
     sub.add_parser("report", help="write results/report.md from the stage outputs")
     args = parser.parse_args()
 

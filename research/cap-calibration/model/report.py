@@ -5,12 +5,11 @@ import json
 import math
 from pathlib import Path
 
-from model.experiments import SCALES, TARGETS, binding_point, chosen_level
+from model.experiments import MEASURES, SCALES, TARGETS, binding_point, candidates, chosen
 
 MEASURE_NAMES = {
-    "p_ever_tail": "NAV below zero at some hour",
-    "p_short_tail": "house cash below zero (the vault short of client balances) at some hour",
-    "p_end_tail": "NAV below zero at day 90",
+    "p_ever": "NAV below zero at some hour",
+    "p_short": "house cash below zero (the vault short of client balances) at some hour",
 }
 
 
@@ -33,6 +32,12 @@ def pct(x, digits: int = 2) -> str:
     if x < 0.0001:
         return "<0.01%"
     return f"{100 * x:.{digits}f}%"
+
+
+def counted(row: dict, key: str) -> str:
+    """A measure as its share of paths, the count, and the 95% upper bound."""
+    count = int(row["ever_paths" if key == "p_ever" else "short_paths"])
+    return f"{pct(row[key], 2)} ({count}; <{pct(row[key + '_upper'], 2)})"
 
 
 def table(header: list[str], rows: list[list]) -> str:
@@ -63,7 +68,8 @@ def data_section(derived: Path) -> str:
         ["Hold (count) p10 / p50 / p90 / p99", " / ".join(f"{v * 3600:.0f}s" if v < 1 / 30 else f"{v * 60:.0f}min" if v < 1 else f"{v:.1f}h" for v in s["hold_hours_quantiles_by_count"].values())],
         ["Exposure-time held over 1h / 24h", f"{pct(s['exposure_time_share_held_over_1h'], 1)} / {pct(s['exposure_time_share_held_over_24h'], 1)}"],
         ["Leverage (notional-weighted) p10 / p50 / p90", " / ".join(f"{v:.0f}x" for v in s["leverage_quantiles_by_notional"].values())],
-        ["Hedged positions: share of notional / exposure-time", f"{pct(s['hedged_share_of_notional'], 1)} / {pct(s['hedged_share_of_exposure_time'], 1)}"],
+        ["Hedged share of notional / exposure-time", f"{pct(s['hedged_share_of_notional'], 1)} / {pct(s['hedged_share_of_exposure_time'], 1)}"],
+        ["Hedged share on the full days the model samples: notional / margin", f"{pct(s['full_days_hedged_share_of_notional'], 1)} / {pct(s['full_days_hedged_share_of_margin'], 1)} ({s['full_days_positions']:,} positions)"],
         ["Exposure offset within accounts / market-wide", f"{pct(s['offset_within_accounts_share'], 1)} / {pct(s['offset_market_wide_share'], 1)}"],
         ["Hedged flow's cost per $1 of loss (haircut and fee on the winning leg)", f"${s['hedged_cost_per_usd_of_loss']:.3f}"],
         ["Winners keep, of raw gains", pct(s["winner_keeps_share_of_raw_gain"], 1)],
@@ -115,14 +121,14 @@ def per_market_section(results: Path) -> str:
         rows.append([
             symbol,
             usd(bind) if bind is not None else "> $100M",
-            pct(at_bind["p_ever_tail"], 3),
-            pct(at_bind["p_short_tail"], 3),
+            counted(at_bind, "p_ever"),
+            counted(at_bind, "p_short"),
             pct(at_bind["refused_share_week1"], 1),
             usd(at_bind["bad_debt_mean"]),
             usd(at_bind["fee_mean"]),
         ])
     header = ["Market", "Refusals end at", "NAV<0 ever", "Cash<0", "Refused, week 1", "Bad debt mean", "Fees mean"]
-    intro = "Each market alone at its share of the flow, at the floor where its 90-day refused share falls under 1%. With a zero floor nothing opens."
+    intro = "Each market alone at its share of the flow, at the floor where its 90-day refused share falls under 1%. With a zero floor nothing opens. Each probability is the share of paths, with the count and the one-sided 95% upper bound in brackets."
     return "\n".join(["## Each market alone", "", intro, "", table(header, rows), ""])
 
 
@@ -132,10 +138,10 @@ JOINT_HEADER = ["Total floor", "NAV<0 ever", "Cash<0", "Queue", "NAV<0 day 90", 
 def joint_row(r: dict) -> list:
     return [
         usd(r["total_floor"]),
-        pct(r["p_ever_tail"], 3),
-        pct(r["p_short_tail"], 3),
+        counted(r, "p_ever"),
+        counted(r, "p_short"),
         pct(r["p_queue"], 3),
-        pct(r["p_end_tail"], 3),
+        pct(r["p_end"], 3),
         pct(r["p_dip_100k"], 2),
         pct(r["p_dip_1m"], 2),
         f"{r['first_negative_day_p50']:.1f}" if r["first_negative_day_p50"] >= 0 else "-",
@@ -147,36 +153,38 @@ def joint_row(r: dict) -> list:
     ]
 
 
+def label(row: dict) -> str:
+    if row["family"] == "uniform":
+        return f"{usd(row['level'])} on every market"
+    return "binding" if row["level"] == 1.0 else f"level {pct(row['level'], 2)}"
+
+
 def joint_section(results: Path) -> str:
     out = ["## All markets together", ""]
-    for measure in ("p_ever_tail", "p_short_tail"):
-        path = results / f"joint_{measure}.csv"
-        if not path.exists():
-            continue
-        rows = sorted(read(path), key=lambda r: r["total_floor"])
-        body = [["binding" if r["level"] == 1.0 else pct(r["level"], 2)] + joint_row(r) for r in rows]
-        out += [f"### Floors set for {MEASURE_NAMES[measure]}", "", table(["Level"] + JOINT_HEADER, body), ""]
-        chosen = {t: chosen_level(rows, measure, t) for t in TARGETS}
+    paths = {f: results / f"joint_{f}.csv" for f in (*MEASURES, "uniform")}
+    if not all(p.exists() for p in paths.values()):
+        return ""
+    families = {f: sorted(read(p), key=lambda r: r["total_floor"]) for f, p in paths.items()}
+    titles = {**{k: f"Floors set by risk level for {MEASURE_NAMES[k]}" for k in MEASURES}, "uniform": "The same floor on every market"}
+    for family, rows in families.items():
+        out += [f"### {titles[family]}", "", table(["Floors"] + JOINT_HEADER, [[label(r)] + joint_row(r) for r in rows]), ""]
+    symbols = list(json.loads(families["uniform"][0]["market_floors"]))
+    for key in MEASURES:
+        picks = {t: chosen(candidates(families, key), key, t) for t in TARGETS}
         lines = [
-            f"- {pct(t)}: "
-            + (f"level {pct(c['level'], 2)}, total floor {usd(c['total_floor'])}, refused {pct(c['refused_share_week1'], 1)} in week 1" if c else "no level meets it; the smallest level gives " + pct(rows[0][measure], 3))
-            for t, c in chosen.items()
+            f"- {pct(t)}: " + (f"{label(c)}, total floor {usd(c['total_floor'])}, {counted(c, key)}, refusing {pct(c['refused_share_week1'], 1)} in week 1 and {pct(c['refused_share_directional'], 1)} over 90 days" if c else "no candidate meets it")
+            for t, c in picks.items()
         ]
-        out += ["Chosen per target:", "", *lines, ""]
-        symbols = list(json.loads(rows[0]["market_floors"]))
-        body = [[s] + [usd(json.loads(c["market_floors"])[s]) if c else "-" for c in chosen.values()] for s in symbols]
-        body.append(["Total"] + [usd(c["total_floor"]) if c else "-" for c in chosen.values()])
+        out += [f"### Chosen for {MEASURE_NAMES[key]}", "", "Of the candidates meeting each target, the one that refuses least over 90 days:", "", *lines, ""]
+        body = [[s] + [usd(json.loads(c["market_floors"])[s]) if c else "-" for c in picks.values()] for s in symbols]
+        body.append(["Total"] + [usd(c["total_floor"]) if c else "-" for c in picks.values()])
         out += [table(["Market"] + [f"Floor at {pct(t)}" for t in TARGETS], body), ""]
-        total_path = results / f"joint_total_{measure}.csv"
+        total_path = results / f"joint_total_{key}.csv"
         if total_path.exists():
             totals = sorted(read(total_path), key=lambda r: r["total_floor"])
             body = [[f"x{r['level']:g}"] + joint_row(r) for r in totals]
-            out += [
-                f"Total floor below the sum, at level {pct(totals[0]['base_level'], 2)}'s market floors:",
-                "",
-                table(["Share of sum"] + JOINT_HEADER, body),
-                "",
-            ]
+            base = {"family": totals[0]["base_family"], "level": totals[0]["base_level"]}
+            out += [f"Total floor below the sum, at the floors chosen at 1% ({label(base)}):", "", table(["Share of sum"] + JOINT_HEADER, body), ""]
     return "\n".join(out)
 
 
@@ -193,18 +201,19 @@ def sensitivity_section(results: Path) -> str:
         largest = lambda key: max((s for s in SCALES if mine[float(s)][key] <= 0.01), default=None)  # noqa: E731
         body.append([
             name,
-            pct(base["p_ever_tail"], 3),
-            pct(base["p_short_tail"], 3),
+            counted(base, "p_ever"),
+            counted(base, "p_short"),
             pct(base["p_dip_100k"], 2),
             pct(base["refused_share_week1"], 1),
             usd(base["nav_end_p50"]),
             usd(base["fee_mean"]),
             usd(base["bad_debt_mean"]),
-            " / ".join(f"x{v:g}" if v is not None else "none" for v in (largest("p_ever_tail"), largest("p_short_tail"))),
+            " / ".join(f"x{v:g}" if v is not None else "none" for v in (largest("p_ever"), largest("p_short"))),
         ])
     first = rows[0]
-    measure, level, met = first["base_measure"], first["base_level"], first["base_meets_target"] == "True"
-    base = f"the floors chosen for {MEASURE_NAMES[measure]} at 1% (level {pct(level, 2)})" if met else "zero floors, as no level met 1%"
+    measure, met = first["base_measure"], first["base_meets_target"] == "True"
+    chosen_floors = label({"family": first["base_family"], "level": first["base_level"]})
+    base = f"the floors chosen for {MEASURE_NAMES[measure]} at 1% ({chosen_floors})" if met else f"the smallest candidate ({chosen_floors}), as none met 1%"
     header = ["Scenario", "NAV<0 ever", "Cash<0", "NAV<-$100k", "Refused, week 1", "NAV day 90 p50", "Fees mean", "Bad debt mean", "Largest scale at 1%: NAV / cash"]
     scales = ", ".join(f"x{s:g}" for s in SCALES)
     intro = f"Every scenario at {base}, and with every floor scaled together by {scales}."

@@ -81,4 +81,30 @@ def test_hedges_flag_both_legs_within_and_across_accounts():
         (4, 0, -1, 1100, 2100, 5.0, 11, 21),  # ... within two blocks at open and close
         (5, 0, -1, 1200, 2200, 6.0, 12, 22),  # a different notional: no pair
     ])
-    assert papertrade.hedges(pos).tolist() == [True, True, False, True, True, False]
+    assert papertrade.hedges(pos).tolist() == [1.0, 1.0, 0.0, 1.0, 1.0, 0.0]
+
+
+def test_a_hedge_counts_only_the_notional_it_offsets_and_offsets_it_once():
+    pos = positions([
+        (1, 0, 1, 100, 900, 20.0, 1, 9),  # long 20 ...
+        (1, 0, -1, 200, 900, 10.0, 2, 9),  # ... a short offsets half of it ...
+        (1, 0, -1, 300, 900, 10.0, 3, 9),  # ... another short the other half ...
+        (1, 0, -1, 400, 900, 10.0, 4, 9),  # ... and a third has nothing left to offset
+        (2, 0, 1, 100, 900, 10.0, 1, 9),  # long 10 ...
+        (2, 0, -1, 200, 300, 10.0, 2, 3),  # ... offset by a short that closes ...
+        (2, 0, -1, 400, 900, 10.0, 4, 9),  # ... so a later short offsets the long again
+        (2, 0, -1, 500, 900, 10.0, 5, 9),  # ... and the next one does not
+    ])
+    assert papertrade.hedges(pos).tolist() == [1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0]
+    partial = positions([(1, 0, 1, 100, 900, 20.0, 1, 9), (1, 0, -1, 200, 900, 10.0, 2, 9)])
+    assert papertrade.hedges(partial).tolist() == [0.5, 1.0]
+
+
+def test_margin_buys_notional_band_by_band():
+    # BTC-USD: 10% to $1M, 20% above; shares: 10% to $500k, 20% to $2M, 50% above (market.rs,
+    # staircase). At 10:1, $1M of margin buys $5.5M of BTC and $3.3M of a share, not $10M.
+    btc = [{"up_to": "1000000", "bps": 1000}, {"bps": 2000}]
+    share = [{"up_to": "500000", "bps": 1000}, {"up_to": "2000000", "bps": 2000}, {"bps": 5000}]
+    margin, leverage = np.array([1e4, 1e6]), np.array([10.0, 1000.0])
+    assert papertrade.mapped_notional(margin, leverage, btc, "capped").tolist() == pytest.approx([1e5, 5.5e6])
+    assert papertrade.mapped_notional(margin, leverage, share, "capped").tolist() == pytest.approx([1e5, 3.3e6])

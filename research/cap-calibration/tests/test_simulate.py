@@ -31,29 +31,32 @@ def bars(gap_at: int | None = None, gap: float = 0.0, fx_gap_at: int | None = No
     return b
 
 
-def market(fin: float = 0.0, quoted_in_fx: bool = False) -> simulate.Markets:
+def market(fin: float = 0.0, quoted_in_fx: bool = False, fin_short: float | None = None, self_quoted: bool = False) -> simulate.Markets:
+    """The market; `quoted_in_fx` converts at column 1's price, and `self_quoted` at the reciprocal
+    of its own, as USD-JPY does."""
     return simulate.Markets(
         symbols=["TEST"],
         margin_rate=np.array([1 / LEVERAGE]),
+        schedule=["S"],
         cap_bps=np.array([5000]),
         total_cap_bps=20000,
         fin_long=np.array([fin]),
-        fin_short=np.array([fin]),
+        fin_short=np.array([fin if fin_short is None else fin_short]),
         mix=np.array([1.0]),
         open_hours_per_week=np.array([168.0]),
         columns=np.array([0]),
-        fx_columns=np.array([1 if quoted_in_fx else -1]),
-        fx_invert=np.array([False]),
+        fx_columns=np.array([0 if self_quoted else 1 if quoted_in_fx else -1]),
+        fx_invert=np.array([self_quoted]),
     )
 
 
-def flow(kind: str = "directional", hold_h: int = 1, mean_hold_h: float | None = None) -> Flow:
+def flow(kind: str = "directional", hold_h: int = 1, mean_hold_h: float | None = None, long_share: float = 1.0) -> Flow:
     mean = float(hold_h) if mean_hold_h is None else mean_hold_h
     return Flow(
-        classes=[FlowClass(kind=kind, hold_h=hold_h, bucket=0, margin_share=1.0, mean_hold_h=mean, mean_sqrt_hold_h=np.sqrt(mean), long_share=1.0)],
-        bucket_leverage=np.array([LEVERAGE]),
+        classes=[FlowClass(kind=kind, hold_h=hold_h, bucket=0, margin_share=1.0, mean_hold_h=mean, mean_sqrt_hold_h=np.sqrt(mean), long_share=long_share)],
+        leverage={(k, m, "S"): np.array([LEVERAGE]) for k in simulate.KINDS for m in ("capped", "relative")},
         daily_margin=np.array([24.0]),
-        sizes={(k, m, int(LEVERAGE)): TINY_ORDERS for k in ("directional", "hedged") for m in ("capped", "relative")},
+        sizes={(k, m, "S"): TINY_ORDERS for k in simulate.KINDS for m in ("capped", "relative")},
         long_share_ar1=0.0,
         long_share_resid_sd=0.0,
         long_share_slope=0.0,
@@ -144,7 +147,7 @@ def test_nothing_opens_without_room_under_a_cap():
     assert run(bars(), market(), flow(), floor=0.0)["refused"] / run(bars(), market(), flow(), floor=0.0)["desired"] == pytest.approx(1.0)
 
 
-def test_orders_larger_than_the_cap_are_refused_whatever_the_flow_around_them():
+def test_orders_that_would_take_the_exposure_past_the_cap_are_refused():
     # Half the margin sits in orders of 200 of notional, half in orders of 2,000: under a 1,000 cap
     # only the small ones can fill.
     sizes = (np.array([199.9, 200.0, 1999.9, 2000.0]), np.array([0.0, 0.5, 0.5, 1.0]))
@@ -209,9 +212,10 @@ def test_churn_pays_the_fee_on_its_expected_gain_and_its_dues_are_funded():
 
 
 def test_churn_open_notional_takes_the_hours_move():
-    # Long churn held half an hour, 200 an hour: the 1% move at hour 50 costs the house 1.
-    out = run(bars(gap_at=50, gap=0.01), market(), flow(hold_h=0, mean_hold_h=0.5))
-    assert out["nav_end"] == pytest.approx(-0.5 * 200 * 0.01, rel=1e-3)
+    # Long churn held half an hour, 200 an hour: the 1% rise inside hour 50 costs the house 1, less
+    # the fee churn pays on its expected gain.
+    out = run(bars(hour_moves={50: (0.01, 0.0, np.log(1.01))}), market(), flow(hold_h=0, mean_hold_h=0.5))
+    assert out["nav_end"] == pytest.approx(-0.5 * 200 * 0.01 + out["fee"], rel=1e-4)  # bars hold millionths
 
 
 def test_the_total_cap_cuts_growth_past_its_room():
@@ -261,3 +265,69 @@ def test_financing_is_charged_at_each_rollover_on_the_marked_notional():
     rate = 1e-4
     out = run(bars(gap_at=20, gap=0.10), market(fin=rate), flow(hold_h=4))
     assert out["financing"] == pytest.approx((2 * 220 + 2 * 200 + 6 * 4 * 200) * rate, rel=1e-6)
+
+
+def test_an_order_that_shrinks_the_exposure_fits_whatever_its_size():
+    # Half the margin sits in orders of 200, half in orders of 2,000, under a 1,000 cap. With
+    # clients net short 800, buys fit up to 1,800 and sells up to 200: half of each fits. Net short
+    # 1,100, past the cap, a 2,000 buy leaves them 900 long, less exposure than before, so every buy
+    # fits and no sell; a pair opens its buy first.
+    sizes = (np.array([199.9, 200.0, 1999.9, 2000.0]), np.array([0.0, 0.5, 0.5, 1.0]))
+    f = flow()
+    f.sizes = {key: sizes for key in f.sizes}
+    cap, total_cap = np.full((1, 1, 1), 1000.0), np.full((1, 1), 1e12)
+    fits = simulate.order_fits(np.full((1, 1, 1), -800.0), cap, total_cap, f, "capped", ["S"])
+    assert fits["long"][0, 0, 0] == fits["short"][0, 0, 0] == pytest.approx(0.5)
+    fits = simulate.order_fits(np.full((1, 1, 1), -1100.0), cap, total_cap, f, "capped", ["S"])
+    assert fits["long"][0, 0, 0] == fits["pair"][0, 0, 0] == 1.0
+    assert fits["short"][0, 0, 0] == 0.0
+
+
+def test_churn_takes_no_reopening_gap():
+    # Churn opens after the open, so a market that reopens 1% up after a closure moves only the
+    # positions held through it, and churn has none.
+    b = bars(gap_at=41, gap=0.01, closed=tuple(range(30, 41)))
+    out = run(b, market(), flow(hold_h=0, mean_hold_h=0.5))
+    assert out["nav_end"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_currency_move_alone_leaves_churn_flat():
+    out = run(bars(fx_gap_at=50, fx_gap=0.10), market(quoted_in_fx=True), flow(hold_h=0, mean_hold_h=0.5))
+    assert out["nav_end"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_churn_on_a_market_quoted_in_its_own_currency_converts_its_gain():
+    # USD-JPY: a long that gains 1% in yen inside the hour is worth 1% / 1.01 in USD at the close.
+    moves = {50: (0.01, 0.0, np.log(1.01))}
+    out = run(bars(hour_moves=moves), market(self_quoted=True), flow(hold_h=0, mean_hold_h=0.5))
+    gain = 0.5 * 200 * 0.01 / 1.01
+    assert out["nav_end"] == pytest.approx(-gain + out["fee"], rel=1e-4)
+    assert out["nav_end"] < -0.9
+
+
+def test_a_financing_credit_absorbs_part_of_a_loss_past_the_balance():
+    # Shorts held 4 hours are credited 0.02 (1 bp of 200) at the 22:00 rollover. A 1% rise at 23
+    # closes out the four open shorts, each 2 down on a balance of 1: the three opened before the
+    # rollover lose 0.98 past their balance, the one opened at 22 loses 1.
+    out = run(bars(gap_at=23, gap=0.01), market(fin=0.0, fin_short=-1e-4), flow(hold_h=4, long_share=0.0))
+    assert out["bad_debt"] == pytest.approx(3 * 0.98 + 1.0, rel=1e-4)
+
+
+def test_each_account_of_a_pair_pays_its_own_financing():
+    # Pairs held 4 hours, legs of 100 with balances of 0.5, each paying 0.01 at the 22:00 rollover.
+    # A 1% fall at 23 closes them: the long loses 1, and for the three pairs that crossed the
+    # rollover its 0.01 of financing is written off with the 0.5 past its balance.
+    out = run(bars(gap_at=23, gap=-0.01), market(fin=1e-4), flow("hedged", hold_h=4))
+    assert out["bad_debt"] == pytest.approx(3 * 0.51 + 0.5, rel=1e-4)
+
+
+def test_the_farming_variants_scale_hedged_flow_alone():
+    f = flow()
+    f.classes = f.classes + [FlowClass(kind="hedged", hold_h=1, bucket=0, margin_share=1.0, mean_hold_h=1.0, mean_sqrt_hold_h=1.0, long_share=0.5)]
+    base = run(bars(), market(), f)
+    none = run(bars(), market(), f, hedged_scale=0.0)
+    double = run(bars(), market(), f, hedged_scale=2.0)
+    assert none["desired_directional"] == base["desired_directional"] == double["desired_directional"]
+    hedged = base["desired"] - base["desired_directional"]
+    assert none["desired"] - none["desired_directional"] == 0.0
+    assert double["desired"] - double["desired_directional"] == pytest.approx(2 * hedged)

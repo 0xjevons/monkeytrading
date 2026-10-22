@@ -18,9 +18,12 @@ Prices are Hyperliquid's integer prices: 1 decimal for BTC, 2 for ETH. Money wor
 decimals.
 
 Outputs under `data/derived/`: `papertrade_flow.csv` (the flow profile the model samples),
-`papertrade_sizes.csv` (the margin-weighted distribution of each position's notional at a launch
-market's leverage limit, which sets the share of flow in orders small enough to fit a cap), `papertrade_daily.csv`, `papertrade_holding.csv`,
-and `papertrade_summary.json`.
+`papertrade_sizes.csv` (per launch margin schedule, the margin-weighted distribution of each
+position's notional, which sets the share of flow in orders small enough to fit a cap),
+`papertrade_leverage.csv` (per launch margin schedule and leverage bin, the notional that margin
+buys), `papertrade_daily.csv`, `papertrade_holding.csv`, and `papertrade_summary.json`. The flow,
+size, and leverage profiles count the closed positions opened on the full days that set the daily
+margin path.
 """
 
 import csv
@@ -165,38 +168,49 @@ def fee_check(pos: dict) -> dict:
 
 
 def hedges(pos: dict) -> np.ndarray:
-    """Flags hedged positions, both legs of each hedge:
-    - within an account: a position opened while the account held at least as much opposite
-      notional in the same asset, and the open opposite positions it offsets, earliest first,
-      up to its notional;
+    """Each position's hedged share of its notional, both legs of each hedge counted:
+    - within an account: the part of a new position that offsets the account's open opposite
+      notional not already offset, and the same amount of those opposite positions, earliest
+      first; when a position closes, what it offset is free to be offset again;
     - across accounts: opposite positions of two accounts at the same notional (to the cent) that
-      opened and closed within `PAIR_WINDOW_BLOCKS` blocks of each other."""
+      opened and closed within `PAIR_WINDOW_BLOCKS` blocks of each other, neither hedged within its
+      own account, are hedged in full."""
     n = len(pos["id"])
-    hedged = np.zeros(n, dtype=bool)
+    matched = np.zeros(n)
     closed_at = np.where(np.isnan(pos["close_block"]), np.inf, pos["close_block"])
 
-    # Same account: sweep each (user, asset) in log order, keeping open notional by side.
+    # Same account: sweep each (user, asset) in log order. `free` holds each open position's
+    # notional not offset by an open opposite position, by side in open order.
     order = np.lexsort((pos["open_order"], pos["asset"], pos["user"]))
     users, assets, sides = pos["user"].tolist(), pos["asset"].tolist(), pos["side"].tolist()
     close_order = np.where(np.isnan(pos["close_order"]), np.inf, pos["close_order"])
-    blocks, notionals, ends = pos["open_order"].tolist(), pos["notional"].tolist(), close_order.tolist()
-    key, live, by_side = None, [], {1: 0.0, -1: 0.0}
+    opens, notionals, ends = pos["open_order"].tolist(), pos["notional"].tolist(), close_order.tolist()
+    key, live, free, partners = None, [], {1: {}, -1: {}}, {}
     for i in order.tolist():
         if (users[i], assets[i]) != key:
-            key, live, by_side = (users[i], assets[i]), [], {1: 0.0, -1: 0.0}
-        while live and live[0][0] <= blocks[i]:
+            key, live, free, partners = (users[i], assets[i]), [], {1: {}, -1: {}}, {}
+        while live and live[0][0] <= opens[i]:
             _, j = heapq.heappop(live)
-            by_side[sides[j]] -= notionals[j]
-        if by_side[-sides[i]] >= notionals[i] * (1 - 1e-9):
-            hedged[i] = True
-            left = notionals[i]
-            for _, j in sorted((blocks[j], j) for _, j in live if sides[j] != sides[i]):
-                if left <= 0:
-                    break
-                hedged[j] = True
-                left -= notionals[j]
+            del free[sides[j]][j]
+            for p, amount in partners.pop(j):
+                if p in free[sides[p]]:  # still open
+                    free[sides[p]][p] += amount
+        left, partners[i] = notionals[i], []
+        for j, available in free[-sides[i]].items():
+            if left <= 0:
+                break
+            amount = min(left, available)
+            if amount <= 0:
+                continue
+            free[-sides[i]][j] -= amount
+            matched[i] += amount
+            matched[j] += amount
+            partners[i].append((j, amount))
+            partners[j].append((i, amount))
+            left -= amount
+        free[sides[i]][i] = left
         heapq.heappush(live, (ends[i], i))
-        by_side[sides[i]] += notionals[i]
+    share = np.minimum(matched / np.maximum(pos["notional"], 1e-12), 1.0)
 
     # Across accounts: same asset and notional (to the cent), opposite sides, matching open and close.
     groups: dict = defaultdict(list)
@@ -215,13 +229,13 @@ def hedges(pos: dict) -> np.ndarray:
             for sb, j in shorts[k:]:
                 if sb > ob + PAIR_WINDOW_BLOCKS:
                     break
-                if j in used or pos["user"][j] == pos["user"][i]:
+                if j in used or pos["user"][j] == pos["user"][i] or matched[i] > 0 or matched[j] > 0:
                     continue
                 if np.isfinite(closed_at[i]) and abs(closed_at[j] - closed_at[i]) <= PAIR_WINDOW_BLOCKS:
-                    hedged[i] = hedged[j] = True
+                    share[i] = share[j] = 1.0
                     used.add(j)
                     break
-    return hedged
+    return share
 
 
 def netting(pos: dict, open_t: np.ndarray, close_t: np.ndarray) -> dict:
@@ -258,14 +272,16 @@ def netting(pos: dict, open_t: np.ndarray, close_t: np.ndarray) -> dict:
     }
 
 
-def long_share_dynamics(pos: dict, open_t: np.ndarray, hedged: np.ndarray, hourly_close: dict) -> dict:
-    """Hourly long share of new directional notional in BTC: its mean, AR(1) coefficient, the
-    residual spread, and its slope on the previous hour's return (negative = buying dips)."""
-    sel = (~hedged) & (pos["asset"] == 0)
+def long_share_dynamics(pos: dict, open_t: np.ndarray, hedged: np.ndarray, sample: np.ndarray, hourly_close: dict) -> dict:
+    """Hourly long share of new directional notional in BTC, over the `sample` positions: its
+    mean, AR(1) coefficient, the residual spread, and its slope on the previous hour's return
+    (negative = buying dips)."""
+    sel = sample & (pos["asset"] == 0)
     hour = (open_t[sel] // 3600).astype(np.int64)
     h0 = hour.min()
-    longs = np.bincount(hour - h0, weights=pos["notional"][sel] * (pos["side"][sel] > 0))
-    total = np.bincount(hour - h0, weights=pos["notional"][sel])
+    directional = pos["notional"][sel] * (1 - hedged[sel])
+    longs = np.bincount(hour - h0, weights=directional * (pos["side"][sel] > 0))
+    total = np.bincount(hour - h0, weights=directional)
     ok = total > 0
     share = np.where(ok, longs / np.where(ok, total, 1), np.nan)
     hours = np.arange(len(share)) + h0
@@ -284,27 +300,37 @@ def long_share_dynamics(pos: dict, open_t: np.ndarray, hedged: np.ndarray, hourl
     }
 
 
-def flow_profile(pos: dict, hold_h: np.ndarray, hedged: np.ndarray, closed: np.ndarray) -> list[dict]:
-    """Opened notional and margin by kind (directional or hedged), hold class, and leverage bin.
-    Means are notional-weighted."""
+def leverage_bin_label(b: int) -> str:
+    return f"{([1] + [e + 1 for e in LEVERAGE_EDGES])[b]}-{LEVERAGE_EDGES[b] - (b == len(LEVERAGE_EDGES) - 1)}"
+
+
+def kinds(hedged: np.ndarray):
+    """Each kind with the share of every position's notional it takes."""
+    return (("directional", 1.0 - hedged), ("hedged", hedged))
+
+
+def flow_profile(pos: dict, hold_h: np.ndarray, hedged: np.ndarray, sample: np.ndarray) -> list[dict]:
+    """Opened notional and margin of the `sample` positions by kind (directional or hedged), hold
+    class, and leverage bin; a partly hedged position counts in both kinds by share. Means are
+    notional-weighted."""
     hold_class = np.searchsorted(HOLD_EDGES_H, hold_h, side="right")
     lev_bin = np.searchsorted(LEVERAGE_EDGES, pos["leverage"], side="left")
     rows = []
-    for kind, mask in (("directional", ~hedged), ("hedged", hedged)):
+    for kind, weight in kinds(hedged):
         for c, hold in enumerate(HOLD_CLASS_H):
             for b in range(len(LEVERAGE_EDGES)):
-                sel = mask & closed & (hold_class == c) & (lev_bin == b)
+                sel = sample & (hold_class == c) & (lev_bin == b) & (weight > 0)
                 if not sel.any():
                     continue
-                w = pos["notional"][sel]
+                w = pos["notional"][sel] * weight[sel]
                 rows.append(
                     {
                         "kind": kind,
                         "hold_class_h": hold if hold is not None else 0,
-                        "leverage_bin": f"{([1] + [e + 1 for e in LEVERAGE_EDGES])[b]}-{LEVERAGE_EDGES[b] - (b == len(LEVERAGE_EDGES) - 1)}",
-                        "positions": int(sel.sum()),
+                        "leverage_bin": leverage_bin_label(b),
+                        "positions": round(float(weight[sel].sum()), 1),
                         "notional_usd": round(float(w.sum()), 2),
-                        "margin_usd": round(float(pos["margin"][sel].sum()), 2),
+                        "margin_usd": round(float((pos["margin"][sel] * weight[sel]).sum()), 2),
                         "mean_leverage": round(float(np.average(pos["leverage"][sel], weights=w)), 1),
                         "mean_sqrt_hold_h": round(float(np.average(np.sqrt(hold_h[sel]), weights=w)), 5),
                         "mean_hold_h": round(float(np.average(hold_h[sel], weights=w)), 4),
@@ -314,24 +340,69 @@ def flow_profile(pos: dict, hold_h: np.ndarray, hedged: np.ndarray, closed: np.n
     return rows
 
 
-def size_profile(pos: dict, hedged: np.ndarray, closed: np.ndarray) -> list[dict]:
-    """Per kind, leverage mapping, and launch leverage limit, the share of margin in positions
-    whose notional at the mapped leverage is at or below each bound. The mappings are
-    `model.flow.mapped_leverage`'s, position by position."""
-    from model.flow import mapped_leverage
+def launch_schedules() -> list[list[dict]]:
+    """The launch markets' distinct margin band schedules."""
+    from model.flow import schedule_key
 
-    limits = sorted({round(1e4 / m["margin_tiers"][0]["bps"]) for m in launch_markets()})
+    return list({schedule_key(m["margin_tiers"]): m["margin_tiers"] for m in launch_markets()}.values())
+
+
+def mapped_notional(margin: np.ndarray, leverage: np.ndarray, tiers: list[dict], mapping: str) -> np.ndarray:
+    """Each position's notional on a launch market: its leverage mapped onto the first tier's
+    maximum, and no more than its margin buys under the market's bands."""
+    from model.flow import banded_notional, mapped_leverage
+
+    first = np.array(1e4 / tiers[0]["bps"])
+    return np.minimum(margin * mapped_leverage(leverage, first, mapping), banded_notional(margin, tiers))
+
+
+def size_profile(pos: dict, hedged: np.ndarray, sample: np.ndarray) -> list[dict]:
+    """Per kind, leverage mapping, and launch margin schedule, the share of the `sample`
+    positions' margin in positions whose notional on that schedule (`mapped_notional`) is at or
+    below each bound."""
+    from model.flow import schedule_key
+
     rows = []
-    for kind, mask in (("directional", ~hedged), ("hedged", hedged)):
-        margin, leverage = pos["margin"][mask & closed], pos["leverage"][mask & closed].astype(float)
+    for kind, weight in kinds(hedged):
+        margin, leverage = pos["margin"][sample], pos["leverage"][sample].astype(float)
+        w = margin * weight[sample]
         for mapping in ("capped", "relative"):
-            for limit in limits:
-                notional = margin * mapped_leverage(leverage, np.array(float(limit)), mapping)
+            for tiers in launch_schedules():
+                notional = mapped_notional(margin, leverage, tiers, mapping)
                 order = np.argsort(notional)
-                cum = np.cumsum(margin[order]) / margin.sum()
+                cum = np.cumsum(w[order]) / w.sum()
                 for bound in SIZE_BOUNDS:
                     share = cum[np.searchsorted(notional[order], bound, side="right") - 1] if notional.min() <= bound else 0.0
-                    rows.append({"kind": kind, "mapping": mapping, "max_leverage": limit, "notional_upto_usd": round(float(bound), 2), "margin_share": round(float(share), 6)})
+                    rows.append({"kind": kind, "mapping": mapping, "schedule": schedule_key(tiers), "notional_upto_usd": round(float(bound), 2), "margin_share": round(float(share), 6)})
+    return rows
+
+
+def leverage_profile(pos: dict, hedged: np.ndarray, sample: np.ndarray) -> list[dict]:
+    """Per kind, leverage mapping, launch margin schedule, and papertrade leverage bin, the
+    `sample` positions' margin and their notional on that schedule (`mapped_notional`)."""
+    from model.flow import schedule_key
+
+    lev_bin = np.searchsorted(LEVERAGE_EDGES, pos["leverage"], side="left")
+    rows = []
+    for kind, weight in kinds(hedged):
+        for mapping in ("capped", "relative"):
+            for tiers in launch_schedules():
+                for b in range(len(LEVERAGE_EDGES)):
+                    sel = sample & (lev_bin == b) & (weight > 0)
+                    if not sel.any():
+                        continue
+                    margin = pos["margin"][sel]
+                    notional = mapped_notional(margin, pos["leverage"][sel].astype(float), tiers, mapping)
+                    rows.append(
+                        {
+                            "kind": kind,
+                            "mapping": mapping,
+                            "schedule": schedule_key(tiers),
+                            "leverage_bin": leverage_bin_label(b),
+                            "margin_usd": round(float((margin * weight[sel]).sum()), 2),
+                            "notional_usd": round(float((notional * weight[sel]).sum()), 2),
+                        }
+                    )
     return rows
 
 
@@ -365,6 +436,11 @@ def derive(raw: Path, raw_markets: Path, out: Path) -> None:
     hold_s = close_t - open_t
     hold_h = np.where(closed, hold_s / 3600, np.nan)
     hedged = hedges(pos)
+    # The flow profiles come from the full days that also set the daily margin path.
+    first_t, last_t = open_t.min(), np.nanmax(close_t)
+    day = (open_t // 86400).astype(np.int64)
+    full_day = (day * 86400 >= first_t) & ((day + 1) * 86400 <= last_t)
+    sample = closed & full_day
 
     exit_ok = closed & (pos["liquidated"] == 0)
     raw_pnl = np.where(closed, pos["side"] * (pos["exit"] / pos["entry"] - 1) * pos["notional"], 0.0)
@@ -388,31 +464,34 @@ def derive(raw: Path, raw_markets: Path, out: Path) -> None:
         "unmatched_closes": d["orphan_ends"],
         "opened_notional_usd": round(float(pos["notional"].sum()), 0),
         "btc_share_of_notional": round(float(pos["notional"][pos["asset"] == 0].sum() / pos["notional"].sum()), 4),
-        "hedged_share_of_notional": round(float(pos["notional"][hedged].sum() / pos["notional"].sum()), 4),
-        "hedged_share_of_exposure_time": round(float(exposure_w[hedged[closed]].sum() / exposure_w.sum()), 4),
+        "hedged_share_of_notional": round(float((pos["notional"] * hedged).sum() / pos["notional"].sum()), 4),
+        "hedged_share_of_exposure_time": round(float((exposure_w * hedged[closed]).sum() / exposure_w.sum()), 4),
+        "full_days_positions": int(sample.sum()),
+        "full_days_hedged_share_of_notional": round(float((pos["notional"] * hedged)[sample].sum() / pos["notional"][sample].sum()), 4),
+        "full_days_hedged_share_of_margin": round(float((pos["margin"] * hedged)[sample].sum() / pos["margin"][sample].sum()), 4),
         "hold_hours_quantiles_by_count": dict(zip(["p10", "p50", "p90", "p99"], np.round(np.quantile(hold_h[closed], [0.1, 0.5, 0.9, 0.99]), 5).tolist())),
         "exposure_time_share_held_over_1h": round(float(exposure_w[hold_h[closed] >= 1].sum() / exposure_w.sum()), 4),
         "exposure_time_share_held_over_24h": round(float(exposure_w[hold_h[closed] >= 24].sum() / exposure_w.sum()), 4),
         "leverage_quantiles_by_notional": dict(zip(["p10", "p50", "p90"], weighted_quantiles(pos["leverage"], pos["notional"], [0.1, 0.5, 0.9]))),
         "notional_quantiles_usd": dict(zip(["p50", "p90", "p99", "p999"], np.round(np.quantile(pos["notional"], [0.5, 0.9, 0.99, 0.999]), 0).tolist())),
         "raw_pnl_over_notional_bps": round(float(raw_pnl[closed].sum() / w.sum() * 1e4), 4),
-        "raw_pnl_over_notional_bps_directional": round(float(raw_pnl[closed & ~hedged].sum() / pos["notional"][closed & ~hedged].sum() * 1e4), 4),
+        "raw_pnl_over_notional_bps_directional": round(float((raw_pnl * (1 - hedged))[closed].sum() / (pos["notional"] * (1 - hedged))[closed].sum() * 1e4), 4),
         "winner_keeps_share_of_raw_gain": round(float(kept.sum() / gains.sum()), 4),
-        "hedged_cost_per_usd_of_loss": round(float((gains[hedged] - kept[hedged]).sum() / losses[hedged].sum()), 4),
+        "hedged_cost_per_usd_of_loss": round(float(((gains - kept) * hedged).sum() / (losses * hedged).sum()), 4),
         "deposits_usd": round(float(d["deposits"][:, 1].sum()), 0) if len(d["deposits"]) else 0.0,
         "withdrawals_usd": round(float(d["withdrawals"][:, 1].sum()), 0) if len(d["withdrawals"]) else 0.0,
     }
     summary.update(netting(pos, open_t, close_t))
-    summary.update(long_share_dynamics(pos, open_t, hedged, binance_hourly_returns(raw_markets)))
+    summary.update(long_share_dynamics(pos, open_t, hedged, full_day, binance_hourly_returns(raw_markets)))
     summary.update(price_check(pos, open_t, raw_markets))
     summary["net_deposits_usd"] = round(summary["deposits_usd"] - summary["withdrawals_usd"], 0)
     summary.update(fee_check(pos))
 
     out.mkdir(parents=True, exist_ok=True)
-    write_csv(out / "papertrade_flow.csv", flow_profile(pos, hold_h, hedged, closed))
-    write_csv(out / "papertrade_sizes.csv", size_profile(pos, hedged, closed))
+    write_csv(out / "papertrade_flow.csv", flow_profile(pos, hold_h, hedged, sample))
+    write_csv(out / "papertrade_sizes.csv", size_profile(pos, hedged, sample))
+    write_csv(out / "papertrade_leverage.csv", leverage_profile(pos, hedged, sample))
 
-    day = (open_t // 86400).astype(np.int64)
     dep_day = (clock(d["deposits"][:, 0]) // 86400).astype(np.int64) if len(d["deposits"]) else np.array([], dtype=np.int64)
     wd_day = (clock(d["withdrawals"][:, 0]) // 86400).astype(np.int64) if len(d["withdrawals"]) else np.array([], dtype=np.int64)
     first_seen = {}
@@ -420,7 +499,6 @@ def derive(raw: Path, raw_markets: Path, out: Path) -> None:
         first_seen.setdefault(u, dd)
     new_by_day = np.bincount(np.array(list(first_seen.values())) - day.min())
     daily = []
-    first_t, last_t = open_t.min(), np.nanmax(close_t)
     for k, dd in enumerate(range(day.min(), day.max() + 1)):
         sel = day == dd
         daily.append(
@@ -432,8 +510,8 @@ def derive(raw: Path, raw_markets: Path, out: Path) -> None:
                 "opened_margin_usd": round(float(pos["margin"][sel].sum()), 0),
                 "active_accounts": int(len(np.unique(pos["user"][sel]))),
                 "new_accounts": int(new_by_day[k]) if k < len(new_by_day) else 0,
-                "hedged_share": round(float(pos["notional"][sel & hedged].sum() / max(pos["notional"][sel].sum(), 1)), 4),
-                "long_share_directional": round(float(pos["notional"][sel & ~hedged & (pos["side"] > 0)].sum() / max(pos["notional"][sel & ~hedged].sum(), 1)), 4),
+                "hedged_share": round(float((pos["notional"] * hedged)[sel].sum() / max(pos["notional"][sel].sum(), 1)), 4),
+                "long_share_directional": round(float((pos["notional"] * (1 - hedged))[sel & (pos["side"] > 0)].sum() / max((pos["notional"] * (1 - hedged))[sel].sum(), 1)), 4),
                 "liquidations": int((sel & (pos["liquidated"] == 1)).sum()),
                 "raw_trader_pnl_usd": round(float(raw_pnl[sel].sum()), 0),
                 "deposits_usd": round(float(d["deposits"][dep_day == dd, 1].sum()), 0) if len(dep_day) else 0.0,

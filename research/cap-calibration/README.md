@@ -98,10 +98,11 @@ Each is a probability over 90 days of simulated trading, starting from a house w
 | NAV below zero at day 90 | House NAV is below zero at the end. |
 | NAV below -$100k, -$1M | The lowest NAV falls below that depth. |
 
-The calibration uses the first two. Below 1% (20 of 2,000 paths), a probability is extrapolated
-from an exponential fit to the worst 5% of paths' lowest NAV or lowest house cash, and never
-reported below the rate the paths show; when the fit does not apply and no path fails, it is the
-95% upper bound for zero events, 3 in the number of paths.
+The calibration uses the first two. Each is the share of simulated paths in which the event
+happens, with the count of those paths and the exact one-sided 95% upper bound beside it; nothing
+is extrapolated past what the paths count. On 2,000 paths a target of 1% allows 20 failing paths,
+0.1% allows 2, and 0.01% allows none, and no failing path bounds the rate only below 0.15%: the
+two smaller targets are met in the paths, not established at 95%.
 
 The cost side is the share of opening notional refused for capacity (directional flow and churn),
 in the first week, when the floors carry the house, and over the 90 days.
@@ -139,21 +140,30 @@ The contract's open-interest event is not used: its changes do not follow positi
 until block 48,217,087 it carried a fixed offset of about $5B a side.
 
 Trading opened at 2026-10-10 14:00 UTC, so the data covers 10.6 days: 18,504 accounts and $713B
-of notional. Both legs of a hedge are *hedged*: a position its account opens while holding at
-least as much opposite notional in the same asset, with the open opposite positions it offsets,
-and two accounts' opposite positions of the same notional that open and close within two blocks of
-each other. The derived dataset, committed under `data/derived/`, is the flow profile the model
-samples (`papertrade_flow.csv`: margin by kind, hold class, and leverage bin), the size profile
-(`papertrade_sizes.csv`: by kind, the margin-weighted distribution of each position's notional at
-each launch leverage limit, 10:1, 100:1, and 200:1, under either leverage mapping), the daily series
-(`papertrade_daily.csv`), the holding-time table (`papertrade_holding.csv`), and the summary
-(`papertrade_summary.json`). `results/report.md` tabulates them. The flow and size profiles count
-closed positions; the 2,168 still open at the end, the longest holds among them, are left out.
+of notional. Both legs of a hedge are *hedged*, for the notional they offset: the part of a
+position that offsets its account's open opposite notional in the same asset not already offset,
+with the same amount of those opposite positions, earliest first (when a position closes, what it
+offset can be offset again); and two accounts' opposite positions of the same notional that open
+and close within two blocks of each other, neither hedged within its account. A partly hedged
+position counts in both kinds by share.
+
+The derived dataset, committed under `data/derived/`, is the flow profile the model samples
+(`papertrade_flow.csv`: margin by kind, hold class, and leverage bin), the size profile
+(`papertrade_sizes.csv`: by kind and launch margin schedule, the margin-weighted distribution of
+each position's notional on that schedule, under either leverage mapping), the leverage profile
+(`papertrade_leverage.csv`: the notional each leverage bin's margin buys on each schedule), the
+daily series (`papertrade_daily.csv`), the holding-time table (`papertrade_holding.csv`), and the
+summary (`papertrade_summary.json`). `results/report.md` tabulates them. The flow, size, and
+leverage profiles and the long-share fit count the closed positions opened on the ten full days
+that also set the daily margin path (1,608,754 positions); the partial first and last days and
+the 2,168 positions still open at the end, the longest holds among them, are left out.
 
 What the data says about the brief's farming premise:
 
-- Hedged positions are 41% of notional and 67% of exposure-time; within accounts, 60% of gross
-  exposure-time is offset by the same account's opposite positions, and market-wide 87%.
+- Hedged flow is 41% of all notional and 67% of exposure-time, but the launch afternoon was the
+  most hedged: on the ten full days it is 24% of notional and 41% of margin, which the model
+  uses. Within accounts, 60% of gross exposure-time is offset by the same account's opposite
+  positions, and market-wide 87%.
 - Holds are short: the median position lasts 64 seconds, but 71% of exposure-time comes from
   positions held over an hour and 9% from positions held over a day.
 - Hedged flow pays $0.235 of haircut and fee on its winning legs per $1 lost on its losing legs.
@@ -169,7 +179,7 @@ What the data says about the brief's farming premise:
 |---|---|
 | Hourly OHLC, 2024-10-28 to 2026-10-12 (102 weeks) | Crypto: Binance spot klines (`data-api.binance.vision`). Everything else: Yahoo Finance chart API (`query1.finance.yahoo.com/v8/finance/chart`), which serves hourly bars for the last 730 days. |
 | Daily closes from 2016 | FRED (St. Louis Fed) where an official series exists: `DEXUSEU`, `DEXUSUK`, `DEXJPUS`, `DEXUSAL`, `SP500`, `NASDAQ100`, `DJIA`, `NIKKEI225`, `DCOILWTICO`, `DCOILBRENTEU`. Otherwise Binance daily klines (from August 2017; SOL from August 2020) or Yahoo daily bars, dividend-adjusted for shares. |
-| Benchmark rates | FRED `SOFR` (3.87%), `IUDSOIA` (SONIA, 3.73%), `ECBESTRVOLWGTTRMDMNRT` (ESTR, 2.44%), each on 2026-10-19 or the latest before; TONA 0.75% and AONIA 3.60% are assumptions. Until #33 sequences rates the engine counts a benchmark as zero; the model charges these. |
+| Benchmark rates | FRED `SOFR` (3.87%), `IUDSOIA` (SONIA, 3.73%), `ECBESTRVOLWGTTRMDMNRT` (ESTR, 2.44%), each on 2026-10-19 or the latest day before, read into `benchmarks.csv`; TONA 0.75% and AONIA 3.60% are assumptions. Until #33 sequences rates the engine counts a benchmark as zero; the model charges these. |
 | Market mix | Hyperliquid's public info API (`api.hyperliquid.xyz/info`, daily candles 2026-09-20 to 2026-10-19): each market's mean daily notional on its Hyperliquid listing, main dex or the builder-deployed `xyz` dex. |
 
 Each launch market's stand-in series (`catalogue.py`): Binance BTCUSDT, ETHUSDT, SOLUSDT; spot FX;
@@ -219,28 +229,34 @@ margin of the same day after launch (its ten full days in order, then the mean o
 $182M a day). Each market takes its Hyperliquid volume share of it (crypto 76.5%, indices 8.8%,
 oil 6.0%, metals 3.1%, shares 5.5%, FX 0.1%), spread over its open hours. A market with no listing
 takes its asset class's smallest listed share. Each papertrade class keeps its share of margin,
-hold, and long share. Its leverage is capped at the market's maximum, the first margin tier, so
-most flow trades at the maximum.
+hold, and long share. Each position's leverage is capped at the market's maximum, the first margin
+tier, so most flow trades at the maximum, and its notional is no more than its margin buys under
+the market's margin bands, which charge each slice of notional at its band's rate: $1M of margin
+buys $10M of a 10:1 market in one tier, but $5.5M of BTC-USD (10% to $1M, then 20%) and $3.3M of a
+share (10% to $500k, 20% to $2M, then 50%).
 
 - *Directional* positions open at the hour's close and settle after their class's hold (1, 4, 16,
   or 48 hours); a planned exit inside a closure waits for the reopening. The long share follows an
-  hourly AR(1) around each class's measured share, fitted to papertrade's BTC flow (coefficient
-  0.70, residual 0.11, and +0.40 per unit of the last hour's log return).
+  hourly AR(1) around each class's measured share, fitted to papertrade's BTC flow on the full
+  days (coefficient 0.69, residual 0.12, and +0.05 per unit of the last hour's log return).
 - *Hedged* positions open as offsetting pairs in two accounts, since an engine account nets to
   one position per market. A pair ends when either leg is closed out, the other leg closing with
   it, or at its hold.
-- Positions held under an hour (churn: 87% of margin, 93% of positions) pay the profit fee on their
-  expected gain over their hold, at the hour's Parkinson volatility. Their mean open net notional
-  over the hour competes for cap room and takes the hour's move, and churners fund what they owe.
+- Positions held under an hour (churn) pay the profit fee on their expected gain over their hold,
+  at the hour's Parkinson volatility. Their mean open net notional over the hour competes for cap
+  room and takes the hour's move from its open, so not a reopening gap, and churners fund what
+  they owe.
 
-Every opening order, directional, paired, or churn, must fit under its cap. An order whose fill
-alone would take the house past a cap is refused whatever flows around it, so each class keeps
-only the share of its margin in orders small enough to fit under the market and total caps, from
-papertrade's size profile at the market's leverage limit. At 10:1, orders up to $1M carry 87% of
-directional margin; at 200:1, 40%, because large-margin positions carry most margin. With no room, as at zero NAV and a zero floor, nothing
-opens. Of what fits, the side that reduces the house's net exposure fills in full and the crowded
-side up to the cap. A pair leaves the house's net exposure unchanged, so once its legs fit, no cap
-refuses it.
+Every opening order, directional, paired, or churn, must be one the engine fills. An order whose
+fill would take the house's net exposure further past a cap is refused, whatever flows around it;
+one that shrinks the exposure fills whatever its size (`check_risk`). So each side of each class
+keeps only the share of its margin in orders small enough for its side's room, from papertrade's
+size profile on the market's margin schedule: up to the room under the market and total caps for
+the side that grows the exposure, and up to that plus twice the exposure for the side that shrinks
+it. A pair's two accounts open first the leg that fits. With no room, as at zero NAV, a zero
+floor, and no exposure, nothing opens. Of what fits, the side that reduces the house's net
+exposure fills in full and the crowded side up to the cap. A pair leaves the house's net exposure
+unchanged, so once its legs fit, no cap refuses it.
 
 **Engine rules** (`model/accounting.py`, each against the engine function it mirrors; the tests
 check them on hand cases from the engine's own tests):
@@ -251,7 +267,8 @@ check them on hand cases from the engine's own tests):
   (`daily_financing`);
 - close-out when equity falls below 50% of margin, at the trigger in continuous trading or at the
   bar's open when the market gaps through it, only while the market is open (`closeout.rs`);
-- negative balance protection: a loss beyond the account's balance is bad debt against the house
+- negative balance protection: a loss beyond the account's balance, after the financing it has
+  paid or received, is bad debt against the house, each account of a pair on its own
   (`settle_bad_debt`);
 - USD settlement (#98): USD-JPY, Japan 225 (yen), Germany 40 (euros), and UK 100 (pounds) accrue
   PnL in their quote currency and convert it at the engine's own USD-JPY, EUR-USD, or GBP-USD
@@ -259,15 +276,16 @@ check them on hand cases from the engine's own tests):
 - each cap the larger of its genesis NAV share (`house_cap_bps`, `house_total_cap_bps`) and its
   floor; an order that would take the house's net exposure past a cap is refused (`check_risk`).
 
-**Sensitivities.** Thirteen variants start from the floors the house-cash measure takes at 1%,
-every market at the floor where it stops refusing orders: no farming, twice the
-farming share, farming that halves every 30 days with the mint rate, pairs held through closures,
+**Sensitivities.** Thirteen variants start from the floors the house-cash measure chooses at 1%:
+no hedged flow, twice the hedged flow (directional flow unchanged in both), hedged flow that
+halves every 30 days with the mint rate, pairs held through closures,
 volatility x1.5 and x2, leverage mapped relative to each limit, markets bootstrapped
 independently, one client long share for every market, flow x0.25 and x4, exits before closures,
 and history with its drift kept. In the closure variant, at the last open hour before each closure
-of 3 hours or more, farmers open pairs at the maximum leverage worth 10% of the hedged margin the
-market accepted over about the past week, in orders that fit under the cap, and close them at the
-reopening, where a gap past a leg's balance is bad debt. Each variant runs with every floor scaled
+of 3 hours or more, farmers open pairs at the maximum leverage worth 10% of the margin the market
+accepted in hedged pairs held an hour or more over about the past week (not hedged churn, whose
+margin turns over within the hour), in orders that fit, and close them at the reopening, where a
+gap past a leg's balance is bad debt. Each variant runs with every floor scaled
 together by x0.1, x0.3, and x1.
 
 **MONKEY.** Losing trades mint MONKEY at a rate per dollar of realised loss (#36), but genesis
@@ -283,13 +301,15 @@ paid as deposits arrive.
 
 **Calibration.** Each market alone, at its share of the flow, gives each measure as a function of
 its floor, over 18 floors from $0 to $100M. A *risk level* `q` sets every market's floor to the
-largest floor at which that market alone stays at or below `q`. That floor is capped where the
-market stops refusing orders (under 1% refused over 90 days) and is zero when even a zero floor
-exceeds `q`. The total floor is the sum. All markets together are then run at twelve levels, from
-0 to 50% and the binding floors, and a target takes the highest level whose joint measure meets it,
-with every lower level meeting it too. The sensitivity stage's baseline adds uniform floors, $1M,
-$3M, and $10M on every market. At the level chosen for 1%, a second
-run sets the total floor to 25% to 100% of the sum, where the total cap starts to bind.
+largest floor at which that market alone stays at or below `q`, every smaller floor too. That
+floor is capped where the market stops refusing orders (under 1% refused over 90 days) and is zero
+when even a zero floor exceeds `q`. The total floor is the sum. A market alone cannot pool its
+fees with the others', so a second family of candidates puts the same floor on every market:
+$100k, $300k, $1M, $3M, and $10M. All markets together then run every candidate, twelve levels
+for each measure and the five uniform floors, on the same 2,000 paths. For each measure and
+target, the recommendation is the candidate that meets the target and refuses the least
+directional notional over the 90 days. At the choice for 1%, a second run sets the total floor to
+25% to 100% of the sum, where the total cap starts to bind.
 
 ## Results
 
@@ -340,23 +360,27 @@ of opening notional, directional flow and churn.
   notional-weighted mean holds within the classes are 1.4, 3.7, 13.7, and 53.6 hours.
 - **Volume.** The flow level assumes this engine draws papertrade's margin. Fees scale with it, so
   the `flow x0.25` and `flow x4` rows bound the effect.
-- **Two years of hourly history.** The tails come from 102 weeks (late 2024 to late 2026), which
-  include April 2025 and March 2026 but not March 2020. Probabilities of 0.1% and below are
-  extrapolations from the worst 5% of paths, not counts; the volatility rows stress them.
+- **Two years of hourly history and 2,000 paths.** The tails come from 102 weeks (late 2024 to
+  late 2026), which include April 2025 and March 2026 but not March 2020; the volatility rows
+  stress them. 2,000 paths count a 1% rate to within about half a point, but cannot tell 0.1%
+  from 0.01%: no failing path bounds the rate only below 0.15%.
 - **Price stand-ins.** DE40 and UK100 use cash indices. Futures series carry roll artefacts that
   the cleaning removes only at holes and one-hour steps; a roll that coincides with a weekend stays
   in that weekend's gap, which overstates gaps for WTI and Brent. Yahoo's hourly bars are a public
   but unofficial source.
 - **Engine detail left out.** Size spreads, stress spreads, and toxicity spreads would add house
   income, and leaving them out is conservative. Further gaps: cross-margin between an account's
-  markets (each position is its own account), margin bands above the first tier, close-outs
-  triggered by financing (financing is charged but does not move a position's trigger), the
+  markets (each position is its own account); the margin bands set how much notional margin buys,
+  but the close-out level stays at half the first tier's rate, below the engine's for orders past
+  the first band, so those close out later and leave less balance against a gap; close-outs
+  triggered by financing (financing moves what an account can lose but not its trigger); the
   stale-price rule that stops dealing when venues disagree (#15 §1), and its #98 form for a
   market whose FX market has no price.
-- **Order sequencing and size.** Within an hour the model nets what fits: it assumes the orders
-  that reduce exposure arrive spread among the crowded ones. When room is small next to the orders,
-  the engine, checking them one by one, refuses more. Orders keep papertrade's sizes; a trader who
-  splits an order under a small cap gets more of it filled than the model gives.
+- **Order sequencing and size.** Within an hour the model nets what fits, against the exposure at
+  the hour's start: it assumes the orders that reduce exposure arrive spread among the crowded
+  ones. When room is small next to the orders, the engine, checking them one by one, refuses more.
+  Orders keep papertrade's sizes; a trader who splits an order under a small cap gets more of it
+  filled than the model gives.
 - **Close-out fills.** In continuous trading a close-out fills at its trigger. A crash inside an
   hour that the venue index jumps across fills worse in the engine, so crypto bad debt is
   understated.
@@ -374,12 +398,13 @@ cd research/cap-calibration
 /tmp/cap-venv/bin/python -I run.py all          # per-market, joint, sensitivity, then results/report.md
 ```
 
-`all` reruns everything from the committed `data/derived/`; it takes a few hours on 4 to 10
-workers (`--workers`), and `--batch-paths` trades memory for speed. Stages run alone with
-`per-market`, `joint`, `sensitivity`, and `report`. Each batch of paths is seeded from `--seed`
-(default 1) and its index, so the same seed and batch size reproduce a run exactly;
-`results/manifest_<stage>.json` records the scenario, including both, and the hashes of the
-derived files it read.
+`all` reruns everything from the committed `data/derived/` with the committed results' settings:
+`DEFAULTS` in `run.py` sets each stage's paths and paths per batch, and `--workers` defaults to 4.
+Stages run alone with `per-market`, `joint`, `sensitivity`, and `report`. Each batch of paths is
+seeded from `--seed` (default 1) and its index, and its size shapes its random draws, so the same
+seed and batch size reproduce a run exactly, and another batch size gives other, equally valid
+paths. `results/manifest_<stage>.json` records the scenario, including both, the hashes of the
+derived files it read, and the run time.
 
 To rebuild the data: `fetch-papertrade` (resumes; `--to-block` pins the end), `fetch-markets`,
 `derive-papertrade`, `derive-markets`. Yahoo serves hourly bars for the last 730 days only, so a
@@ -400,7 +425,7 @@ To recalibrate as live data arrives:
 - `catalogue.py`: launch markets from the genesis, and the public series for each.
 - `fetch/`: `papertrade.py` and `markets.py` pull the raw data into `data/raw/` (gitignored).
 - `derive/`: `papertrade.py` decodes positions; `markets.py` builds the hourly dataset, statistics,
-  and mix, into `data/derived/`.
+  mix, and benchmark rates, into `data/derived/`.
 - `model/`: `accounting.py` (engine rules), `prices.py` (bootstrap), `flow.py` (behaviour),
   `simulate.py` (the hourly simulation), `experiments.py` (runs and measures), `report.py`.
 - `tests/`: the engine rules, the simulation's accounting, the data derivation, and the

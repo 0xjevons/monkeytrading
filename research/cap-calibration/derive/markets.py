@@ -9,6 +9,8 @@ Outputs, under `data/derived/`:
   return correlation and volatility ratio of the hourly data against it.
 - `market_mix.csv`: each market's share of trading volume, from its Hyperliquid listing's mean
   daily notional; a market with no listing takes its asset class's smallest listed volume.
+- `benchmarks.csv`: the financing benchmark rates, from FRED on `RATES_ON` or the latest day
+  before it, and the assumed TONA and AONIA (`ASSUMED_BPS`).
 
 Cleaning rules for hourly bars:
 - A gap across a one-hour step is set to zero. A continuously traded market's next bar opens at the
@@ -33,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-from catalogue import FRED_CHECKS, HYPERLIQUID, launch_markets
+from catalogue import FRED_BENCHMARKS, FRED_CHECKS, HYPERLIQUID, launch_markets
 from fetch.markets import DAILY_START
 
 WEEK0 = datetime(2024, 10, 28, tzinfo=UTC)
@@ -42,6 +44,10 @@ HOURS = WEEKS * 168
 UNIT = 1e6
 CLOSED = np.iinfo(np.int32).min
 FOLDED = {"DE40", "UK100"}  # cash indices standing in for long-hours futures
+RATES_ON = date(2026, 10, 19)
+# No FRED series is current for these: near the Bank of Japan and Reserve Bank of Australia
+# policy rates.
+ASSUMED_BPS = {"TONA": 75, "AONIA": 360}
 
 
 def yahoo_bars(path: Path) -> tuple[np.ndarray, ...]:
@@ -283,6 +289,18 @@ def market_mix(raw: Path, markets: list[dict]) -> list[dict]:
     return rows
 
 
+def benchmarks(raw: Path) -> list[dict]:
+    """Each financing benchmark's rate on `RATES_ON` or the latest day before it with a value."""
+    rows = []
+    for name, sid in FRED_BENCHMARKS.items():
+        lines = gzip.decompress((raw / "fred" / f"{sid}.csv.gz").read_bytes()).decode().splitlines()
+        values = [(d, float(v)) for d, v in csv.reader(lines[1:]) if v not in ("", ".") and date.fromisoformat(d) <= RATES_ON]
+        day, pct = max(values)
+        rows.append({"benchmark": name, "source": f"FRED {sid}", "date": day, "bps": round(pct * 100, 2)})
+    rows += [{"benchmark": name, "source": "assumption", "date": "", "bps": bps} for name, bps in ASSUMED_BPS.items()]
+    return rows
+
+
 def derive(raw: Path, out: Path) -> None:
     markets = launch_markets()
     grids, rows = [], []
@@ -300,7 +318,7 @@ def derive(raw: Path, out: Path) -> None:
         week0=np.array(WEEK0.isoformat()),
         unit=np.array(UNIT),
     )
-    for name, table in (("market_stats.csv", rows), ("market_mix.csv", market_mix(raw, markets))):
+    for name, table in (("market_stats.csv", rows), ("market_mix.csv", market_mix(raw, markets)), ("benchmarks.csv", benchmarks(raw))):
         with (out / name).open("w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=list(table[0]))
             writer.writeheader()

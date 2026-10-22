@@ -39,13 +39,22 @@ def closeout_fill(side, trigger, bar_open, bar_extreme):
     return np.where(gapped, bar_open, np.where(reached, trigger, np.nan))
 
 
-def settle(side, exit_price, balance, fx_ratio=1.0):
-    """Client PnL credited at exit and bad debt written off against the house: the account loses
-    at most its balance (`closeout.rs`, `settle_bad_debt`). A market quoted in another currency
-    accrues PnL in that currency and converts it to USD at the FX index of the fill (#98), so its
-    PnL per unit of USD entry notional carries `fx_ratio`, the FX index at exit over at entry."""
-    pnl = side * (exit_price - 1.0) * fx_ratio
-    return np.maximum(pnl, -balance), np.maximum(-pnl - balance, 0.0)
+def realised_pnl(side, exit_price, fx_ratio=1.0):
+    """Realised PnL per unit of USD entry notional. A market quoted in another currency accrues PnL
+    in that currency and converts it to USD at the FX index of the fill (#98), so its PnL carries
+    `fx_ratio`, the FX index at exit over at entry."""
+    return side * (exit_price - 1.0) * fx_ratio
+
+
+def settle(pnl, balance, financing=0.0):
+    """One account's exit: the profit fee, the bad debt written off against the house, and what is
+    left to the client. Financing has already moved the balance at each rollover, so the account
+    loses at most its balance after financing (`closeout.rs`, `settle_bad_debt`). Returns
+    `(fee, bad_debt, proceeds)`; the house takes `-pnl + fee - bad_debt`."""
+    fee = profit_fee(pnl)
+    equity = balance + pnl - fee - financing
+    bad = np.maximum(-equity, 0.0)
+    return fee, bad, equity + bad
 
 
 def daily_financing(side, notional, benchmark_bps, markup_bps, day_basis):
@@ -59,6 +68,17 @@ def exposure_cap(nav, cap_bps, floor):
     """A house exposure cap: the larger of a share of house NAV and a fixed floor (#15 section 2,
     PR #99)."""
     return np.maximum(np.asarray(nav) * cap_bps / 1e4, floor)
+
+
+def order_room(exposure, cap, total_room):
+    """The largest long and short order that fills against clients' net exposure `exposure` in a
+    market: a fill that grows the absolute exposure must stay within the market cap and within
+    `total_room`, the total cap less the gross exposure of the other markets; one that shrinks it
+    always fills (`execution.rs`, `check_risk`). Returns `(long_room, short_room)`."""
+    exposure = np.asarray(exposure, dtype=float)
+    long_room = np.maximum(2 * np.maximum(-exposure, 0.0), np.minimum(cap - exposure, total_room - exposure))
+    short_room = np.maximum(2 * np.maximum(exposure, 0.0), np.minimum(cap + exposure, total_room + exposure))
+    return np.maximum(long_room, 0.0), np.maximum(short_room, 0.0)
 
 
 def accepted_share(exposure, cap, longs, shorts):
