@@ -1,10 +1,10 @@
 //! Node wiring: attest the enclave key and the API's TLS key, recover the engine from its log and
 //! the history index, then run the sequencer, ticker, price feeds, custody, trusted time check,
-//! history index, API, and rate-limit upkeep as supervised tasks. Any task stopping stops the node.
-//! On SIGTERM or ctrl-c, every task but the sequencer is stopped; the sequencer then drains what is
-//! queued and writes a final checkpoint.
+//! history index, API, rate-limit upkeep, monitor, metrics listener, and alert routing as
+//! supervised tasks. Any task stopping stops the node. On SIGTERM or ctrl-c, every task but the
+//! sequencer is stopped; the sequencer then drains what is queued and writes a final checkpoint,
+//! and the alerts already logged are delivered.
 
-use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,8 +18,8 @@ use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{interval, timeout};
 use tracing::{error, info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
 
+use crate::alerts::Routing;
 use crate::api::{ApiState, Feed, MAX_BACKFILLS, router};
 use crate::clock::{Clock, SystemClock, now_ms};
 use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProvider};
@@ -29,38 +29,44 @@ use crate::feeds::venue::{self, Timing};
 use crate::history::{History, HistoryCheck};
 use crate::limits::{ApiLimits, run_retain};
 use crate::log::Manifest;
+use crate::metrics::Metrics;
 use crate::sequencer::{ReplayedLog, Request, Sequencer, SequencerConfig};
 use crate::tee::{Attestor, ConfigfsTsm, EnclaveKey, MockAttestor, attest_key};
+use crate::telemetry::Telemetry;
 use crate::tls::{TlsIdentity, serve};
-use crate::trusted_time;
+use crate::{metrics, monitor, trusted_time};
 
 /// How long the sequencer gets to drain and checkpoint after a shutdown signal.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const CHANNEL_CAPACITY: usize = 65_536;
-
 type TaskResult = (&'static str, anyhow::Result<()>);
 
-/// Installs the global log subscriber at `level`, a `tracing` filter directive. Colour codes
-/// go only to a terminal, so a log file or collector gets plain `field=value` text.
+/// Runs the node until a shutdown signal, or until the first supervised task stops, then delivers
+/// the alerts already logged, for up to `SHUTDOWN_GRACE`.
 /// Error cases:
-/// - `level` is not a valid filter directive
-pub fn init_logging(level: &str) -> anyhow::Result<()> {
-    let filter = EnvFilter::try_new(level).context("log level")?;
-    fmt().with_env_filter(filter).with_ansi(std::io::stdout().is_terminal()).init();
-    Ok(())
+/// - see `serve_node`
+pub async fn run(cfg: NodeConfig, telemetry: Telemetry) -> anyhow::Result<()> {
+    let Telemetry { metrics, alerts, pages_critical } = telemetry;
+    if !pages_critical {
+        warn!("no alerts.critical webhook: Critical alerts are only logged");
+    }
+    let mut routing = alerts.spawn(cfg.alerts.episode_quiet)?;
+    let outcome = serve_node(cfg, metrics, &mut routing).await;
+    routing.drain(SHUTDOWN_GRACE).await;
+    outcome
 }
 
-/// Runs the node until a shutdown signal, or until the first supervised task stops.
+/// Runs every task but alert routing, which it supervises.
 /// Error cases:
 /// - operator rotation is enabled
 /// - `feeds.provider = "venues"` without `[feeds.venues]`, or the TLS config cannot be built
 /// - generating the TLS key, attesting the keys, opening the history index (or a fresh one in place
 ///   of an index the log does not match), recovering the log (including a log that records another
 ///   client auth or operator, or whose genesis did not apply in full), connecting custody, or
-///   binding the listener fails
+///   binding a listener fails
 /// - the engine would reject a genesis command
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
-pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
+async fn serve_node(cfg: NodeConfig, metrics: Arc<Metrics>, routing: &mut Routing) -> anyhow::Result<()> {
     if cfg.operator.rotation_enabled {
         bail!("operator rotation is not implemented yet; set operator.rotation_enabled = false");
     }
@@ -107,6 +113,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         max_drift: cfg.time.max_drift,
         client_auth: client_auth.clone(),
         operator,
+        metrics: metrics.clone(),
     };
     let mut seq = Sequencer::recover_from(log, seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
@@ -134,6 +141,8 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     let ticks = tx.clone();
     tasks.spawn(async move { ("ticker", run_ticker(ticks, tick).await) });
 
+    // The monitor exports quote times only for the sources this config still feeds.
+    let sources = feeds::configured_sources(&cfg.feeds);
     let feeds = cfg.feeds;
     match feeds.provider {
         FeedProvider::Mock => {
@@ -174,6 +183,17 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     );
     tasks.spawn(async move { ("history", history.run(history_feed).await) });
 
+    let monitor_tx = tx.clone();
+    let (monitor_metrics, no_price_after) = (metrics.clone(), cfg.alerts.no_price_after);
+    tasks.spawn(async move { ("monitor", monitor::run(monitor_tx, monitor_metrics, no_price_after, sources).await) });
+
+    let metrics_listen = cfg.metrics.listen;
+    let metrics_listener =
+        TcpListener::bind(metrics_listen).await.with_context(|| format!("binding {metrics_listen}"))?;
+    info!(listen = %metrics_listen, "metrics up");
+    let metrics_app = metrics::router(metrics);
+    tasks.spawn(async move { ("metrics", axum::serve(metrics_listener, metrics_app).await.context("metrics server")) });
+
     let listener = TcpListener::bind(cfg.node.listen).await.with_context(|| format!("binding {}", cfg.node.listen))?;
     let limits = Arc::new(ApiLimits::new(&cfg.api));
     let app = router(ApiState {
@@ -197,6 +217,10 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
 
     let outcome = tokio::select! {
         joined = tasks.join_next() => Err(stopped_task(joined)),
+        err = routing.stopped() => {
+            error!(alert = "task_stopped", "{err:#}");
+            Err(err)
+        }
         joined = &mut sequencer => {
             tasks.shutdown().await;
             sequencer_outcome(joined)?;
@@ -276,6 +300,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::{iter, net};
 
+    use crate::alerts::{self, AlertLayer, Routes};
     use crate::config::HistorySection;
     use crate::history::INDEX_FILE;
     use crate::log::{LogEntry, MANIFEST, Offset, segment_seq};
@@ -318,8 +343,10 @@ mod tests {
         let mut cfg = dev_config();
         (cfg.node.log_dir, cfg.history.dir) = (kept.clone(), index.clone());
         cfg.node.listen = held.local_addr().unwrap();
+        cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
         let (_guard, mut alerts) = capture_alerts();
-        let stopped = timeout(Duration::from_secs(10), run(cfg)).await.expect("the node stops in time");
+        let (telemetry, _layer) = telemetry();
+        let stopped = timeout(Duration::from_secs(10), run(cfg, telemetry)).await.expect("the node stops in time");
         let err = stopped.expect_err("the API port is held");
         assert!(format!("{err:#}").contains("binding"), "{err:#}");
         let alert = alerts.try_recv().expect("an alert");
@@ -345,8 +372,10 @@ mod tests {
         let mut cfg = dev_config();
         (cfg.node.log_dir, cfg.history.dir) = (kept.clone(), index);
         cfg.node.listen = "127.0.0.1:0".parse().unwrap();
+        cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
         let (_guard, mut alerts) = capture_alerts();
-        let refused = timeout(Duration::from_secs(10), run(cfg)).await.expect("the node stops in time");
+        let (telemetry, _layer) = telemetry();
+        let refused = timeout(Duration::from_secs(10), run(cfg, telemetry)).await.expect("the node stops in time");
         let err = refused.expect_err("the index cannot be discarded");
         assert!(format!("{err:#}").contains("removing"), "{err:#}");
         let levels: Vec<_> = iter::from_fn(|| alerts.try_recv().ok())
@@ -372,7 +401,9 @@ mod tests {
         let mut cfg = dev_config();
         (cfg.node.log_dir, cfg.history.dir) = (dir.clone(), index);
         cfg.node.listen = "127.0.0.1:0".parse().unwrap();
-        let refused = timeout(Duration::from_secs(10), run(cfg)).await.expect("the node stops in time");
+        cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
+        let (telemetry, _layer) = telemetry();
+        let refused = timeout(Duration::from_secs(10), run(cfg, telemetry)).await.expect("the node stops in time");
         let err = refused.expect_err("genesis did not finish");
         assert!(format!("{err:#}").contains("did not reach the checkpoint after its house capital credit"), "{err:#}");
         assert_eq!(files(&dir), before, "the log is as it was found");
@@ -387,8 +418,10 @@ mod tests {
         (cfg.node.log_dir, cfg.history.dir) = (dir.clone(), index);
         cfg.node.listen = "127.0.0.1:0".parse().unwrap();
         cfg.genesis.benchmarks[0].annual_bps = 40_000;
+        cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
         let (_guard, mut alerts) = capture_alerts();
-        let refused = timeout(Duration::from_secs(10), run(cfg)).await.expect("the node stops in time");
+        let (telemetry, _layer) = telemetry();
+        let refused = timeout(Duration::from_secs(10), run(cfg, telemetry)).await.expect("the node stops in time");
         let err = refused.expect_err("the engine rejects the benchmark");
         assert!(format!("{err:#}").contains("genesis benchmark SOFR: the engine rejects it"), "{err:#}");
         let raised: Vec<_> = iter::from_fn(|| alerts.try_recv().ok())
@@ -399,6 +432,14 @@ mod tests {
     }
 
     // ── Helpers ──
+
+    /// Telemetry with no webhooks, and the layer that feeds it, kept so the router stays open; the
+    /// test's own subscriber sees the alert lines.
+    fn telemetry() -> (Telemetry, AlertLayer) {
+        let metrics = Arc::new(Metrics::new());
+        let (layer, alerts) = alerts::channel(Routes::default(), metrics.clone());
+        (Telemetry { metrics, alerts, pages_critical: false }, layer)
+    }
 
     /// A log in a new directory named after `name`, as the disk keeps it when the power fails after
     /// its first deposit, and an index that took a second deposit the log then lost.

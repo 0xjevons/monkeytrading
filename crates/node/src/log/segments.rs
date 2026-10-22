@@ -317,7 +317,7 @@ impl LogWriter {
         fs::rename(&staged, &path).with_context(|| format!("renaming {} into place", staged.display()))?;
         self.open = Some((Segment::empty(first_seq), BufWriter::new(file)));
         if std::mem::take(&mut self.rotation_failing) {
-            info!("log segments rotate again");
+            info!(alert_resolved = "log_rotation_failed", "log segments rotate again");
         }
         Ok(())
     }

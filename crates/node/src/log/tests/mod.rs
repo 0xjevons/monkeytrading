@@ -8,6 +8,7 @@ use engine_core::types::AccountId;
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
+use crate::alerts::{Severity, capture};
 use crate::test_support::{every_event, file_entries, log_entries, scratch_dir};
 
 mod reader;
@@ -266,10 +267,16 @@ fn a_segment_that_cannot_be_started_leaves_the_current_one_growing_until_it_can(
     // A directory in the way of the staged file makes creating it fail.
     let staged = dir.join(format!("{SEG_2}.tmp"));
     fs::create_dir(&staged).unwrap();
-    writer.append(&cmd(2)).unwrap();
-    fs::remove_dir(&staged).unwrap();
-    writer.append(&cmd(3)).unwrap();
+    let alerts = capture(|| {
+        writer.append(&cmd(2)).unwrap();
+        fs::remove_dir(&staged).unwrap();
+        writer.append(&cmd(3)).unwrap();
+    });
     writer.flush().unwrap();
+    // The failure pages once, and recovering resolves it.
+    let [failed, resolved] = alerts.as_slice() else { panic!("{alerts:?}") };
+    assert_eq!((failed.key(), failed.severity), ("log_rotation_failed{}".to_owned(), Some(Severity::Warning)));
+    assert_eq!((resolved.key(), resolved.severity), (failed.key(), None));
 
     assert_eq!(file_entries(&dir.join(SEG_0)), [cmd(0), cmd(1), cmd(2)]);
     assert_eq!(file_entries(&dir.join("00000000000000000003.jsonl")), [cmd(3)]);

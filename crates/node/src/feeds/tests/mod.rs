@@ -3,6 +3,7 @@
 
 pub(super) mod fake;
 mod late;
+mod mock;
 mod scenario;
 
 use std::collections::BTreeMap;
@@ -184,7 +185,8 @@ async fn a_binary_message_is_refused_with_an_alert() {
     send(&mut ws, &[kraken_book("BTC/USD", "100", "101", ts)]).await;
 
     let alert = next_alert(&mut alerts).await;
-    assert_eq!((alert["alert"].as_str(), alert["reason"].as_str()), ("venue_message_refused", "binary message"));
+    assert_eq!(alert["alert"].as_str(), "venue_message_refused");
+    assert!(alert["message"].contains("binary message"), "{alert:?}");
     // The connection carries on.
     assert_eq!(next_prices(&mut rx).await, (1, vec![quote(Venue::Kraken, "100.5", ts)]));
 }
@@ -374,7 +376,7 @@ async fn a_kraken_book_that_fails_verification_resubscribes_without_a_quote() {
     send(&mut first, &[corrupted]).await;
     let alert = next_alert(&mut alerts).await;
     assert_eq!((alert["alert"].as_str(), alert["venue"].as_str()), ("venue_message_refused", "kraken"));
-    assert!(alert["reason"].contains("checksum mismatch"), "{alert:?}");
+    assert!(alert["message"].contains("checksum mismatch"), "{alert:?}");
 
     // A book that verifies but is crossed is suspect too: it is dropped the same way.
     let (mut crossed, _) = accept(&listener).await;

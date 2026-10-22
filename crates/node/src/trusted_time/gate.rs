@@ -44,6 +44,18 @@ pub struct TimeGate {
     refused: u64,
 }
 
+impl Halt {
+    /// The alert this halt raises, and the line that resolves it when the halt ends; a normal start
+    /// raises none.
+    fn alert(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Halt::Starting => None,
+            Halt::Drift => Some(("clock_drift", "the host clock is back within the drift bound of trusted time")),
+            Halt::NoSample => Some(("trusted_time_unavailable", "a trusted time sample is back within the grace")),
+        }
+    }
+}
+
 impl Refusal {
     /// The halt this refusal puts sequencing in.
     fn halt(self) -> Halt {
@@ -72,6 +84,12 @@ impl TimeGate {
     pub fn admit(&mut self, host_ms: Millis, ts: Millis, now: Instant) -> bool {
         let refusal = self.check(host_ms, ts, now);
         let halt = refusal.map(Refusal::halt);
+        // A halt that ends, or gives way to another, resolves the alert it raised.
+        if self.halted != halt
+            && let Some((alert, cleared)) = self.halted.and_then(Halt::alert)
+        {
+            info!(alert_resolved = alert, "{cleared}");
+        }
         match refusal {
             None if self.halted == Some(Halt::Starting) => {
                 info!(refused = self.refused, "first trusted time sample: sequencing started");
@@ -115,20 +133,18 @@ impl TimeGate {
     /// Raises the Critical alert for a refusal that halts sequencing.
     fn alert(&self, ts: Millis, refusal: Refusal) {
         match refusal {
+            // The readings change from stamp to stamp, so they go in the message, not the episode key.
             Refusal::Drift { host_ms, earliest_ms, latest_ms } => error!(
                 alert = "clock_drift",
-                ts,
-                host = host_ms,
-                earliest = earliest_ms,
-                latest = latest_ms,
-                max_drift_ms = self.max_drift_ms,
-                "host clock or stamp is not within the drift bound of trusted time: sequencing halted"
+                "host clock or stamp is not within the drift bound of trusted time: sequencing halted \
+                 (stamp {ts}, host {host_ms}, trusted {earliest_ms} to {latest_ms}, bound {}ms)",
+                self.max_drift_ms
             ),
             Refusal::NoSample { waited, sampled } => error!(
                 alert = "trusted_time_unavailable",
-                for_ms = floor_millis(waited),
-                sampled,
-                "no trusted time sample within the grace: sequencing halted"
+                "no trusted time sample within the grace: sequencing halted (waited {}ms, sampled before: \
+                 {sampled})",
+                floor_millis(waited)
             ),
         }
     }

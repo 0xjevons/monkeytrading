@@ -26,7 +26,13 @@ pub(super) async fn credit(tx: &mpsc::Sender<Request>, deposit: &VaultDeposit) -
     async move {
         let Some(amount) = usdc_to_fixed(deposit.units) else {
             // Nothing re-examines it, and the USDC stays in the vault uncredited.
-            error!(alert = "deposit_unrepresentable", units = %deposit.units, "deposit too large to credit");
+            // Keyed by the deposit, so each one pages; the amount goes in the message.
+            error!(
+                alert = "deposit_unrepresentable",
+                chain_ref = %deposit.chain_ref(),
+                "deposit of {} USDC units too large to credit",
+                deposit.units
+            );
             return Ok(());
         };
         let credited_ref = chain_ref.clone();
@@ -45,7 +51,11 @@ pub(super) async fn credit(tx: &mpsc::Sender<Request>, deposit: &VaultDeposit) -
                 // The sequencer alerts a refused trader deposit as `deposit_rejected`; a refused
                 // house deposit is an admin rejection, which it does not alert.
                 Event::AdminRejected { reason } => {
-                    error!(alert = "house_deposit_rejected", %amount, reason, "house deposit not credited");
+                    error!(
+                        alert = "house_deposit_rejected",
+                        chain_ref = %deposit.chain_ref(),
+                        "house deposit of {amount} not credited: {reason}"
+                    );
                 }
                 _ => {}
             }

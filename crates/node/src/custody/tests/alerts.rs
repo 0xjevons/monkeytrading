@@ -1,19 +1,101 @@
 //! The watcher's alerts over time: one per kind of stall, escalation of a stall that lasts, and
 //! the finality and head watchdogs. Paused time drives the poll loop.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::primitives::U256;
 use engine_core::Engine;
 use tokio::sync::oneshot;
-use tokio::time::{sleep, timeout};
+use tokio::time::{advance, sleep, timeout};
+use tracing::subscriber::set_default;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry;
 
-use crate::custody::evm::{Beneficiary, VaultIdentity};
+use crate::alerts::{Routes, channel, is_alert_callsite};
+use crate::clock::now_ms;
+use crate::custody::evm::{Beneficiary, VaultDeposit, VaultIdentity};
 use crate::custody::stall::Polled;
 use crate::custody::tests::fakes::{
     FakeChain, Logs, Node, TRADER, USDC, USDC_TOKEN, deposit, refusing_sequencer, scratch, stored_cursor, usdc,
     wait_for_polls, watcher,
 };
+use crate::custody::watchdog::Watchdog;
+use crate::metrics::Metrics;
 use crate::sequencer::Request;
+
+/// Whatever the blocks, ages, or amounts, each custody alert keeps one key per subject, so its
+/// repeats share an episode, and the line that ends the condition resolves it under that key. A
+/// refused deposit is its own subject, so each one pages.
+#[tokio::test(start_paused = true)]
+async fn custody_alerts_keep_one_key_per_subject_and_resolve_under_it() {
+    let (layer, router) = channel(Routes::default(), Arc::new(Metrics::new()));
+    let _logging = set_default(registry().with(layer.with_filter(filter_fn(is_alert_callsite))));
+
+    // A read outage that outlasts `stall_critical_after` (1s), then reads again.
+    let dir = scratch("alert-keys");
+    let (chain, node) = (FakeChain::default(), Node::start(&dir));
+    chain.add(deposit(0, 1, Beneficiary::Trader(TRADER), 3 * USDC));
+    chain.set_final(Some(1));
+    chain.0.lock().unwrap().failing = true;
+    let run = tokio::spawn(watcher(&chain, &dir, 1_000, None).run(node.tx.clone()));
+    sleep(Duration::from_millis(1_500)).await;
+    chain.0.lock().unwrap().failing = false;
+    while node.balance(TRADER).await.is_none() {
+        sleep(Duration::from_millis(5)).await;
+    }
+    sleep(Duration::from_millis(50)).await;
+    run.abort();
+
+    // Two deposits the engine cannot take, each its own subject.
+    let max = 1_000_000_000 * USDC;
+    let unrepresentable = VaultDeposit { units: U256::MAX, ..deposit(1, 2, Beneficiary::Trader(TRADER), 0) };
+    let house = deposit(2, 3, Beneficiary::House, max + 1);
+    let refs = [unrepresentable.chain_ref(), house.chain_ref()];
+    chain.add(unrepresentable);
+    chain.add(house);
+    chain.set_final(Some(3));
+    let log_seq = node.read(|engine| engine.last_seq()).await;
+    let mut resumed = watcher(&chain, &dir, 1_000, log_seq);
+    assert!(matches!(resumed.poll(&node.tx).await.map(Polled::caught_up), Ok(true)));
+
+    // The watchdogs: reads trailing the final block, a head a day old, and a final block that stays
+    // put while the head moves on, each past the budget and then cleared.
+    let mut watchdog = Watchdog::new(Duration::from_secs(1));
+    let now_s = || u64::try_from(now_ms()).unwrap() / 1_000;
+    watchdog.observe_read(false, 5, 9);
+    advance(Duration::from_secs(1)).await;
+    watchdog.observe_read(false, 6, 9);
+    watchdog.observe_read(true, 9, 9);
+    watchdog.observe(10, now_s() - 86_400, Some(9));
+    watchdog.observe(11, now_s(), Some(9));
+    advance(Duration::from_secs(1)).await;
+    watchdog.observe(12, now_s(), Some(9));
+    watchdog.observe(13, now_s(), Some(12));
+
+    let lines: Vec<(String, bool)> = router.queued().iter().map(|line| (line.key(), line.severity.is_none())).collect();
+    let fired = |key: &str| (key.to_owned(), false);
+    let resolved = |key: &str| (key.to_owned(), true);
+    assert_eq!(
+        lines,
+        [
+            fired("custody_rpc_failed{}"),
+            fired("custody_deposits_stalled{}"),
+            resolved("custody_rpc_failed{}"),
+            resolved("custody_deposits_stalled{}"),
+            fired(&format!("deposit_unrepresentable{{chain_ref={}}}", refs[0])),
+            fired(&format!("house_deposit_rejected{{chain_ref={}}}", refs[1])),
+            fired("custody_deposits_lagging{}"),
+            resolved("custody_deposits_lagging{}"),
+            fired("custody_head_stale{}"),
+            resolved("custody_head_stale{}"),
+            fired("custody_finality_stalled{}"),
+            resolved("custody_finality_stalled{}"),
+        ]
+    );
+}
 
 #[tokio::test(start_paused = true)]
 async fn an_rpc_outage_alerts_once_escalates_once_and_crediting_resumes_after_it() {

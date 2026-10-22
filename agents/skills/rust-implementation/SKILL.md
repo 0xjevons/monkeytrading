@@ -62,8 +62,15 @@ failed check on such input:
   crash-loop across restarts and block operator repair.
 - Alert severity for rejected input: **Warning** when a Critical escalation backstop exists;
   **Critical** only when nothing re-examines the state — no self-healing or escalation path.
-- Until a paging integration exists, an alert is a log line at `error` (Critical) or `warn`
-  (Warning) carrying an `alert = "<snake_case_name>"` field, emitted inside the unit of work's span.
+- An alert is a log line at `error` (Critical) or `warn` (Warning) carrying an
+  `alert = "<snake_case_name>"` field, emitted inside the unit of work's span. The node posts it to
+  the webhook for its severity, once per episode: its name and fields identify the episode, and a
+  repeat with the same fields pages again only after `alerts.episode_quiet` without one. Values
+  that change while one problem persists (counts, retry delays, ages) go in the message, so they
+  do not split it into many episodes. When the emitter sees the condition clear, it logs an `info`
+  line carrying `alert_resolved = "<name>"` and the same fields, which ends the episode. Span
+  fields are context, not part of the key, so an alert about one unit of work (one deposit, say)
+  names it in an event field.
 - Ledger integrity beats uptime: anything that would let trading continue on possibly-diverged
   books — cash not conserved between accounts and the house, positions not matching the per-market
   aggregates — fails closed (crash).
@@ -190,7 +197,7 @@ everything else is a config key.
 - HTTP: one middleware layer, registered outermost, owns the request span; a handler records the
   entity id (`Span::current().record("id", …)`) as soon as the entity is known.
 - A spawned future does not inherit the current span: spawn `fut.instrument(span)` or `fut.instrument(Span::current())`, or its lines lose the id. Never hold a `span.enter()` guard across an `.await`.
-- Ids go in their own fields: `info!(id = %order_id, "…")` for the subject, role names for other entities (`account = %w.account`). Never re-emit the span's id as an event field.
+- Ids go in their own fields: `info!(id = %order_id, "…")` for the subject, role names for other entities (`account = %w.account`). Never re-emit the span's id as an event field, except to key an alert on its unit of work.
 - Fire alerts inside the correlation span, so they carry its fields.
 - Never log secrets, keys, or raw request bodies that may carry signatures.
 

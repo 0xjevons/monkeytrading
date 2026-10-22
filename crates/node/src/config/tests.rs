@@ -2,6 +2,8 @@ use super::*;
 
 use crate::test_support::{ANVIL_CONFIG as ANVIL, DEV_CONFIG as DEV, own_operator_key};
 
+use crate::config::telemetry_tests::CRITICAL_ROUTE;
+
 #[test]
 fn the_committed_dev_config_loads() {
     let cfg = NodeConfig::load(Path::new(DEV)).unwrap();
@@ -37,7 +39,9 @@ fn unsigned_requests_need_the_mock_tee_and_mock_custody() {
         let cfg: NodeConfig = toml::from_str(text).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("node.auth = \"none\""), "{err:#}");
-        let mut signed: NodeConfig = toml::from_str(&text.replace("auth = \"none\"", "auth = \"eip712\"")).unwrap();
+        let route = if text.contains("\n[alerts.critical]") { "" } else { CRITICAL_ROUTE };
+        let signed = format!("{}{route}", text.replace("auth = \"none\"", "auth = \"eip712\""));
+        let mut signed: NodeConfig = toml::from_str(&signed).unwrap();
         // Real attestation also refuses the dev configs' published operator key.
         signed.operator.public_key = own_operator_key();
         signed.validate().unwrap();

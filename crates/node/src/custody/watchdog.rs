@@ -1,7 +1,8 @@
 //! Watchdogs for an endpoint that answers but stops moving: a head whose timestamp falls behind
 //! this node's clock, a final block that stops advancing while the head moves on, and reads that
 //! keep trailing the final block. Each leaves new deposits waiting with no failed read to report,
-//! so each raises a Critical alert once per episode.
+//! so each raises a Critical alert once per episode, keyed by its name alone, and resolves it when
+//! the condition clears.
 
 use std::time::Duration;
 
@@ -56,7 +57,10 @@ impl Watchdog {
     pub(super) fn observe_read(&mut self, caught_up: bool, next_block: u64, final_block: u64) {
         if caught_up {
             if self.lag_alerted {
-                info!(next_block, "deposit reads have caught up with the final block");
+                info!(
+                    alert_resolved = "custody_deposits_lagging",
+                    "deposit reads have caught up with the final block at block {next_block}"
+                );
             }
             (self.behind_since, self.lag_alerted) = (None, false);
             return;
@@ -65,10 +69,7 @@ impl Watchdog {
         if !self.lag_alerted && behind_for >= self.budget {
             error!(
                 alert = "custody_deposits_lagging",
-                next_block,
-                final_block,
-                ?behind_for,
-                "deposit reads trail the final block"
+                "deposit reads trail the final block: at block {next_block} of {final_block} for {behind_for:?}"
             );
             self.lag_alerted = true;
         }
@@ -82,11 +83,11 @@ impl Watchdog {
         let age = now.saturating_sub(Duration::from_secs(self.newest_head_time));
         if age < self.budget {
             if self.head_stale {
-                info!(head, "the endpoint's head is current again");
+                info!(alert_resolved = "custody_head_stale", "the endpoint's head is current again at block {head}");
                 self.head_stale = false;
             }
         } else if !self.head_stale {
-            error!(alert = "custody_head_stale", head, ?age, "the endpoint's head is not advancing");
+            error!(alert = "custody_head_stale", "the endpoint's head is not advancing: block {head} is {age:?} old");
             self.head_stale = true;
         }
     }
@@ -100,7 +101,10 @@ impl Watchdog {
         let rose = self.finality.as_ref().is_none_or(|seen| final_block > seen.highest);
         if rose {
             if self.finality.as_ref().is_some_and(|seen| seen.alerted) {
-                info!(final_block, "the final block is advancing again");
+                info!(
+                    alert_resolved = "custody_finality_stalled",
+                    "the final block is advancing again: {final_block:?}"
+                );
             }
             self.finality = Some(FinalitySeen { highest: final_block, head, moving_since: None, alerted: false });
             return;
@@ -115,10 +119,7 @@ impl Watchdog {
             let highest = seen.highest;
             error!(
                 alert = "custody_finality_stalled",
-                ?highest,
-                head,
-                ?stalled_for,
-                "the final block has stopped advancing"
+                "the final block has stopped advancing: {highest:?} with the head at {head} for {stalled_for:?}"
             );
             seen.alerted = true;
         }

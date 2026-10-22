@@ -25,7 +25,8 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "CC0-1.0",
-    # webpki-roots: Mozilla's CA bundle, compiled in so venue TLS never trusts the host's roots.
+    # webpki-roots: Mozilla's CA bundle, compiled in so venue feeds and alert webhooks never trust the
+    # host's roots.
     # webpki-root-certs: the same bundle as certificates, compiled in as the only TLS roots for the
     # custody RPC; reqwest's rustls-platform-verifier also pulls it.
     "CDLA-Permissive-2.0",

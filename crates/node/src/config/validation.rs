@@ -26,6 +26,7 @@ impl NodeConfig {
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
     /// - `tee.provider` is not `mock` and `operator.public_key` is a published test key (see
     ///   `refuse_test_keys`)
+    /// - `[alerts.critical]` is missing with a TEE or custody provider other than `mock`
     /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
     ///   no longer than `feeds.interval`
     /// - `time.servers` has fewer than two servers, lists a public key twice, or has an address
@@ -97,6 +98,16 @@ impl NodeConfig {
         }
         self.history.retention_ms().context("history.retention")?;
         self.validate_custody()?;
+        // Without a Critical webhook, Critical alerts reach only the node's own log, so a node
+        // beside a real enclave or real funds must have one.
+        if self.alerts.critical.is_none()
+            && (self.tee.provider != TeeProvider::Mock || self.custody.provider != CustodyProvider::Mock)
+        {
+            anyhow::bail!(
+                "[alerts.critical] is required unless tee.provider and custody.provider are both \"mock\": \
+                 without it Critical alerts page no one"
+            );
+        }
         // The engine replaces a market or benchmark rate set twice, so a repeated id or name would
         // silently drop the earlier entry, and a repeated symbol would name two markets.
         let markets = &self.genesis.markets;

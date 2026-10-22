@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::{Context, bail, ensure};
 use engine_core::event::Event;
 use engine_core::protocol::ProtocolVersion;
-use engine_core::types::AccountId;
+use engine_core::types::{AccountId, Millis};
 use engine_core::{Engine, Fixed};
 
 use crate::log::{self, LogEntry, SegmentedLog};
@@ -26,6 +26,8 @@ pub struct Replayed {
     pub activations: Vec<(ProtocolVersion, u64)>,
     /// How far the log got through genesis.
     pub genesis: GenesisProgress,
+    /// Sequenced time of the command the last checkpoint covers.
+    pub last_checkpoint_ts: Option<Millis>,
 }
 
 /// Re-applies a log entry by entry, as it is read, and checks every checkpoint root, logged event,
@@ -43,6 +45,7 @@ pub(super) struct Replay {
     approved: VecDeque<(AccountId, Fixed, u64)>,
     logs_events: bool,
     genesis: GenesisProgress,
+    last_checkpoint_ts: Option<Millis>,
 }
 
 impl Replay {
@@ -100,6 +103,8 @@ impl Replay {
                 }
                 self.checkpoints += 1;
                 self.genesis.checkpoint();
+                // The checkpoint covers the last command applied, whose stamp is the engine's time.
+                self.last_checkpoint_ts = Some(engine.now());
             }
         }
         Ok(())
@@ -108,9 +113,9 @@ impl Replay {
     /// What the entries applied so far replay to.
     pub(super) fn finish(self) -> Replayed {
         let unsigned = if self.logs_events { self.approved.into() } else { Vec::new() };
-        let (engine, commands, checkpoints, activations, genesis) =
-            (self.engine, self.commands, self.checkpoints, self.activations, self.genesis);
-        Replayed { engine, commands, checkpoints, unsigned, activations, genesis }
+        let (engine, commands, checkpoints, activations, genesis, last_checkpoint_ts) =
+            (self.engine, self.commands, self.checkpoints, self.activations, self.genesis, self.last_checkpoint_ts);
+        Replayed { engine, commands, checkpoints, unsigned, activations, genesis, last_checkpoint_ts }
     }
 }
 

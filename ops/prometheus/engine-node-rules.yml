@@ -1,0 +1,42 @@
+# Alerting rules for the operator's Prometheus, which runs outside the enclave. They page on what
+# the node cannot page itself: a node whose metrics stop answering, and alert pages that its
+# webhook keeps failing or refuses, or that the node drops. Route them through Alertmanager to a
+# receiver other than the node's own webhook. The rules assume the scrape job is named `engine`.
+groups:
+  - name: engine-node
+    rules:
+      - alert: EngineNodeDown
+        expr: up{job="engine"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Engine node {{ $labels.instance }} has not answered a metrics scrape for a minute"
+
+      - alert: EngineAlertPagesFailing
+        # The pages' severity moves to `route`, since this rule's own severity label replaces it.
+        expr: >-
+          label_replace(increase(engine_alert_deliveries_total{outcome=~"failed|dropped"}[15m]) > 0,
+          "route", "$1", "severity", "(.*)")
+        labels:
+          severity: critical
+        annotations:
+          summary: "Engine node {{ $labels.instance }} could not deliver {{ $labels.route }} alert pages ({{ $labels.outcome }})"
+
+      # Each failed post counts as it happens, so a webhook outage shows while its page is still
+      # retrying; three failures in five minutes is past a single transient error.
+      - alert: EngineAlertDeliveryFailing
+        expr: >-
+          label_replace(increase(engine_alert_attempts_failed_total[5m]) >= 3,
+          "route", "$1", "severity", "(.*)")
+        labels:
+          severity: critical
+        annotations:
+          summary: "Engine node {{ $labels.instance }} keeps failing to post {{ $labels.route }} alert pages"
+
+      - alert: EngineAlertLinesDropped
+        expr: increase(engine_alerts_dropped_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Engine node {{ $labels.instance }} dropped alert lines before routing them"

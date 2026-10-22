@@ -115,7 +115,12 @@ impl Server {
     /// Records a verified reply, ending any outage.
     fn answered(&mut self) {
         if self.failures >= FAILURES_BEFORE_ALERT {
-            info!(server = %self.config.name, failures = self.failures, "roughtime server answering again");
+            info!(
+                alert_resolved = "roughtime_server_failing",
+                server = %self.config.name,
+                "roughtime server answering again after {} failures",
+                self.failures
+            );
         }
         self.failures = 0;
         self.retry_at = None;
@@ -126,7 +131,8 @@ impl Server {
         self.failures = self.failures.saturating_add(1);
         let (server, failures) = (&self.config.name, self.failures);
         if failures == FAILURES_BEFORE_ALERT {
-            warn!(alert = "roughtime_server_failing", %server, failures, "roughtime queries failing: {error:#}");
+            // The count rises while the server stays down, so it is in the message, not the key.
+            warn!(alert = "roughtime_server_failing", %server, "roughtime queries failing, {failures} in a row: {error:#}");
         } else {
             debug!(%server, failures, "roughtime query failed: {error:#}");
         }
@@ -143,14 +149,12 @@ impl Server {
             warn!(
                 alert = "roughtime_server_disagrees",
                 %server,
-                earliest,
-                latest,
-                sample_earliest = sample.earliest_ms,
-                sample_latest = sample.latest_ms,
-                "roughtime server signed a time outside the agreed sample"
+                "roughtime server signed a time outside the agreed sample ({earliest} to {latest}, sample {} to {})",
+                sample.earliest_ms,
+                sample.latest_ms
             );
         } else if agrees && self.dissenting {
-            info!(%server, "roughtime server agrees again");
+            info!(alert_resolved = "roughtime_server_disagrees", %server, "roughtime server agrees again");
         }
         self.dissenting = !agrees;
     }
@@ -181,7 +185,11 @@ impl Sampler {
         match agree(&ranges, self.servers.len(), self.max_width_ms) {
             Ok(sample) => {
                 if !self.sampling {
-                    info!(replies = replies.len(), "trusted time sample restored");
+                    info!(
+                        alert_resolved = "trusted_time_no_sample",
+                        "trusted time sample restored from {} replies",
+                        replies.len()
+                    );
                 }
                 self.sampling = true;
                 replies.iter().for_each(|(i, reply)| self.servers[*i].compare(reply, &sample));

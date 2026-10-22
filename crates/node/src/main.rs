@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use engine_core::auth::{ClientAuth, Operator};
 use engine_node::admin::{self, AdminArgs, HexKey, KeyEnv};
-use engine_node::{NodeConfig, init_logging, replay_path, run};
+use engine_node::{NodeConfig, init_logging, init_telemetry, replay_path, run};
 
 #[derive(Subcommand)]
 enum Cmd {
@@ -37,7 +37,8 @@ struct Cli {
 
 /// Dispatches the subcommand.
 /// Error cases:
-/// - the config cannot be loaded, or the node stops with an error
+/// - the config cannot be loaded, an alert webhook variable is unset or invalid, or the node stops
+///   with an error
 /// - the log is missing or cannot be read, fails its manifest check or verification, or holds no
 ///   command or no checkpoint
 /// - an admin command cannot be signed or submitted, or the engine rejects it
@@ -46,8 +47,8 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Run { config } => {
             let cfg = NodeConfig::load(&config)?;
-            init_logging(&cfg.logging.level)?;
-            run(cfg).await
+            let telemetry = init_telemetry(&cfg, |var| std::env::var(var).ok())?;
+            run(cfg, telemetry).await
         }
         Cmd::Replay { log: path } => {
             init_logging("info")?;

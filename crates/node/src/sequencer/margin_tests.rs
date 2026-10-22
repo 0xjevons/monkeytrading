@@ -113,7 +113,7 @@ fn a_house_with_no_capital_opens_trading_and_alerts_on_a_deficit() {
         }
     });
     assert_eq!(logs.matches(r#"alert="house_deficit""#).count(), 1, "{logs}");
-    assert!(logs.contains("suppressed=0"), "{logs}");
+    assert!(logs.contains("(0 more since the last alert)"), "{logs}");
     seq.flush().unwrap();
     drop(seq);
 

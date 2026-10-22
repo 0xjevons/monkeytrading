@@ -26,6 +26,8 @@ use serde::{Deserialize, Deserializer};
 
 mod custody;
 pub use custody::{EvmCustodySection, FinalityTag, SecretUrl};
+mod telemetry;
+pub use crate::config::telemetry::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +89,8 @@ pub struct NodeConfig {
     pub feeds: FeedsSection,
     pub time: TimeSection,
     pub history: HistorySection,
+    pub metrics: MetricsSection,
+    pub alerts: AlertsSection,
     /// Sequenced as admin commands after protocol activation on a log's first boot, all or nothing,
     /// so the rules every fill ran under are part of the public record.
     pub genesis: Genesis,
@@ -248,6 +252,9 @@ pub struct VenueSymbol {
 pub struct MockMid {
     pub market: u32,
     pub mid: Fixed,
+    /// Stops quoting this market this long after boot, so its price goes stale.
+    #[serde(default, with = "humantime_serde")]
+    pub stop_after: Option<Duration>,
 }
 
 /// Trusted time: the Roughtime servers the host clock is checked against.
@@ -348,6 +355,7 @@ impl NodeConfig {
     /// - `node.auth` is `none` with a TEE or custody provider other than `mock`
     /// - `tee.provider` is not `mock` and `operator.public_key` is a published test key, listed in
     ///   `config/test-keys.toml`
+    /// - `[alerts.critical]` is missing with a TEE or custody provider other than `mock`
     /// - `feeds.venues` is missing for `provider = "venues"`, fails validation, or has a `timeout`
     ///   no longer than `feeds.interval`
     /// - `time.servers` has fewer than two servers, lists a public key twice, or has an address
@@ -436,5 +444,7 @@ fn public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<VerifyingKey
 mod test_keys;
 mod validation;
 
+#[cfg(test)]
+mod telemetry_tests;
 #[cfg(test)]
 mod tests;

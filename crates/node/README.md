@@ -5,8 +5,8 @@
 The node that runs `engine-core` inside a TEE (an Intel TDX or AMD SEV-SNP confidential VM). It
 sequences every command into a public, append-only log, signs state-root checkpoints with an
 attested enclave key, serves the client API, streams the log live, indexes each account's history
-from the log, and talks to custody and price feeds. The same binary replays a published log and
-verifies its checkpoints.
+from the log, and talks to custody and price feeds. For its operator it serves Prometheus metrics
+and posts alerts to webhooks. The same binary replays a published log and verifies its checkpoints.
 
 ## Features
 
@@ -53,6 +53,10 @@ verifies its checkpoints.
 - EVM custody: each vault deposit credited once, after a configurable finality tag and
   confirmations, with a cursor that survives restarts
 - Mock custody and a mock price feed for local development
+- Prometheus metrics on a separate operator address, from a registry the node owns, with no
+  per-account labels or values
+- Alert routing: Critical and Warning alert lines are posted as JSON to a webhook per severity,
+  once when an episode starts and once when it is resolved
 
 ## Repository Structure
 
@@ -62,7 +66,9 @@ verifies its checkpoints.
 - `src/admin/tls.rs` — the TLS connection to a node, pinned to its attested key
 - `src/admin/tests.rs` — `engine admin` tests: key sources, commands, signing, and pins
 - `src/node.rs` — startup, task supervision, and shutdown
-- `src/sequencer/mod.rs` — the sequencer, stream messages, and checkpoints
+- `src/telemetry.rs` — the log subscriber, which feeds alert lines to the router, and the metrics
+  registry, set up before the node runs
+- `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, and metrics
 - `src/sequencer/replay.rs` — log replay, which recovery and `engine replay` share
 - `src/sequencer/required.rs` — client auth, the operator, protocol activation, and genesis, which
   wait for trusted time
@@ -79,6 +85,7 @@ verifies its checkpoints.
 - `src/sequencer/margin_tests.rs` — the margin and solvency dev scenario on the dev genesis (a
   close-out after the rollover's financing, and a withdrawal limited at a stale market's last
   mark), and a genesis with no house capital that trades and alerts on a house deficit
+- `src/sequencer/metrics_tests.rs` — the sequencer's metrics and alert-line tests
 - `src/log/mod.rs` — the JSON-lines log format, stream offsets, and the single-file reader
 - `src/log/segments.rs` — segment files, rotation, the manifest, and the recovery read, a segment
   at a time, with its checks
@@ -119,8 +126,8 @@ verifies its checkpoints.
 - `src/trusted_time/mod.rs` — the trusted time task: queries the Roughtime servers, backs off
   failing ones, and turns agreeing replies into a sample
 - `src/trusted_time/gate.rs` — the sequencer's check of each stamp against the latest sample
-- `src/trusted_time/tests/` — agreement, round, back-off, and gate tests, and the offline dev
-  scenario
+- `src/trusted_time/tests/` — agreement, round, back-off, gate, and alert key tests, and the
+  offline dev scenario
 - `src/roughtime/mod.rs` — the Roughtime client: builds requests and verifies signed replies, for
   version 1 (RFC 10049) and the final drafts' 0x8000000c
 - `src/roughtime/message.rs` — the Roughtime wire format
@@ -135,7 +142,11 @@ verifies its checkpoints.
 - `src/config/mod.rs` — the node config schema and loading
 - `src/config/custody.rs` — the `[custody.evm]` section, the redacted RPC URL, and the custody
   checks
+- `src/config/telemetry.rs` — the metrics listener and alert webhook config, and the redacting
+  `WebhookUrl`
 - `src/config/tests.rs` — config loading and validation tests
+- `src/config/telemetry_tests.rs` — metrics and alert config tests: the Critical route, the dev
+  config's telemetry, and webhook URLs
 - `src/config/validation.rs` — the checks a parsed config must also pass
 - `src/config/test_keys.rs` — the published test keys from `config/test-keys.toml`, which a node
   with real attestation refuses, and their tests
@@ -180,9 +191,21 @@ verifies its checkpoints.
   what the feed sequences, and the wait for the next alert
 - `src/feeds/tests/late.rs` — venue tasks against a sequencer that answers late: when a quote
   counts as the venue quoting, and how a connection's last quotes are settled after it ends
+- `src/feeds/tests/mock.rs` — the mock feed stopping one market at its `stop_after`
 - `src/feeds/tests/scenario.rs` — the dev scenario through the sequencer and engine
 - `src/throttle.rs` — holds a repeating alert to one a minute, counting the ones it held back
 - `src/clock.rs` — the wall and monotonic clocks the sequencer stamps and checks with
+- `src/metrics/mod.rs` — the metrics registry, event counting, and the `/metrics` route
+- `src/metrics/tests.rs` — metrics tests
+- `src/monitor/mod.rs` — samples queue depth, the house, markets, and quote freshness into
+  metrics, and raises `market_no_price`, `market_unfed`, and `sequencer_stalled`
+- `src/monitor/tests.rs` — monitor tests
+- `src/alerts/mod.rs` — the tracing layer that picks up alert lines, the router, and the page
+  format
+- `src/alerts/episodes.rs` — one page per episode start and end
+- `src/alerts/webhook.rs` — webhook routes, the TLS client, and one delivery task per route, with
+  retries
+- `src/alerts/tests.rs` — alert routing tests
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
 - `tests/reference_logs.rs` — replays every committed node reference log, events included
 - `tests/usd_settlement.rs` — the USD settlement dev scenario on the committed dev config: Germany 40
@@ -383,6 +406,53 @@ checkpoint's signed entry, then check the proof with `engine-core`'s `AccountPro
 gets 404 until the next one. Each checkpoint logs, at `debug`, how long its root took and how many
 leaves and tree nodes it hashed.
 
+The operator listener, `metrics.listen` (`127.0.0.1:9464` in `config/dev.toml`), serves
+`GET /metrics` in Prometheus text format. `ops/grafana/engine-node.json` is a Grafana dashboard
+over it, showing sequencer health and the quote freshness of each venue the config feeds (one
+that has not quoted reads as stale from the node's start), and
+`ops/prometheus/engine-node-rules.yml` holds alerting rules for the operator's Prometheus that page
+on what the node cannot page itself: a scrape that stops, and alert pages that fail or are dropped.
+
+The node also watches itself every second. An open market that a configured feed prices raises the
+Critical `market_no_price` once it has had no usable price for `alerts.no_price_after` (its own
+index, or for a market quoted in another currency the FX index it converts at), and a
+sequencer that answers no sample for as long raises `sequencer_stalled`. A market that no configured
+feed prices, such as the non-crypto markets of `config/dev.toml` with `feeds.provider = "venues"`,
+cannot trade; the node names such markets once, in the Warning `market_unfed`, and never pages for
+them.
+
+An alert is a log line at `error` (Critical) or `warn` (Warning) carrying `alert = "<name>"`; a line
+carrying `alert_resolved = "<name>"` and the same fields ends it. With `[alerts.critical]` or
+`[alerts.warning]` configured, the node posts each episode's start and end as JSON to that
+severity's webhook:
+
+```json
+{
+  "status": "firing",
+  "severity": "critical",
+  "alert": "market_no_price",
+  "key": "market_no_price{market=1}",
+  "summary": "BTC-USD has had no usable price for 5s: only 0 fresh sources, need 2",
+  "fields": { "market": "1" },
+  "context": "",
+  "ts_ms": 1792503583932
+}
+```
+
+`status` is `firing` or `resolved`, and `key` is the same for both, so a receiver can match a
+resolve to its alert and drop duplicates. `context` names the spans the line was logged in, such
+as `command{id=42}`. Repeats of a key do not page again until it has been quiet for
+`alerts.episode_quiet`. Each severity's webhook has its own queue, and delivery never blocks the
+code that logged the alert. A page is retried from 1s, doubling to a minute, until the webhook
+answers 2xx; a redirect, or a 4xx other than 408 or 429, refuses it, and it is given up an hour
+after its first attempt. A route holds up to 1024 pages; past that, a page is dropped, logged, and
+counted. Episodes and pending pages live in memory: pages still queued or retrying when the node
+stops are lost once the shutdown grace runs out, though their alert lines remain in the log; after
+a restart an alert still firing pages again, and one that cleared while the node was down sends no
+resolve. Pages that survive a restart are tracked in
+[#102](https://github.com/0xjevons/monkeytrading/issues/102). The HTTP client's own logs are held
+at `warn` whatever `logging.level` says, since a webhook URL is a credential.
+
 ## Configuration
 
 `CONFIG_PATH`: path to the node config file, used when `run` or `admin` is given no config flag.
@@ -391,6 +461,12 @@ leaves and tree nodes it hashed.
 
 `OPERATOR_KEY_FILE`: a file holding the operator's private key in hex, for `admin`.
 
+The alert webhook URLs are credentials, so config names the environment variable that holds each
+(`alerts.critical.url_env`, `alerts.warning.url_env`) rather than the URL. A URL must be HTTPS
+unless it is HTTP to a loopback address, and the node refuses to start when a named variable is
+unset. A node whose TEE or custody provider is not `mock` refuses to start without
+`[alerts.critical]`, since its Critical alerts would otherwise page no one.
+
 ## Testing
 
 ```bash
@@ -398,6 +474,9 @@ cargo test -p engine-node
 
 # The trusted time dev scenario, offline against loopback Roughtime servers
 cargo test -p engine-node trusted_time::tests::scenario
+
+# Dev scenario: a mock feed stops, the market goes stale, and a local webhook gets one page
+./scripts/dev-metrics-alerts.sh
 ```
 
 ## Authors

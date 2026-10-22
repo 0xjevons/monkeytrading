@@ -3,8 +3,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use engine_core::auth::ClientAuth;
@@ -23,6 +24,7 @@ use tracing::field::{Field, Visit};
 use tracing::subscriber::DefaultGuard;
 use tracing::{Event as LogEvent, Subscriber};
 use tracing_subscriber::Registry;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 use crate::api::{Feed, MAX_BACKFILLS};
@@ -30,6 +32,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::config::{HistorySection, NodeConfig};
 use crate::history::{History, HistoryCheck, HistoryEvent, Reader};
 use crate::log::{self, LogEntry, LogReader, Manifest, Offset, SegmentedLog};
+use crate::metrics::Metrics;
 use crate::sequencer::{Request, Sequencer, SequencerConfig, SignedWithdrawal, StreamMsg};
 use crate::tee::EnclaveKey;
 use crate::trusted_time::Sample;
@@ -53,6 +56,7 @@ pub struct TestSequencer {
     pub manifest: watch::Receiver<Manifest>,
     /// What custody receives.
     pub withdrawals: mpsc::UnboundedReceiver<SignedWithdrawal>,
+    pub metrics: Arc<Metrics>,
     task: JoinHandle<anyhow::Result<()>>,
 }
 
@@ -70,7 +74,9 @@ impl TestSequencer {
         let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
         let (manifest_tx, manifest) = watch::channel(Manifest::default());
         let key = Arc::new(EnclaveKey::generate());
-        let cfg = SequencerConfig { clock: clock.clone(), ..sequencer_config(dir, manifest_tx) };
+        let metrics = Arc::new(Metrics::new());
+        let cfg =
+            SequencerConfig { clock: clock.clone(), metrics: metrics.clone(), ..sequencer_config(dir, manifest_tx) };
         let mut seq = Sequencer::recover(cfg, key, stream.clone(), withdrawals_tx).expect("sequencer recovers");
         // As the node does, parameters an older log set take the config's notional weighting first.
         let weighting = dev_config().genesis.params.toxicity.notional.expect("the dev config weighs by notional");
@@ -83,7 +89,7 @@ impl TestSequencer {
         seq.trust(sample_around(clock.as_ref())).expect("dev genesis");
         let (tx, rx) = mpsc::channel(64);
         let task = tokio::spawn(seq.run(rx));
-        Self { tx, stream, manifest, withdrawals, task }
+        Self { tx, stream, manifest, withdrawals, metrics, task }
     }
 
     /// Stops the sequencer as a shutdown does: it drains and writes a final checkpoint.
@@ -245,6 +251,7 @@ pub fn sequencer_config(dir: &Path, manifest: watch::Sender<Manifest>) -> Sequen
         max_drift: Duration::from_secs(10),
         client_auth: ClientAuth::Unsigned,
         operator: dev_config().operator().expect("the dev operator parses"),
+        metrics: Arc::new(Metrics::new()),
     }
 }
 
@@ -447,4 +454,34 @@ pub fn every_event() -> Vec<Event> {
         }
     }
     events
+}
+
+/// A log writer that keeps what it is given.
+#[derive(Clone, Default)]
+pub struct Written(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for Written {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'w> MakeWriter<'w> for Written {
+    type Writer = Written;
+
+    fn make_writer(&'w self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl Written {
+    /// Everything written so far.
+    pub fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
 }

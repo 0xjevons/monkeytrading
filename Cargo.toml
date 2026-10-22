@@ -32,11 +32,15 @@ humantime-serde = "1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+prometheus-client = "0.25"
 proptest = { version = "1.12", default-features = false, features = ["std"] }
 rand = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+# HTTPS for alert webhooks. TLS is configured in code: rustls on ring with the compiled-in Mozilla roots.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
-# TLS for the API and venue feeds with ring as the only crypto provider, so no OpenSSL or aws-lc build.
+# TLS for the API, venue feeds, and alert webhooks with ring as the only crypto provider, so no
+# OpenSSL or aws-lc build.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
