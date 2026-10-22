@@ -17,6 +17,18 @@ def test_tail_probability_extrapolates_an_exponential_tail():
     assert experiments.tail_probability(values) == pytest.approx(np.exp(-10), rel=0.5)
 
 
+def test_tail_probability_never_reports_less_than_the_sample_shows():
+    # 5 failures in 2,000 paths, with the rest of the worst 5% bunched far above zero: the fit alone
+    # would give about 2e-5, under the observed 0.25%.
+    rng = np.random.default_rng(1)
+    values = np.concatenate([np.full(5, -10.0), 250 + 50 * rng.random(95), 300 + 100 * rng.random(1900)])
+    assert experiments.tail_probability(values) == pytest.approx(5 / 2000)
+
+
+def test_tail_probability_is_zero_when_nothing_ever_opened():
+    assert experiments.tail_probability(np.full(2000, np.inf)) == 0.0
+
+
 def test_tail_probability_falls_back_to_the_rule_of_three():
     values = np.concatenate([np.zeros(500), np.full(500, np.inf)])  # no tail below the cut to fit
     assert experiments.tail_probability(values) == pytest.approx(3 / 1000)
@@ -42,3 +54,11 @@ def test_the_chosen_level_is_the_largest_total_floor_meeting_the_target():
     rows = [{"total_floor": f, "p": p} for f, p in ((0, 0.0), (10, 0.0005), (20, 0.003), (30, 0.0))]
     assert experiments.chosen_level(rows, "p", 0.001)["total_floor"] == 10
     assert experiments.chosen_level([{"total_floor": 0, "p": 0.5}], "p", 0.01) is None
+
+
+def test_a_lane_where_nothing_opened_cannot_be_insolvent():
+    n = 2000
+    out = {k: np.zeros((n, 1)) for k in ("nav_end", "refused", "refused_hedged", "desired", "desired_directional", "refused_week1", "desired_week1", "fee", "financing", "bad_debt", "mint_basis", "max_queue", "max_gross_exposure")}
+    out |= {"min_nav": np.full((n, 1), np.inf), "min_cash": np.full((n, 1), np.inf), "ever_negative": np.zeros((n, 1), bool), "queued": np.zeros((n, 1), bool), "first_negative_h": np.full((n, 1), -1)}
+    stats = experiments.lane_stats(out, 0)
+    assert stats["p_end_tail"] == stats["p_ever_tail"] == stats["p_short_tail"] == 0.0

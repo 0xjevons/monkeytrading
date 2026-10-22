@@ -4,11 +4,13 @@ sensitivities.
 Insolvency measures, each a probability over the 90 days:
 - `p_end`: house NAV is below zero at the end;
 - `p_ever`: house NAV is below zero at some hour-end;
-- `p_short`: at some hour-end the vault holds less than the free balances clients could withdraw
-  on demand, which happens exactly when house cash plus the margin in open positions is negative;
+- `p_short`: at some hour-end house cash is below zero, so the vault holds less than clients'
+  balances. What clients may withdraw at once is never more than their balances, so this bounds
+  from above the chance that the vault cannot pay a withdrawal on demand;
 - `p_queue`: under the modelled withdrawals, some withdrawal waits in the #49 queue.
 The first three have a `_tail` form, read from the sample down to 20 paths and extrapolated below
-that from the worst 5% of the underlying amount (NAV at the end, the lowest NAV, the lowest cover),
+that from the worst 5% of the underlying amount (NAV at the end, the lowest NAV, the lowest house
+cash),
 which the calibration uses. `p_dip_100k` and `p_dip_1m` give the chance the lowest NAV falls
 below -$100k and -$1M.
 
@@ -16,7 +18,8 @@ Calibration, per measure: each market alone gives a curve of the measure against
 risk level `q` sets every market's floor to the largest tested floor at which the market alone
 stays at or below `q`, no higher than the floor at which it stops refusing orders, and zero when
 even a zero floor exceeds `q`; the total floor is the sum. The joint runs sweep `q`, and a target
-takes the largest `q` whose joint measure meets it.
+takes the largest `q` whose joint measure meets it. At the level chosen for 1%, a second joint run
+sweeps the total floor below the sum, where the total cap starts to bind.
 """
 
 import csv
@@ -31,47 +34,57 @@ from model import simulate
 TARGETS = (0.01, 0.001, 0.0001)
 MEASURES = ("p_ever_tail", "p_short_tail")
 MARKET_FLOORS = np.concatenate([[0.0], np.geomspace(1e4, 1e8, 17)])
-LEVELS = (0.0, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 0.1, 1.0)  # 1.0: every market at its binding point
-SCALES = np.array([0.25, 0.5, 1.0, 2.0, 4.0])
+LEVELS = (0.0, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.2, 0.3, 0.5, 1.0)  # 1.0: every market at its binding point
+TOTAL_FRACTIONS = np.array([0.25, 0.5, 0.75, 1.0])  # total floor as a share of the market floors' sum
+SCALES = np.array([0.1, 0.3, 1.0])  # sensitivity floor scales
 NO_TOTAL_LIMIT = 1e15
 
 
 def tail_probability(values: np.ndarray, threshold: float = 0.0, tail: float = 0.05) -> float:
     """P(value < threshold): read from the sample when it holds at least 20 such paths, else
-    extrapolated from an exponential fit to the worst `tail` of the sample. When neither works and
-    no path is below the threshold, the 95% upper bound for zero events, 3 / paths."""
+    extrapolated from an exponential fit to the worst `tail` of the sample, never below the rate
+    the sample shows. When the fit does not apply, the observed rate, or with no path below the
+    threshold the 95% upper bound for zero events, 3 / paths."""
     n = len(values)
     hits = int((values < threshold).sum())
     if hits >= 20:
         return hits / n
     finite = values[np.isfinite(values)]
+    if len(finite) == 0:  # no path ever opened anything: nothing can fall below zero
+        return 0.0
     if len(finite) >= 200:
         cut = np.quantile(finite, min(1.0, tail * n / len(finite)))  # the worst `tail` of all paths
         excess = cut - finite[finite < cut]
         if cut > threshold and len(excess) > 0 and excess.mean() > 0:
-            return float(tail * np.exp(-(cut - threshold) / excess.mean()))
+            return max(hits / n, float(tail * np.exp(-(cut - threshold) / excess.mean())))
     return max(hits, 3) / n
 
 
 def lane_stats(out: dict, lane: int) -> dict:
     nav_end = out["nav_end"][:, lane]
+    opened = bool(np.isfinite(out["min_nav"][:, lane]).any())  # some path had cash or exposure
+    tail = tail_probability if opened else (lambda values: 0.0)
+    first_negative = out["first_negative_h"][:, lane][out["first_negative_h"][:, lane] >= 0]
+    lowest_nav = np.where(np.isfinite(out["min_nav"][:, lane]), out["min_nav"][:, lane], 0.0)  # 0 where nothing opened
     return {
         "p_end": float((nav_end < 0).mean()),
-        "p_end_tail": tail_probability(nav_end),
+        "p_end_tail": tail(nav_end),
         "p_ever": float(out["ever_negative"][:, lane].mean()),
-        "p_ever_tail": tail_probability(out["min_nav"][:, lane]),
+        "p_ever_tail": tail(out["min_nav"][:, lane]),
         "p_queue": float(out["queued"][:, lane].mean()),
         "p_dip_100k": float((out["min_nav"][:, lane] < -1e5).mean()),
         "p_dip_1m": float((out["min_nav"][:, lane] < -1e6).mean()),
-        "p_short": float((out["min_cover"][:, lane] < 0).mean()),
-        "p_short_tail": tail_probability(out["min_cover"][:, lane]),
-        "refused_share": float(out["refused"][:, lane].sum() / out["desired"][:, lane].sum()),
+        "p_short": float((out["min_cash"][:, lane] < 0).mean()),
+        "p_short_tail": tail(out["min_cash"][:, lane]),
+        "refused_share": float((out["refused"][:, lane].sum() + out["refused_hedged"][:, lane].sum()) / max(out["desired"][:, lane].sum(), 1e-9)),
         "refused_share_directional": float(out["refused"][:, lane].sum() / max(out["desired_directional"][:, lane].sum(), 1e-9)),
+        "refused_share_week1": float(out["refused_week1"][:, lane].sum() / max(out["desired_week1"][:, lane].sum(), 1e-9)),
+        "first_negative_day_p50": float(np.median(first_negative) / 24) if len(first_negative) else -1.0,
         "nav_end_mean": float(nav_end.mean()),
         "nav_end_p01": float(np.quantile(nav_end, 0.01)),
         "nav_end_p50": float(np.quantile(nav_end, 0.5)),
-        "min_nav_p01": float(np.quantile(out["min_nav"][:, lane], 0.01)),
-        "min_nav_p50": float(np.quantile(out["min_nav"][:, lane], 0.5)),
+        "min_nav_p01": float(np.quantile(lowest_nav, 0.01)),
+        "min_nav_p50": float(np.quantile(lowest_nav, 0.5)),
         "fee_mean": float(out["fee"][:, lane].mean()),
         "financing_mean": float(out["financing"][:, lane].mean()),
         "bad_debt_mean": float(out["bad_debt"][:, lane].mean()),
@@ -151,6 +164,21 @@ def joint(scenario, markets, bars, flow, sweep: list[dict], workers: int) -> dic
     return {
         key: joint_rows(markets, out, floors, floors.sum(axis=1), list(LEVELS))
         for key, floors, out in zip(MEASURES, floor_sets, simulate.run_many(tasks, workers))
+    }
+
+
+def total_sweep(scenario, markets, bars, flow, base: dict[str, dict], workers: int) -> dict:
+    """For each measure, its base level's market floors with the total floor at `TOTAL_FRACTIONS`
+    of their sum."""
+    tasks, floor_sets = [], []
+    for key in MEASURES:
+        floors = np.array([base[key]["market_floors"][s] for s in markets.symbols])
+        lanes = np.repeat(floors[None, :], len(TOTAL_FRACTIONS), axis=0)
+        floor_sets.append((lanes, TOTAL_FRACTIONS * floors.sum()))
+        tasks.append((replace(scenario, name=f"total {key}"), markets, bars, flow, lanes, TOTAL_FRACTIONS * floors.sum()))
+    return {
+        key: joint_rows(markets, out, lanes, totals, TOTAL_FRACTIONS.tolist())
+        for key, (lanes, totals), out in zip(MEASURES, floor_sets, simulate.run_many(tasks, workers))
     }
 
 

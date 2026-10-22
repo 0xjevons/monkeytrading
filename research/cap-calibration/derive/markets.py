@@ -5,7 +5,8 @@ Outputs, under `data/derived/`:
   `WEEK0`, four log returns in millionths: the bar's open against the previous bar's close
   (`gap`), and its high, low, and close against its own open. A closed hour is `CLOSED`.
 - `market_stats.csv`: volatility, gap, and jump statistics per market, over the hourly window and
-  over the long daily history.
+  over the daily history from 2016, and for each market with an official FRED series the weekly
+  return correlation and volatility ratio of the hourly data against it.
 - `market_mix.csv`: each market's share of trading volume, from its Hyperliquid listing's mean
   daily notional; a market with no listing takes its asset class's smallest listed volume.
 
@@ -13,9 +14,10 @@ Cleaning rules for hourly bars:
 - A gap across a one-hour step is set to zero. A continuously traded market's next bar opens at the
   previous close; the gaps the public series show there are front- and next-month contracts
   alternating around a futures roll.
-- For the nearly 24-hour markets (crypto, FX, futures), a gap after an unexplained weekday hole of
-  3 to 24 hours is set to zero: those holes are where the public futures series switches contract.
-  Gaps over the daily break (2 hours), weekends, and holidays (24 hours or more) are kept.
+- For the nearly 24-hour markets (crypto, FX, futures), a gap after a hole of 3 to 24 hours is set
+  to zero unless the hole touches a US market holiday or early close (or the day either side):
+  the other holes are where the public futures series switches contract. Gaps over the daily
+  break (2 hours), weekends, holiday halts, and holidays are kept.
 - For shares, the overnight gap is kept.
 - DE40 and UK100 use cash indices, which close overnight, for venue futures that trade 20 or more
   hours a day. A weekday overnight gap is folded into the next bar as continuous movement. A
@@ -26,12 +28,13 @@ Cleaning rules for hourly bars:
 import csv
 import gzip
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 
 from catalogue import FRED_CHECKS, HYPERLIQUID, launch_markets
+from fetch.markets import DAILY_START
 
 WEEK0 = datetime(2024, 10, 28, tzinfo=UTC)
 WEEKS = 102
@@ -71,6 +74,52 @@ def clean(ts, o, h, l, c):
     return ts, o, h, l, c
 
 
+def easter(year: int) -> date:
+    """Gregorian Easter Sunday (the anonymous algorithm)."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    m = (32 + 2 * e + 2 * i - h - k) % 7
+    n = (a + 11 * h + 22 * m) // 451
+    return date(year, (h + m - 7 * n + 114) // 31, (h + m - 7 * n + 114) % 31 + 1)
+
+
+def nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The n-th `weekday` (Monday 0) of a month; n = -1 is the last."""
+    if n > 0:
+        first = date(year, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+    last = date(year + month // 12, month % 12 + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def us_closure_dates(years) -> set[date]:
+    """US market holidays (observed) and early closes, where US venues halt or shut."""
+    out = set()
+    for y in years:
+        fixed = [date(y, 1, 1), date(y, 6, 19), date(y, 7, 4), date(y, 12, 25)]
+        for d in fixed:
+            out.add(d + timedelta(days={5: -1, 6: 1}.get(d.weekday(), 0)))
+        thanksgiving = nth_weekday(y, 11, 3, 4)
+        out |= {
+            nth_weekday(y, 1, 0, 3), nth_weekday(y, 2, 0, 3), easter(y) - timedelta(days=2),
+            nth_weekday(y, 5, 0, -1), nth_weekday(y, 9, 0, 1), thanksgiving,
+            thanksgiving + timedelta(days=1), date(y, 7, 3), date(y, 12, 24),
+        }
+    return out
+
+
+HOLIDAYS = us_closure_dates(range(WEEK0.year - 1, WEEK0.year + 4))
+
+
+def near_holiday(hour: int) -> bool:
+    day = (WEEK0 + timedelta(hours=int(hour))).date()
+    return any(day + timedelta(days=k) in HOLIDAYS for k in (-1, 0, 1))
+
+
 def hourly_grid(ts, o, h, l, c, kind: str) -> np.ndarray:
     """(HOURS, 4) int32 grid of gap, high, low, close log returns, cleaned as the module says."""
     start = int(WEEK0.timestamp())
@@ -86,7 +135,9 @@ def hourly_grid(ts, o, h, l, c, kind: str) -> np.ndarray:
     step[1:] = np.diff(hour)
     gap[step <= 1] = 0.0
     if kind == "continuous":
-        gap[(step >= 3) & (step < 24)] = 0.0
+        for i in np.flatnonzero((step >= 3) & (step < 24)):
+            if not (near_holiday(hour[i - 1]) or near_holiday(hour[i])):
+                gap[i] = 0.0
     gap[0] = 0.0
     hi, lo, cl = np.log(h / o), np.log(l / o), np.log(c / o)
     if kind == "folded":
@@ -124,10 +175,10 @@ def daily_closes(raw: Path, symbol: str, source: str, ticker: str) -> tuple[str,
             if value not in ("", ".") and float(value) > 0:  # WTI settled below zero on 2020-04-20
                 dates.append(datetime.fromisoformat(date).replace(tzinfo=UTC).timestamp())
                 values.append(float(value))
-        return f"FRED {sid}", np.array(dates), np.array(values)
+        return trim(f"FRED {sid}", np.array(dates), np.array(values))
     if source == "binance":
         ts, _, _, _, c = clean(*load_bars(raw, source, ticker, "1d"))
-        return f"Binance {ticker} 1d", ts.astype(float), c
+        return trim(f"Binance {ticker} 1d", ts.astype(float), c)
     result = json.loads(gzip.decompress((raw / "yahoo" / f"{ticker}_1d.json.gz").read_bytes()))["chart"]["result"][0]
     ts = np.array(result["timestamp"], dtype=float)
     close = np.array(result["indicators"]["quote"][0]["close"], dtype=float)
@@ -135,7 +186,35 @@ def daily_closes(raw: Path, symbol: str, source: str, ticker: str) -> tuple[str,
     if adj is not None:
         close = np.array(adj, dtype=float)
     ok = np.isfinite(close) & (close > 0)
-    return f"Yahoo {ticker} 1d", ts[ok], close[ok]
+    return trim(f"Yahoo {ticker} 1d", ts[ok], close[ok])
+
+
+def trim(source: str, ts: np.ndarray, close: np.ndarray) -> tuple[str, np.ndarray, np.ndarray]:
+    """Daily closes from `DAILY_START` on, so every market's long history covers the same span."""
+    keep = ts >= DAILY_START.timestamp()
+    return source, ts[keep], close[keep]
+
+
+def weekly_check(grid: np.ndarray, ts: np.ndarray, close: np.ndarray) -> tuple[float, float]:
+    """Correlation and volatility ratio of week-on-week log returns: the hourly grid's last close
+    before Saturday 00:00 UTC in each week against the official series' last close dated in the
+    same week, both Friday's close in a normal week."""
+    hourly_ret, _ = path_returns(grid)
+    level = np.cumsum(hourly_ret)
+    is_open = grid[:, 0] != CLOSED
+    ours = np.full(WEEKS, np.nan)
+    for w in range(WEEKS):
+        hours = np.flatnonzero(is_open[w * 168 : w * 168 + 120])  # Monday to Friday
+        if len(hours):
+            ours[w] = level[w * 168 + hours[-1]]
+    theirs = np.full(WEEKS, np.nan)
+    week = ((ts - WEEK0.timestamp()) // (7 * 86400)).astype(np.int64)
+    for w, value in zip(week, np.log(close)):
+        if 0 <= w < WEEKS:
+            theirs[w] = value
+    a, b = np.diff(ours), np.diff(theirs)
+    ok = np.isfinite(a) & np.isfinite(b)
+    return float(np.corrcoef(a[ok], b[ok])[0, 1]), float(a[ok].std() / b[ok].std())
 
 
 def margin_rate(market: dict) -> float:
@@ -152,6 +231,7 @@ def stats_row(market: dict, grid: np.ndarray, daily: tuple) -> dict:
     reopen = gaps[np.isfinite(gaps) & (gaps != 0)]
     m = margin_rate(market)
     source, d_ts, d_close = daily
+    check = weekly_check(grid, d_ts, d_close) if market["symbol"] in FRED_CHECKS else None
     d_ret = np.diff(np.log(d_close))
     span_years = (d_ts[-1] - d_ts[0]) / (365.25 * 86400)
     per_year = len(d_ret) / span_years
@@ -177,6 +257,9 @@ def stats_row(market: dict, grid: np.ndarray, daily: tuple) -> dict:
         "daily_abs_p99_long": round(np.quantile(np.abs(d_ret), 0.99), 4),
         "daily_abs_max_long": round(np.abs(d_ret).max(), 4),
         "daily_kurtosis_long": round(float(((d_ret - d_ret.mean()) ** 4).mean() / d_ret.var() ** 2 - 3), 1),
+        "check_series": source if market["symbol"] in FRED_CHECKS else "",
+        "check_weekly_corr": round(check[0], 3) if check else "",
+        "check_weekly_vol_ratio": round(check[1], 3) if check else "",
     }
 
 

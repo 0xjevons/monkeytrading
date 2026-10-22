@@ -1,0 +1,42 @@
+{
+ "command": [
+  "sensitivity",
+  "--workers",
+  "4",
+  "--batch-paths",
+  "50"
+ ],
+ "scenario": {
+  "name": "baseline",
+  "paths": 1000,
+  "seed": 1,
+  "days": 90,
+  "flow_scale": 1.0,
+  "hedged_share": null,
+  "leverage_mapping": "capped",
+  "vol_scale": 1.0,
+  "block_weeks": 4,
+  "independent_markets": false,
+  "common_direction": false,
+  "demean": true,
+  "hold_through_closures": true,
+  "farm_half_life_days": null,
+  "gap_pair_share": 0.0,
+  "withdraw_on_exit": 0.5,
+  "idle_withdraw_per_day": 0.05,
+  "run_withdraw_per_day": 0.5,
+  "batch_paths": 50
+ },
+ "derived_sha256": {
+  "hourly_bars.npz": "d742bab6c751e973",
+  "market_mix.csv": "cbf00cf20cf6fde8",
+  "market_stats.csv": "5c590a0c86a90c0a",
+  "papertrade_daily.csv": "295c2cd9fe38756b",
+  "papertrade_flow.csv": "80d20e5b76f09a05",
+  "papertrade_holding.csv": "bf066bbc49e19029",
+  "papertrade_sizes.csv": "aa8a8141f2bdbcf2",
+  "papertrade_summary.json": "c5b04a82fbf0c5ba"
+ },
+ "workers": 4,
+ "seconds": 35735
+}

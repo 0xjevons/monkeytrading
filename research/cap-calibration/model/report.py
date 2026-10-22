@@ -9,7 +9,7 @@ from model.experiments import SCALES, TARGETS, binding_point, chosen_level
 
 MEASURE_NAMES = {
     "p_ever_tail": "NAV below zero at some hour",
-    "p_short_tail": "vault short of free balances at some hour",
+    "p_short_tail": "house cash below zero (the vault short of client balances) at some hour",
     "p_end_tail": "NAV below zero at day 90",
 }
 
@@ -27,7 +27,7 @@ def usd(x) -> str:
 
 
 def pct(x, digits: int = 2) -> str:
-    x = float(x)
+    x = max(float(x), 0.0)  # refused shares can come out a rounding error below zero
     if x == 0:
         return "0"
     if x < 0.0001:
@@ -112,19 +112,39 @@ def per_market_section(results: Path) -> str:
         mine = sorted((r for r in sweep if r["symbol"] == symbol), key=lambda r: r["floor"])
         bind = binding_point(mine)
         at_bind = next((r for r in mine if r["floor"] == bind), mine[-1])
-        zero = mine[0]
         rows.append([
             symbol,
-            pct(zero["refused_share_directional"], 1),
             usd(bind) if bind is not None else "> $100M",
-            pct(zero["p_ever_tail"], 3),
             pct(at_bind["p_ever_tail"], 3),
-            pct(zero["p_short_tail"], 3),
             pct(at_bind["p_short_tail"], 3),
-            usd(zero["bad_debt_mean"]),
+            pct(at_bind["refused_share_week1"], 1),
+            usd(at_bind["bad_debt_mean"]),
+            usd(at_bind["fee_mean"]),
         ])
-    header = ["Market", "Refused at zero floor", "Refusals end at", "NAV<0 ever, zero floor", "at refusals' end", "Short, zero floor", "at refusals' end", "Bad debt mean, zero floor"]
-    return "\n".join(["## Each market alone", "", table(header, rows), ""])
+    header = ["Market", "Refusals end at", "NAV<0 ever", "Cash<0", "Refused, week 1", "Bad debt mean", "Fees mean"]
+    intro = "Each market alone at its share of the flow, at the floor where its 90-day refused share falls under 1%. With a zero floor nothing opens."
+    return "\n".join(["## Each market alone", "", intro, "", table(header, rows), ""])
+
+
+JOINT_HEADER = ["Total floor", "NAV<0 ever", "Cash<0", "Queue", "NAV<0 day 90", "NAV<-$100k", "NAV<-$1M", "First dip p50 (day)", "Refused, week 1", "Refused, 90 days", "NAV day 90 p50", "Lowest NAV p1", "Bad debt mean"]
+
+
+def joint_row(r: dict) -> list:
+    return [
+        usd(r["total_floor"]),
+        pct(r["p_ever_tail"], 3),
+        pct(r["p_short_tail"], 3),
+        pct(r["p_queue"], 3),
+        pct(r["p_end_tail"], 3),
+        pct(r["p_dip_100k"], 2),
+        pct(r["p_dip_1m"], 2),
+        f"{r['first_negative_day_p50']:.1f}" if r["first_negative_day_p50"] >= 0 else "-",
+        pct(r["refused_share_week1"], 1),
+        pct(r["refused_share_directional"], 1),
+        usd(r["nav_end_p50"]),
+        usd(r["min_nav_p01"]),
+        usd(r["bad_debt_mean"]),
+    ]
 
 
 def joint_section(results: Path) -> str:
@@ -134,32 +154,29 @@ def joint_section(results: Path) -> str:
         if not path.exists():
             continue
         rows = sorted(read(path), key=lambda r: r["total_floor"])
-        body = [
-            [
-                "binding" if float(r["level"]) == 1.0 else pct(r["level"], 2),
-                usd(r["total_floor"]),
-                pct(r["p_ever_tail"], 3),
-                pct(r["p_short_tail"], 3),
-                pct(r["p_queue"], 3),
-                pct(r["p_end_tail"], 3),
-                pct(r["p_dip_100k"], 2),
-                pct(r["p_dip_1m"], 2),
-                pct(r["refused_share_directional"], 1),
-                usd(r["nav_end_p50"]),
-                usd(r["min_nav_p01"]),
-                usd(r["bad_debt_mean"]),
-            ]
-            for r in rows
-        ]
-        header = ["Level", "Total floor", "NAV<0 ever", "Short", "Queue", "NAV<0 day 90", "NAV<-$100k", "NAV<-$1M", "Refused", "NAV day 90 p50", "Lowest NAV p1", "Bad debt mean"]
-        out += [f"### Floors set for {MEASURE_NAMES[measure]}", "", table(header, body), ""]
+        body = [["binding" if r["level"] == 1.0 else pct(r["level"], 2)] + joint_row(r) for r in rows]
+        out += [f"### Floors set for {MEASURE_NAMES[measure]}", "", table(["Level"] + JOINT_HEADER, body), ""]
         chosen = {t: chosen_level(rows, measure, t) for t in TARGETS}
-        lines = [f"- {pct(t)}: " + (f"level {pct(c['level'], 2)}, total floor {usd(c['total_floor'])}, refused {pct(c['refused_share_directional'], 1)}" if c else "no level meets it; zero floors give " + pct(rows[0][measure], 3)) for t, c in chosen.items()]
+        lines = [
+            f"- {pct(t)}: "
+            + (f"level {pct(c['level'], 2)}, total floor {usd(c['total_floor'])}, refused {pct(c['refused_share_week1'], 1)} in week 1" if c else "no level meets it; the smallest level gives " + pct(rows[0][measure], 3))
+            for t, c in chosen.items()
+        ]
         out += ["Chosen per target:", "", *lines, ""]
         symbols = list(json.loads(rows[0]["market_floors"]))
         body = [[s] + [usd(json.loads(c["market_floors"])[s]) if c else "-" for c in chosen.values()] for s in symbols]
         body.append(["Total"] + [usd(c["total_floor"]) if c else "-" for c in chosen.values()])
         out += [table(["Market"] + [f"Floor at {pct(t)}" for t in TARGETS], body), ""]
+        total_path = results / f"joint_total_{measure}.csv"
+        if total_path.exists():
+            totals = sorted(read(total_path), key=lambda r: r["total_floor"])
+            body = [[f"x{r['level']:g}"] + joint_row(r) for r in totals]
+            out += [
+                f"Total floor below the sum, at level {pct(totals[0]['base_level'], 2)}'s market floors:",
+                "",
+                table(["Share of sum"] + JOINT_HEADER, body),
+                "",
+            ]
     return "\n".join(out)
 
 
@@ -171,13 +188,26 @@ def sensitivity_section(results: Path) -> str:
     names = list(dict.fromkeys(r["scenario"] for r in rows))
     body = []
     for name in names:
-        mine = {float(r["floor_scale"]): r for r in rows if r["scenario"] == name}
+        mine = {r["floor_scale"]: r for r in rows if r["scenario"] == name}
         base = mine[1.0]
-        ok = [s for s in SCALES if float(mine[float(s)]["p_ever_tail"]) <= 0.001]
-        body.append([name, pct(base["p_ever_tail"], 3), pct(base["p_short_tail"], 3), pct(base["p_queue"], 3), pct(base["p_dip_100k"], 2), pct(base["refused_share_directional"], 1), usd(base["nav_end_p50"]), usd(base["bad_debt_mean"]), f"x{max(ok):g}" if ok else "none"])
-    level = rows[0]["base_level"]
-    header = ["Scenario", "NAV<0 ever", "Short", "Queue", "NAV<-$100k", "Refused", "NAV day 90 p50", "Bad debt mean", "Largest floor scale meeting 0.1%"]
-    intro = f"Every floor at the level chosen for {MEASURE_NAMES['p_ever_tail']} at 0.1% (level {pct(level, 2)}), and scaled together by x0.25 to x4."
+        largest = lambda key: max((s for s in SCALES if mine[float(s)][key] <= 0.01), default=None)  # noqa: E731
+        body.append([
+            name,
+            pct(base["p_ever_tail"], 3),
+            pct(base["p_short_tail"], 3),
+            pct(base["p_dip_100k"], 2),
+            pct(base["refused_share_week1"], 1),
+            usd(base["nav_end_p50"]),
+            usd(base["fee_mean"]),
+            usd(base["bad_debt_mean"]),
+            " / ".join(f"x{v:g}" if v is not None else "none" for v in (largest("p_ever_tail"), largest("p_short_tail"))),
+        ])
+    first = rows[0]
+    measure, level, met = first["base_measure"], first["base_level"], first["base_meets_target"] == "True"
+    base = f"the floors chosen for {MEASURE_NAMES[measure]} at 1% (level {pct(level, 2)})" if met else "zero floors, as no level met 1%"
+    header = ["Scenario", "NAV<0 ever", "Cash<0", "NAV<-$100k", "Refused, week 1", "NAV day 90 p50", "Fees mean", "Bad debt mean", "Largest scale at 1%: NAV / cash"]
+    scales = ", ".join(f"x{s:g}" for s in SCALES)
+    intro = f"Every scenario at {base}, and with every floor scaled together by {scales}."
     return "\n".join(["## Sensitivity", "", intro, "", table(header, body), ""])
 
 
@@ -185,7 +215,7 @@ def write(derived: Path, results: Path) -> None:
     parts = [
         "# Cap calibration results",
         "",
-        "Generated by `run.py report` from `data/derived/` and `results/`. Probabilities are over 90 days.",
+        "Generated by `run.py report` from `data/derived/` and `results/`. Probabilities are over 90 days; refused shares are of opening notional, directional flow and churn.",
         "",
         data_section(derived),
         market_section(derived),

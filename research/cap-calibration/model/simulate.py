@@ -9,15 +9,20 @@ Per hour and market:
    the open when the market gaps through it. A loss beyond the balance is bad debt.
 2. House NAV is house cash minus clients' unrealised PnL; each cap is the larger of its NAV share
    and its floor, per market and in total.
-3. New directional flow is accepted up to the caps: the side that reduces the house's net
-   exposure in full, the crowded side up to the cap. Refused notional is counted.
-4. Hedged flow opens offsetting pairs in two accounts, which the caps never refuse; a pair ends
-   when either leg is closed out (the other leg closes with it) or at its hold.
-5. Flow held under an hour (churn) pays the profit fee on its expected gain over its hold.
-6. Cash moves through the vault: exits return proceeds to idle balances, new margin is drawn
-   from them first and the rest deposited, and a share of the proceeds left is withdrawn; idle
-   balances leave at a daily rate, faster while NAV is below zero; a withdrawal the vault cannot
-   pay waits in a first-in-first-out queue (#49).
+3. At a 22:00 rollover, every open position pays or receives financing on its notional at the
+   mark.
+4. New flow opens only in orders small enough to fit under the cap; of that, the side that reduces
+   the house's net exposure fills in full and the crowded side up to the cap. Refused notional is
+   counted.
+5. Hedged flow opens offsetting pairs in two accounts, which leave the house's net exposure
+   unchanged; a pair ends when either leg is closed out (the other leg closes with it) or at its
+   hold.
+6. Flow held under an hour (churn) pays the profit fee on its expected gain over its hold, and its
+   mean open net notional takes the hour's move.
+7. Cash moves through the vault: exits return proceeds to idle balances, new margin and churn's
+   dues are drawn from them first and the rest deposited, and a share of the proceeds left is
+   withdrawn; idle balances leave at a daily rate, faster while NAV is below zero; a withdrawal
+   the vault cannot pay waits in a first-in-first-out queue (#49).
 """
 
 from dataclasses import dataclass
@@ -26,7 +31,7 @@ import numpy as np
 
 from model import accounting
 from model import prices as pricing
-from model.flow import Flow, daily_margin_path, mapped_leverage
+from model.flow import Flow, daily_margin_path, fit_share, mapped_leverage
 
 # Benchmark rates in bps a year: FRED on 2026-10-19 for SOFR (3.87%), SONIA (3.73%), and ESTR
 # (2.44%); TONA and AONIA are assumptions near the Bank of Japan and Reserve Bank of Australia
@@ -52,7 +57,7 @@ class Scenario:
     demean: bool = True  # remove each market's drift over the history
     hold_through_closures: bool = True  # a planned exit inside a closure waits for the open
     farm_half_life_days: float | None = None  # hedged flow decays with the MONKEY mint rate
-    gap_pair_share: float = 0.0  # hedged margin of the past week held through each closure, at max leverage
+    gap_pair_share: float = 0.0  # share of the past week's accepted hedged margin held through each closure, at max leverage
     withdraw_on_exit: float = 0.5  # share of exit proceeds withdrawn at once
     idle_withdraw_per_day: float = 0.05
     run_withdraw_per_day: float = 0.5  # while NAV is below zero
@@ -125,19 +130,29 @@ class Prepared:
     paths: pricing.Paths
     next_open: np.ndarray
     prev_open: np.ndarray
-    rollovers: np.ndarray  # rollovers up to and including each hour
+    rollovers: np.ndarray  # (paths, hours + 1, markets) sum of USD marks at the rollovers up to each hour
     margin_rate_hour: np.ndarray  # (paths, hours, markets) margin flow per hour
     leverage: np.ndarray  # (buckets, markets)
     first_cross: np.ndarray  # (2, buckets, paths, hours, markets) hours to the trigger; 0 = none
-    pair_cash: np.ndarray  # (paths, hours, markets) house cash from pairs settling each hour
-    pair_proceeds: np.ndarray
-    pair_margin: np.ndarray  # margin pairs post each hour
-    pair_totals: dict
     horizon: int  # hours from an entry to its latest possible settlement
 
 
-def rollover_counts(hours: int) -> np.ndarray:
-    return np.cumsum(np.arange(hours + 1) % 24 == ROLLOVER_HOUR_UTC)
+def is_rollover(hour) -> np.ndarray:
+    """Whether a rollover (22:00) falls at the start of `hour`, between the previous bar's close
+    and this bar's."""
+    return (np.asarray(hour) % 24 == ROLLOVER_HOUR_UTC) & (np.asarray(hour) >= 1)
+
+
+def rollover_marks(paths: pricing.Paths, hours: int) -> np.ndarray:
+    """(paths, hours + 1, markets): the sum, over the rollovers up to and including each hour, of
+    the USD mark (close times FX) at that rollover. A position opened at hour t and settled at
+    hour x pays financing at the rollovers in (t, x], on its notional at each one's mark."""
+    mark = paths.close * paths.fx
+    at_rollover = np.zeros(mark.shape[:1] + (hours + 1,) + mark.shape[2:])
+    hour = np.arange(1, hours + 1)
+    take = is_rollover(hour)
+    at_rollover[:, 1:][:, take] = mark[:, hour[take] - 1]
+    return np.cumsum(at_rollover, axis=1)
 
 
 def prev_open_hour(is_open: np.ndarray) -> np.ndarray:
@@ -155,8 +170,8 @@ def prev_open_hour(is_open: np.ndarray) -> np.ndarray:
 def first_crossings(paths: pricing.Paths, balance: np.ndarray, margin_rate: np.ndarray, horizon: int) -> np.ndarray:
     """Hours from each entry (at an hour's close) until the first bar in which a one-position
     account with `balance` (buckets, markets) per unit of notional falls below the close-out
-    level, long at the bar's low and short at its high, valued in USD at the hour's FX; 0 when
-    it does not within `horizon` hours."""
+    level, long at the bar's low and short at its high, valued in USD at the hour's FX, in an
+    hour the market is open; 0 when it does not within `horizon` hours."""
     close = paths.close.astype(np.float32)
     low = paths.low.astype(np.float32)
     high = paths.high.astype(np.float32)
@@ -172,10 +187,11 @@ def first_crossings(paths: pricing.Paths, balance: np.ndarray, margin_rate: np.n
         # Equity less the close-out level, before the balance, per unit of entry notional.
         long_room = (x_low - 1) * g - half_margin * x_low * g
         short_room = -(x_high - 1) * g - half_margin * x_high * g
+        tradeable = paths.is_open[:, k:]
         for j in range(n_buckets):
             for side, room in ((0, long_room), (1, short_room)):
                 view = out[side, j, :, : hours - k]
-                view[(room < -balance[j]) & (view == 0)] = k
+                view[(room < -balance[j]) & tradeable & (view == 0)] = k
     return out
 
 
@@ -212,9 +228,7 @@ def prepare(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow, 
     horizon = max(c.hold_h for c in flow.classes) + longest_wait
     first_cross = first_crossings(paths, 1.0 / leverage, markets.margin_rate, horizon)
 
-    prep = Prepared(paths, next_open, prev_open, rollover_counts(hours), margin_rate_hour, leverage, first_cross, None, None, None, {}, horizon)
-    pair_flows(prep, scenario, markets, flow, hours)
-    return prep
+    return Prepared(paths, next_open, prev_open, rollover_marks(paths, hours), margin_rate_hour, leverage, first_cross, horizon)
 
 
 def hedged_scale(scenario: Scenario, flow: Flow) -> tuple[float, float]:
@@ -231,143 +245,140 @@ def farm_decay(scenario: Scenario, hours: int) -> np.ndarray:
     return 0.5 ** (np.arange(hours) / 24 / scenario.farm_half_life_days)
 
 
-def pair_flows(prep: Prepared, scenario: Scenario, markets: Markets, flow: Flow, hours: int) -> None:
-    """Cash, proceeds, and margin of every hedged pair, by settlement hour. A pair's legs are
-    equal and opposite, so it never changes the house's net exposure."""
-    paths = prep.paths
-    n_paths, _, n_markets = paths.close.shape
-    cash = np.zeros((n_paths, hours + 1, n_markets))
-    proceeds = np.zeros((n_paths, hours + 1, n_markets))
-    margin = np.zeros((n_paths, hours, n_markets))
-    totals = {k: np.zeros(n_paths) for k in ("fee", "financing", "bad_debt", "mint_basis", "notional")}
-    h_scale, _ = hedged_scale(scenario, flow)
-    decay = farm_decay(scenario, hours)[None, :, None]
-    p = np.arange(n_paths)[:, None, None]
-    m = np.arange(n_markets)[None, None, :]
-    t = np.arange(hours)[None, :, None]
-    fin_both = markets.fin_long + markets.fin_short  # per unit notional per rollover, both legs
-
-    def settle_pairs(leg_notional, exit_hour, move, balance):
-        """Books pairs with `leg_notional` per leg that settle at `exit_hour` with the price
-        moved by `move` (relative, signed)."""
-        gain = np.abs(move)
-        loss = np.minimum(gain, balance)
-        bad = gain - loss
-        fee = accounting.profit_fee(gain)
-        fin = (prep.rollovers[np.minimum(exit_hour, hours)] - prep.rollovers[np.broadcast_to(t, exit_hour.shape)]) * fin_both
-        valid = exit_hour < hours
-        house = np.where(valid, leg_notional * (fee + fin - bad), 0.0)
-        client = np.where(valid, leg_notional * (2 * balance - loss + gain - fee - fin), 0.0)
-        flat = ((np.broadcast_to(p, exit_hour.shape) * (hours + 1) + np.where(valid, exit_hour, hours)) * n_markets + np.broadcast_to(m, exit_hour.shape)).ravel()
-        cash.reshape(-1)[:] += np.bincount(flat, house.ravel(), minlength=cash.size)
-        proceeds.reshape(-1)[:] += np.bincount(flat, client.ravel(), minlength=proceeds.size)
-        totals["fee"] += np.where(valid, leg_notional * fee, 0).sum(axis=(1, 2))
-        totals["financing"] += np.where(valid, leg_notional * fin, 0).sum(axis=(1, 2))
-        totals["bad_debt"] += np.where(valid, leg_notional * bad, 0).sum(axis=(1, 2))
-        totals["mint_basis"] += np.where(valid, leg_notional * loss, 0).sum(axis=(1, 2))
-
-    close = paths.close
-    for cls in flow.classes:
-        if cls.kind != "hedged" or cls.hold_h == 0:
-            continue
-        j = cls.bucket
-        lev = prep.leverage[j][None, None, :]
-        balance = 1.0 / lev
-        leg = prep.margin_rate_hour * cls.margin_share * h_scale * decay / 2 * lev
-        target = np.minimum(np.arange(hours) + cls.hold_h, hours)
-        exit_planned = prep.next_open[:, target, :]
-        if not scenario.hold_through_closures:
-            last = prep.prev_open[:, target, :]
-            exit_planned = np.where(last > t, last, exit_planned)
-        cross = [prep.first_cross[s, j] for s in (0, 1)]
-        cross_hour = [np.where(c > 0, t + c, np.iinfo(np.int32).max) for c in cross]
-        first = np.minimum(cross_hour[0], cross_hour[1])
-        closed_out = first <= exit_planned
-        exit_hour = np.where(closed_out, first, exit_planned)
-        side = np.where(cross_hour[0] <= cross_hour[1], 1.0, -1.0)  # the losing leg
-        at = np.minimum(exit_hour, hours - 1)
-        g = paths.fx[p, at, m] / paths.fx
-        trig = accounting.closeout_trigger(side, balance / g, markets.margin_rate[None, None, :])
-        bar_open = paths.open[p, at, m] / close
-        fill = np.where(side * (bar_open - trig) <= 0, bar_open, trig)
-        move = (np.where(closed_out, fill, paths.close[p, at, m] / close) - 1.0) * g
-        settle_pairs(leg, exit_hour, move, balance)
-        margin += 2 * leg * balance
-        totals["notional"] += 2 * leg.sum(axis=(1, 2))
-
-    if scenario.gap_pair_share > 0:
-        balance = markets.margin_rate[None, :]
-        weekly = prep.margin_rate_hour[:, :, :].sum(axis=1) / max(hours / pricing.WEEK, 1)
-        hedged_margin = weekly * sum(c.margin_share for c in flow.classes if c.kind == "hedged") * h_scale
-        is_open = paths.is_open
-        for mi in range(n_markets):
-            for pi in range(n_paths):
-                opens = np.flatnonzero(is_open[pi, :, mi])
-                gaps = np.flatnonzero(np.diff(opens) >= 24)
-                for g in gaps:
-                    entry, reopen = opens[g], opens[g + 1]
-                    leg = scenario.gap_pair_share * hedged_margin[pi, mi] / 2 / balance[0, mi]
-                    g = paths.fx[pi, reopen, mi] / paths.fx[pi, entry, mi]
-                    move = (paths.open[pi, reopen, mi] / close[pi, entry, mi] - 1.0) * g
-                    gain = abs(move)
-                    loss = min(gain, balance[0, mi])
-                    fee = float(accounting.profit_fee(gain))
-                    fin = (prep.rollovers[reopen] - prep.rollovers[entry]) * fin_both[mi]
-                    cash[pi, reopen, mi] += leg * (fee + fin - (gain - loss))
-                    proceeds[pi, reopen, mi] += leg * (2 * balance[0, mi] - loss + gain - fee - fin)
-                    margin[pi, entry, mi] += 2 * leg * balance[0, mi]
-                    totals["fee"][pi] += leg * fee
-                    totals["financing"][pi] += leg * fin
-                    totals["bad_debt"][pi] += leg * (gain - loss)
-                    totals["mint_basis"][pi] += leg * loss
-                    totals["notional"][pi] += 2 * leg
-
-    prep.pair_cash, prep.pair_proceeds, prep.pair_margin, prep.pair_totals = cash[:, :hours], proceeds[:, :hours], margin, totals
-
-
 CHUNK_H = 24
-# Ring channels: change in clients' quantity and cost, house cash, client proceeds.
-Q, COST, HOUSE, PROCEEDS = range(4)
+# Ring channels: change in clients' long and short quantity and their cost, house cash, client
+# proceeds. Quantity and cost are divided by the FX index at entry (see `run_batch`).
+LONG, SHORT, COST, HOUSE, PROCEEDS = range(5)
 # Total channels: fee, financing, bad debt, mint basis.
 FEE, FINANCING, BAD_DEBT, MINT = range(4)
 
 
-def cohort_units(prep: Prepared, scenario: Scenario, markets: Markets, cls, side: int, t0: int, t1: int, hours: int):
-    """Per unit of notional, the settlement of a directional cohort entering in each hour of
-    [t0, t1): exit hour (paths, n, markets), ring channels (paths, n, markets, 4), and total
-    channels (paths, n, markets, 4). A cohort settling past the horizon has zero channels."""
-    s_i = 0 if side > 0 else 1
-    j = cls.bucket
-    balance = 1.0 / prep.leverage[j][None, None, :]
-    paths = prep.paths
+def planned_exits(prep: Prepared, scenario: Scenario, hold_h: int, t0: int, t1: int, hours: int) -> np.ndarray:
+    """(paths, n, markets) planned exit hour of positions entering in [t0, t1) with `hold_h`."""
     t = np.arange(t0, t1)[None, :, None]
-    target = np.minimum(np.arange(t0, t1) + cls.hold_h, hours)
+    target = np.minimum(np.arange(t0, t1) + hold_h, hours)
     planned = prep.next_open[:, target, :]
     if not scenario.hold_through_closures:
         last = prep.prev_open[:, target, :]
         planned = np.where(last > t, last, planned)
-    cross = prep.first_cross[s_i, j][:, t0:t1].astype(np.int64)
-    closed_out = (cross > 0) & (t + cross <= planned)
-    exit_hour = np.where(closed_out, t + cross, planned)
+    return planned
+
+
+def settle_at(prep: Prepared, markets: Markets, side, closed_out, exit_hour, balance, t0: int, t1: int, hours: int):
+    """Exit price relative to entry and FX ratio of positions entering in [t0, t1): the close-out
+    fill (the trigger, or the open when the market gaps through it) or the exit bar's close."""
+    paths = prep.paths
     p = np.arange(exit_hour.shape[0])[:, None, None]
     m = np.arange(exit_hour.shape[2])[None, None, :]
     at = np.minimum(exit_hour, hours - 1)
     entry = paths.close[:, t0:t1]
-    entry_fx = paths.fx[:, t0:t1]
-    g = paths.fx[p, at, m] / entry_fx
-    trig = accounting.closeout_trigger(side, balance / g, markets.margin_rate[None, None, :])
-    bar_open = paths.open[p, at, m] / entry
-    fill = np.where(side * (bar_open - trig) <= 0, bar_open, trig)
-    x = np.where(closed_out, fill, paths.close[p, at, m] / entry)
+    g = paths.fx[p, at, m] / paths.fx[:, t0:t1]
+    trigger = accounting.closeout_trigger(side, balance / g, markets.margin_rate[None, None, :])
+    fill = accounting.closeout_fill(side, trigger, paths.open[p, at, m] / entry, trigger)
+    return np.where(closed_out, fill, paths.close[p, at, m] / entry), g
+
+
+def financing_units(prep: Prepared, rate, exit_hour, t0: int, t1: int, hours: int):
+    """Financing per unit of entry notional over the rollovers in (entry, exit], at each one's mark."""
+    paths = prep.paths
+    p = np.arange(exit_hour.shape[0])[:, None, None]
+    m = np.arange(exit_hour.shape[2])[None, None, :]
+    marks = prep.rollovers[p, np.minimum(exit_hour, hours), m] - prep.rollovers[:, t0:t1]
+    return rate * marks / (paths.close[:, t0:t1] * paths.fx[:, t0:t1])
+
+
+def cohort_units(prep: Prepared, scenario: Scenario, markets: Markets, cls, side: int, t0: int, t1: int, hours: int):
+    """Per unit of notional, the settlement of a directional cohort entering in each hour of
+    [t0, t1): exit hour (paths, n, markets), ring channels (paths, n, markets, 5), and total
+    channels (paths, n, markets, 4). A cohort settling past the horizon has zero channels; its
+    financing is charged at each rollover from the books, as for every open position."""
+    s_i = 0 if side > 0 else 1
+    j = cls.bucket
+    balance = 1.0 / prep.leverage[j][None, None, :]
+    t = np.arange(t0, t1)[None, :, None]
+    planned = planned_exits(prep, scenario, cls.hold_h, t0, t1, hours)
+    cross = prep.first_cross[s_i, j][:, t0:t1].astype(np.int64)
+    closed_out = (cross > 0) & (t + cross <= planned)
+    exit_hour = np.where(closed_out, t + cross, planned)
+    x, g = settle_at(prep, markets, side, closed_out, exit_hour, balance, t0, t1, hours)
     client, bad = accounting.settle(side, x, balance, g)
     fee = accounting.profit_fee(client)
-    fin_rate = (markets.fin_long if side > 0 else markets.fin_short)[None, None, :]
-    fin = (prep.rollovers[np.minimum(exit_hour, hours)] - prep.rollovers[t]) * fin_rate
-    shortfall = np.maximum(fee + fin - balance - client, 0.0)  # financing past the balance
+    fin = financing_units(prep, (markets.fin_long if side > 0 else markets.fin_short)[None, None, :], exit_hour, t0, t1, hours)
+    shortfall = np.maximum(fee + fin - balance - client, 0.0)  # financing and fee past the balance
     valid = exit_hour < hours
-    ring = np.stack([-side / (entry * entry_fx), -side / entry_fx, -client + fee + fin - shortfall, balance + client - fee - fin + shortfall], axis=-1)
-    totals = np.stack([fee, fin, bad + shortfall, np.maximum(-client, 0.0)], axis=-1)
+    entry_usd = prep.paths.close[:, t0:t1] * prep.paths.fx[:, t0:t1]
+    quantity = -1.0 / entry_usd
+    ring = np.stack(
+        [
+            quantity * (side > 0),
+            quantity * (side < 0),
+            -side / prep.paths.fx[:, t0:t1],
+            -client + fee - shortfall,
+            balance + client - fee - fin + shortfall,
+        ],
+        axis=-1,
+    )
+    totals = np.stack([fee, np.zeros_like(fee), bad + shortfall, np.maximum(-client, 0.0)], axis=-1)
     return np.where(valid, exit_hour, t), ring * valid[..., None], totals * valid[..., None]
+
+
+def pair_units(prep: Prepared, scenario: Scenario, markets: Markets, cls, t0: int, t1: int, hours: int):
+    """Per unit of each leg's notional, the settlement of hedged pairs entering in [t0, t1). A pair
+    ends when either leg is closed out, the other closing with it, or at its planned exit."""
+    j = cls.bucket
+    balance = 1.0 / prep.leverage[j][None, None, :]
+    t = np.arange(t0, t1)[None, :, None]
+    planned = planned_exits(prep, scenario, cls.hold_h, t0, t1, hours)
+    cross = [prep.first_cross[s, j][:, t0:t1].astype(np.int64) for s in (0, 1)]
+    cross_hour = [np.where(c > 0, t + c, np.iinfo(np.int64).max) for c in cross]
+    first = np.minimum(cross_hour[0], cross_hour[1])
+    closed_out = first <= planned
+    exit_hour = np.where(closed_out, first, planned)
+    loser = np.where(cross_hour[0] <= cross_hour[1], 1.0, -1.0)
+    x, g = settle_at(prep, markets, loser, closed_out, exit_hour, balance, t0, t1, hours)
+    gain = np.abs(x - 1.0) * g
+    loss = np.minimum(gain, balance)
+    bad = gain - loss
+    fee = accounting.profit_fee(gain)
+    fin = financing_units(prep, (markets.fin_long + markets.fin_short)[None, None, :], exit_hour, t0, t1, hours)
+    shortfall = np.maximum(fin - (2 * balance - loss + gain - fee), 0.0)
+    valid = exit_hour < hours
+    quantity = -1.0 / (prep.paths.close[:, t0:t1] * prep.paths.fx[:, t0:t1])
+    ring = np.stack(
+        [quantity, quantity, np.zeros_like(quantity), fee - bad - shortfall, 2 * balance - loss + gain - fee - fin + shortfall],
+        axis=-1,
+    )
+    totals = np.stack([fee, np.zeros_like(fee), bad + shortfall, loss], axis=-1)
+    return np.where(valid, exit_hour, t), ring * valid[..., None], totals * valid[..., None]
+
+
+def gap_pair_units(prep: Prepared, markets: Markets, t0: int, t1: int, hours: int):
+    """Per unit of each leg's notional, pairs at the maximum leverage opened at an hour in
+    [t0, t1) that is the last open hour before a closure of 3 hours or more, and closed at the
+    reopening open (the `gap_pair_share` stress). Zero where the hour starts no such closure."""
+    paths = prep.paths
+    t = np.arange(t0, t1)[None, :, None]
+    reopen = prep.next_open[:, t0 + 1 : t1 + 1, :]
+    starts = paths.is_open[:, t0:t1] & (reopen - t >= 3) & (reopen < hours)
+    exit_hour = np.where(starts, reopen, t)
+    p = np.arange(exit_hour.shape[0])[:, None, None]
+    m = np.arange(exit_hour.shape[2])[None, None, :]
+    at = np.minimum(exit_hour, hours - 1)
+    balance = markets.margin_rate[None, None, :]
+    g = paths.fx[p, at, m] / paths.fx[:, t0:t1]
+    gain = np.abs(paths.open[p, at, m] / paths.close[:, t0:t1] - 1.0) * g
+    loss = np.minimum(gain, balance)
+    bad = gain - loss
+    fee = accounting.profit_fee(gain)
+    fin = financing_units(prep, (markets.fin_long + markets.fin_short)[None, None, :], exit_hour, t0, t1, hours)
+    shortfall = np.maximum(fin - (2 * balance - loss + gain - fee), 0.0)
+    quantity = -1.0 / (paths.close[:, t0:t1] * paths.fx[:, t0:t1])
+    ring = np.stack(
+        [quantity, quantity, np.zeros_like(quantity), fee - bad - shortfall, 2 * balance - loss + gain - fee - fin + shortfall],
+        axis=-1,
+    )
+    totals = np.stack([fee, np.zeros_like(fee), bad + shortfall, loss], axis=-1)
+    return exit_hour, ring * starts[..., None], totals * starts[..., None], starts
 
 
 def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow, floors: np.ndarray, total_floors: np.ndarray, seed: int, n_paths: int) -> dict:
@@ -386,19 +397,22 @@ def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow
     market_floors = floors.T[None]  # (1, markets, lanes)
     cap_bps = markets.cap_bps[None, :, None]
 
-    # Clients' net quantity and cost basis, each divided by the FX index at entry, so that a
-    # market's USD notional is price * FX * q and clients' unrealised PnL FX * (price * q - cost).
-    q = np.zeros(shape)
+    # Clients' long and short quantity and their net cost basis, each divided by the FX index at
+    # entry, so that a market's USD notional is price * FX * quantity and clients' unrealised PnL
+    # FX * (price * (long - short) - cost).
+    longs = np.zeros(shape)
+    shorts = np.zeros(shape)
     cost = np.zeros(shape)
     house = np.zeros(shape)  # house cash by market
-    ring = np.zeros((n_paths, ring_len, n_markets, 4, n_lanes))
+    ring = np.zeros((n_paths, ring_len, n_markets, 5, n_lanes))
     totals = np.zeros((n_paths, n_markets, 4, n_lanes))
     vault, idle, in_positions, queue = (np.zeros(lanes_shape) for _ in range(4))
 
-    out = {k: np.zeros(lanes_shape) for k in ("desired", "refused", "desired_directional", "deposits", "withdrawn", "max_queue", "max_gross_exposure")}
+    # `desired` and `refused_hedged` cover hedged flow too; `refused` and the week-one figures are
+    # directional (churn included), as `desired_directional` is.
+    out = {k: np.zeros(lanes_shape) for k in ("desired", "refused", "refused_hedged", "desired_directional", "desired_week1", "refused_week1", "deposits", "withdrawn", "max_queue", "max_gross_exposure")}
     out["min_nav"] = np.full(lanes_shape, np.inf)
     out["min_cash"] = np.full(lanes_shape, np.inf)
-    out["min_cover"] = np.full(lanes_shape, np.inf)  # vault USDC less every free balance and queued claim
     out["ever_negative"] = np.zeros(lanes_shape, dtype=bool)
     out["queued"] = np.zeros(lanes_shape, dtype=bool)
     out["first_negative_h"] = np.full(lanes_shape, -1)
@@ -411,32 +425,58 @@ def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow
     h_scale, d_scale = hedged_scale(scenario, flow)
     decay = farm_decay(scenario, hours)
     directional = [c for c in flow.classes if c.kind == "directional" and c.hold_h > 0]
+    hedged = [c for c in flow.classes if c.kind == "hedged" and c.hold_h > 0]
     cohorts = [(cls, side) for cls in directional for side in (1, -1)]
     churn = [c for c in flow.classes if c.hold_h == 0]
     deviation = np.zeros((n_paths, 1 if scenario.common_direction else n_markets))
     log_close = np.log(paths.close)
+    usd_mark = paths.close * paths.fx
     p_idx = np.arange(n_paths)[:, None]
     m_idx = np.arange(n_markets)[None, :]
-    margin_unit = [(cls, cls.margin_share * d_scale * prep.leverage[cls.bucket]) for cls in directional]
-    churn_unit = [(cls, cls.margin_share * prep.leverage[cls.bucket]) for cls in churn]
+    limits = np.round(markets.max_leverage).astype(int)
+    limit_groups = {int(v): np.flatnonzero(limits == v) for v in np.unique(limits)}
+    hedged_week = np.zeros(shape)  # hedged margin accepted over about the past week
+    week_decay = np.exp(-1 / pricing.WEEK)
+    run_rate = 1 - (1 - scenario.idle_withdraw_per_day - scenario.run_withdraw_per_day) ** (1 / 24)
+    calm_rate = 1 - (1 - scenario.idle_withdraw_per_day) ** (1 / 24)
+
+    def book(units, k, amount, need_rate):
+        """Adds `amount` (paths, markets, lanes) of a cohort's notional to the books and schedules
+        its settlement; returns the margin it posts, summed by lane."""
+        exit_hour, ring_unit, total_unit = units
+        nonlocal totals
+        ring[p_idx, exit_hour[:, k] % ring_len, m_idx] += amount[:, :, None, :] * ring_unit[:, k][..., None]
+        totals += amount[:, :, None, :] * total_unit[:, k][..., None]
+        return (amount * need_rate[None, :, None]).sum(axis=1)
 
     for t0 in range(0, hours, CHUNK_H):
         t1 = min(t0 + CHUNK_H, hours)
         units = [cohort_units(prep, scenario, markets, cls, side, t0, t1, hours) for cls, side in cohorts]
+        pairs = [pair_units(prep, scenario, markets, cls, t0, t1, hours) for cls in hedged]
+        gaps = gap_pair_units(prep, markets, t0, t1, hours) if scenario.gap_pair_share > 0 else None
         for t in range(t0, t1):
             k = t - t0
+            # Financing at a rollover, on every position open across it, at the mark before it.
+            if is_rollover(t):
+                mark = usd_mark[:, t - 1][..., None]
+                charge = mark * (longs * markets.fin_long[None, :, None] + shorts * markets.fin_short[None, :, None])
+                house += charge
+                in_positions -= charge.sum(axis=1)
+                totals[:, :, FINANCING] += charge
+
             slot = t % ring_len
             due = ring[:, slot]  # (paths, markets, channel, lanes)
-            q += due[:, :, Q]
+            longs += due[:, :, LONG]
+            shorts += due[:, :, SHORT]
             cost += due[:, :, COST]
-            exit_cash = due[:, :, HOUSE] + prep.pair_cash[:, t][..., None]
+            exit_cash = due[:, :, HOUSE].copy()  # the slot is zeroed below
             house += exit_cash
-            proceeds = due[:, :, PROCEEDS].sum(axis=1) + prep.pair_proceeds[:, t].sum(axis=1)[:, None]
+            proceeds = due[:, :, PROCEEDS].sum(axis=1)
             due[...] = 0.0
 
             entry = paths.close[:, t]
             fx = paths.fx[:, t]
-            exposure = (entry * fx)[..., None] * q  # USD notional at the mark
+            exposure = (entry * fx)[..., None] * (longs - shorts)  # USD notional at the mark
             nav = (house - (exposure - fx[..., None] * cost)).sum(axis=1)
             cap = accounting.exposure_cap(nav[:, None, :], cap_bps, market_floors)
             total_cap = accounting.exposure_cap(nav, markets.total_cap_bps, total_floors[None])
@@ -447,82 +487,133 @@ def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow
                 prev_ret = prev_ret.mean(axis=1, keepdims=True)
             deviation = flow.long_share_ar1 * deviation + flow.long_share_slope * prev_ret + flow.long_share_resid_sd * rng.standard_normal(deviation.shape)
 
-            margin_hour = prep.margin_rate_hour[:, t]
+            # Orders larger than a cap never fill: each class keeps the share of its flow in orders
+            # that fit, at its leverage, under the market's cap and the total cap.
+            room = np.minimum(cap, total_cap[:, None, :])
+            fits = {kind: np.zeros(shape) for kind in ("directional", "hedged")}
+            for kind in fits:
+                for limit, cols in limit_groups.items():
+                    fits[kind][:, cols] = fit_share(room[:, cols], flow.sizes[(kind, scenario.leverage_mapping, limit)])
+
+            margin_hour = prep.margin_rate_hour[:, t][..., None]
             wants = []
-            for cls, unit in margin_unit:
-                notional = margin_hour * unit
-                share = np.clip(cls.long_share + deviation, 0.0, 1.0)
+            for cls in directional:
+                notional = margin_hour * cls.margin_share * d_scale * prep.leverage[cls.bucket][None, :, None] * fits["directional"]
+                share = np.clip(cls.long_share + deviation, 0.0, 1.0)[..., None]
                 wants += [notional * share, notional * (1 - share)]
-            zero = np.zeros((n_paths, n_markets))
+            zero = np.zeros(shape)
             long_total = sum(wants[0::2], zero)
             short_total = sum(wants[1::2], zero)
-            churn_long, churn_short, churn_hedged, gain_long, gain_short, gain_hedged = (np.zeros((n_paths, n_markets)) for _ in range(6))
-            for cls, unit in churn_unit:
-                notional = margin_hour * unit
-                gain = GAIN_PER_SD * paths.parkinson[:, t] * cls.mean_sqrt_hold_h
+            desired_full = sum(
+                (margin_hour * c.margin_share * d_scale * prep.leverage[c.bucket][None, :, None] for c in directional),
+                zero,
+            )
+            churn_long, churn_short, churn_hedged, hedged_full = zero.copy(), zero.copy(), zero.copy(), zero.copy()
+            open_long, open_short = zero.copy(), zero.copy()  # churn's mean open notional over the hour
+            gain_long, gain_short, gain_hedged = zero.copy(), zero.copy(), zero.copy()
+            for cls in churn:
+                full = margin_hour * cls.margin_share * prep.leverage[cls.bucket][None, :, None]
+                notional = full * fits[cls.kind]
+                gain = (GAIN_PER_SD * paths.parkinson[:, t] * cls.mean_sqrt_hold_h)[..., None]
                 if cls.kind == "hedged":
+                    hedged_full += full * h_scale * decay[t]
                     churn_hedged += notional * h_scale * decay[t]
                     gain_hedged += notional * h_scale * decay[t] * gain
                 else:
-                    share = np.clip(cls.long_share + deviation, 0.0, 1.0)
+                    share = np.clip(cls.long_share + deviation, 0.0, 1.0)[..., None]
+                    desired_full = desired_full + full * d_scale
                     churn_long += notional * d_scale * share
                     churn_short += notional * d_scale * (1 - share)
+                    open_long += notional * d_scale * share * min(cls.mean_hold_h, 1.0)
+                    open_short += notional * d_scale * (1 - share) * min(cls.mean_hold_h, 1.0)
                     gain_long += notional * d_scale * share * gain
                     gain_short += notional * d_scale * (1 - share) * gain
 
-            long_ok, short_ok = accounting.accepted_share(exposure, cap, long_total[..., None], short_total[..., None])
-            change = long_ok * long_total[..., None] - short_ok * short_total[..., None]
+            # The crowded side fills up to the cap, the side that reduces exposure in full; churn
+            # competes for room with its mean open notional over the hour.
+            want_long, want_short = long_total + open_long, short_total + open_short
+            long_ok, short_ok = accounting.accepted_share(exposure, cap, want_long, want_short)
+            change = long_ok * want_long - short_ok * want_short
             growth = np.maximum(np.abs(exposure + change) - np.abs(exposure), 0.0)
-            room = np.maximum(total_cap - np.abs(exposure).sum(axis=1), 0.0)
+            room_total = np.maximum(total_cap - np.abs(exposure).sum(axis=1), 0.0)
             wanted = growth.sum(axis=1)
-            cut = np.where(wanted > room, 1.0 - room / np.where(wanted > 0, wanted, 1.0), 0.0)[:, None, :] * growth
+            cut = np.where(wanted > room_total, 1.0 - room_total / np.where(wanted > 0, wanted, 1.0), 0.0)[:, None, :] * growth
             with np.errstate(divide="ignore", invalid="ignore"):
-                long_ok = np.where((change > 0) & (long_total[..., None] > 0), np.maximum(long_ok - cut / long_total[..., None], 0.0), long_ok)
-                short_ok = np.where((change < 0) & (short_total[..., None] > 0), np.maximum(short_ok - cut / short_total[..., None], 0.0), short_ok)
+                long_ok = np.where((change > 0) & (want_long > 0), np.maximum(long_ok - cut / want_long, 0.0), long_ok)
+                short_ok = np.where((change < 0) & (want_short > 0), np.maximum(short_ok - cut / want_short, 0.0), short_ok)
 
-            desired = long_total + short_total + churn_long + churn_short
-            refused = (1 - long_ok) * (long_total + churn_long)[..., None] + (1 - short_ok) * (short_total + churn_short)[..., None]
-            desired_by_market += desired
+            # Desired and refused opening notional; what does not fit counts as refused.
+            accepted = long_ok * (long_total + churn_long) + short_ok * (short_total + churn_short)
+            refused = desired_full - accepted
+            desired_by_market += desired_full[..., 0]
             refused_by_market += refused
-            out["desired"] += (desired + churn_hedged).sum(axis=1)[:, None]
-            out["desired_directional"] += desired.sum(axis=1)[:, None]
+            pair_legs = [margin_hour * c.margin_share * h_scale * decay[t] / 2 * prep.leverage[c.bucket][None, :, None] for c in hedged]
+            pair_fits = [fits["hedged"] for _ in hedged]
+            hedged_full = hedged_full + sum((2 * leg for leg in pair_legs), zero)
+            hedged_open = churn_hedged + sum((2 * leg * fit for leg, fit in zip(pair_legs, pair_fits)), zero)
+            out["desired"] += (desired_full + hedged_full).sum(axis=1)
+            out["refused_hedged"] += (hedged_full - hedged_open).sum(axis=1)
+            out["desired_directional"] += desired_full.sum(axis=1)
             out["refused"] += refused.sum(axis=1)
+            if t < pricing.WEEK:
+                out["desired_week1"] += desired_full.sum(axis=1)
+                out["refused_week1"] += refused.sum(axis=1)
 
-            # Book accepted directional cohorts: state and totals per side, settlement per cohort.
+            # Book accepted cohorts and pairs and schedule their settlement.
+            entry_usd = (entry * fx)[..., None]
             need = np.zeros(lanes_shape)
-            for side, ok in ((1, long_ok), (-1, short_ok)):
-                mine = [(n, cls) for n, (cls, s) in enumerate(cohorts) if s == side]
-                if not mine:
-                    continue
-                want = sum(wants[n] for n, _ in mine)
-                q += side * ok * (want / (entry * fx))[..., None]
-                cost += side * ok * (want / fx)[..., None]
-                need += (ok * sum(wants[n] / prep.leverage[cls.bucket] for n, cls in mine)[..., None]).sum(axis=1)
-                totals += ok[:, :, None, :] * sum(wants[n][..., None] * units[n][2][:, k] for n, _ in mine)[..., None]
-                for n, _ in mine:
-                    exit_hour, ring_unit, _ = units[n]
-                    ring[p_idx, exit_hour[:, k] % ring_len, m_idx] += ok[:, :, None, :] * (wants[n][..., None] * ring_unit[:, k])[..., None]
+            for (cls, side), want, unit in zip(cohorts, wants, units):
+                amount = (long_ok if side > 0 else short_ok) * want
+                if side > 0:
+                    longs += amount / entry_usd
+                else:
+                    shorts += amount / entry_usd
+                cost += side * amount / fx[..., None]
+                need += book(unit, k, amount, 1.0 / prep.leverage[cls.bucket])
+            pair_margin = zero.copy()
+            for cls, unit, leg, fit in zip(hedged, pairs, pair_legs, pair_fits):
+                leg = leg * fit
+                longs += leg / entry_usd
+                shorts += leg / entry_usd
+                need += book(unit, k, leg, 2.0 / prep.leverage[cls.bucket])
+                pair_margin += 2 * leg / prep.leverage[cls.bucket][None, :, None]
+            if gaps is not None:
+                # The stress: a share of the past week's accepted hedged margin, at the maximum
+                # leverage, held through the closure that starts now, in orders that fit.
+                start = gaps[3][:, k][..., None]
+                wanted_leg = np.where(start, scenario.gap_pair_share * hedged_week / 2 * markets.max_leverage[None, :, None], 0.0)
+                leg = wanted_leg * fits["hedged"]
+                longs += leg / entry_usd
+                shorts += leg / entry_usd
+                need += book(gaps[:3], k, leg, 2.0 * markets.margin_rate)
+                out["desired"] += 2 * wanted_leg.sum(axis=1)
+                out["refused_hedged"] += 2 * (wanted_leg - leg).sum(axis=1)
+            hedged_week = hedged_week * week_decay + pair_margin
 
-            # Churn pays the fee on its expected gain over its hold.
-            churn_gain = gain_long[..., None] * long_ok + gain_short[..., None] * short_ok + gain_hedged[..., None]
+            # Churn pays the profit fee on its expected gain over its hold, and its mean open net
+            # notional takes the hour's move; churners fund what they owe.
+            churn_gain = gain_long * long_ok + gain_short * short_ok + gain_hedged
             churn_fee = accounting.profit_fee(churn_gain)
-            house += churn_fee
+            hour_ret = usd_mark[:, t] / usd_mark[:, t - 1] - 1.0 if t >= 1 else np.zeros((n_paths, n_markets))
+            churn_pnl = (open_long * long_ok - open_short * short_ok) * hour_ret[..., None]
+            churn_cash = churn_fee - churn_pnl  # to the house
+            house += churn_cash
             totals[:, :, FEE] += churn_fee
             totals[:, :, MINT] += churn_gain
 
-            # Vault: exit proceeds to idle balances, new margin drawn from them first and the rest
-            # deposited, then withdrawals of what is left, and the queue.
-            idle += proceeds - churn_fee.sum(axis=1)
-            need += prep.pair_margin[:, t].sum(axis=1)[:, None]
-            draw = np.minimum(np.maximum(idle, 0.0), need)
+            # Vault: exit proceeds to idle balances, new margin and churn's dues drawn from them
+            # first and the rest deposited, then withdrawals of what is left, and the queue.
+            owed = churn_cash.sum(axis=1)
+            idle += proceeds - np.minimum(owed, 0.0)
+            need += np.maximum(owed, 0.0)
+            draw = np.minimum(idle, need)
             idle -= draw
             vault += need - draw
-            in_positions += need - proceeds - exit_cash.sum(axis=1)
+            in_positions += need - np.maximum(owed, 0.0) - proceeds - exit_cash.sum(axis=1)
             out["deposits"] += need - draw
-            left = np.maximum(idle, 0.0)
-            from_exits = scenario.withdraw_on_exit * np.minimum(np.maximum(proceeds, 0.0), left)
-            idle_rate = (scenario.idle_withdraw_per_day + np.where(nav < 0, scenario.run_withdraw_per_day, 0.0)) / 24
-            request = from_exits + idle_rate * (left - from_exits)
+            from_exits = scenario.withdraw_on_exit * np.minimum(np.maximum(proceeds, 0.0), idle)
+            rate = np.where(nav < 0, run_rate, calm_rate)
+            request = from_exits + rate * (idle - from_exits)
             idle -= request
             paid = np.where(queue > 0, 0.0, np.minimum(vault, request))
             queue += request - paid
@@ -535,33 +626,27 @@ def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow
             out["max_queue"] = np.maximum(out["max_queue"], queue)
             identity_gap = max(identity_gap, float(np.abs(vault - (idle + in_positions + queue + house.sum(axis=1))).max()))
 
-            exposure = (entry * fx)[..., None] * q
+            exposure = (entry * fx)[..., None] * (longs - shorts)
             nav = (house - (exposure - fx[..., None] * cost)).sum(axis=1)
             newly = (nav < 0) & ~out["ever_negative"]
             out["first_negative_h"] = np.where(newly, t, out["first_negative_h"])
             out["ever_negative"] |= nav < 0
             started |= (np.abs(house).sum(axis=1) > 0) | (np.abs(exposure).sum(axis=1) > 0)
             out["min_nav"] = np.minimum(out["min_nav"], np.where(started, nav, np.inf))
-            out["min_cash"] = np.minimum(out["min_cash"], house.sum(axis=1))
-            out["min_cover"] = np.minimum(out["min_cover"], np.where(started, house.sum(axis=1) + in_positions, np.inf))
+            out["min_cash"] = np.minimum(out["min_cash"], np.where(started, house.sum(axis=1), np.inf))
             out["max_gross_exposure"] = np.maximum(out["max_gross_exposure"], np.abs(exposure).sum(axis=1))
             if t % 24 == 23:
                 out["daily_nav"][:, :, t // 24] = nav
 
     for name, channel in (("fee", FEE), ("financing", FINANCING), ("bad_debt", BAD_DEBT), ("mint_basis", MINT)):
-        out[name] = totals[:, :, channel].sum(axis=1) + prep.pair_totals[name][:, None]
-    out["desired"] += prep.pair_totals["notional"][:, None]
+        out[name] = totals[:, :, channel].sum(axis=1)
     out["nav_end"] = nav
     out["pnl_by_market"] = (house - (exposure - fx[..., None] * cost)).transpose(0, 2, 1)
     out["refused_by_market"] = refused_by_market.transpose(0, 2, 1)
     out["desired_by_market"] = np.broadcast_to(desired_by_market[:, None, :], (n_paths, n_lanes, n_markets)).copy()
+    out["in_positions_end"] = in_positions
     out["identity_gap"] = np.array(identity_gap)
     return out
-
-
-def run(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow, floors: np.ndarray, total_floors: np.ndarray, workers: int = 1) -> dict:
-    """All paths of a scenario, in batches, concatenated by path."""
-    return run_many([(scenario, markets, bars, flow, floors, total_floors)], workers)[0]
 
 
 def run_many(tasks: list[tuple], workers: int = 1) -> list[dict]:

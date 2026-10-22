@@ -50,8 +50,8 @@ def drift_per_open_hour(bars: np.ndarray) -> np.ndarray:
 
 def build(bars: np.ndarray, weeks: np.ndarray, hours: int, vol_scale: float = 1.0, drift: np.ndarray | None = None) -> Paths:
     """Price levels for the sampled weeks. `weeks` is (paths, n_weeks), or (paths, n_weeks, markets)
-    to give each market its own weeks. `drift`, per market, is taken off every open hour's
-    close-to-close return before `vol_scale` scales the moves."""
+    to give each market its own weeks. `drift`, per market, is taken off every open hour's gap, which
+    moves the whole bar and keeps its open inside its range, before `vol_scale` scales the moves."""
     n_markets = bars.shape[1]
     by_week = bars.reshape(-1, WEEK, n_markets, 4)
     if weeks.ndim == 2:
@@ -63,7 +63,7 @@ def build(bars: np.ndarray, weeks: np.ndarray, hours: int, vol_scale: float = 1.
     is_open = sampled[..., 0] != CLOSED
     moves = np.where(is_open[..., None], sampled, 0).astype(np.float64) / 1e6
     if drift is not None:
-        moves[..., 1:] -= np.where(is_open, drift, 0.0)[..., None]
+        moves[..., 0] -= np.where(is_open, drift, 0.0)
     moves *= vol_scale
     gap, hi, lo, cl = moves[..., 0], moves[..., 1], moves[..., 2], moves[..., 3]
     log_close = np.cumsum(gap + cl, axis=1)

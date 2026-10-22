@@ -17,19 +17,6 @@ def profit_fee(realised, fee_bps: int = PROFIT_FEE_BPS):
     return np.maximum(realised, 0.0) * fee_bps / 1e4
 
 
-def margin_for(notional, tiers: list[dict]):
-    """Margin for a position of `notional`: each band's rate on the slice inside it
-    (`market.rs`, `staircase`)."""
-    notional = np.abs(np.asarray(notional, dtype=float))
-    total = np.zeros_like(notional)
-    low = 0.0
-    for tier in tiers:
-        high = float(tier["up_to"]) if "up_to" in tier else np.inf
-        total += np.clip(notional - low, 0.0, high - low) * tier["bps"] / 1e4
-        low = high
-    return total
-
-
 def closeout_trigger(side, balance, margin_rate, level_bps: int = CLOSEOUT_LEVEL_BPS):
     """The relative price at which a one-position account's equity falls to the close-out level.
 

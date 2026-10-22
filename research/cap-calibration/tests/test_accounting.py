@@ -13,15 +13,6 @@ def test_profit_fee_is_ten_percent_of_gains_and_nothing_on_losses():
     assert accounting.profit_fee(0.0) == 0.0
 
 
-def test_margin_charges_each_slice_at_its_band_rate():
-    # crates/core/src/market.rs, staircase_charges_each_slice_at_its_band_rate
-    tiers = [{"up_to": "1000000", "bps": 0}, {"up_to": "5000000", "bps": 2}, {"bps": 5}]
-    assert accounting.margin_for(500_000, tiers) == pytest.approx(0.0)
-    assert accounting.margin_for(2_000_000, tiers) == pytest.approx(200.0)
-    assert accounting.margin_for(6_000_000, tiers) == pytest.approx(1_300.0)
-    assert accounting.margin_for(-6_000_000, tiers) == pytest.approx(1_300.0)
-
-
 def test_closeout_trigger_puts_equity_at_half_the_margin():
     # A 1,000 balance long 0.09 BTC at 100,000 with 10% margin (crates/core/tests/risk.rs).
     balance, notional = 1_000.0, 9_000.0

@@ -18,7 +18,9 @@ Prices are Hyperliquid's integer prices: 1 decimal for BTC, 2 for ETH. Money wor
 decimals.
 
 Outputs under `data/derived/`: `papertrade_flow.csv` (the flow profile the model samples),
-`papertrade_daily.csv`, `papertrade_holding.csv`, and `papertrade_summary.json`.
+`papertrade_sizes.csv` (the margin-weighted distribution of each position's notional at a launch
+market's leverage limit, which sets the share of flow in orders small enough to fit a cap), `papertrade_daily.csv`, `papertrade_holding.csv`,
+and `papertrade_summary.json`.
 """
 
 import csv
@@ -30,6 +32,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+
+from catalogue import launch_markets
 
 OPEN = "0x88451ea1189f73b554f0bf39c09868560ed149b3d788fcc933ff66ba926827f3"
 CLOSE = "0x87902ed2451849f465fc4d36a01d7f5c67b53af12f63ee85d2814a2d582f89bf"
@@ -43,6 +47,7 @@ HOLD_EDGES_H = [1.0, 2.0, 8.0, 32.0, np.inf]
 HOLD_CLASS_H = [None, 1, 4, 16, 48]  # class 0 is churn: opened and closed within the hour
 LEVERAGE_EDGES = [50, 300, 1001]  # papertrade leverage bins: <=50, 51-300, 301-1000
 PAIR_WINDOW_BLOCKS = 2
+SIZE_BOUNDS = np.geomspace(1.0, 1e9, 73)  # eight a decade
 LOG_ORDER = 100_000  # orders logs as block * LOG_ORDER + log index
 
 
@@ -55,8 +60,13 @@ def words(data: str) -> list[int]:
 
 
 def read_logs(raw: Path):
-    """Yields (block, tx_index, log_index, topics, data) in chain order."""
+    """Yields (block, tx_index, log_index, topics, data) in chain order, from the chunks inside
+    the manifest's pulled range only."""
+    manifest = json.loads((raw / "manifest.json").read_text())
+    first, last = manifest["from_block"], manifest["last_block_pulled"]
     for path in sorted((raw / "logs").glob("*.jsonl.gz")):
+        if not first <= int(path.name.split(".")[0]) <= last:
+            continue
         with gzip.open(path, "rt") as fh:
             rows = [json.loads(line) for line in fh]
         rows.sort(key=lambda r: (r[0], r[1], r[2]))
@@ -64,9 +74,18 @@ def read_logs(raw: Path):
 
 
 def block_clock(raw: Path):
+    """Block -> UTC seconds, interpolated between the fetched anchors; a block outside them is
+    an error rather than a clamped time."""
     with (raw / "block_times.csv").open() as fh:
         anchors = np.array([(int(r["block"]), int(r["timestamp"])) for r in csv.DictReader(fh)], dtype=float)
-    return lambda blocks: np.interp(blocks, anchors[:, 0], anchors[:, 1])
+
+    def clock(blocks):
+        blocks = np.asarray(blocks, dtype=float)
+        if blocks.size and (blocks.min() < anchors[0, 0] or blocks.max() > anchors[-1, 0]):
+            raise ValueError("block outside the timestamp anchors; re-run fetch-papertrade")
+        return np.interp(blocks, anchors[:, 0], anchors[:, 1])
+
+    return clock
 
 
 def decode(raw: Path) -> dict:
@@ -145,10 +164,13 @@ def fee_check(pos: dict) -> dict:
     return {"closes_checked": int(closes.sum()), "fee_over_adjusted_pnl_median": round(float(np.median(ratio)), 5)}
 
 
-def hedges(pos: dict, hold_s: np.ndarray) -> np.ndarray:
-    """Flags hedged positions: opened while the same account held at least as much opposite
-    notional in the same asset, or matched with an opposite position of another account that
-    opened and closed within `PAIR_WINDOW_BLOCKS` blocks of it at the same notional."""
+def hedges(pos: dict) -> np.ndarray:
+    """Flags hedged positions, both legs of each hedge:
+    - within an account: a position opened while the account held at least as much opposite
+      notional in the same asset, and the open opposite positions it offsets, earliest first,
+      up to its notional;
+    - across accounts: opposite positions of two accounts at the same notional (to the cent) that
+      opened and closed within `PAIR_WINDOW_BLOCKS` blocks of each other."""
     n = len(pos["id"])
     hedged = np.zeros(n, dtype=bool)
     closed_at = np.where(np.isnan(pos["close_block"]), np.inf, pos["close_block"])
@@ -167,6 +189,12 @@ def hedges(pos: dict, hold_s: np.ndarray) -> np.ndarray:
             by_side[sides[j]] -= notionals[j]
         if by_side[-sides[i]] >= notionals[i] * (1 - 1e-9):
             hedged[i] = True
+            left = notionals[i]
+            for _, j in sorted((blocks[j], j) for _, j in live if sides[j] != sides[i]):
+                if left <= 0:
+                    break
+                hedged[j] = True
+                left -= notionals[j]
         heapq.heappush(live, (ends[i], i))
         by_side[sides[i]] += notionals[i]
 
@@ -286,6 +314,27 @@ def flow_profile(pos: dict, hold_h: np.ndarray, hedged: np.ndarray, closed: np.n
     return rows
 
 
+def size_profile(pos: dict, hedged: np.ndarray, closed: np.ndarray) -> list[dict]:
+    """Per kind, leverage mapping, and launch leverage limit, the share of margin in positions
+    whose notional at the mapped leverage is at or below each bound. The mappings are
+    `model.flow.mapped_leverage`'s, position by position."""
+    from model.flow import mapped_leverage
+
+    limits = sorted({round(1e4 / m["margin_tiers"][0]["bps"]) for m in launch_markets()})
+    rows = []
+    for kind, mask in (("directional", ~hedged), ("hedged", hedged)):
+        margin, leverage = pos["margin"][mask & closed], pos["leverage"][mask & closed].astype(float)
+        for mapping in ("capped", "relative"):
+            for limit in limits:
+                notional = margin * mapped_leverage(leverage, np.array(float(limit)), mapping)
+                order = np.argsort(notional)
+                cum = np.cumsum(margin[order]) / margin.sum()
+                for bound in SIZE_BOUNDS:
+                    share = cum[np.searchsorted(notional[order], bound, side="right") - 1] if notional.min() <= bound else 0.0
+                    rows.append({"kind": kind, "mapping": mapping, "max_leverage": limit, "notional_upto_usd": round(float(bound), 2), "margin_share": round(float(share), 6)})
+    return rows
+
+
 def weighted_quantiles(values: np.ndarray, weights: np.ndarray, qs: list[float]) -> list[float]:
     order = np.argsort(values)
     cum = np.cumsum(weights[order]) / weights.sum()
@@ -310,11 +359,12 @@ def derive(raw: Path, raw_markets: Path, out: Path) -> None:
     pos = d["positions"]
     clock = block_clock(raw)
     open_t = clock(pos["open_block"])
-    close_t = np.where(np.isnan(pos["close_block"]), np.nan, clock(np.nan_to_num(pos["close_block"])))
     closed = ~np.isnan(pos["close_block"])
+    close_t = np.full(len(open_t), np.nan)
+    close_t[closed] = clock(pos["close_block"][closed])
     hold_s = close_t - open_t
     hold_h = np.where(closed, hold_s / 3600, np.nan)
-    hedged = hedges(pos, hold_s)
+    hedged = hedges(pos)
 
     exit_ok = closed & (pos["liquidated"] == 0)
     raw_pnl = np.where(closed, pos["side"] * (pos["exit"] / pos["entry"] - 1) * pos["notional"], 0.0)
@@ -360,6 +410,7 @@ def derive(raw: Path, raw_markets: Path, out: Path) -> None:
 
     out.mkdir(parents=True, exist_ok=True)
     write_csv(out / "papertrade_flow.csv", flow_profile(pos, hold_h, hedged, closed))
+    write_csv(out / "papertrade_sizes.csv", size_profile(pos, hedged, closed))
 
     day = (open_t // 86400).astype(np.int64)
     dep_day = (clock(d["deposits"][:, 0]) // 86400).astype(np.int64) if len(d["deposits"]) else np.array([], dtype=np.int64)

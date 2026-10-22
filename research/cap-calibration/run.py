@@ -19,7 +19,8 @@ RAW = ROOT / "data" / "raw"
 DERIVED = ROOT / "data" / "derived"
 RESULTS = ROOT / "results"
 STAGES = ("per-market", "joint", "sensitivity")
-SENSITIVITY_TARGET = 0.001  # the sensitivities start from the floors chosen for this target
+BASE_TARGET = 0.01  # the total-floor sweep and the sensitivities start from the floors chosen for this target
+SENSITIVITY_MEASURE = "p_short_tail"  # whose choice at BASE_TARGET the sensitivities start from
 
 
 def inputs():
@@ -68,17 +69,27 @@ def simulate_stage(stage: str, args) -> None:
     elif stage == "joint":
         scenario = replace(base, paths=args.paths or 2000, batch_paths=args.batch_paths or 100)
         sweep = read_rows(RESULTS / "per_market_sweep.csv")
-        for key, rows in experiments.joint(scenario, markets, bars, flow, sweep, args.workers).items():
+        levels = experiments.joint(scenario, markets, bars, flow, sweep, args.workers)
+        for key, rows in levels.items():
             experiments.write_rows(RESULTS / f"joint_{key}.csv", rows)
+        base_rows = {key: experiments.chosen_level(rows, key, BASE_TARGET) or rows[0] for key, rows in levels.items()}
+        for key, rows in experiments.total_sweep(scenario, markets, bars, flow, base_rows, args.workers).items():
+            for row in rows:
+                row["base_level"] = base_rows[key]["level"]
+            experiments.write_rows(RESULTS / f"joint_total_{key}.csv", rows)
     elif stage == "sensitivity":
         scenario = replace(base, paths=args.paths or 1000, batch_paths=args.batch_paths or 100)
-        rows = read_rows(RESULTS / "joint_p_ever_tail.csv")
-        chosen = experiments.chosen_level(rows, "p_ever_tail", SENSITIVITY_TARGET) or rows[0]
+        rows = read_rows(RESULTS / f"joint_{SENSITIVITY_MEASURE}.csv")
+        chosen = experiments.chosen_level(rows, SENSITIVITY_MEASURE, BASE_TARGET)
+        met = chosen is not None
+        chosen = chosen or rows[0]
         floors = np.array([json.loads(chosen["market_floors"])[s] for s in markets.symbols])
         measured = sum(c.margin_share for c in flow.classes if c.kind == "hedged")
         out = experiments.sensitivity(scenario, markets, bars, flow, floors, measured, args.workers)
         for row in out:
             row["base_level"] = chosen["level"]
+            row["base_meets_target"] = met
+            row["base_measure"] = SENSITIVITY_MEASURE
         experiments.write_rows(RESULTS / "sensitivity.csv", out)
     record = manifest(args, scenario) | {"seconds": round(time.time() - started)}
     (RESULTS / f"manifest_{stage}.json").write_text(json.dumps(record, indent=1, default=str))

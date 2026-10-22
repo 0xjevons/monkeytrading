@@ -149,7 +149,7 @@ def fetch(out: Path, to_block: int | None) -> None:
     manifest_path = out / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     to_block = to_block or manifest.get("to_block") or int(rpc(next(iter(ENDPOINTS)), "eth_blockNumber", []), 16)
-    last_start = to_block - (to_block - DEPLOY_BLOCK) % CHUNK  # whole chunks only
+    last_start = to_block + 1 - (to_block + 1 - DEPLOY_BLOCK) % CHUNK  # whole chunks up to to_block
     starts = list(range(DEPLOY_BLOCK, last_start, CHUNK))
     todo = [s for s in starts if not chunk_path(out, s).exists()]
     print(f"{len(starts)} chunks to block {last_start - 1}, {len(todo)} missing", file=sys.stderr)
