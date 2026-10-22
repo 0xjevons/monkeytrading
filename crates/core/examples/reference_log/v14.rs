@@ -1,4 +1,4 @@
-//! The session's `V13` part: a listing refused for a benchmark with no rate, the resting-order cap,
+//! The session's `V14` part: a listing refused for a benchmark with no rate, the resting-order cap,
 //! the minimum notional at placement, a placement that checks only its own order, and a rollover
 //! over a benchmark with no rate.
 
@@ -13,15 +13,15 @@ use crate::common::stress::with_divergence_shares;
 use crate::common::{ETH, Harness, f, market, ny, params};
 use crate::helpers::accepted;
 
-/// A market the part lists under a benchmark with no rate, before `V13`.
+/// A market the part lists under a benchmark with no rate, before `V14`.
 const SILVER: MarketId = 19;
-/// A listing `V13` refuses, under the same benchmark.
+/// A listing `V14` refuses, under the same benchmark.
 const PLATINUM: MarketId = 20;
 /// SOL, which the session lists earlier, financed at SOFR.
 const SOL: MarketId = 10;
 
-/// A silver listing names its benchmark "Sofr", which has no rate, before `V13` activates; under
-/// `V13` a platinum listing naming it is refused, and resting orders are capped at two per account.
+/// A silver listing names its benchmark "Sofr", which has no rate, before `V14` activates; under
+/// `V14` a platinum listing naming it is refused, and resting orders are capped at two per account.
 /// Two orders rest, a third is refused at the cap, a cancel frees a place, and a limit below ETH's
 /// minimum notional is refused as it is placed. A limit held back by its spread stays resting while
 /// another account places an order, and fills on the next price. At the rollover the silver long
@@ -32,7 +32,7 @@ pub(crate) fn session(h: &mut Harness) {
         MarketSpec { financing: FinancingSpec { benchmark: "Sofr".into(), ..spec.financing.clone() }, ..spec }
     };
     h.operator_admin(AdminCommand::UpsertMarket(listing(SILVER, "XAG-USD")));
-    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V13 });
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V14 });
     h.operate(AdminCommand::UpsertMarket(listing(PLATINUM, "XPT-USD")));
     let capped = ProtocolParams {
         profit_fee_bps: 1_500,

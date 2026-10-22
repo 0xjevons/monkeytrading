@@ -63,7 +63,7 @@ struct Priced {
 impl Engine {
     /// Authorises the request, then fills a market order now or rests a limit or stop order,
     /// emitting acceptance or rejection. A resting order is checked against the live price at once:
-    /// from `V13` only that order, and before `V13` the market's whole book.
+    /// from `V14` only that order, and before `V14` the market's whole book.
     pub(crate) fn place_order(&mut self, req: &OrderRequest, events: &mut Vec<Event>) {
         let reject = |reason, events: &mut Vec<Event>| {
             events.push(Event::OrderRejected { account: req.account, client_id: req.client_id, reason })
@@ -115,7 +115,7 @@ impl Engine {
                 self.markets.get_mut(&req.market).expect("validated").resting.insert(order_id, req.account);
                 self.record_order(req.account, order_id);
                 events.push(Event::OrderAccepted { account: req.account, client_id: req.client_id, order_id });
-                if self.protocol_version < ProtocolVersion::V13 {
+                if self.protocol_version < ProtocolVersion::V14 {
                     self.trigger_resting(req.market, events);
                 } else if let Some(mid) = self.trigger_mid(req.market) {
                     self.trigger_order(order_id, req.account, mid, events);

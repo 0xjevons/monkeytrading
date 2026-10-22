@@ -68,7 +68,7 @@ pub enum Event {
         market: MarketId,
         amount: Fixed,
     },
-    /// At a rollover from `V13`, a benchmark with no rate and the markets that use it, which accrue no
+    /// At a rollover from `V14`, a benchmark with no rate and the markets that use it, which accrue no
     /// financing for that day.
     BenchmarkRateMissing {
         benchmark: String,

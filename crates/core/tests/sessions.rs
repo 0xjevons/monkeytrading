@@ -104,7 +104,7 @@ fn financing_after_downtime_charges_every_missed_day() {
 }
 
 #[test]
-fn a_market_whose_benchmark_has_no_rate_accrues_no_financing_from_v13() {
+fn a_market_whose_benchmark_has_no_rate_accrues_no_financing_from_v14() {
     // Genesis sets SOFR, and a gold listing names it "Sofr".
     let mut h = Harness::v12();
     h.operator_admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 500 });
@@ -117,13 +117,13 @@ fn a_market_whose_benchmark_has_no_rate_accrues_no_financing_from_v13() {
     h.market_order(gold, GOLD, Side::Buy, "1", "2000");
     h.market_order(bitcoin, BTC, Side::Buy, "1", "100000");
 
-    // Before `V13` the missing rate counts as zero, so the gold long pays the 2.5% markup alone.
+    // Before `V14` the missing rate counts as zero, so the gold long pays the 2.5% markup alone.
     let ev = rollover(&mut h, 20);
     assert!(ev.contains(&Event::Financing { account: gold, market: GOLD, amount: f("0.136986302") }), "{ev:?}");
 
-    // From `V13` the gold long accrues nothing and the rollover records the benchmark, while the
+    // From `V14` the gold long accrues nothing and the rollover records the benchmark, while the
     // bitcoin long still pays SOFR plus the markup.
-    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V13 });
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V14 });
     let balance = h.balance(gold);
     let ev = rollover(&mut h, 21);
     assert!(ev.contains(&missing_rate("Sofr", &[GOLD])), "{ev:?}");
@@ -138,7 +138,7 @@ fn every_rollover_records_each_benchmark_with_no_rate_and_finances_only_rated_ma
     // BTC, ETH, and AAPL use SOFR, the two euro listings ESTR, and sterling SONIA. They are listed
     // before any benchmark has a rate, as the production genesis lists its markets, and then only
     // SONIA gets one.
-    let mut h = Harness::v13();
+    let mut h = Harness::v14();
     for (id, benchmark) in [(EURO_A, "ESTR"), (EURO_B, "ESTR"), (STERLING, "SONIA")] {
         h.operator_admin(AdminCommand::UpsertMarket(listing(id, benchmark)));
     }
@@ -171,14 +171,14 @@ fn every_rollover_records_each_benchmark_with_no_rate_and_finances_only_rated_ma
 }
 
 #[test]
-fn once_a_benchmark_has_a_rate_a_listing_names_only_one_with_a_rate_from_v13() {
+fn once_a_benchmark_has_a_rate_a_listing_names_only_one_with_a_rate_from_v14() {
     let refused = |events: Vec<Event>| {
         assert!(
             matches!(&events[..], [Event::AdminRejected { reason }] if reason == "benchmark Sofr has no rate"),
             "{events:?}"
         );
     };
-    let mut h = Harness::v13();
+    let mut h = Harness::v14();
     // With no rate yet, a listing may name any benchmark.
     h.operator_admin(AdminCommand::UpsertMarket(listing(GOLD, "Sofr")));
     h.operator_admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 500 });
@@ -192,7 +192,7 @@ fn once_a_benchmark_has_a_rate_a_listing_names_only_one_with_a_rate_from_v13() {
     h.operator_admin(AdminCommand::UpsertMarket(MarketSpec { max_slippage_bps: 30, ..listing(GOLD, "Sofr") }));
     h.operator_admin(AdminCommand::UpsertMarket(listing(EURO_A, "SOFR")));
 
-    // Before `V13` the same listing applies.
+    // Before `V14` the same listing applies.
     let mut h = Harness::v12();
     h.operator_admin(AdminCommand::SetBenchmarkRate { benchmark: "SOFR".into(), annual_bps: 500 });
     h.operator_admin(AdminCommand::UpsertMarket(listing(EURO_A, "Sofr")));

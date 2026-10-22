@@ -22,7 +22,7 @@ const MAX_MULTIPLE_BPS: i64 = 100_000;
 /// every later one once the horizon is lowered; the cap bounds that wait.
 const MAX_HORIZON_MS: i64 = 3_600_000;
 /// The resting-order cap of parameters that name none, as those recorded before the cap existed.
-/// It is protocol: changing it changes what those logs mean from `V13`.
+/// It is protocol: changing it changes what those logs mean from `V14`.
 pub const DEFAULT_MAX_RESTING_ORDERS: usize = 100;
 /// The highest resting-order cap accepted. A price update checks every resting order in its market,
 /// so the cap bounds what one account adds to that work.
@@ -53,7 +53,7 @@ pub struct ProtocolParams {
     /// negative house NAV is. Zero means none, and is left out of the encoding.
     #[serde(default, skip_serializing_if = "Fixed::is_zero")]
     pub house_total_cap_floor: Fixed,
-    /// Most resting orders one account may hold at once, across every market, from `V13`. Left out of
+    /// Most resting orders one account may hold at once, across every market, from `V14`. Left out of
     /// the encoding at its default, so parameters that name none keep the roots they had.
     #[serde(default = "default_max_resting_orders", skip_serializing_if = "is_default_max_resting_orders")]
     pub max_resting_orders: usize,

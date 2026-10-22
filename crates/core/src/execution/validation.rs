@@ -14,7 +14,7 @@ impl Engine {
     /// - an unknown market
     /// - a qty, quoted price, or trigger price at or below zero or above `Fixed::MAX_INPUT`
     /// - an account that has never been credited
-    /// - from `V13`, a limit or stop order from an account already resting the parameters' cap, or
+    /// - from `V14`, a limit or stop order from an account already resting the parameters' cap, or
     ///   one that is not reduce-only whose notional at its own price, in USD at that price in a
     ///   market that converts at its own index and at its FX market's last mark in any other, is
     ///   below the market's minimum, or whose FX market has no mark yet
@@ -39,7 +39,7 @@ impl Engine {
         let Some(acct) = self.accounts.get(&req.account) else {
             return Err(Reject::InsufficientFunds { available: Fixed::ZERO });
         };
-        if rests && self.protocol_version >= ProtocolVersion::V13 {
+        if rests && self.protocol_version >= ProtocolVersion::V14 {
             if acct.orders.len() >= params.max_resting_orders {
                 return Err(Reject::TooManyOrders { max: params.max_resting_orders });
             }

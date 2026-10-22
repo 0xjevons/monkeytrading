@@ -1,4 +1,4 @@
-//! Resting orders from `V13`: an account rests at most the parameters' cap, a resting order that may
+//! Resting orders from `V14`: an account rests at most the parameters' cap, a resting order that may
 //! add risk meets its market's minimum notional at its own price, and placing one checks only that
 //! order against the live price.
 
@@ -21,7 +21,7 @@ const FR40: MarketId = 7;
 #[test]
 fn an_account_rests_dust_limits_up_to_the_default_cap_and_no_more() {
     // The issue's scenario: buy limits of one unit of precision at a price of one unit of precision.
-    let mut h = Harness::v13();
+    let mut h = Harness::v14();
     let (a, b) = (acct(1), acct(2));
     h.deposit(a, "1000");
     h.deposit(b, "1000");
@@ -43,7 +43,7 @@ fn an_account_rests_dust_limits_up_to_the_default_cap_and_no_more() {
 
 #[test]
 fn the_cap_counts_every_resting_kind_and_follows_the_parameters_in_force() {
-    let mut h = Harness::v13();
+    let mut h = Harness::v14();
     h.operator_admin(AdminCommand::SetParams(ProtocolParams {
         max_resting_orders: 2,
         ..with_divergence_shares(params())
@@ -72,13 +72,13 @@ fn the_cap_counts_every_resting_kind_and_follows_the_parameters_in_force() {
 }
 
 #[test]
-fn the_cap_applies_from_the_seq_v13_activates() {
+fn the_cap_applies_from_the_seq_v14_activates() {
     let mut h = Harness::v12();
-    // Before `V13` parameters may not name a cap, and the default is not applied.
+    // Before `V14` parameters may not name a cap, and the default is not applied.
     let capped = AdminCommand::SetParams(ProtocolParams { max_resting_orders: 1, ..params() });
     let events = h.operate(capped);
     assert!(
-        matches!(&events[..], [Event::AdminRejected { reason }] if reason.contains("needs protocol V13")),
+        matches!(&events[..], [Event::AdminRejected { reason }] if reason.contains("needs protocol V14")),
         "{events:?}"
     );
     let a = acct(1);
@@ -87,7 +87,7 @@ fn the_cap_applies_from_the_seq_v13_activates() {
     (0..=DEFAULT_MAX_RESTING_ORDERS).for_each(|_| {
         accepted(&dust_limit(&mut h, a, BTC));
     });
-    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V13 });
+    h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V14 });
     assert_eq!(rejection(&dust_limit(&mut h, a, BTC)), &Reject::TooManyOrders { max: DEFAULT_MAX_RESTING_ORDERS });
     assert_eq!(h.engine.accounts()[&a].orders.len(), DEFAULT_MAX_RESTING_ORDERS + 1);
     h.operator_admin(AdminCommand::SetParams(ProtocolParams {
@@ -99,7 +99,7 @@ fn the_cap_applies_from_the_seq_v13_activates() {
 #[test]
 fn a_resting_order_that_may_add_risk_meets_the_minimum_notional_at_its_own_price() {
     let below = || Reject::InvalidOrder { reason: "below minimum order notional".into() };
-    let mut h = Harness::v13();
+    let mut h = Harness::v14();
     let mut eth = market(ETH, "ETH-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000);
     eth.min_order_notional = f("100");
     h.operator_admin(AdminCommand::UpsertMarket(eth.clone()));
@@ -117,7 +117,7 @@ fn a_resting_order_that_may_add_risk_meets_the_minimum_notional_at_its_own_price
     let reducing = reducing(a, ETH, "0.01", OrderKind::Stop { price: f("2500") });
     accepted(&h.cmd(Command::PlaceOrder(reducing)));
 
-    // Before `V13` the dust limit rests, and only a fill checks the minimum.
+    // Before `V14` the dust limit rests, and only a fill checks the minimum.
     let mut h = Harness::v12();
     h.operator_admin(AdminCommand::UpsertMarket(eth));
     h.deposit(a, "100000");
@@ -129,7 +129,7 @@ fn a_resting_order_that_may_add_risk_meets_the_minimum_notional_at_its_own_price
 fn a_resting_order_in_a_market_quoted_in_euros_meets_the_minimum_in_dollars() {
     let below = || Reject::InvalidOrder { reason: "below minimum order notional".into() };
     let euro = |id, symbol: &str| MarketSpec { id, symbol: symbol.into(), min_order_notional: f("100"), ..de40(500) };
-    let mut h = Harness::v13();
+    let mut h = Harness::v14();
     h.operator_admin(AdminCommand::UpsertMarket(market(EURUSD, "EUR-USD", AssetClass::Fx, Schedule::AlwaysOpen, 200)));
     h.operator_admin(AdminCommand::UpsertMarket(euro(DE40, "DE40")));
     let a = acct(1);
@@ -153,7 +153,7 @@ fn a_usd_jpy_order_is_valued_at_its_own_price_as_its_fill_would_be() {
     // USD-JPY is quoted in yen and converts at its own index, so a fill's dollar notional is its
     // qty, at whatever price it fills.
     let below = || Reject::InvalidOrder { reason: "below minimum order notional".into() };
-    let mut h = Harness::v13();
+    let mut h = Harness::v14();
     let usdjpy = market(USDJPY, "USD-JPY", AssetClass::Fx, Schedule::AlwaysOpen, 200);
     let yen = QuoteCurrency::Jpy { fx_market: USDJPY };
     let spec = MarketSpec { quote_currency: yen, min_order_notional: f("100"), ..usdjpy };
@@ -172,8 +172,8 @@ fn a_usd_jpy_order_is_valued_at_its_own_price_as_its_fill_would_be() {
 }
 
 #[test]
-fn placing_a_resting_order_checks_only_that_order_from_v13() {
-    for (mut h, fills_on_placement) in [(Harness::v12(), true), (Harness::v13(), false)] {
+fn placing_a_resting_order_checks_only_that_order_from_v14() {
+    for (mut h, fills_on_placement) in [(Harness::v12(), true), (Harness::v14(), false)] {
         let version = h.engine.protocol_version();
         let (a, b) = (acct(1), acct(2));
         h.deposit(a, "100000");
@@ -185,7 +185,7 @@ fn placing_a_resting_order_checks_only_that_order_from_v13() {
         let held = accepted(&h.order(a, BTC, Side::Buy, "0.1", OrderKind::Limit { price: f("100000") }));
         h.operator_admin(AdminCommand::SetStressFloor { market: Some(BTC), level: 0 });
 
-        // Another account's resting order fills the held limit only before `V13`.
+        // Another account's resting order fills the held limit only before `V14`.
         let ev = h.order(b, BTC, Side::Buy, "0.1", OrderKind::Limit { price: f("90000") });
         let filled: Vec<OrderId> = fills(&ev).iter().map(|fill| fill.order_id).collect();
         assert_eq!(filled == [held], fills_on_placement, "{version:?}: {ev:?}");
@@ -193,7 +193,7 @@ fn placing_a_resting_order_checks_only_that_order_from_v13() {
         let marketable = h.order(b, BTC, Side::Buy, "0.1", OrderKind::Limit { price: f("100010") });
         let order_id = accepted(&marketable);
         assert_eq!(fills(&marketable).iter().map(|fill| fill.order_id).collect::<Vec<_>>(), [order_id], "{version:?}");
-        // From `V13` the next price fills the held limit.
+        // From `V14` the next price fills the held limit.
         let ev = h.price(BTC, "100000");
         let filled: Vec<OrderId> = fills(&ev).iter().map(|fill| fill.order_id).collect();
         assert_eq!(filled == [held], !fills_on_placement, "{version:?}: {ev:?}");
@@ -202,7 +202,7 @@ fn placing_a_resting_order_checks_only_that_order_from_v13() {
 
 #[test]
 fn a_placed_order_that_cannot_fill_is_cancelled_and_frees_its_place() {
-    let mut h = Harness::v13();
+    let mut h = Harness::v14();
     h.operator_admin(AdminCommand::SetParams(ProtocolParams {
         max_resting_orders: 1,
         ..with_divergence_shares(params())

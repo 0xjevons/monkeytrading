@@ -109,10 +109,10 @@ impl Engine {
     }
 
     /// One day of overnight financing on every open position. Longs pay benchmark + markup; shorts
-    /// receive benchmark - markup. From `V13` each benchmark with no rate is recorded with the markets
+    /// receive benchmark - markup. From `V14` each benchmark with no rate is recorded with the markets
     /// that use it, which accrue nothing.
     fn charge_financing(&mut self, events: &mut Vec<Event>) {
-        if self.protocol_version >= ProtocolVersion::V13 {
+        if self.protocol_version >= ProtocolVersion::V14 {
             let unrated = self
                 .markets
                 .iter()
@@ -145,7 +145,7 @@ impl Engine {
     }
 
     /// One day's financing on `pos` in USD, positive when the account pays, or `None` when the market
-    /// has no mark to value it at or, from `V13`, its benchmark has no rate. Before `V13` a benchmark
+    /// has no mark to value it at or, from `V14`, its benchmark has no rate. Before `V14` a benchmark
     /// with no rate counts as zero. From `V5` the amount rounds up, so a charge rounds against the
     /// account and a credit toward zero; before `V5` it truncates. A market quoted in another
     /// currency converts the amount to USD rounded up, the same way.
@@ -155,7 +155,7 @@ impl Engine {
         let financing = &market.spec.financing;
         let benchmark = match self.benchmarks.get(&financing.benchmark) {
             Some(rate) => *rate,
-            None if self.protocol_version >= ProtocolVersion::V13 => return None,
+            None if self.protocol_version >= ProtocolVersion::V14 => return None,
             None => 0,
         };
         let annual_bps =
