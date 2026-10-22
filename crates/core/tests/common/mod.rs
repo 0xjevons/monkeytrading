@@ -141,6 +141,14 @@ impl Harness {
         h
     }
 
+    /// `v11`, then `V12`, which brings every market to the sequenced time before each command and
+    /// counts a venue quote stamped ahead at once.
+    pub fn v12() -> Self {
+        let mut h = Harness::v11();
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V12 });
+        h
+    }
+
     /// No commands yet, at the harness start time.
     fn empty() -> Self {
         Harness {
@@ -193,11 +201,16 @@ impl Harness {
     /// Lists EUR-USD (USD-quoted), USD-JPY (quoted in yen and converted at its own index), both with
     /// 2% margin, and Germany 40 (5% margin) quoted in euros and converted at EUR-USD; all 24/7.
     pub fn list_fx(&mut self) {
-        self.admin(AdminCommand::UpsertMarket(market(EURUSD, "EUR-USD", AssetClass::Fx, Schedule::AlwaysOpen, 200)));
         let usdjpy = market(USDJPY, "USD-JPY", AssetClass::Fx, Schedule::AlwaysOpen, 200);
         let yen = QuoteCurrency::Jpy { fx_market: USDJPY };
-        self.admin(AdminCommand::UpsertMarket(MarketSpec { quote_currency: yen, ..usdjpy }));
-        self.admin(AdminCommand::UpsertMarket(de40(500)));
+        let eurusd = market(EURUSD, "EUR-USD", AssetClass::Fx, Schedule::AlwaysOpen, 200);
+        for spec in [eurusd, MarketSpec { quote_currency: yen, ..usdjpy }, de40(500)] {
+            // Once the log records an operator, the operator signs listings.
+            match self.engine.operator() {
+                Some(_) => self.operator_admin(AdminCommand::UpsertMarket(spec)),
+                None => self.admin(AdminCommand::UpsertMarket(spec)),
+            }
+        }
     }
 
     /// Sequences and applies one command at the current time, recording it in the log. An unsigned
@@ -351,6 +364,11 @@ pub fn operator() -> Operator {
 /// Parses a decimal.
 pub fn f(s: &str) -> Fixed {
     s.parse().unwrap()
+}
+
+/// A quote from `source` at `mid`, stamped `ts`.
+pub fn quote(source: &str, mid: &str, ts: Millis) -> SourceQuote {
+    SourceQuote { source: source.into(), mid: f(mid), ts }
 }
 
 /// A distinct account per `n`.

@@ -8,7 +8,8 @@
 //!
 //! A price update checks the accounts holding its market. From `V6`, financing and parameter or
 //! listing changes check accounts too, only a market inside its trading session can trade, and a
-//! market that can trade counts at the index a close-out would fill it at.
+//! market that can trade counts at the index a close-out would fill it at. From `V12`, so does any
+//! change to a market's index without a price update, before the next command acts.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +19,6 @@ use crate::engine::Engine;
 use crate::event::Event;
 use crate::execution::{Exec, PriceGuard};
 use crate::fixed::Rounding;
-use crate::price::compute_index;
 use crate::protocol::ProtocolVersion;
 use crate::types::{AccountId, MarketId, Side};
 
@@ -26,8 +26,8 @@ impl Engine {
     /// Closes out every account holding a position in `market_id` that has fallen below the
     /// close-out level.
     ///
-    /// TODO: this scans every account on each price update; index accounts by market before the
-    /// account count makes the scan a cost on the sequencer path.
+    /// TODO: this scans every account on each price update or, from `V12`, index change; index
+    /// accounts by market before the account count makes the scan a cost on the sequencer path.
     pub(crate) fn check_closeouts(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
         self.close_out_where(|acct| acct.positions.contains_key(&market_id), events);
     }
@@ -133,12 +133,12 @@ impl Engine {
     /// another currency than USD. From `V6`, the market must also be inside its session now, as its
     /// open flag changes only when its session is refreshed, and a close-out can run before that.
     pub(crate) fn tradeable_index(&self, market_id: MarketId) -> Option<(Fixed, Option<Fixed>)> {
-        let market = &self.markets[&market_id];
-        let in_session = self.protocol_version < ProtocolVersion::V6 || market.spec.schedule.is_open(self.now);
-        if !market.open || !in_session {
+        let in_session =
+            self.protocol_version < ProtocolVersion::V6 || self.markets[&market_id].spec.schedule.is_open(self.now);
+        if !in_session {
             return None;
         }
-        let mid = compute_index(&market.quotes, &market.spec.price_rules, self.now).ok()?.mid;
+        let mid = self.live_index(market_id)?.mid;
         Some((mid, self.live_fx(market_id).ok()?))
     }
 }

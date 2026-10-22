@@ -56,11 +56,16 @@ this crate and reproduce the signed state roots exactly.
   average of the account's markouts, from a neutral prior and over at most a memory of fill
   notional, so dust cannot reset a score and no single fill sets one; each markout is scored only at
   an index valid when it is scored, within one horizon of falling due
+- From protocol `V12`, every command first brings each market to its sequenced time: an index that
+  changes without a price update, at an open, when a quote ages out, or when its FX market gains a
+  price, sets the mark and stress and fills resting orders and close-outs before any order,
+  rollover, or check uses it, and a venue quote stamped ahead counts at once
 
 ## Repository Structure
 
 - `src/lib.rs` — module index and the protocol summary
-- `src/engine.rs` — engine state, command dispatch, sessions, prices, and USD valuation
+- `src/engine.rs` — engine state, command dispatch, sessions, and USD valuation
+- `src/marks.rs` — venue prices, and marking a market and the markets that convert at its index
 - `src/execution.rs` — order placement, triggers, pricing, risk checks, and booking fills
 - `src/markouts.rs` — each fill's markout, queued and then marked against the index after its
   horizon, and toxicity scores
@@ -91,7 +96,8 @@ this crate and reproduce the signed state roots exactly.
 - `src/types.rs` — ids, sides, and asset classes
 - `tests/` — protocol tests through `Engine::apply`, with a shared harness, its signing client
   (`client.rs`), and the reference-log format in `tests/common/`; `tests/operator.rs` covers signed
-  admin commands and every-market reduce-only, and `tests/toxicity.rs` toxicity scoring
+  admin commands and every-market reduce-only, `tests/toxicity.rs` toxicity scoring, and
+  `tests/quote_timing.rs` indices that change without a price update and venue quotes stamped ahead
 - `tests/reference/` — one reference log per protocol version: each line is a sequenced command and
   the state root after it
 - `tests/reference_logs.rs` — replays every reference log and fails at the first seq whose root
@@ -108,7 +114,8 @@ this crate and reproduce the signed state roots exactly.
 - `tests/fixtures/merkle.json` — state tree vectors computed with Foundry's `cast`: keys, leaf ABI
   encodings and value hashes, a root, and proofs
 - `examples/reference_log/` — writes the reference log for a new protocol version: the session
-  (`main.rs`), the requests and event names it uses (`helpers.rs`), and its `V10` part (`v10.rs`)
+  (`main.rs`), the requests and event names it uses (`helpers.rs`), and its `V10` and `V12` parts
+  (`v10.rs`, `v12.rs`)
 - `examples/sign_request.rs` — a client signing a request body for the API
 - `examples/verify_proof.rs` — checks an account proof from the API against a root
 
@@ -164,18 +171,21 @@ Two suites guard replay and accounting:
   aarch64 Linux, and `scripts/check-reference-logs.sh` fails a branch that changes, renames, or
   deletes a committed log.
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
-  under `V2`, `V6`, `V7` with markets quoted in other currencies, and `V11`. Each mixes client,
-  feed, custody, and operator commands, with values inside and outside the input bounds, and checks
-  after every command that nothing panicked, cash is conserved, and every market's aggregates match
-  its accounts' positions. Raise `CASES` or change `SEED` in `tests/invariants/main.rs` to search
-  further. The same suite generates adds, reductions, and flips at one price under `V5` and checks
-  that none realises a profit; fills in random spread and margin bands under `V11` and checks that
-  none pays less spread or posts less margin than the exact amount; and fills of any size from dust
-  up, each marked out at a moved index or after a window without one, under `V11`, and checks that
-  the toxicity score stays within a millionth of a bp of the exact notional-weighted average of its
-  markouts.
-  Under `V9`, the same sessions check that roots computed from what changed, at random points,
-  equal a root hashed from scratch, and that every account's proof verifies against them.
+  under `V2`, `V6`, `V7` with markets quoted in other currencies, `V11`, and `V12` with those
+  markets and signed operator commands. Each mixes client, feed, custody, and operator commands,
+  with values inside and outside the input bounds, and checks after every command that nothing
+  panicked, cash is conserved, and every market's aggregates match its accounts' positions. Under
+  `V12` it also checks that every market has processed the index it can deal at, holds no quote
+  stamped after the sequenced time, and was filled only at that index and its FX market's. Raise
+  `CASES` or change `SEED` in `tests/invariants/main.rs` to search further. The same suite generates
+  adds, reductions, and flips at one price under `V5` and checks that none realises a profit; fills
+  in random spread and margin bands under `V11` and checks that none pays less spread or posts less
+  margin than the exact amount; and fills of any size from dust up, each marked out at a moved index
+  or after a window without one, under `V11`, and checks that the toxicity score stays within a
+  millionth of a bp of the exact notional-weighted average of its markouts.
+  Under the latest version, the same sessions check that roots computed from what changed, at
+  random points, equal a root hashed from scratch, and that every account's proof verifies against
+  them.
 
 ### Adding a protocol version
 
@@ -201,7 +211,9 @@ reduce-only, and refuses parameters whose spreads would refuse a close; it activ
 and its log is `v8.jsonl`. `V9` makes the state root the root of the state tree; its log is
 `v9.jsonl`. `V10` rounds spreads and margin in the house's favour; its log is `v10.jsonl`. `V11`
 makes a toxicity score the notional-weighted average of its markouts, to nine decimals, each scored
-only at a valid index; its log is `v11.jsonl`. For each later version:
+only at a valid index; its log is `v11.jsonl`. `V12` brings every market to its sequenced time before
+each command and counts a quote stamped ahead at once; its log is `v12.jsonl`. For each later
+version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log/main.rs` so it activates the new version and exercises the new rules.

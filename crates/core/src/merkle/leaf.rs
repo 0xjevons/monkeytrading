@@ -11,7 +11,8 @@
 //!   market's first price; `quoteCurrency` 0 for USD, 1 for EUR, 2 for GBP, and 3 for JPY, with
 //!   `fxMarket` the market whose index converts it to USD (0 for USD); `fxMarked` false and
 //!   `fxMark` 0 until that index has priced it; and `stateHash` the keccak-256 of the JSON encoding
-//!   of its spec, venue quotes, open and reduce-only flags, and stress state. A market's index of
+//!   of its spec, venue quotes, open and reduce-only flags, stress state, and, from `V12`, the index
+//!   it was last processed at. A market's index of
 //!   resting orders is left out: the order leaves hold those orders. An amount in a EUR or GBP
 //!   market is `fxMark` times as many USD, and one in a JPY market `1 / fxMark` times as many.
 //! - **Resting order:** the keccak-256 of the JSON encoding of `{ "account", "order" }`.
@@ -46,7 +47,7 @@ use crate::account::{Account, Position, RestingOrder};
 use crate::engine::{MarketState, Markout, StressState};
 use crate::market::{MarketSpec, QuoteCurrency};
 use crate::merkle::keccak;
-use crate::price::SourceQuote;
+use crate::price::{Index, SourceQuote};
 use crate::types::{AccountId, MarketId, OrderId};
 
 /// The kind byte that starts each key.
@@ -122,7 +123,7 @@ pub struct MarketLeaf {
     pub client_qty: Fixed,
     pub client_cost: Fixed,
     /// keccak-256 of the JSON encoding of the market's spec, venue quotes, open and reduce-only
-    /// flags, and stress state.
+    /// flags, stress state, and, from `V12`, the index it was last processed at.
     pub state_hash: B256,
 }
 
@@ -134,6 +135,9 @@ struct MarketRest<'a> {
     open: bool,
     reduce_only: bool,
     stress: &'a StressState,
+    /// Left out while `None`, as it is before `V12`, so earlier roots stand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    processed_index: &'a Option<Index>,
 }
 
 /// What a resting order's leaf covers.
@@ -192,9 +196,20 @@ impl MarketLeaf {
     /// The leaf of `market`.
     pub(crate) fn of(market: &MarketState) -> Self {
         // `resting` indexes orders the order leaves hold.
-        let MarketState { spec, quotes, open, reduce_only, mark, fx_mark, client_qty, client_cost, stress, resting: _ } =
-            market;
-        let rest = MarketRest { spec, quotes, open: *open, reduce_only: *reduce_only, stress };
+        let MarketState {
+            spec,
+            quotes,
+            open,
+            reduce_only,
+            mark,
+            fx_mark,
+            client_qty,
+            client_cost,
+            stress,
+            resting: _,
+            processed_index,
+        } = market;
+        let rest = MarketRest { spec, quotes, open: *open, reduce_only: *reduce_only, stress, processed_index };
         MarketLeaf {
             mark: *mark,
             quote_currency: spec.quote_currency,

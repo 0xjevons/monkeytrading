@@ -12,7 +12,8 @@ use crate::market::PriceRules;
 use crate::types::Millis;
 
 /// How far after the sequenced time a venue may stamp a quote. A quote stamped up to this far ahead
-/// is kept and counts once the sequenced time reaches its stamp; one stamped further ahead is refused.
+/// is kept: from `V12` it counts at once, stamped at the sequenced time, and before `V12` it counts
+/// once the sequenced time reaches its stamp. One stamped further ahead is refused.
 pub const MAX_QUOTE_LEAD_MS: Millis = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -28,7 +29,8 @@ pub enum PriceError {
 pub struct SourceQuote {
     pub source: String,
     pub mid: Fixed,
-    /// Venue timestamp of the quote.
+    /// Venue timestamp of the quote; from `V12`, a stored quote whose venue stamped it ahead of the
+    /// sequenced time carries the sequenced time instead.
     pub ts: Millis,
 }
 

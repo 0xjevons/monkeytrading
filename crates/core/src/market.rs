@@ -244,7 +244,7 @@ impl QuoteCurrency {
 
     /// Whether `fx`, a valid index of this currency's FX market, can convert it: one unit of the
     /// currency is worth at most `MAX_USD_PER_UNIT`.
-    pub(crate) fn converts_at(self, fx: Fixed) -> bool {
+    pub fn converts_at(self, fx: Fixed) -> bool {
         self.to_usd(Fixed::ONE, Some(fx), Rounding::Up) <= MAX_USD_PER_UNIT
     }
 }

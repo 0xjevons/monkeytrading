@@ -1,9 +1,10 @@
 //! The engine state machine: `apply(sequenced command) -> events`.
 //!
 //! Single-threaded and deterministic. Time comes only from the sequencer's stamp. This file holds
-//! the state, dispatch, time, prices, and USD valuation; funds and financing live in `funds.rs`,
-//! admin and stress in `admin.rs`, client request auth in `auth.rs`, orders and pricing in
-//! `execution.rs`, close-outs in `closeout.rs`, and markouts in `markouts.rs`.
+//! the state, dispatch, time, sessions, and USD valuation; venue prices and marks live in
+//! `marks.rs`, funds and financing in `funds.rs`, admin and stress in `admin.rs`, client request
+//! auth in `auth.rs`, orders and pricing in `execution.rs`, close-outs in `closeout.rs`, and
+//! markouts in `markouts.rs`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
@@ -16,10 +17,10 @@ use crate::auth::{ClientAuth, Operator};
 use crate::command::{Command, Sequenced};
 use crate::event::{Event, Reject};
 use crate::fixed::Rounding;
-use crate::market::{MarketSpec, QuoteCurrency};
+use crate::market::MarketSpec;
 use crate::merkle::state::{Changed, StateTree, is_zero};
 use crate::params::ProtocolParams;
-use crate::price::{Index, MAX_QUOTE_LEAD_MS, SourceQuote, compute_index};
+use crate::price::{Index, SourceQuote, compute_index};
 use crate::protocol::ProtocolVersion;
 use crate::tracked::{TrackedMap, TrackedSet};
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
@@ -99,6 +100,11 @@ pub struct MarketState {
     pub stress: StressState,
     /// Resting orders in time priority.
     pub resting: BTreeMap<OrderId, AccountId>,
+    /// From `V12`, the index the mark, stress, resting orders, and close-outs were last processed
+    /// at, or `None` once the market cannot deal: closed, with no valid index, or with no FX price.
+    /// Left out of the encoding while `None`, so roots before `V12` do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processed_index: Option<Index>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -139,6 +145,7 @@ impl MarketState {
             client_cost: Fixed::ZERO,
             stress: StressState::default(),
             resting: BTreeMap::new(),
+            processed_index: None,
         }
     }
 
@@ -171,8 +178,23 @@ impl Engine {
         self.now = sequenced.ts;
 
         let mut events = Vec::new();
+        // From `V12`, a price command's quotes are stored first, then every market is brought to the
+        // sequenced time, so no fill or check, a rollover's included, acts on an index the market
+        // does not have at that time, or before it is processed.
+        let v12 = self.protocol_version >= ProtocolVersion::V12;
+        if v12 {
+            let priced = match &sequenced.cmd {
+                Command::Prices { market, quotes } => {
+                    self.store_quotes(*market, quotes, &mut events).then_some(*market)
+                }
+                _ => None,
+            };
+            self.advance_markets(priced, &mut events);
+        }
         self.run_rollovers(&mut events);
         match &sequenced.cmd {
+            // From `V12` the quotes are stored and processed above.
+            Command::Prices { .. } if v12 => {}
             Command::Prices { market, quotes } => self.on_prices(*market, quotes, &mut events),
             Command::Tick => self.refresh_all_sessions(&mut events),
             Command::Deposit { account, amount, chain_ref } => self.deposit(*account, *amount, chain_ref, &mut events),
@@ -379,105 +401,10 @@ impl Engine {
     }
 
     /// Refreshes every market's session, so opens and closes fire even without price traffic.
-    fn refresh_all_sessions(&mut self, events: &mut Vec<Event>) {
+    pub(crate) fn refresh_all_sessions(&mut self, events: &mut Vec<Event>) {
         let ids: Vec<MarketId> = self.markets.keys().copied().collect();
         for market_id in ids {
             self.refresh_session(market_id, events);
         }
-    }
-
-    /// Stores venue quotes, then marks the market from them (`reprice`). Malformed quotes, and quotes
-    /// stamped more than `MAX_QUOTE_LEAD_MS` after the sequenced time, are refused one by one.
-    fn on_prices(&mut self, market_id: MarketId, quotes: &[SourceQuote], events: &mut Vec<Event>) {
-        let now = self.now;
-        let Some(market) = self.markets.get_mut(&market_id) else {
-            events.push(Event::PricesRejected { market: market_id, reason: "unknown market".into() });
-            return;
-        };
-        for quote in quotes {
-            if !quote.is_well_formed() {
-                let reason = format!("malformed quote from {}", quote.source);
-                events.push(Event::PricesRejected { market: market_id, reason });
-                continue;
-            }
-            let lead_ms = quote.ts.saturating_sub(now);
-            if lead_ms > MAX_QUOTE_LEAD_MS {
-                let reason = format!("quote from {} stamped {lead_ms}ms ahead of the sequenced time", quote.source);
-                events.push(Event::PricesRejected { market: market_id, reason });
-                continue;
-            }
-            // A stored quote stamped after the sequenced time does not count yet, so it never holds
-            // back a replacement.
-            if market.quotes.get(&quote.source).is_none_or(|old| quote.ts >= old.ts || old.ts > now) {
-                market.quotes.insert(quote.source.clone(), quote.clone());
-            }
-        }
-        self.reprice(market_id, events);
-    }
-
-    /// Marks a market from its stored quotes, as a price update does: if it is open with a valid
-    /// index, gives that index to the markets that convert at it as their FX mark, and marks the
-    /// market and each of those that is open with a price from its own quotes. Only once every mark
-    /// is set does each marked market update its stress and trigger its resting orders, and
-    /// close-outs run in every market whose value moved.
-    pub(crate) fn reprice(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
-        let now = self.now;
-        self.refresh_session(market_id, events);
-        let market = &self.markets[&market_id];
-        if !market.open || self.params.is_none() {
-            return;
-        }
-        let Ok(index) = compute_index(&market.quotes, &market.spec.price_rules, now) else { return };
-        let dependents: Vec<MarketId> =
-            self.mark_fx(market_id, index.mid).into_iter().filter(|id| *id != market_id).collect();
-        let mut marked = Vec::new();
-        if self.set_mark(market_id, index) {
-            marked.push((market_id, index));
-        }
-        for &dependent in &dependents {
-            self.refresh_session(dependent, events);
-            let market = &self.markets[&dependent];
-            let live =
-                if market.open { compute_index(&market.quotes, &market.spec.price_rules, now).ok() } else { None };
-            if let Some(index) = live
-                && self.set_mark(dependent, index)
-            {
-                marked.push((dependent, index));
-            }
-        }
-        for (id, index) in &marked {
-            self.update_stress(*id, index.mid, index.divergence_bps, events);
-        }
-        for (id, _) in &marked {
-            self.trigger_resting(*id, events);
-        }
-        if marked.first().is_some_and(|(id, _)| *id == market_id) {
-            self.check_closeouts(market_id, events);
-        }
-        // A new FX mark moves the USD value of every market that took it, marked or not.
-        for dependent in dependents {
-            self.check_closeouts(dependent, events);
-        }
-    }
-
-    /// Marks a market at `index`, its live index, and returns true, unless its FX market has no
-    /// price: then it has none either, keeps its last mark, and this returns false.
-    fn set_mark(&mut self, market_id: MarketId, index: Index) -> bool {
-        if self.live_fx(market_id).is_err() {
-            return false;
-        }
-        self.markets.get_mut(&market_id).expect("market exists").mark = Some(index.mid);
-        true
-    }
-
-    /// Sets `mid` as the FX mark of every market that converts at `fx_market`'s index and that `mid`
-    /// can convert, and returns those markets.
-    fn mark_fx(&mut self, fx_market: MarketId, mid: Fixed) -> Vec<MarketId> {
-        let converts = |currency: QuoteCurrency| currency.fx_market() == Some(fx_market) && currency.converts_at(mid);
-        let marked: Vec<MarketId> =
-            self.markets.iter().filter(|(_, m)| converts(m.spec.quote_currency)).map(|(id, _)| *id).collect();
-        // Only the markets it marks are taken for change, so the state root rehashes those alone.
-        marked.iter().for_each(|id| self.markets.get_mut(id).expect("found above").fx_mark = Some(mid));
-        marked
     }
 }

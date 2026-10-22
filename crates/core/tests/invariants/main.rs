@@ -1,11 +1,14 @@
 //! Accounting invariants under generated sessions. Each case sequences random client, feed,
 //! custody, and operator commands, with values inside and outside the engine's input bounds, under
 //! `V2`, the rules every log starts under, and again under `V6`, under `V7` with markets quoted in
-//! other currencies, and under `V11`, the latest. It checks after every command that
-//! it did not panic, that cash is conserved, and that each market's aggregates match its accounts'
-//! positions. Under each version the same sessions must reach every path that moves cash and the
-//! refusal of out-of-range amounts, order numbers, and quotes, and under `V6` a close-out that no
-//! price triggered, so the checks cannot pass vacuously.
+//! other currencies, under `V11`, and under `V12` with those markets and the operator signing its
+//! commands. It checks after every command that it did not panic, that cash is conserved, and that
+//! each market's aggregates match its accounts' positions; under `V12`, also that every market has
+//! processed the index its quotes give at the sequenced time, holds no quote stamped after it, and
+//! was filled only at that index. Under each version the same sessions must reach every path that
+//! moves cash and the refusal of out-of-range amounts, order numbers, and quotes; under `V6` a
+//! close-out that no price triggered; and under `V12` a resting order filled by a command with
+//! neither prices nor an order, which `V2` never fills; so the checks cannot pass vacuously.
 
 mod charges;
 #[path = "../common/mod.rs"]
@@ -20,7 +23,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::{HOUSE_CAPITAL, Harness, acct};
 use engine_core::command::Command;
-use engine_core::event::{Event, Reject};
+use engine_core::engine::MarketState;
+use engine_core::event::{Event, Fill, Reject};
+use engine_core::market::QuoteCurrency;
+use engine_core::price::compute_index;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::types::MarketId;
 use engine_core::{Engine, Fixed};
@@ -29,8 +35,13 @@ use session::{Session, command, session};
 
 /// Seed for every run, so CI and local runs check the same sessions.
 const SEED: u64 = 0x5eed_0021;
-/// Sessions per run: enough to find edge-of-range panics, few enough to run in about a second.
+/// Sessions per run: enough to find edge-of-range panics, few enough to run in a few seconds.
 const CASES: u32 = 1_024;
+/// The coverage path of a resting order filled by a command that carries neither prices nor an
+/// order, as only an index changed without a price update can fill it.
+const QUIET_RESTING_FILL: &str = "resting order filled without a price or an order";
+/// The coverage path of a fill in a market quoted in yen.
+const YEN_FILL: &str = "fill in yen";
 
 #[test]
 fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
@@ -38,7 +49,12 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
     // checked.
     let reached: RefCell<BTreeMap<ProtocolVersion, BTreeSet<&str>>> = RefCell::default();
     let result = TestRunner::new(config()).run(&session(), |session| {
-        for genesis in [Harness::new(), Harness::v6(), Harness::fx(), Harness::v11()] {
+        let v12 = || {
+            let mut h = Harness::v12();
+            h.list_fx();
+            h
+        };
+        for genesis in [Harness::new(), Harness::v6(), Harness::fx(), Harness::v11(), v12()] {
             let mut h = funded(genesis, &session);
             let version = h.engine.protocol_version();
             let mut inflow = h.deposits + Fixed::from_int(HOUSE_CAPITAL);
@@ -55,9 +71,27 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
                 {
                     paths.insert("close-out without a price");
                 }
+                let quiet = !matches!(cmd, Command::Prices { .. } | Command::PlaceOrder(_));
+                if quiet && events.iter().any(|e| matches!(e, Event::Fill(fill) if !fill.liquidation)) {
+                    paths.insert(QUIET_RESTING_FILL);
+                }
+                let in_yen = |fill: &Fill| {
+                    matches!(h.engine.markets()[&fill.market].spec.quote_currency, QuoteCurrency::Jpy { .. })
+                };
+                if events.iter().any(|e| matches!(e, Event::Fill(fill) if in_yen(fill))) {
+                    paths.insert(YEN_FILL);
+                }
                 inflow += cash_moved(&events);
-                check(&h.engine, inflow)
-                    .map_err(|e| TestCaseError::fail(format!("{version:?}, after {cmd:?}: {e}")))?;
+                let fail = |e| TestCaseError::fail(format!("{version:?}, after {cmd:?}: {e}"));
+                check(&h.engine, inflow).map_err(fail)?;
+                if version >= ProtocolVersion::V12 {
+                    check_processed(&h.engine).map_err(fail)?;
+                }
+                // An operator command can change an index after the command processed an earlier one.
+                let admin = matches!(cmd, Command::Admin(_) | Command::SignedAdmin(_));
+                if version >= ProtocolVersion::V12 && !admin {
+                    check_fills(&h.engine, &events).map_err(fail)?;
+                }
             }
         }
         Ok(())
@@ -87,15 +121,21 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
     ];
     let reached = reached.into_inner();
     let missed: Vec<(ProtocolVersion, &str)> =
-        [ProtocolVersion::V2, ProtocolVersion::V6, ProtocolVersion::V7, ProtocolVersion::V11]
+        [ProtocolVersion::V2, ProtocolVersion::V6, ProtocolVersion::V7, ProtocolVersion::V11, ProtocolVersion::V12]
             .into_iter()
             .flat_map(|version| expected.iter().map(move |path| (version, *path)))
-            .chain([(ProtocolVersion::V6, "close-out without a price")])
-            // Only `V7` lists markets quoted in another currency.
+            .chain([
+                (ProtocolVersion::V6, "close-out without a price"),
+                (ProtocolVersion::V12, "close-out without a price"),
+            ])
+            // Only `V7` and `V12` list markets quoted in another currency.
             .chain([(ProtocolVersion::V7, "fill converted to USD"), (ProtocolVersion::V7, "no FX price")])
+            .chain([(ProtocolVersion::V12, "fill converted to USD"), (ProtocolVersion::V12, "no FX price")])
+            .chain([(ProtocolVersion::V12, QUIET_RESTING_FILL), (ProtocolVersion::V12, YEN_FILL)])
             .filter(|(version, path)| !reached.get(version).is_some_and(|paths| paths.contains(path)))
             .collect();
     assert!(missed.is_empty(), "generated sessions never reach {missed:?}");
+    assert!(!reached[&ProtocolVersion::V2].contains(QUIET_RESTING_FILL), "V2 reached {QUIET_RESTING_FILL}");
 }
 
 // ── Helpers ──
@@ -142,6 +182,80 @@ fn check(engine: &Engine, inflow: Fixed) -> Result<(), String> {
         Some(id) => Err(format!("positions in unlisted market {id}")),
         None => Ok(()),
     }
+}
+
+/// Fails unless every market's session and processed index are those at the sequenced time, every
+/// market that can deal is marked at that index and FX index, and no market holds a quote stamped
+/// after the sequenced time.
+/// Error cases:
+/// - a market's open flag differs from its schedule at the sequenced time
+/// - a market's processed index differs from the index it can deal at now, or its mark or FX mark
+///   from that index's and its FX market's
+/// - a market holds a quote stamped after the sequenced time
+fn check_processed(engine: &Engine) -> Result<(), String> {
+    let now = engine.now();
+    let index_of = |market: &MarketState| compute_index(&market.quotes, &market.spec.price_rules, now).ok();
+    engine.markets().iter().try_for_each(|(id, market)| {
+        if market.open != market.spec.schedule.is_open(now) {
+            return Err(format!("market {id} open {} at {now}, against its schedule", market.open));
+        }
+        // The index its FX market converts it at now: `Some(None)` for a USD market, `None` without
+        // an FX price. A market that converts at its own index takes its FX mark from that index.
+        let currency = market.spec.quote_currency;
+        let fx = match currency.fx_market() {
+            None => Some(None),
+            Some(fx_id) if fx_id == *id => {
+                index_of(market).filter(|index| currency.converts_at(index.mid)).map(|index| Some(index.mid))
+            }
+            Some(fx_id) => {
+                let fx = &engine.markets()[&fx_id];
+                index_of(fx)
+                    .filter(|index| fx.spec.schedule.is_open(now) && currency.converts_at(index.mid))
+                    .filter(|_| market.fx_mark.is_some())
+                    .map(|index| Some(index.mid))
+            }
+        };
+        let dealable = market.open && engine.params().is_some() && fx.is_some();
+        let live = dealable.then(|| index_of(market)).flatten();
+        if market.processed_index != live {
+            return Err(format!("market {id} processed {:?}, but deals at {live:?}", market.processed_index));
+        }
+        if let Some(index) = live
+            && (market.mark != Some(index.mid) || market.fx_mark != fx.flatten())
+        {
+            return Err(format!(
+                "market {id} marked at {:?} and {:?}, not its index {index:?}",
+                market.mark, market.fx_mark
+            ));
+        }
+        match market.quotes.values().find(|quote| quote.ts > now) {
+            Some(quote) => Err(format!("market {id} holds {quote:?} stamped after {now}")),
+            None => Ok(()),
+        }
+    })
+}
+
+/// Fails unless every fill among `events` is at its market's processed index, and converts to USD at
+/// its FX market's.
+/// Error cases:
+/// - a fill at an index other than its market's processed index
+/// - a fill converted at an FX index other than its FX market's processed index
+fn check_fills(engine: &Engine, events: &[Event]) -> Result<(), String> {
+    let processed = |market| engine.markets().get(&market).and_then(|m| m.processed_index).map(|index| index.mid);
+    let fills = events.iter().filter_map(|event| match event {
+        Event::Fill(fill) => Some(fill),
+        _ => None,
+    });
+    fills.into_iter().try_for_each(|fill: &Fill| {
+        let fx_market = engine.markets()[&fill.market].spec.quote_currency.fx_market();
+        if processed(fill.market) != Some(fill.index) {
+            return Err(format!("{fill:?} is not at its market's processed index"));
+        }
+        if fill.fx_index.is_some() && fx_market.and_then(processed) != fill.fx_index {
+            return Err(format!("{fill:?} does not convert at its FX market's processed index"));
+        }
+        Ok(())
+    })
 }
 
 /// Cash the events moved across the engine's boundary: deposits and house capital in, approved

@@ -28,6 +28,9 @@
 //!   positions can be proven against a posted root.
 //! - From `V10`, every spread charge and margin requirement rounds up against the trader, though a
 //!   sell's spread stops a unit short of the price.
+//! - From `V12`, each command first processes every index that changed without a price update, so
+//!   every fill and check uses the index the quotes give at its sequenced time, and a venue quote
+//!   stamped ahead of that time counts at once.
 
 pub mod account;
 mod admin;
@@ -44,6 +47,7 @@ pub use fixed::Fixed;
 mod funds;
 pub mod market;
 mod markouts;
+mod marks;
 pub mod merkle;
 pub mod params;
 pub mod price;

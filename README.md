@@ -42,8 +42,9 @@ Margin is shared across an account's positions. When equity falls below half of 
 requirement, the largest losing position that can trade is closed first, and so on until the
 account recovers; a position in a market that is closed or has no fresh price waits until that
 market prices again. Losses beyond an account's balance fall on the house, never on the trader. The
-check runs on each price update, after each day's financing, and after a change to a margin table
-or the close-out level. A market with no fresh price allows no dealing at all, while accounts
+check runs on each price update, whenever a price moves without one because a market opens or a
+quote grows too old, after each day's financing, and after a change to a margin table or the
+close-out level. A market with no fresh price allows no dealing at all, while accounts
 holding it trade other markets and withdraw against its last price. Markets in real-world assets
 keep their exchange's hours, holidays, and early closes, and orders resting while a market is
 closed fill at the first price after it opens, gap and all. The house limits its own risk by

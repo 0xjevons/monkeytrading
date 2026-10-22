@@ -9,6 +9,7 @@ mod common;
 mod helpers;
 mod v10;
 mod v11;
+mod v12;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -89,8 +90,10 @@ fn main() -> anyhow::Result<()> {
 /// signed and refused for each reason, and every market reduce-only. Then, under `V9`, the state
 /// tree: a new account's deposit, resting order and cancel, a dollar round trip, a euro position, and
 /// a marked markout. Then, under `V10`, spreads, a margin requirement, and close-out levels that
-/// round up; and under `V11`, markouts averaged by notional and scored at a valid index. Every
-/// client request is signed by its account's key unless the comment says otherwise.
+/// round up; and under `V11`, markouts averaged by notional and scored at a valid index. Then, under
+/// `V12`, gapped opens, quotes ageing out, a session close, a leading venue, and an FX index ageing
+/// out, each processed before the next command acts. Every client request is signed by its account's
+/// key unless the comment says otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -473,5 +476,6 @@ fn session() -> Vec<Sequenced> {
     h.market_order(late, BTC, Side::Sell, "0.02", "80100");
     v10::session(&mut h);
     v11::session(&mut h);
+    v12::session(&mut h);
     h.log
 }

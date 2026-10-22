@@ -3,11 +3,11 @@
 
 mod common;
 
-use common::{BTC, Harness, acct, f, fills, rejection};
+use common::{BTC, Harness, acct, f, fills, quote, rejection};
 use engine_core::Fixed;
 use engine_core::command::{AdminCommand, Command, OrderKind};
 use engine_core::event::{Event, Reject};
-use engine_core::price::{MAX_QUOTE_LEAD_MS, PriceError, SourceQuote};
+use engine_core::price::{MAX_QUOTE_LEAD_MS, PriceError};
 use engine_core::types::{Millis, Side};
 
 #[test]
@@ -276,11 +276,4 @@ fn limit_orders_never_fill_worse_than_the_limit() {
     assert!(fills(&ev).is_empty());
     let ev = h.price(BTC, "98500");
     assert_eq!(fills(&ev)[0].price, f("98500"));
-}
-
-// ── Helpers ──
-
-/// A venue quote.
-fn quote(source: &str, mid: &str, ts: Millis) -> SourceQuote {
-    SourceQuote { source: source.into(), mid: f(mid), ts }
 }

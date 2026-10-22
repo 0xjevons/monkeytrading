@@ -20,7 +20,8 @@ fn incremental_roots_match_a_rebuild_and_every_account_proves_against_them() {
     // Whether to compute a root after each step, so roots fall after one command or after many.
     let roots = vec(weighted(0.1), 200);
     let result = TestRunner::new(config()).run(&(session(), roots), |(session, roots)| {
-        // The FX markets are listed, so sessions also move FX marks and euro and yen positions.
+        // The FX markets are listed, so sessions also move FX marks and euro and yen positions, under
+        // the latest rules, so the tree holds every state they keep.
         let mut genesis = Harness::fx();
         genesis.admin(AdminCommand::SetOperator(operator()));
         genesis.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST });

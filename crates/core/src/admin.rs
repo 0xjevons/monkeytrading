@@ -53,6 +53,9 @@ impl Engine {
                 self.next_rollover = Some(params.rollover.next_after(self.now));
                 self.params = Some(params.clone());
                 self.restress_all(events);
+                if self.protocol_version >= ProtocolVersion::V12 {
+                    self.advance_markets(None, events);
+                }
                 if self.protocol_version >= ProtocolVersion::V6 {
                     self.check_all_closeouts(events);
                 }
@@ -63,6 +66,8 @@ impl Engine {
                     return Err(format!("dated closures and special sessions need protocol {:?}", ProtocolVersion::V4));
                 }
                 self.check_quote_currency(spec)?;
+                let currency_changed =
+                    self.markets.get(&spec.id).is_some_and(|market| market.spec.quote_currency != spec.quote_currency);
                 match self.markets.get_mut(&spec.id) {
                     Some(market) => {
                         // An FX mark belongs to the currency it was taken for.
@@ -81,10 +86,14 @@ impl Engine {
                 let converts_here = |market: &MarketState| {
                     market.spec.id != spec.id && market.spec.quote_currency.fx_market() == Some(spec.id)
                 };
-                if self.protocol_version >= ProtocolVersion::V7
+                let reprices = self.protocol_version >= ProtocolVersion::V7
                     && self.params.is_some()
-                    && self.markets.values().any(converts_here)
-                {
+                    && self.markets.values().any(converts_here);
+                if self.protocol_version >= ProtocolVersion::V12 {
+                    // A new quote currency drops the FX mark, which a market that converts at its own
+                    // index takes back from its own index only when it is processed.
+                    self.advance_markets((reprices || currency_changed).then_some(spec.id), events);
+                } else if reprices {
                     self.reprice(spec.id, events);
                 }
                 if self.protocol_version >= ProtocolVersion::V6 && self.params.is_some() {
