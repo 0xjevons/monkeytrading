@@ -15,8 +15,8 @@ an index: load only the rule whose hint matches the current action.
   nonces, and expiries), USD settlement of markets quoted in other currencies, admin commands signed
   by the operator key the log records, protocol versions, and the state tree (a keccak-256 sparse
   Merkle tree over the state, with account proofs, in `merkle/`). It does no IO and uses no clocks,
-  randomness, or floats. `impl Engine` is split by area (`engine.rs`, `execution.rs`, `closeout.rs`,
-  `funds.rs`, `admin.rs`, `auth.rs`). Unit tests sit inline; protocol tests are in `tests/` by area,
+  randomness, or floats. `impl Engine` is split by area (`engine.rs`, `execution.rs`, `markouts.rs`,
+  `closeout.rs`, `funds.rs`, `admin.rs`, `auth.rs`). Unit tests sit inline; protocol tests are in `tests/` by area,
   with the shared harness in `tests/common/`. `tests/reference/` holds one reference log per
   protocol version, written once by `examples/reference_log/` and replayed to its roots by
   `tests/reference_logs.rs`; `tests/invariants/` holds the property tests. Its `README.md` lists

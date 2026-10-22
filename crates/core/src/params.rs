@@ -6,6 +6,8 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use crate::Fixed;
+use crate::fixed::Rounding;
+use crate::protocol::ProtocolVersion;
 use crate::types::Millis;
 
 /// The most any per-trade rate may be: 100%.
@@ -15,8 +17,8 @@ pub const MAX_BENCHMARK_BPS: i64 = 10_000;
 /// The most a multiplier or house cap may be: ten times.
 const MAX_MULTIPLE_BPS: i64 = 100_000;
 /// The longest markout horizon: one hour. A horizon near `i64::MAX` overflows a markout's due time,
-/// and markouts are marked in fill order, so one queued under a long horizon holds back every later
-/// one once the horizon is lowered; the cap bounds that wait.
+/// and before `V11` markouts are marked in fill order, so one queued under a long horizon holds back
+/// every later one once the horizon is lowered; the cap bounds that wait.
 const MAX_HORIZON_MS: i64 = 3_600_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -69,16 +71,33 @@ pub struct StressTrigger {
 }
 
 /// Markout-based flow scoring. Each fill is marked against the index `horizon_ms` later; the
-/// account's score is an EWMA of those markouts in bps (positive means the trader won). Persistent
+/// account's score averages those markouts in bps (positive means the trader won). Persistent
 /// winners on short horizons are picking off stale prices and pay a wider spread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToxicityParams {
     pub horizon_ms: i64,
-    /// Weight of each new markout in the EWMA, in bps.
+    /// Before `V11`, the weight of each new markout in the score's EWMA, in bps.
     pub ewma_weight_bps: i64,
+    /// From `V11`, how a score weighs markouts by their fills' notional. Parameters set before `V11`
+    /// have none, and are left out of the encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notional: Option<NotionalWeighting>,
     /// Ascending by `min_score_bps`; the highest tier reached applies.
     pub tiers: Vec<ToxicityTier>,
+}
+
+/// From `V11`, an account's toxicity score is the notional-weighted average of its fills' markouts
+/// and of `prior` of neutral history at a score of zero, over at most `memory` of notional: past
+/// that, each markout weighs its fill's notional against `memory` of history, and older markouts
+/// fade. A single fill never sets a score, and dust barely moves one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotionalWeighting {
+    /// The neutral history every account starts with, in USD of fill notional.
+    pub prior: Fixed,
+    /// The most history, in USD of fill notional, a score averages over.
+    pub memory: Fixed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +127,7 @@ impl ProtocolParams {
     /// - a non-positive move window, or a negative cooldown
     /// - a toxicity horizon outside 1..=3600000 ms, an EWMA weight outside 1..=10000 bps, tiers
     ///   not strictly ascending, or an extra spread outside 0..=10000 bps
+    /// - notional weighting that fails `NotionalWeighting::validate`
     /// - a rollover time that does not exist (hour above 23 or minute above 59)
     pub fn validate(&self) -> Result<(), String> {
         let rate = 0..=MAX_RATE_BPS;
@@ -151,6 +171,9 @@ impl ProtocolParams {
         {
             return Err("toxicity tiers must be ascending with extra_spread_bps in 0..=10000".into());
         }
+        if let Some(notional) = &tox.notional {
+            notional.validate()?;
+        }
         if self.rollover.hour > 23 || self.rollover.minute > 59 {
             return Err("invalid rollover time".into());
         }
@@ -174,9 +197,41 @@ impl ProtocolParams {
         Ok(())
     }
 
+    /// Checks markouts are weighed by their fills' notional, as `V11` needs.
+    /// Error cases:
+    /// - no notional weighting
+    pub fn check_notional_weighting(&self) -> Result<(), String> {
+        if self.toxicity.notional.is_none() {
+            return Err(format!("toxicity needs notional weighting from protocol {:?}", ProtocolVersion::V11));
+        }
+        Ok(())
+    }
+
     /// Extra spread for an account with this toxicity score: the highest tier it reaches.
     pub fn toxicity_spread_bps(&self, score_bps: i64) -> i64 {
         self.toxicity.tiers.iter().rev().find(|t| score_bps >= t.min_score_bps).map_or(0, |t| t.extra_spread_bps)
+    }
+}
+
+impl NotionalWeighting {
+    /// Checks the prior is history and fits in the memory.
+    /// Error cases:
+    /// - a prior at or below zero, a memory below the prior, or a memory above `Fixed::MAX_INPUT`
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.prior.is_positive() || self.memory < self.prior || self.memory > Fixed::MAX_INPUT {
+            return Err(format!("toxicity notional needs 0 < prior <= memory <= {}", Fixed::MAX_INPUT));
+        }
+        Ok(())
+    }
+
+    /// `score`, with `history` of notional behind it, after a markout of `markout_bps` on a fill of
+    /// `notional`: their notional-weighted average, and the history after it, at most `memory`.
+    /// Rounds up, in the house's favour: a markout above the score always raises it, and none moves
+    /// it past itself.
+    pub(crate) fn averaged(&self, score: Fixed, history: Fixed, markout_bps: Fixed, notional: Fixed) -> (Fixed, Fixed) {
+        // `history` is at least the positive prior, and the step is at most the markout's distance.
+        let step = (markout_bps - score).mul_div(notional, history + notional, Rounding::Up);
+        (score + step, (history + notional).min(self.memory))
     }
 }
 
@@ -212,6 +267,10 @@ mod tests {
         Rollover { tz, hour, minute }
     }
 
+    fn f(s: &str) -> Fixed {
+        s.parse().unwrap()
+    }
+
     fn utc_ms(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> Millis {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().timestamp_millis()
     }
@@ -224,7 +283,15 @@ mod tests {
             stress_levels: vec![StressLevel { size_spread_multiplier_bps: 10_000, min_spread_bps: 0, trigger: None }],
             stress_move_window_ms: 60_000,
             stress_cooldown_ms: 0,
-            toxicity: ToxicityParams { horizon_ms: 1_000, ewma_weight_bps: 5_000, tiers: vec![] },
+            toxicity: ToxicityParams {
+                horizon_ms: 1_000,
+                ewma_weight_bps: 5_000,
+                notional: Some(NotionalWeighting {
+                    prior: Fixed::from_int(10_000),
+                    memory: Fixed::from_int(10_000_000),
+                }),
+                tiers: vec![],
+            },
             rollover: rollover(chrono_tz::Europe::London, 22, 0),
             house_total_cap_floor: Fixed::ZERO,
         }
@@ -302,6 +369,55 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains(r#""house_total_cap_floor":"5""#), "{json}");
         assert_eq!(serde_json::from_str::<ProtocolParams>(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn notional_weighting_needs_a_positive_prior_within_its_memory() {
+        let weighting = |prior: Fixed, memory: Fixed| NotionalWeighting { prior, memory };
+        let one = Fixed::from_raw(1);
+        for (prior, memory) in [(one, one), (one, Fixed::MAX_INPUT), (Fixed::MAX_INPUT, Fixed::MAX_INPUT)] {
+            assert!(weighting(prior, memory).validate().is_ok(), "{prior} {memory}");
+        }
+        for (prior, memory) in [(Fixed::ZERO, one), (-one, one), (f("2"), f("1")), (one, Fixed::MAX_INPUT + one)] {
+            assert!(weighting(prior, memory).validate().is_err(), "{prior} {memory}");
+        }
+        let mut p = params();
+        p.toxicity.notional = Some(weighting(Fixed::ZERO, one));
+        assert!(p.validate().is_err());
+        // Parameters set before `V11` have none: they validate as they did, and `V11` refuses them.
+        p.toxicity.notional = None;
+        assert!(p.validate().is_ok());
+        assert!(p.check_notional_weighting().is_err());
+        assert!(!serde_json::to_string(&p).unwrap().contains(r#""notional""#));
+    }
+
+    #[test]
+    fn a_markout_averages_into_the_score_by_its_fills_notional() {
+        let weighting = NotionalWeighting { prior: f("10000"), memory: f("100000") };
+        let (score, history) = (f("10"), f("10000"));
+        // A markout of 30 against 10,000 of history at 10: the notional-weighted average, short of
+        // the markout however large the fill, with the history growing up to the memory.
+        let cases = [
+            ("0.0001", "10.0000002", "10000.0001"),
+            ("10000", "20", "20000"),
+            ("30000", "25", "40000"),
+            ("990000", "29.8", "100000"),
+        ];
+        for (notional, moved, after) in cases {
+            assert_eq!(weighting.averaged(score, history, f("30"), f(notional)), (f(moved), f(after)), "{notional}");
+        }
+        // At the memory, a fill as large as it moves the score half way, and older history fades.
+        let memory = weighting.memory;
+        assert_eq!(weighting.averaged(score, memory, f("30"), memory), (f("20"), memory));
+        // A whole input bound of qty at a whole bound of price stays in range, and counts in full:
+        // rounded up, it takes the score onto a markout above it, and a unit short of one below.
+        let huge = Fixed::MAX_INPUT.mul(Fixed::MAX_INPUT);
+        assert_eq!(weighting.averaged(score, memory, f("30"), huge), (f("30"), memory));
+        assert_eq!(weighting.averaged(score, memory, f("-30"), huge).0, f("-29.999999999"));
+        // A step of under one unit of precision rounds up: it raises the score by a unit, here onto
+        // the markout, and lowers it not at all.
+        assert_eq!(weighting.averaged(score, history, f("10.000000001"), f("1")).0, f("10.000000001"));
+        assert_eq!(weighting.averaged(score, history, f("9.999999999"), f("1")).0, score);
     }
 
     #[test]

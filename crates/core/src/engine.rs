@@ -3,7 +3,7 @@
 //! Single-threaded and deterministic. Time comes only from the sequencer's stamp. This file holds
 //! the state, dispatch, time, prices, and USD valuation; funds and financing live in `funds.rs`,
 //! admin and stress in `admin.rs`, client request auth in `auth.rs`, orders and pricing in
-//! `execution.rs`, and close-outs in `closeout.rs`.
+//! `execution.rs`, close-outs in `closeout.rs`, and markouts in `markouts.rs`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
@@ -23,9 +23,6 @@ use crate::price::{Index, MAX_QUOTE_LEAD_MS, SourceQuote, compute_index};
 use crate::protocol::ProtocolVersion;
 use crate::tracked::{TrackedMap, TrackedSet};
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
-
-/// Clamp on a single markout, so one wild print cannot dominate an account's toxicity score.
-const MAX_MARKOUT_BPS: i64 = 1_000;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SequenceError {
@@ -122,6 +119,10 @@ pub(crate) struct Markout {
     pub market: MarketId,
     pub side: Side,
     pub price: Fixed,
+    /// From `V11`, the fill's notional, which weighs its markout. Left out of the encoding while
+    /// zero, as it is for fills booked before `V11`.
+    #[serde(default, skip_serializing_if = "Fixed::is_zero")]
+    pub notional: Fixed,
 }
 
 impl MarketState {
@@ -478,23 +479,5 @@ impl Engine {
         // Only the markets it marks are taken for change, so the state root rehashes those alone.
         marked.iter().for_each(|id| self.markets.get_mut(id).expect("found above").fx_mark = Some(mid));
         marked
-    }
-
-    /// Marks every fill whose horizon has passed and folds the markout into its account's score.
-    fn process_markouts(&mut self) {
-        let Some(params) = &self.params else { return };
-        let weight = params.toxicity.ewma_weight_bps;
-        while self.markouts.front().is_some_and(|markout| markout.due <= self.now) {
-            let markout = self.pop_markout().expect("front exists");
-            let mark = self.markets.get(&markout.market).and_then(|market| market.mark);
-            let (Some(mark), Some(acct)) = (mark, self.accounts.get_mut(&markout.account)) else {
-                continue;
-            };
-            let bps = (mark - markout.price)
-                .mul_int(markout.side.sign())
-                .bps_of(markout.price)
-                .clamp(-MAX_MARKOUT_BPS, MAX_MARKOUT_BPS);
-            acct.toxicity_bps += (bps - acct.toxicity_bps) * weight / 10_000;
-        }
     }
 }

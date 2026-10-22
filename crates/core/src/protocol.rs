@@ -66,11 +66,16 @@ pub enum ProtocolVersion {
     /// sell's stops a unit short of the price, so rounding never makes a spread reach the price; and
     /// every margin requirement rounds up, from the position's notional to the close-out level.
     V10,
+    /// Toxicity scores carry nine decimals of a bp. A score is the notional-weighted average of its
+    /// account's markouts, from a neutral prior and over at most a memory of fill notional
+    /// (`ToxicityParams::notional`), and a markout is scored only at an index valid when it is
+    /// scored, within one horizon of falling due. Markouts queue in due order.
+    V11,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V10;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V11;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

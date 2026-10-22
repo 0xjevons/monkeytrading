@@ -184,6 +184,13 @@ tiers = [
   { min_score_bps = 15, extra_spread_bps = 3 },
 ]
 
+# From protocol V11 a toxicity score is the notional-weighted average of an
+# account's markouts, from `prior` USD of neutral history and over at most
+# `memory` USD of fill notional; ewma_weight_bps applies before V11 only.
+[genesis.params.toxicity.notional]
+prior = "10000"
+memory = "10000000"
+
 # Level 0 is normal. Higher levels widen spreads, either automatically on
 # any trigger or when the operator raises the floor.
 [[genesis.params.stress_levels]]

@@ -143,6 +143,7 @@ impl AdminAction {
                 params
                     .validate()
                     .and_then(|()| params.check_closing_spread())
+                    .and_then(|()| params.check_notional_weighting())
                     .map_err(anyhow::Error::msg)
                     .with_context(|| file.display().to_string())?;
                 AdminCommand::SetParams(params)

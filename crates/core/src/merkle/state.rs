@@ -216,6 +216,26 @@ impl Engine {
         self.changed.markouts.insert(self.markout_base + self.markouts.len() as u64 - 1);
     }
 
+    /// Queues a markout in due order, after every markout due no later, recording for the state root
+    /// the index of each markout it moves.
+    pub(crate) fn insert_markout(&mut self, markout: Markout) {
+        let at = self.markouts.partition_point(|queued| queued.due <= markout.due);
+        self.markouts.insert(at, markout);
+        let base = self.markout_base;
+        self.changed.markouts.extend((at..self.markouts.len()).map(|position| base + position as u64));
+    }
+
+    /// Puts back at the front of the queue a markout `pop_markout` took in the same pass, recording
+    /// its index for the state root.
+    pub(crate) fn requeue_markout(&mut self, markout: Markout) {
+        self.markouts.push_front(markout);
+        if self.protocol_version >= ProtocolVersion::V9 {
+            // `pop_markout` moved the index up when it took this markout.
+            self.markout_base = self.markout_base.checked_sub(1).expect("a requeued markout was popped first");
+        }
+        self.changed.markouts.insert(self.markout_base);
+    }
+
     /// Takes the markout at the front of the queue, recording its index for the state root. From
     /// `V9` the next markout's index moves up by one; earlier versions keep every index at 0, which
     /// their encoding leaves out.

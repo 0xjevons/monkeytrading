@@ -395,13 +395,10 @@ impl Engine {
 
         self.record_position(exec.account, exec.market);
         if !exec.liquidation {
-            self.queue_markout(Markout {
-                due: markout_due,
-                account: exec.account,
-                market: exec.market,
-                side: exec.side,
-                price: priced.price,
-            });
+            let quote = self.markets[&exec.market].spec.quote_currency;
+            let notional = quote.to_usd(priced.qty.mul(priced.price), priced.fx, Rounding::Down);
+            let (account, market, side, price) = (exec.account, exec.market, exec.side, priced.price);
+            self.record_markout(Markout { due: markout_due, account, market, side, price, notional });
         }
         Fill {
             account: exec.account,

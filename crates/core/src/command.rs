@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::Fixed;
 use crate::auth::{ClientAuth, Operator, RequestAuth};
 use crate::market::MarketSpec;
-use crate::params::ProtocolParams;
+use crate::params::{NotionalWeighting, ProtocolParams};
 use crate::price::SourceQuote;
 use crate::protocol::ProtocolVersion;
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
@@ -106,6 +106,9 @@ pub enum AdminCommand {
     SetClientAuth(ClientAuth),
     /// Records the operator whose signed admin commands apply from `V8`. A log records it once.
     SetOperator(Operator),
+    /// Gives parameters set before `V11`, which do not weigh markouts by notional, the node's
+    /// weighting, so that `V11` can activate over them.
+    SetToxicityNotional(NotionalWeighting),
     /// Applies `version`'s rules from this seq on. Versions only move forward.
     ActivateProtocol {
         version: ProtocolVersion,
@@ -178,9 +181,10 @@ impl AdminCommand {
             | AdminCommand::SetBenchmarkRate { .. }
             | AdminCommand::SetStressFloor { .. }
             | AdminCommand::SetReduceOnly { .. } => true,
-            AdminCommand::SetClientAuth(_) | AdminCommand::SetOperator(_) | AdminCommand::ActivateProtocol { .. } => {
-                false
-            }
+            AdminCommand::SetClientAuth(_)
+            | AdminCommand::SetOperator(_)
+            | AdminCommand::SetToxicityNotional(_)
+            | AdminCommand::ActivateProtocol { .. } => false,
         }
     }
 }

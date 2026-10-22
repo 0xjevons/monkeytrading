@@ -16,7 +16,9 @@ use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Seque
 use engine_core::eip712::{self, B256, cancel_hash, order_hash, withdrawal_hash};
 use engine_core::event::{Event, Fill, Reject};
 use engine_core::market::{FinancingSpec, MarketSpec, PriceRules, QuoteCurrency, Tier};
-use engine_core::params::{ProtocolParams, Rollover, StressLevel, StressTrigger, ToxicityParams, ToxicityTier};
+use engine_core::params::{
+    NotionalWeighting, ProtocolParams, Rollover, StressLevel, StressTrigger, ToxicityParams, ToxicityTier,
+};
 use engine_core::price::SourceQuote;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::session::Schedule;
@@ -128,6 +130,14 @@ impl Harness {
     pub fn v10() -> Self {
         let mut h = Harness::v9();
         h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V10 });
+        h
+    }
+
+    /// `v10`, then `V11`, which averages markouts by notional, to nine decimals of a bp, against the
+    /// index when they are scored.
+    pub fn v11() -> Self {
+        let mut h = Harness::v10();
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V11 });
         h
     }
 
@@ -349,7 +359,8 @@ pub fn acct(n: u8) -> AccountId {
 }
 
 /// 10% profit fee, 50% close-out, one stress level tripped at 10bps divergence, a 200bps move, or
-/// 80% cap use, and a 3bps toxicity add-on from a 20bps score.
+/// 80% cap use, and a 3bps toxicity add-on from a 20bps score, with markouts averaged by notional
+/// from 10,000 of neutral history over at most 10m.
 pub fn params() -> ProtocolParams {
     ProtocolParams {
         profit_fee_bps: 1_000,
@@ -372,6 +383,7 @@ pub fn params() -> ProtocolParams {
         toxicity: ToxicityParams {
             horizon_ms: 1_000,
             ewma_weight_bps: 5_000,
+            notional: Some(NotionalWeighting { prior: Fixed::from_int(10_000), memory: Fixed::from_int(10_000_000) }),
             tiers: vec![ToxicityTier { min_score_bps: 20, extra_spread_bps: 3 }],
         },
         rollover: Rollover { tz: chrono_tz::Europe::London, hour: 22, minute: 0 },

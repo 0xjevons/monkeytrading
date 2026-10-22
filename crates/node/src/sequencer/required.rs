@@ -5,6 +5,7 @@ use anyhow::bail;
 use engine_core::Engine;
 use engine_core::auth::{ClientAuth, Operator};
 use engine_core::command::{AdminCommand, Command};
+use engine_core::params::NotionalWeighting;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::types::Millis;
 use tracing::info;
@@ -40,6 +41,21 @@ impl Sequencer {
         }
         info!(version = ?ProtocolVersion::LATEST, seq = self.next_seq, "activating protocol");
         self.sequence_required("protocol activation", cmds)
+    }
+
+    /// Gives parameters the log set before `V11`, which do not weigh toxicity markouts by notional,
+    /// the config's `weighting`, ahead of `activate_protocol`: `V11` refuses to activate over
+    /// parameters without it. The command is the node's own, so the engine takes it unsigned however
+    /// much is credited. It waits for a stamp trusted time admits, like activation.
+    /// Error cases:
+    /// - the engine rejects the weighting
+    /// - the log cannot be written
+    pub fn carry_toxicity_notional(&mut self, weighting: NotionalWeighting) -> anyhow::Result<()> {
+        if self.engine.params().is_none_or(|params| params.toxicity.notional.is_some()) {
+            return Ok(());
+        }
+        info!(prior = %weighting.prior, memory = %weighting.memory, "carrying the config's toxicity notional weighting");
+        self.sequence_required("toxicity notional", vec![Command::Admin(AdminCommand::SetToxicityNotional(weighting))])
     }
 
     /// Checks that the engine accepts every genesis command, then sequences them as ordinary admin

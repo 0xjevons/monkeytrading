@@ -3,7 +3,7 @@
 
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest};
 use engine_core::market::{FinancingSpec, MarketSpec, PriceRules, Tier};
-use engine_core::params::{ProtocolParams, ToxicityParams};
+use engine_core::params::{NotionalWeighting, ProtocolParams, ToxicityParams};
 use engine_core::price::SourceQuote;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::session::Schedule;
@@ -296,6 +296,14 @@ fn params_change() -> impl Strategy<Value = ProtocolParams> {
         amount().prop_map(|house_total_cap_floor| ProtocolParams { house_total_cap_floor, ..params() }),
         duration().prop_map(move |horizon| ProtocolParams { toxicity: toxicity(horizon, 5_000), ..params() }),
         bps().prop_map(move |weight| ProtocolParams { toxicity: toxicity(1_000, weight), ..params() }),
+        // A prior as large as the memory: a fixed history every markout weighs its fill against.
+        amount().prop_map(|history| ProtocolParams {
+            toxicity: ToxicityParams {
+                notional: Some(NotionalWeighting { prior: history, memory: history }),
+                ..params().toxicity
+            },
+            ..params()
+        }),
         (bps(), bps()).prop_map(|(multiplier_bps, min_spread_bps)| {
             let mut changed = params();
             changed.stress_levels[1].size_spread_multiplier_bps = multiplier_bps;
