@@ -17,6 +17,7 @@ use engine_core::eip712;
 use engine_core::event::Event;
 use engine_core::market::MarketSpec;
 use engine_core::params::ProtocolParams;
+use engine_core::protocol::ProtocolVersion;
 use engine_core::types::{MarketId, Millis};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -140,8 +141,9 @@ impl AdminAction {
             }
             AdminAction::SetParams { file } => {
                 let params: ProtocolParams = read_toml(&file)?;
+                // The node runs the latest version, so these are the parameters it would apply.
                 params
-                    .validate()
+                    .validate_for(ProtocolVersion::LATEST)
                     .and_then(|()| params.check_closing_spread())
                     .and_then(|()| params.check_notional_weighting())
                     .map_err(anyhow::Error::msg)

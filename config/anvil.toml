@@ -131,6 +131,7 @@ benchmarks = [
 profit_fee_bps = 1000
 closeout_level_bps = 5000
 house_total_cap_bps = 20000
+# A fast move counts within this trailing window, and up to a tenth of it further back.
 stress_move_window_ms = 60000
 stress_cooldown_ms = 300000
 
@@ -155,7 +156,9 @@ prior = "10000"
 memory = "10000000"
 
 # Level 0 is normal. Higher levels widen spreads, either automatically on
-# any trigger or when the operator raises the floor.
+# any trigger or when the operator raises the floor. A divergence trigger is
+# a share of each market's max_divergence_bps, so every market can reach each
+# level: 60% and 80% are 15 and 20 bps at crypto's 25 bps bound.
 [[genesis.params.stress_levels]]
 size_spread_multiplier_bps = 10000
 min_spread_bps = 0
@@ -163,12 +166,12 @@ min_spread_bps = 0
 [[genesis.params.stress_levels]]
 size_spread_multiplier_bps = 20000
 min_spread_bps = 2
-trigger = { divergence_bps = 15, move_bps = 150, utilisation_bps = 8000 }
+trigger = { divergence_share_bps = 6000, move_bps = 150, utilisation_bps = 8000 }
 
 [[genesis.params.stress_levels]]
 size_spread_multiplier_bps = 40000
 min_spread_bps = 10
-trigger = { divergence_bps = 20, move_bps = 300, utilisation_bps = 9500 }
+trigger = { divergence_share_bps = 8000, move_bps = 300, utilisation_bps = 9500 }
 
 # --- Crypto: 24/7 ---------------------------------------------------------
 

@@ -101,6 +101,16 @@ fn genesis_values_the_engine_would_refuse_fail_the_boot() {
         (dev.replace("house_cap_bps = 1000\n", "house_cap_bps = 0\n"), "genesis market AAPL: the engine rejects it"),
         (capital("-1"), "genesis.house_capital: the engine rejects it"),
         (capital("1000000000.000000001"), "genesis.house_capital: the engine rejects it"),
+        // The latest version takes a divergence trigger only as a share of each market's bound, and a
+        // share above zero can never fire at a zero bound.
+        (
+            dev.replace("divergence_share_bps = 6000", "divergence_bps = 15"),
+            "genesis.params: the engine rejects it: from protocol V13 a divergence trigger is divergence_share_bps",
+        ),
+        (
+            dev.replacen("max_divergence_bps = 25", "max_divergence_bps = 0", 1),
+            "genesis market BTC-USD: the engine rejects it: a divergence share above zero can never fire",
+        ),
     ];
     for (text, expected) in &refused {
         assert_ne!(text, &dev, "the replacement must change the config");

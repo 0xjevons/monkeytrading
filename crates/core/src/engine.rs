@@ -2,9 +2,9 @@
 //!
 //! Single-threaded and deterministic. Time comes only from the sequencer's stamp. This file holds
 //! the state, dispatch, time, sessions, and USD valuation; venue prices and marks live in
-//! `marks.rs`, funds and financing in `funds.rs`, admin and stress in `admin.rs`, client request
-//! auth in `auth.rs`, orders and pricing in `execution.rs`, close-outs in `closeout.rs`, and
-//! markouts in `markouts.rs`.
+//! `marks.rs`, funds and financing in `funds.rs`, admin in `admin.rs`, stress levels in
+//! `stress.rs`, client request auth in `auth.rs`, orders and pricing in `execution/`, close-outs in
+//! `closeout.rs`, and markouts in `markouts.rs`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
@@ -22,6 +22,7 @@ use crate::merkle::state::{Changed, StateTree, is_zero};
 use crate::params::ProtocolParams;
 use crate::price::{Index, SourceQuote, compute_index};
 use crate::protocol::ProtocolVersion;
+pub use crate::stress::{MoveBucket, StressState};
 use crate::tracked::{TrackedMap, TrackedSet};
 use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
 
@@ -105,16 +106,6 @@ pub struct MarketState {
     /// Left out of the encoding while `None`, so roots before `V12` do not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processed_index: Option<Index>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct StressState {
-    /// Effective level: max(auto, floor, global floor).
-    pub level: usize,
-    pub auto: usize,
-    pub auto_since: Millis,
-    pub floor: usize,
-    pub move_ref: Option<(Millis, Fixed)>,
 }
 
 /// A fill waiting to be marked against the index once its horizon has passed.
@@ -213,6 +204,7 @@ impl Engine {
                 Err(reason) => events.push(Event::AdminRejected { reason }),
             },
         }
+        self.refresh_all_stress(&sequenced.cmd, &mut events);
         // After the command, so a price arriving at the horizon is the one marked against.
         self.process_markouts();
         Ok(events)
@@ -389,6 +381,7 @@ impl Engine {
         market.open = open;
         if open {
             market.stress.move_ref = None;
+            market.stress.move_window.clear();
             events.push(Event::MarketOpened { market: market_id });
         } else {
             events.push(Event::MarketClosed { market: market_id });

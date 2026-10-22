@@ -91,7 +91,7 @@ impl Engine {
                     guard: PriceGuard::Quote { quoted, max_bps },
                     liquidation: false,
                 };
-                match self.execute(exec) {
+                match self.execute(exec, events) {
                     Ok(fill) => {
                         events.push(Event::OrderAccepted { account: req.account, client_id: req.client_id, order_id });
                         self.after_fill(fill, events);
@@ -153,7 +153,9 @@ impl Engine {
         }
     }
 
-    /// Prices and risk-checks one fill, then books it. Nothing is mutated on error.
+    /// Prices and risk-checks one fill, then books it. From `V13` the market's stress level is
+    /// re-evaluated first, so the fill pays the level its inputs set now, after any fill before it;
+    /// nothing else is mutated on error.
     /// Error cases:
     /// - the market is closed, or has no valid index, or its FX market has no price
     /// - reduce-only with no opposite position, or new risk in a reduce-only market
@@ -161,7 +163,11 @@ impl Engine {
     /// - a spread at this size that reaches the price itself
     /// - a live price beyond the slippage bound or the limit
     /// - not enough margin, or no house capacity, for the risk the fill adds
-    pub(crate) fn execute(&mut self, exec: Exec) -> Result<Fill, Reject> {
+    pub(crate) fn execute(&mut self, exec: Exec, events: &mut Vec<Event>) -> Result<Fill, Reject> {
+        if self.protocol_version >= ProtocolVersion::V13 {
+            let nav = self.house_nav();
+            self.refresh_stress(exec.market, nav, events);
+        }
         let priced = self.price(&exec)?;
         if priced.increases && !exec.liquidation {
             self.check_risk(&exec, &priced)?;
@@ -240,7 +246,7 @@ impl Engine {
             guard,
             liquidation: false,
         };
-        match self.execute(exec) {
+        match self.execute(exec, events) {
             Ok(fill) => {
                 self.remove_order(account, order_id);
                 self.after_fill(fill, events);
@@ -460,38 +466,4 @@ fn profit_fee(realised: Fixed, fee_bps: i64, version: ProtocolVersion) -> Fixed 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn f(n: i64) -> Fixed {
-        Fixed::from_int(n)
-    }
-
-    #[test]
-    fn growth_covers_increase_flip_and_reduce() {
-        assert_eq!(growth(f(0), f(3)), (f(0), f(3)));
-        assert_eq!(growth(f(2), f(3)), (f(2), f(5)));
-        // Long 2, sell 5: the 3 short is new risk.
-        assert_eq!(growth(f(2), f(-5)), (f(0), f(3)));
-        assert_eq!(growth(f(5), f(-2)), (f(0), f(0)));
-        assert_eq!(growth(f(5), f(-5)), (f(0), f(0)));
-    }
-
-    #[test]
-    fn profit_fee_only_on_gains() {
-        for version in [ProtocolVersion::V2, ProtocolVersion::V5] {
-            assert_eq!(profit_fee(f(100), 1_000, version), f(10));
-            assert_eq!(profit_fee(f(-100), 1_000, version), f(0));
-            assert_eq!(profit_fee(f(0), 1_000, version), f(0));
-        }
-    }
-
-    #[test]
-    fn a_fractional_profit_fee_rounds_up() {
-        let realised = Fixed::from_raw(9);
-        assert_eq!(profit_fee(realised, 1_000, ProtocolVersion::V5), Fixed::from_raw(1));
-        assert_eq!(profit_fee(realised, 1_000, ProtocolVersion::V2), Fixed::ZERO);
-        // The highest fee the engine accepts, 99.99%, takes the whole profit and no more.
-        assert_eq!(profit_fee(realised, 9_999, ProtocolVersion::V5), realised);
-    }
-}
+mod tests;

@@ -7,6 +7,7 @@
 #[path = "../../tests/common/mod.rs"]
 mod common;
 mod helpers;
+mod stress;
 mod v10;
 mod v11;
 mod v12;
@@ -92,8 +93,9 @@ fn main() -> anyhow::Result<()> {
 /// a marked markout. Then, under `V10`, spreads, a margin requirement, and close-out levels that
 /// round up; and under `V11`, markouts averaged by notional and scored at a valid index. Then, under
 /// `V12`, gapped opens, quotes ageing out, a session close, a leading venue, and an FX index ageing
-/// out, each processed before the next command acts. Every client request is signed by its account's
-/// key unless the comment says otherwise.
+/// out, each processed before the next command acts. Then, under `V13`, stress that follows its
+/// inputs (`stress.rs`). Every client request is signed by its account's key unless the comment says
+/// otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -477,5 +479,6 @@ fn session() -> Vec<Sequenced> {
     v10::session(&mut h);
     v11::session(&mut h);
     v12::session(&mut h);
+    stress::session(&mut h);
     h.log
 }

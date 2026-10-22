@@ -7,8 +7,9 @@
 //! processed the index its quotes give at the sequenced time, holds no quote stamped after it, and
 //! was filled only at that index. Under each version the same sessions must reach every path that
 //! moves cash and the refusal of out-of-range amounts, order numbers, and quotes; under `V6` a
-//! close-out that no price triggered; and under `V12` a resting order filled by a command with
-//! neither prices nor an order, which `V2` never fills; so the checks cannot pass vacuously.
+//! close-out that no price triggered; under `V12` a resting order filled by a command with neither
+//! prices nor an order, which `V2` never fills; and under `V13`, which runs as `V12` does, a stress
+//! change; so the checks cannot pass vacuously.
 
 mod charges;
 #[path = "../common/mod.rs"]
@@ -54,7 +55,12 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
             h.list_fx();
             h
         };
-        for genesis in [Harness::new(), Harness::v6(), Harness::fx(), Harness::v11(), v12()] {
+        let v13 = || {
+            let mut h = Harness::v13();
+            h.list_fx();
+            h
+        };
+        for genesis in [Harness::new(), Harness::v6(), Harness::fx(), Harness::v11(), v12(), v13()] {
             let mut h = funded(genesis, &session);
             let version = h.engine.protocol_version();
             let mut inflow = h.deposits + Fixed::from_int(HOUSE_CAPITAL);
@@ -120,20 +126,24 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
         "admin rejected",
     ];
     let reached = reached.into_inner();
-    let missed: Vec<(ProtocolVersion, &str)> =
-        [ProtocolVersion::V2, ProtocolVersion::V6, ProtocolVersion::V7, ProtocolVersion::V11, ProtocolVersion::V12]
-            .into_iter()
-            .flat_map(|version| expected.iter().map(move |path| (version, *path)))
-            .chain([
-                (ProtocolVersion::V6, "close-out without a price"),
-                (ProtocolVersion::V12, "close-out without a price"),
-            ])
-            // Only `V7` and `V12` list markets quoted in another currency.
-            .chain([(ProtocolVersion::V7, "fill converted to USD"), (ProtocolVersion::V7, "no FX price")])
-            .chain([(ProtocolVersion::V12, "fill converted to USD"), (ProtocolVersion::V12, "no FX price")])
-            .chain([(ProtocolVersion::V12, QUIET_RESTING_FILL), (ProtocolVersion::V12, YEN_FILL)])
-            .filter(|(version, path)| !reached.get(version).is_some_and(|paths| paths.contains(path)))
-            .collect();
+    let missed: Vec<(ProtocolVersion, &str)> = [
+        ProtocolVersion::V2,
+        ProtocolVersion::V6,
+        ProtocolVersion::V7,
+        ProtocolVersion::V11,
+        ProtocolVersion::V12,
+        ProtocolVersion::V13,
+    ]
+    .into_iter()
+    .flat_map(|version| expected.iter().map(move |path| (version, *path)))
+    .chain([(ProtocolVersion::V6, "close-out without a price"), (ProtocolVersion::V12, "close-out without a price")])
+    // Only `V7` and `V12` list markets quoted in another currency.
+    .chain([(ProtocolVersion::V7, "fill converted to USD"), (ProtocolVersion::V7, "no FX price")])
+    .chain([(ProtocolVersion::V12, "fill converted to USD"), (ProtocolVersion::V12, "no FX price")])
+    .chain([(ProtocolVersion::V12, QUIET_RESTING_FILL), (ProtocolVersion::V12, YEN_FILL)])
+    .chain([(ProtocolVersion::V13, "stress changed")])
+    .filter(|(version, path)| !reached.get(version).is_some_and(|paths| paths.contains(path)))
+    .collect();
     assert!(missed.is_empty(), "generated sessions never reach {missed:?}");
     assert!(!reached[&ProtocolVersion::V2].contains(QUIET_RESTING_FILL), "V2 reached {QUIET_RESTING_FILL}");
 }
@@ -287,6 +297,7 @@ fn path(event: &Event) -> &'static str {
         Event::Fill(_) => "fill",
         Event::BadDebt { .. } => "bad debt",
         Event::Financing { .. } => "financing",
+        Event::StressChanged { .. } => "stress changed",
         Event::OrderRejected { reason: Reject::InvalidOrder { reason }, .. } if reason.ends_with("out of range") => {
             "order out of range"
         }
