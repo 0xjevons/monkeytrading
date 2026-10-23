@@ -63,14 +63,23 @@ pub struct BlockRef {
     pub hash: B256,
 }
 
+/// Identity-qualified head observations for a fixed configured provider population.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadSupport {
+    pub required: usize,
+    pub heads: Vec<Option<u64>>,
+}
+
 /// The chain's head, and the block the finality tag names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finality {
     pub head: u64,
     /// The head block's timestamp, in seconds since the epoch.
     pub head_time: u64,
     /// `None` while the chain has no block at the tag yet.
     pub tagged: Option<BlockRef>,
+    /// Per-provider diagnostics; raw single-provider readers leave this unset.
+    pub head_support: Option<HeadSupport>,
 }
 
 /// Which chain an endpoint serves and which token its vault holds.
@@ -107,8 +116,6 @@ pub struct DepositWatcher<V> {
     vault: V,
     /// The token the vault must hold.
     usdc: Address,
-    /// Whether the endpoint has shown the configured chain and token since startup.
-    verified: bool,
     pub(super) cursor: Cursor,
     cursor_path: PathBuf,
     /// Blocks the final block sits below the tagged block.
@@ -155,7 +162,6 @@ impl<V: VaultReader> DepositWatcher<V> {
         Ok(DepositWatcher {
             vault,
             usdc: cfg.usdc,
-            verified: false,
             cursor,
             cursor_path: cfg.cursor_path.clone(),
             confirmations: cfg.confirmations,
@@ -180,23 +186,20 @@ impl<V: VaultReader> DepositWatcher<V> {
         // TODO: the vault, its token, the finality tag, the confirmations, and the start block all
         // come from the host-supplied config; binding the config into the attestation report will
         // bound them.
-        if !self.verified {
-            let identity = self.vault.identity().await.map_err(PollError::rpc)?;
-            let expected = VaultIdentity { chain_id: self.cursor.chain_id, token: Some(self.usdc) };
-            if identity != expected {
-                return Err(PollError::inconsistent(anyhow!(
-                    "the endpoint serves chain {} with vault token {:?}, not chain {} and token {}",
-                    identity.chain_id,
-                    identity.token,
-                    expected.chain_id,
-                    self.usdc
-                )));
-            }
-            self.verified = true;
+        let identity = self.vault.identity().await.map_err(PollError::rpc)?;
+        let expected = VaultIdentity { chain_id: self.cursor.chain_id, token: Some(self.usdc) };
+        if identity != expected {
+            return Err(PollError::inconsistent(anyhow!(
+                "the endpoint serves chain {} with vault token {:?}, not chain {} and token {}",
+                identity.chain_id,
+                identity.token,
+                expected.chain_id,
+                self.usdc
+            )));
         }
         let finality = self.vault.finality().await.map_err(PollError::rpc)?;
         let final_block = finality.tagged.and_then(|tagged| tagged.number.checked_sub(self.confirmations));
-        self.watchdog.observe(finality.head, finality.head_time, final_block);
+        self.watchdog.observe(finality.head, finality.head_time, final_block, finality.head_support.as_ref());
         let (Some(tagged), Some(final_block)) = (finality.tagged, final_block) else {
             debug!(head = finality.head, "no block is final yet");
             return Ok(Polled::Waiting);

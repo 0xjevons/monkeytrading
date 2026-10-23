@@ -5,11 +5,10 @@
 //! certificates compiled into this binary, never the host-supplied store, and config validation
 //! refuses plain HTTP off this machine, so the host cannot forge answers in transit.
 //!
-//! TODO: answers are trusted as the provider gives them, bounded by the deposit-count check and the
-//! proven chain of block hashes, and the provider is whichever one the host-supplied config names.
-//! Verifying logs against block receipts and the L1 batch, or a quorum of providers, would remove
-//! that trust.
+//! The quorum reader compares these answers across independent providers before the watcher
+//! uses them. Configured provider independence remains an operator responsibility.
 
+use std::fmt;
 use std::future::IntoFuture;
 use std::time::Duration;
 
@@ -26,7 +25,7 @@ use anyhow::{Context, anyhow, bail};
 use engine_core::types::AccountId;
 use tokio::time::timeout;
 
-use crate::config::{EvmCustodySection, FinalityTag};
+use crate::config::{EvmCustodySection, FinalityTag, SecretUrl};
 use crate::custody::chain::BlockLink;
 use crate::custody::evm::{Beneficiary, BlockRef, Finality, VaultDeposit, VaultIdentity, VaultReader};
 
@@ -47,6 +46,31 @@ pub struct VaultRpc {
     vault: Address,
     finality_tag: BlockNumberOrTag,
     rpc_timeout: Duration,
+}
+
+/// Explicit RPC-content inconsistency, distinct from an unavailable transport.
+#[derive(Debug)]
+pub(super) struct InvalidRpcResponse;
+
+impl fmt::Display for InvalidRpcResponse {
+    /// Formats the content failure without carrying an endpoint credential.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("inconsistent RPC response")
+    }
+}
+
+impl std::error::Error for InvalidRpcResponse {}
+
+/// Validates an explicit RPC header response against its requested height.
+/// Error cases:
+/// - the successful response is null or names another height
+pub(super) fn decode_header(header: Option<Header>, number: u64) -> anyhow::Result<BlockLink> {
+    let header = header.ok_or(InvalidRpcResponse).with_context(|| format!("the RPC has no block {number}"))?;
+    if header.number != number {
+        return Err(anyhow::Error::new(InvalidRpcResponse)
+            .context(format!("asked for block {number}, got block {}", header.number)));
+    }
+    Ok(BlockLink { number, hash: header.hash, parent_hash: header.parent_hash })
 }
 
 impl VaultReader for VaultRpc {
@@ -76,6 +100,7 @@ impl VaultReader for VaultRpc {
             .await?
             .context("the RPC has no latest block")?;
         Ok(Finality {
+            head_support: None,
             head: head.header.number,
             head_time: head.header.timestamp,
             tagged: tagged.map(|block| BlockRef { number: block.header.number, hash: block.header.hash }),
@@ -96,14 +121,8 @@ impl VaultReader for VaultRpc {
         self.deadline("eth_getBlockByNumber batch", batch.send()).await?;
         let mut links = Vec::with_capacity(waiters.len());
         for (number, waiter) in (from..=to).zip(waiters) {
-            let header = self
-                .deadline("eth_getBlockByNumber", waiter)
-                .await?
-                .with_context(|| format!("the RPC has no block {number}"))?;
-            if header.number != number {
-                bail!("asked for block {number}, got block {}", header.number);
-            }
-            links.push(BlockLink { number, hash: header.hash, parent_hash: header.parent_hash });
+            let header = self.deadline("eth_getBlockByNumber", waiter).await?;
+            links.push(decode_header(header, number)?);
         }
         Ok(links)
     }
@@ -143,8 +162,8 @@ impl VaultRpc {
     /// nothing until the watcher polls.
     /// Error cases:
     /// - the RPC URL is invalid, or the HTTP client cannot be built
-    pub fn new(cfg: &EvmCustodySection, vault: Address) -> anyhow::Result<Self> {
-        let url = cfg.rpc_url.expose()?;
+    pub fn new(cfg: &EvmCustodySection, rpc_url: &SecretUrl, vault: Address) -> anyhow::Result<Self> {
+        let url = rpc_url.expose()?;
         let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
             .iter()
             .map(|cert| Certificate::from_der(cert))
@@ -183,7 +202,18 @@ impl VaultRpc {
     {
         match timeout(self.rpc_timeout, request.into_future()).await {
             Err(_) => bail!("{method} timed out after {:?}", self.rpc_timeout),
-            Ok(Err(e)) => Err(anyhow!("{method} failed: {}", self.scrub(&format!("{:#}", anyhow::Error::new(e))))),
+            Ok(Err(e)) => {
+                let cause = anyhow::Error::new(e);
+                let malformed = cause
+                    .downcast_ref::<alloy::transports::TransportError>()
+                    .is_some_and(|cause| cause.is_deser_error());
+                let message = format!("{method} failed: {}", self.scrub(&format!("{cause:#}")));
+                if malformed {
+                    Err(anyhow::Error::new(InvalidRpcResponse).context(message))
+                } else {
+                    Err(anyhow!(message))
+                }
+            }
             Ok(Ok(value)) => Ok(value),
         }
     }

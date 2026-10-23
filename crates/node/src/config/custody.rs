@@ -1,6 +1,7 @@
-//! The `[custody.evm]` section, the RPC URL that may carry a credential, and the checks that tie
+//! The `[custody.evm]` section, the independent providers whose URLs may carry credentials, and the checks that tie
 //! the custody section to its provider.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -29,8 +30,8 @@ pub struct EvmCustodySection {
     /// HTTPS unless it is on this machine (`127.0.0.1` or `[::1]`). It must serve state at past
     /// blocks back to `start_block` (an archive node), which catch-up after downtime and rescans
     /// read.
-    pub rpc_url: SecretUrl,
-    /// The USDC contract the vault must hold; the watcher checks it on its first poll.
+    pub providers: Vec<RpcProviderSection>,
+    /// The USDC contract the vault must hold; the watcher checks it on every poll.
     pub usdc: Address,
     /// A deposit is final once its block is at least `confirmations` below the block this tag
     /// names: `safe` with no confirmations on Arbitrum One.
@@ -56,6 +57,14 @@ pub struct EvmCustodySection {
     pub cursor_path: PathBuf,
 }
 
+/// Independently operated RPC service; its name identifies alerts without exposing credentials.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RpcProviderSection {
+    pub name: String,
+    pub rpc_url: SecretUrl,
+}
+
 /// A URL that may carry credentials. `Debug` hides it; read it with `expose` where it is used.
 #[derive(Deserialize)]
 #[serde(transparent)]
@@ -74,7 +83,7 @@ impl SecretUrl {
     /// - the value is not a valid URL
     pub fn expose(&self) -> anyhow::Result<Url> {
         // `url::ParseError` names the problem, never the input, so nothing secret reaches a log.
-        Url::parse(&self.0).map_err(|e| anyhow::anyhow!("custody.evm.rpc_url: {e}"))
+        Url::parse(&self.0).map_err(|e| anyhow::anyhow!("custody.evm.providers.rpc_url: {e}"))
     }
 }
 
@@ -83,7 +92,7 @@ impl NodeConfig {
     /// only under mock custody.
     /// Error cases:
     /// - `provider = "evm"` without `[custody.evm]`, or `provider = "mock"` with it
-    /// - `custody.evm.rpc_url` is not a URL, or is plain HTTP to another machine, where the host
+    /// - `custody.evm.providers[].rpc_url` is not a URL, or is plain HTTP to another machine, where the host
     ///   could rewrite every answer
     /// - a range, interval, or timeout in `[custody.evm]` is zero
     /// - `genesis.house_capital` is not zero with EVM custody
@@ -94,11 +103,20 @@ impl NodeConfig {
             (CustodyProvider::Evm, None) => bail!("custody.provider = \"evm\" needs a [custody.evm] section"),
             (CustodyProvider::Evm, Some(evm)) => evm,
         };
-        let url = evm.rpc_url.expose()?;
-        // Literal addresses only: `localhost` resolves through the host-controlled `/etc/hosts`.
-        let on_this_machine = matches!(url.host_str(), Some("127.0.0.1" | "[::1]"));
-        if url.scheme() != "https" && !on_this_machine {
-            bail!("custody.evm.rpc_url must use https unless it is on this machine");
+        if evm.providers.len() < 3 {
+            bail!("custody.evm.providers requires at least three independent RPC providers");
+        }
+        let (mut names, mut urls) = (BTreeSet::new(), BTreeSet::new());
+        for provider in &evm.providers {
+            let url = provider.rpc_url.expose()?;
+            if provider.name.trim().is_empty() || !names.insert(&provider.name) || !urls.insert(url.clone()) {
+                bail!("custody.evm.providers requires non-empty unique names and distinct URLs");
+            }
+            // Literal addresses only: `localhost` resolves through the host-controlled `/etc/hosts`.
+            let on_this_machine = matches!(url.host_str(), Some("127.0.0.1" | "[::1]"));
+            if url.scheme() != "https" && !(url.scheme() == "http" && on_this_machine) {
+                bail!("custody.evm.providers.rpc_url must use https unless it is on this machine");
+            }
         }
         if evm.max_block_range == 0 || evm.poll_interval.is_zero() || evm.rpc_timeout.is_zero() {
             bail!("custody.evm.max_block_range, poll_interval, and rpc_timeout must be non-zero");

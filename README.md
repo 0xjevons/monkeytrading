@@ -182,7 +182,8 @@ connecting to custody and price feeds. Node configuration lives in [`config`](co
 assets such as the Grafana dashboard in [`ops`](ops), and each crate's README describes its files.
 [`contracts`](contracts) is a Foundry project holding the custody vault, and
 [`scripts/dev-vault-deposits.sh`](scripts/dev-vault-deposits.sh) runs a node against it on a local
-Anvil chain.
+Anvil chain through three local RPC proxies. `RPC_QUORUM_SCENARIO=1` adds fabricated-deposit,
+provider-outage and quorum-recovery checks; production requires independent provider operators.
 
 ## Contributing
 

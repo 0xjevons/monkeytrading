@@ -63,16 +63,17 @@ an index: load only the rule whose hint matches the current action.
   public data it studies, inside `research/` and its PR only.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate;
   `check-reference-logs.sh`, which fails a branch that changes a committed reference log;
-  `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil; `dev-metrics-alerts.sh`,
+  `dev-vault-deposits.sh`, the vault deposit and RPC quorum dev scenarios on Anvil, with
+  `dev-rpc-proxy.py` providing three local fault-injection endpoints; `dev-metrics-alerts.sh`,
   the metrics and alert routing dev scenario; `dev-alert-outbox.sh`, the isolated alert retry
   kill/restart scenario.
 - **ops/** — operator assets: `grafana/engine-node.json`, the node's Grafana dashboard, and
   `prometheus/engine-node-rules.yml`, the alerting rules for a down node or failing alert pages.
 - **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, the reference-log
   replay and invariant tests on x86_64 and aarch64 Linux, the unchanged-reference-log check,
-  `cargo-deny`, the contracts' `forge fmt --check` / build / test, the vault deposit dev scenario,
-  the metrics and alert routing dev scenario, and the alert outbox kill/restart scenario, on every push to `main` and
-  every PR. Actions are
+  `cargo-deny`, the contracts' `forge fmt --check` / build / test, the vault deposit and RPC quorum
+  dev scenario, the metrics and alert routing dev scenario, and the alert outbox kill/restart
+  scenario, on every push to `main` and every PR. Actions are
   pinned by commit SHA. `ci-passed` is the one CI check branch rules require: it passes only when
   every other job succeeded, so each new job must be added to its `needs`. The test job also checks
   command latency budgets against 100k-account fixtures.
@@ -127,7 +128,9 @@ Run from the repo root:
 - Alert outbox kill/restart dev scenario: `./scripts/dev-alert-outbox.sh` (needs `python3`,
   `curl`, and `jq`; uses loopback endpoints and private temporary data)
 - Vault deposit dev scenario: `./scripts/dev-vault-deposits.sh` (starts Anvil, deploys the vault
-  and a mock USDC, runs a node on `config/anvil.toml`, and checks each deposit credits once)
+  and a mock USDC, runs a node on `config/anvil.toml`, and checks each deposit credits once;
+  `RPC_QUORUM_SCENARIO=1` also injects a fictional deposit, stops providers and checks recovery;
+  needs `python3`)
 - Sign and submit an admin command as the operator: `cargo run -p engine-node -- admin --pin <the
   node's attested tls_public_key_sha256> <command>`, with the key from `--key-file`,
   `OPERATOR_KEY_FILE`, or `OPERATOR_KEY`; `config/dev.toml` names the public key of the local test

@@ -3,7 +3,7 @@
 
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep};
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::custody::evm::{DepositWatcher, VaultReader};
 use crate::sequencer::Request;
@@ -131,7 +131,7 @@ impl<V: VaultReader> DepositWatcher<V> {
         let mut stalled: Option<StallEpisode> = None;
         loop {
             let next_block = self.cursor.next_block;
-            let caught_up = match self.poll(&tx).await {
+            let caught_up = match self.poll(&tx).instrument(info_span!("custody_poll", id = next_block)).await {
                 Ok(Polled::Read { caught_up }) => {
                     if let Some(episode) = stalled.take() {
                         info!(next_block, stalled_for = ?episode.since.elapsed(), "deposit watcher resumed");

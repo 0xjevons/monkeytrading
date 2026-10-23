@@ -334,7 +334,7 @@ fn the_custody_section_must_match_its_provider() {
     let mock_with_section = anvil.replace("provider = \"evm\"", "provider = \"mock\"");
     assert_validation_fails(&mock_with_section, "[custody.evm] is set");
     assert_validation_fails(&anvil.replace("max_block_range = 1000", "max_block_range = 0"), "must be non-zero");
-    assert_validation_fails(&anvil.replace("http://127.0.0.1:8545", "not a url"), "custody.evm.rpc_url");
+    assert_validation_fails(&anvil.replace("http://127.0.0.1:8545", "not a url"), "custody.evm.providers.rpc_url");
 }
 
 #[test]
@@ -368,7 +368,7 @@ fn a_plain_http_rpc_url_is_refused_unless_it_is_a_literal_loopback_address() {
 #[test]
 fn a_malformed_config_line_is_named_but_never_quoted() {
     let anvil = std::fs::read_to_string(ANVIL).unwrap();
-    let line = anvil.lines().position(|l| l.starts_with("rpc_url")).unwrap() + 1;
+    let line = anvil.lines().position(|l| l.contains("rpc_url")).unwrap() + 1;
     let text =
         anvil.replace("rpc_url = \"http://127.0.0.1:8545\"", "rpc_url = [\"https://rpc.example/v2/secret-key\"]");
     let path = std::env::temp_dir().join(format!("engine-config-test-{}.toml", std::process::id()));

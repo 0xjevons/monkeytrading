@@ -59,7 +59,12 @@ chain_id = 31337
 vault = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 
 [custody.evm]
-rpc_url = "http://127.0.0.1:8545"
+# Three local proxies to the same Anvil chain; production uses independent operators.
+providers = [
+  { name = "local-a", rpc_url = "http://127.0.0.1:8545" },
+  { name = "local-b", rpc_url = "http://127.0.0.1:8546" },
+  { name = "local-c", rpc_url = "http://127.0.0.1:8547" },
+]
 usdc = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
 # Anvil started with `--slots-in-an-epoch 1` marks the block below the head safe, so a deposit is
 # final three blocks after it is mined. On Arbitrum One: "safe" and no confirmations.
