@@ -354,6 +354,13 @@ live reservation absent from authenticated recovered work before touching histor
 durability, not cryptographic protection against host deletion or rollback, and never authorize
 withdrawal release. Unidentified external pending work, an unrelated nonce consumer, or a stuck
 fee policy pauses posting for operator intervention; no automatic fee bump or cancel is sent.
+After actual finalized vault progress makes an older reservation obsolete, the next checkpoint can
+reuse its still-free nonce. A bounded, signature-checked `reused_through` checkpoint records that
+obsolete prefix. If a dropped predecessor later consumes the reused nonce, canonical finalized
+transaction history must prove it was an authorized obsolete vault call before the successor can
+move to the next free nonce. Foreign nonce consumers still refuse. The endpoint must support
+historical account-nonce reads and full consuming-block transactions; unavailable history leaves
+the reservation intact. These nonce proofs never authorize withdrawal release.
 It signs and
 pays gas for relays; only the attested enclave's signature authorizes a vault commitment. Reads
 pin signer, root, deposit count, and USDC balance to one canonical block hash. This RPC's chain view

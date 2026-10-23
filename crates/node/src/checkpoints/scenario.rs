@@ -61,14 +61,17 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     })
     .await
     .unwrap();
-    let relayer = provider.get_accounts().await.unwrap()[0];
+    let accounts = provider.get_accounts().await.unwrap();
+    let relayer = accounts[0];
+    // Checkpoint nonce ownership is independent of deployment, funding, and deposit transactions.
+    let checkpoint_relayer = accounts[9];
     let key = Arc::new(EnclaveKey::generate());
     let token = deploy(&provider, relayer, "MockUSDC.sol/MockUSDC.json", &[]).await;
     let vault =
         deploy(&provider, relayer, "Vault.sol/Vault.json", &(token, Address::from(key.address())).abi_encode()).await;
     let domain = CheckpointDomain { chain_id: 31337, vault: AccountId(vault.into()) };
     let section: CheckpointSection = toml::from_str(&format!(
-        "rpc_url = {url:?}\nrelayer = '{relayer:#x}'\nretry_interval = '40ms'\nrpc_timeout = '2s'"
+        "rpc_url = {url:?}\nrelayer = '{checkpoint_relayer:#x}'\nretry_interval = '40ms'\nrpc_timeout = '2s'"
     ))
     .unwrap();
     let dir = scratch_dir("checkpoint-anvil");
@@ -91,7 +94,7 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     cfg.custody.evm = anvil_cfg.custody.evm;
     let evm = cfg.custody.evm.as_mut().unwrap();
     evm.rpc_url = toml::from_str::<CheckpointSection>(&format!(
-        "rpc_url = {url:?}\nrelayer = '{relayer:#x}'\nretry_interval = '40ms'\nrpc_timeout = '2s'"
+        "rpc_url = {url:?}\nrelayer = '{checkpoint_relayer:#x}'\nretry_interval = '40ms'\nrpc_timeout = '2s'"
     ))
     .unwrap()
     .rpc_url;
@@ -261,9 +264,13 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     let work = crate::checkpoints::Work { checkpoint, liabilities: current.balance, deposits: current.deposits };
     include_checkpoint(&delayed, &work.checkpoint).await;
     assert_eq!(delayed.reconcile(&work).await.unwrap(), (None, false));
-    let nonce = provider.get_transaction_count(relayer).await.unwrap();
+    let nonce = provider.get_transaction_count(checkpoint_relayer).await.unwrap();
     assert_eq!(delayed.reconcile(&work).await.unwrap(), (None, false));
-    assert_eq!(provider.get_transaction_count(relayer).await.unwrap(), nonce, "pending finality must not resubmit");
+    assert_eq!(
+        provider.get_transaction_count(checkpoint_relayer).await.unwrap(),
+        nonce,
+        "pending finality must not resubmit"
+    );
     assert_ne!(
         delayed.chain.state(View::Finalized).await.unwrap().checkpoint,
         Some((seq, work.checkpoint.root.clone()))

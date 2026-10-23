@@ -13,7 +13,7 @@ use crate::checkpoints::rpc::submission::posting::checkpoint_input;
 use crate::checkpoints::rpc::{CheckpointRpc, postCheckpointCall};
 use crate::log::{Checkpoint, CheckpointParent};
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ConsumingBlock {
     hash: B256,
     number: U64,
@@ -154,7 +154,7 @@ impl CheckpointRpc {
             parent: Some(CheckpointParent {
                 has_checkpoint: call.hasParent,
                 seq: call.parentSeq,
-                root: engine_core::eip712::B256(call.parentRoot.0),
+                root: engine_core::eip712::B256::from(call.parentRoot.0),
             }),
             deferred_withdrawals: obsolete.deferred_withdrawals,
         };
