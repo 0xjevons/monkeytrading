@@ -3,8 +3,10 @@
 
 mod common;
 
+use chrono::{TimeZone, Utc};
+
 use common::events::rejection;
-use common::{BTC, Harness, acct, f, market};
+use common::{BTC, Harness, acct, f, market, params};
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::{Event, Reject};
@@ -44,6 +46,36 @@ fn the_engine_refuses_gaps_and_time_running_backwards() {
     assert_eq!(engine.apply(&at(1, 999)), Err(SequenceError::TimeReversed { last: 1_000, got: 999 }));
     // A refused command changes nothing: the next valid one still lands at seq 1.
     assert!(engine.apply(&at(1, 1_000)).is_ok());
+}
+
+#[test]
+fn the_engine_refuses_a_stamp_outside_the_range_it_accepts() {
+    // SetParams schedules the first rollover from the stamp, which panics on one chrono cannot
+    // represent; the command is refused instead, and the refusal names its seq.
+    let mut engine = Engine::new();
+    let bad = Sequenced { seq: 0, ts: i64::MAX, cmd: Command::Admin(AdminCommand::SetParams(params())) };
+    assert_eq!(engine.apply(&bad), Err(SequenceError::StampOutOfRange { seq: 0, got: i64::MAX }));
+    // The refusal changed nothing: valid commands still land, and a refusal past seq 0 names
+    // the seq it refused.
+    assert!(engine.apply(&Sequenced { seq: 0, ts: 1_000, cmd: Command::Tick }).is_ok());
+    let bad = Sequenced { seq: 1, ts: i64::MAX, cmd: Command::Tick };
+    assert_eq!(engine.apply(&bad), Err(SequenceError::StampOutOfRange { seq: 1, got: i64::MAX }));
+    assert!(engine.apply(&Sequenced { seq: 1, ts: 1_000, cmd: Command::Tick }).is_ok());
+}
+
+#[test]
+fn the_latest_accepted_stamp_is_the_end_of_9999() {
+    // `MAX_STAMP_MS` is 9999-12-31T23:59:59.999Z, a conservative bound well inside chrono's
+    // range: the rollover walk always has a next day to step to, whatever a market's time zone
+    // does to the wall clock. The latest accepted stamp applies — `SetParams` schedules its
+    // rollover — and one millisecond later is refused.
+    let max = Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59).unwrap().timestamp_millis() + 999;
+    let set = |ts| Sequenced { seq: 0, ts, cmd: Command::Admin(AdminCommand::SetParams(params())) };
+    let mut engine = Engine::new();
+    let events = engine.apply(&set(max)).expect("the latest accepted stamp applies");
+    assert!(matches!(events.last(), Some(Event::AdminApplied)), "{events:?}");
+    let mut engine = Engine::new();
+    assert_eq!(engine.apply(&set(max + 1)), Err(SequenceError::StampOutOfRange { seq: 0, got: max + 1 }));
 }
 
 #[test]

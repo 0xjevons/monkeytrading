@@ -24,7 +24,7 @@ use crate::price::{Index, SourceQuote, compute_index};
 use crate::protocol::ProtocolVersion;
 pub use crate::stress::{MoveBucket, StressState};
 use crate::tracked::{TrackedMap, TrackedSet};
-use crate::types::{AccountId, MarketId, Millis, OrderId, Side};
+use crate::types::{AccountId, MAX_STAMP_MS, MarketId, Millis, OrderId, Side};
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SequenceError {
@@ -32,6 +32,8 @@ pub enum SequenceError {
     Gap { expected: u64, got: u64 },
     #[error("time went backwards: {last} -> {got}")]
     TimeReversed { last: Millis, got: Millis },
+    #[error("stamp {got} at seq {seq} is past the end of 9999, the latest the engine accepts")]
+    StampOutOfRange { seq: u64, got: Millis },
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -157,6 +159,7 @@ impl Engine {
     /// Error cases:
     /// - `seq` is not exactly one more than the last applied (or 0 for the first)
     /// - `ts` is earlier than the last applied
+    /// - `ts` is later than the end of 9999, the latest stamp the engine accepts
     pub fn apply(&mut self, sequenced: &Sequenced) -> Result<Vec<Event>, SequenceError> {
         let expected = self.last_seq.map_or(0, |n| n + 1);
         if sequenced.seq != expected {
@@ -164,6 +167,9 @@ impl Engine {
         }
         if sequenced.ts < self.now {
             return Err(SequenceError::TimeReversed { last: self.now, got: sequenced.ts });
+        }
+        if sequenced.ts > MAX_STAMP_MS {
+            return Err(SequenceError::StampOutOfRange { seq: sequenced.seq, got: sequenced.ts });
         }
         self.last_seq = Some(sequenced.seq);
         self.now = sequenced.ts;

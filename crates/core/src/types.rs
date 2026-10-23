@@ -11,6 +11,12 @@ use crate::Fixed;
 /// clock of its own.
 pub type Millis = i64;
 
+/// The latest stamp the engine accepts: 9999-12-31T23:59:59.999Z. Anything later is refused
+/// before it becomes engine time, so every time derived from a stamp — a session check, a
+/// rollover — stays well inside chrono's range in any market's time zone, and the rollover walk
+/// in `crate::params::Rollover::next_after` always has a representable day to step to.
+pub(crate) const MAX_STAMP_MS: Millis = 253_402_300_799_999;
+
 pub type MarketId = u32;
 pub type OrderId = u64;
 

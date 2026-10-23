@@ -10,8 +10,8 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use common::reference::{ReferenceEntry, root_hex};
-use common::{BTC, Harness, acct, params};
-use engine_core::command::{AdminCommand, Command, Sequenced};
+use common::{BTC, Harness, acct};
+use engine_core::command::Command;
 use engine_core::types::Side;
 use engine_core::{Engine, Fixed};
 
@@ -46,13 +46,14 @@ fn a_changed_command_is_reported_at_the_first_seq_it_alters() {
 }
 
 #[test]
-fn a_panicking_command_is_reported_at_its_seq() {
-    // Relies on the engine panicking when it applies parameters at a timestamp past chrono's range,
-    // where the next rollover cannot be computed; only a corrupt log carries one.
-    let cmd = Command::Admin(AdminCommand::SetParams(params()));
-    let entries = [ReferenceEntry { sequenced: Sequenced { seq: 0, ts: i64::MAX, cmd }, root: root_hex([0; 32]) }];
+fn an_out_of_range_stamp_is_refused_at_its_seq() {
+    // The stamp this refuses used to panic the engine when it scheduled the first rollover; the
+    // refusal names the seq instead, and only a corrupt log carries one. Seq 1, not 0, so the
+    // named seq is the one refused.
+    let mut entries = fresh_log();
+    entries[1].sequenced.ts = i64::MAX;
     let err = verify_roots(&entries).unwrap_err();
-    assert!(err.starts_with("seq 0 panicked:"), "{err}");
+    assert!(err.starts_with("seq 1 refused: stamp "), "{err}");
 }
 
 #[test]

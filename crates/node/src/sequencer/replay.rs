@@ -51,7 +51,8 @@ pub(super) struct Replay {
 impl Replay {
     /// Applies the log's next entry.
     /// Error cases:
-    /// - a command out of sequence or with time running backwards
+    /// - a command out of sequence, with time running backwards, or stamped past the range the
+    ///   engine accepts
     /// - logged events that differ from the replayed ones, or a command without logged events after
     ///   one with them
     /// - a withdrawal entry that does not match the next unmatched withdrawal its command approved
