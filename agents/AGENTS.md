@@ -55,6 +55,12 @@ an index: load only the rule whose hint matches the current action.
   their venue calendars, each calendar's sources and unpublished gaps, their quote currencies, and
   the launch margins and fees; a deployment's node sections complete it into a config. Every
   section rejects unknown keys.
+- **research/** — studies that set protocol parameters from data, outside the build and CI.
+  `cap-calibration/` calibrates the house exposure-cap floors by Monte Carlo (#111): scripts that
+  fetch and derive its public data (raw pulls in gitignored `data/raw/`, the derived dataset in
+  `data/derived/`), the Python model behind `run.py`, its tests, and `results/`. Its `README.md`
+  gives the method, sources, results, and how to re-run. Research may name the platforms whose
+  public data it studies, inside `research/` and its PR only.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate;
   `check-reference-logs.sh`, which fails a branch that changes a committed reference log;
   `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil; and `dev-metrics-alerts.sh`,
@@ -119,6 +125,10 @@ Run from the repo root:
   node's attested tls_public_key_sha256> <command>`, with the key from `--key-file`,
   `OPERATOR_KEY_FILE`, or `OPERATOR_KEY`; `config/dev.toml` names the public key of the local test
   key `0x4242…42`. Against anything but a local dev node, [no-deploy](rules/no-deploy.md) applies
+- Cap calibration, from a virtualenv outside the repo with
+  `research/cap-calibration/requirements.txt`: `python -I research/cap-calibration/run.py <command>`
+  (`all` re-runs the simulations and report from the committed data), and its tests with
+  `python -I -m pytest research/cap-calibration/tests`
 
 ## Repo facts
 
