@@ -9,13 +9,14 @@
 # Passes when every deposit is credited once, only after the configured confirmations, house NAV
 # equals the house deposits, and the node's log replays.
 #
-# Needs anvil, forge, cast, curl, and jq, and the contract dependencies
+# Needs anvil, forge, cast, curl, jq, and python3, and the contract dependencies
 # (`forge soldeer install` in contracts/). ANVIL_PORT, API_PORT, and METRICS_PORT override 8545,
-# 8080, and 9464.
+# 8080, and 9464. RPC_A_PORT, RPC_B_PORT and RPC_C_PORT override the local proxy ports
+# 18545, 18546 and 18547. RPC_QUORUM_SCENARIO=1 also exercises lies, outages and recovery.
 set -euo pipefail
 
-# EVM custody needs a Critical alert route. No alert may fire in this scenario (checked at the
-# end), so nothing is posted to it; a closed local port stands in for the webhook.
+# A closed local port stands in for the required Critical route; the quorum scenario checks
+# alert emission in the node log. The alert-routing scenario tests delivery separately.
 export ENGINE_ALERTS_CRITICAL_URL="http://127.0.0.1:9/alerts"
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -36,10 +37,19 @@ trader="$(cast wallet address --private-key "$trader_key" | tr '[:upper:]' '[:lo
 usdc_units=1000000
 anvil_pid=""
 node_pid=""
+proxy_pids=()
+rpc_a_port="${RPC_A_PORT:-18545}"
+rpc_b_port="${RPC_B_PORT:-18546}"
+rpc_c_port="${RPC_C_PORT:-18547}"
 
 cleanup() {
   [[ -n "$node_pid" ]] && kill "$node_pid" 2>/dev/null || true
   [[ -n "$anvil_pid" ]] && kill "$anvil_pid" 2>/dev/null || true
+  for pid in "${proxy_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  if [[ -n "${SCENARIO_LOG_DIR:-}" ]]; then
+    mkdir -p "$SCENARIO_LOG_DIR"
+    cp "$work"/*.log "$SCENARIO_LOG_DIR/" 2>/dev/null || true
+  fi
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -71,6 +81,7 @@ stays() {
 }
 
 trader_balance() { curl -sk "$api/v1/accounts/$trader" | jq -r '.balance // "none"'; }
+fictional_balance() { curl -sk "$api/v1/accounts/0xabababababababababababababababababababab" | jq -r '.balance // "none"'; }
 house_nav() { curl -sk "$api/v1/house" | jq -r '.nav'; }
 rescanned_deposits() { jq -r '.next_deposit_id' "$work/custody-cursor.json" 2>/dev/null || echo none; }
 cursor_stored() { [[ -f "$work/custody-cursor.json" ]] && echo yes || echo no; }
@@ -136,8 +147,19 @@ for funder_key in "$trader_key" "$house_key"; do
   send "$usdc" "approve(address,uint256)" "$vault" $((10000000 * usdc_units)) --private-key "$funder_key"
 done
 
+step "Start three local RPC proxies"
+for port in "$rpc_a_port" "$rpc_b_port" "$rpc_c_port"; do
+  python3 "$root/scripts/dev-rpc-proxy.py" --port "$port" --target "$rpc" --lie-file "$work/lie-$port" >"$work/proxy-$port.log" 2>&1 &
+  proxy_pids+=("$!")
+  for _ in $(seq 1 100); do
+    kill -0 "${proxy_pids[${#proxy_pids[@]}-1]}" 2>/dev/null || fail "proxy exited"
+    cast block-number --rpc-url "http://127.0.0.1:$port" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+done
+
 step "A first boot without trusted time stores the deposit cursor while the log is empty"
-sed -e "s#data/anvil#$work#g" -e "s#127.0.0.1:8545#127.0.0.1:$anvil_port#" -e "s#127.0.0.1:8080#127.0.0.1:$api_port#" \
+sed -e "s#data/anvil#$work#g" -e "s#127.0.0.1:8545#127.0.0.1:$rpc_a_port#" -e "s#127.0.0.1:8546#127.0.0.1:$rpc_b_port#" -e "s#127.0.0.1:8547#127.0.0.1:$rpc_c_port#" -e "s#127.0.0.1:8080#127.0.0.1:$api_port#" \
   -e "s#127.0.0.1:9464#127.0.0.1:$metrics_port#" config/anvil.toml >"$work/anvil.toml"
 # Every Roughtime server points at a closed local port, so no sample arrives and nothing is
 # sequenced, while the watcher reads the blocks so far and stores its cursor. That boot's time
@@ -213,14 +235,55 @@ wait_for trader_balance 1377
 mine 3
 stays trader_balance 1377
 
+expected_deposits=5
+if [[ "${RPC_QUORUM_SCENARIO:-0}" == "1" ]]; then
+  step "A fictional deposit from one provider is ignored and alerted"
+  touch "$work/lie-$rpc_c_port"
+  mine 5
+  stays trader_balance 1377
+  [[ "$(fictional_balance)" == "none" ]] || fail "fictional account was credited"
+  grep -q 'alert="custody_rpc_provider_disagreed".*provider="local-c".*operation="deposits"' "$work/node.log" || fail "no provider disagreement alert"
+  rm "$work/lie-$rpc_c_port"
+  mine 4
+  sleep 1
+  grep -q 'alert_resolved="custody_rpc_provider_disagreed".*provider="local-c"' "$work/node.log" || fail "disagreement did not resolve"
+
+  step "One stopped provider leaves a quorum that credits a real deposit"
+  kill "${proxy_pids[2]}"
+  wait "${proxy_pids[2]}" 2>/dev/null || true
+  send "$vault" "deposit(uint256)" $((10 * usdc_units)) --private-key "$trader_key"
+  mine 3
+  wait_for trader_balance 1387
+  grep -q 'alert="custody_rpc_provider_failed".*provider="local-c"' "$work/node.log" || fail "no provider outage alert"
+
+  step "Two stopped providers halt crediting with a Critical alert while the API keeps serving"
+  kill "${proxy_pids[1]}"
+  wait "${proxy_pids[1]}" 2>/dev/null || true
+  send "$vault" "deposit(uint256)" $((20 * usdc_units)) --private-key "$trader_key"
+  mine 3
+  stays trader_balance 1387
+  grep -q 'ERROR.*alert="custody_rpc_quorum_lost"' "$work/node.log" || fail "no Critical lost-quorum alert"
+  curl -skf "$api/v1/markets" >/dev/null || fail "node stopped serving markets"
+
+  step "Restoring one provider resumes crediting exactly once"
+  python3 "$root/scripts/dev-rpc-proxy.py" --port "$rpc_b_port" --target "$rpc" >"$work/proxy-recovered.log" 2>&1 &
+  proxy_pids+=("$!")
+  wait_for trader_balance 1407
+  grep -q 'alert_resolved="custody_rpc_quorum_lost"' "$work/node.log" || fail "lost quorum did not resolve"
+  expected_deposits=7
+fi
+
 step "The log holds one command per deposit and replays"
 stop_node
 # Genesis's zero house capital credit marks genesis done; every other credit is a vault deposit.
 deposits="$(jq -c 'select(.entry == "command" and (.cmd.type == "deposit" or .cmd.type == "house_capital")
   and .cmd.chain_ref != "genesis")' "$work"/log/[0-9]*.jsonl | wc -l | tr -d ' ')"
-[[ "$deposits" == "5" ]] || fail "expected 5 deposit commands in the log, found $deposits"
+[[ "$deposits" == "$expected_deposits" ]] || fail "expected $expected_deposits deposit commands in the log, found $deposits"
 "$engine" replay --log "$work/log" | grep -q '^verified' || fail "the log does not replay"
 # Restarts, the rescan, and the reorg are all expected: none of them may raise an alert.
-if grep -q 'alert=' "$work/node.log"; then fail "unexpected alert: $(grep -m 1 'alert=' "$work/node.log")"; fi
+if [[ "${RPC_QUORUM_SCENARIO:-0}" != "1" ]] && grep -q 'alert=' "$work/node.log"; then fail "unexpected alert: $(grep -m 1 'alert=' "$work/node.log")"; fi
 
 echo "PASS: every deposit credited once after finality; house NAV equals house deposits"
+if [[ "${RPC_QUORUM_SCENARIO:-0}" == "1" ]]; then
+  echo "PASS: fabricated deposit ignored; one outage credits; two halt; recovery credits once"
+fi

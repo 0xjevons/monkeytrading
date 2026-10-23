@@ -156,7 +156,9 @@ jobs:
       - name: Install contract dependencies
         working-directory: contracts
         run: forge soldeer install
-      - name: Run the vault deposit dev scenario
+      - name: Run the vault deposit and RPC quorum dev scenario
+        env:
+          RPC_QUORUM_SCENARIO: "1"
         run: ./scripts/dev-vault-deposits.sh
 
   dev-metrics-alerts:

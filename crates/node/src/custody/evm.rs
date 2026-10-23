@@ -107,8 +107,6 @@ pub struct DepositWatcher<V> {
     vault: V,
     /// The token the vault must hold.
     usdc: Address,
-    /// Whether the endpoint has shown the configured chain and token since startup.
-    verified: bool,
     pub(super) cursor: Cursor,
     cursor_path: PathBuf,
     /// Blocks the final block sits below the tagged block.
@@ -155,7 +153,6 @@ impl<V: VaultReader> DepositWatcher<V> {
         Ok(DepositWatcher {
             vault,
             usdc: cfg.usdc,
-            verified: false,
             cursor,
             cursor_path: cfg.cursor_path.clone(),
             confirmations: cfg.confirmations,
@@ -180,19 +177,16 @@ impl<V: VaultReader> DepositWatcher<V> {
         // TODO: the vault, its token, the finality tag, the confirmations, and the start block all
         // come from the host-supplied config; binding the config into the attestation report will
         // bound them.
-        if !self.verified {
-            let identity = self.vault.identity().await.map_err(PollError::rpc)?;
-            let expected = VaultIdentity { chain_id: self.cursor.chain_id, token: Some(self.usdc) };
-            if identity != expected {
-                return Err(PollError::inconsistent(anyhow!(
-                    "the endpoint serves chain {} with vault token {:?}, not chain {} and token {}",
-                    identity.chain_id,
-                    identity.token,
-                    expected.chain_id,
-                    self.usdc
-                )));
-            }
-            self.verified = true;
+        let identity = self.vault.identity().await.map_err(PollError::rpc)?;
+        let expected = VaultIdentity { chain_id: self.cursor.chain_id, token: Some(self.usdc) };
+        if identity != expected {
+            return Err(PollError::inconsistent(anyhow!(
+                "the endpoint serves chain {} with vault token {:?}, not chain {} and token {}",
+                identity.chain_id,
+                identity.token,
+                expected.chain_id,
+                self.usdc
+            )));
         }
         let finality = self.vault.finality().await.map_err(PollError::rpc)?;
         let final_block = finality.tagged.and_then(|tagged| tagged.number.checked_sub(self.confirmations));

@@ -333,7 +333,11 @@ pub(super) fn stored_cursor(dir: &Path) -> Cursor {
 pub(super) fn evm_toml(dir: &Path, max_block_range: u64) -> String {
     format!(
         r#"
-        rpc_url = "http://127.0.0.1:1"
+        providers = [
+          {{ name = "a", rpc_url = "http://127.0.0.1:1" }},
+          {{ name = "b", rpc_url = "http://127.0.0.1:2" }},
+          {{ name = "c", rpc_url = "http://127.0.0.1:3" }},
+        ]
         usdc = "0xc0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
         finality_tag = "safe"
         confirmations = 0

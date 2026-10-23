@@ -5,10 +5,8 @@
 //! certificates compiled into this binary, never the host-supplied store, and config validation
 //! refuses plain HTTP off this machine, so the host cannot forge answers in transit.
 //!
-//! TODO: answers are trusted as the provider gives them, bounded by the deposit-count check and the
-//! proven chain of block hashes, and the provider is whichever one the host-supplied config names.
-//! Verifying logs against block receipts and the L1 batch, or a quorum of providers, would remove
-//! that trust.
+//! The quorum reader compares these answers across independent providers before the watcher
+//! uses them. Configured provider independence remains an operator responsibility.
 
 use std::future::IntoFuture;
 use std::time::Duration;
@@ -26,7 +24,7 @@ use anyhow::{Context, anyhow, bail};
 use engine_core::types::AccountId;
 use tokio::time::timeout;
 
-use crate::config::{EvmCustodySection, FinalityTag};
+use crate::config::{EvmCustodySection, FinalityTag, SecretUrl};
 use crate::custody::chain::BlockLink;
 use crate::custody::evm::{Beneficiary, BlockRef, Finality, VaultDeposit, VaultIdentity, VaultReader};
 
@@ -143,8 +141,8 @@ impl VaultRpc {
     /// nothing until the watcher polls.
     /// Error cases:
     /// - the RPC URL is invalid, or the HTTP client cannot be built
-    pub fn new(cfg: &EvmCustodySection, vault: Address) -> anyhow::Result<Self> {
-        let url = cfg.rpc_url.expose()?;
+    pub fn new(cfg: &EvmCustodySection, rpc_url: &SecretUrl, vault: Address) -> anyhow::Result<Self> {
+        let url = rpc_url.expose()?;
         let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
             .iter()
             .map(|cert| Certificate::from_der(cert))

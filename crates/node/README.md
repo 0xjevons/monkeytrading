@@ -50,8 +50,8 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   outages, symbols with no fresh quote, and venue times well ahead of the host clock
 - A `house_deficit` alert when house NAV falls below zero, at most one a minute while it keeps
   crossing zero
-- EVM custody: each vault deposit credited once, after a configurable finality tag and
-  confirmations, with a cursor that survives restarts
+- EVM custody: each vault deposit credited once after a strict majority of at least three RPC
+  providers agrees, at a configurable finality tag and confirmations, with a resumable cursor
 - Mock custody and a mock price feed for local development
 - Prometheus metrics on a separate operator address, from a registry the node owns, with no
   per-account labels or values
@@ -143,11 +143,12 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/tls/tests/stream.rs` — the stream end to end over TLS: the subscriber and message caps
 - `src/limits.rs` — request rate limits, connection caps, and the stream subscriber cap
 - `src/config/mod.rs` — the node config schema and loading
-- `src/config/custody.rs` — the `[custody.evm]` section, the redacted RPC URL, and the custody
-  checks
+- `src/config/custody.rs` — the `[custody.evm]` section, independent RPC providers, redacted
+  URLs, and custody checks
 - `src/config/telemetry.rs` — the metrics listener and alert webhook config, and the redacting
   `WebhookUrl`
 - `src/config/tests.rs` — config loading and validation tests
+- `src/config/custody_tests.rs` — independent provider configuration checks
 - `src/config/telemetry_tests.rs` — metrics and alert config tests: the Critical route, the dev
   config's telemetry, and webhook URLs
 - `src/config/validation.rs` — the checks a parsed config must also pass
@@ -164,6 +165,8 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   stall raises
 - `src/custody/sizing.rs` — read sizes that adapt to a provider's limits
 - `src/custody/credit.rs` — crediting one deposit once, and the sequencer round trips it needs
+- `src/custody/quorum.rs` — strict-majority reads at common block heights, provider alerts, and
+  a Critical alert while quorum is lost
 - `src/custody/rpc.rs` — the vault over JSON-RPC, trusting only compiled-in TLS roots, with
   errors scrubbed of the endpoint URL
 - `src/custody/cursor.rs` — the deposit cursor kept between restarts
@@ -172,6 +175,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/custody/tests/cursor.rs` — the deposit cursor across restarts, and which cursors a log
   refuses
 - `src/custody/tests/fakes.rs` — the fake chain, test sequencer, log capture, and fixtures
+- `src/custody/tests/quorum.rs` — fabrication, disagreement, lag, outages, and quorum recovery
 - `src/custody/tests/rpc.rs` — the RPC adapter's log decoding, deadlines, and URL scrubbing
 - `src/custody/tests/reorg.rs` — reorgs and forked answers against the proven chain
 - `src/feeds/mod.rs` — the feed index and the mock feed
@@ -261,11 +265,29 @@ jq -r '.file' archive/manifest.jsonl |
 
 # Run the vault deposit scenario: Anvil, the vault, and a node with EVM custody
 ./scripts/dev-vault-deposits.sh
+
+# Also fabricate a deposit at one provider, stop two providers, and recover quorum
+RPC_QUORUM_SCENARIO=1 ./scripts/dev-vault-deposits.sh
 ```
 
-EVM custody reads the vault through `custody.evm.rpc_url`, which must use HTTPS unless it is on
-this machine and must serve state at past blocks back to `custody.evm.start_block` (an archive
-node): catching up after downtime and rescanning both read past blocks.
+EVM custody requires at least three entries in `custody.evm.providers`, each with a unique
+`name` and a distinct credential-bearing `rpc_url`. Use independently operated services in
+production; configuration cannot prove operator independence. Each URL must use HTTPS unless it
+is a literal loopback address and must serve state back to `custody.evm.start_block` (an archive
+node). The old single `custody.evm.rpc_url` config is rejected and must be migrated before restart.
+A strict majority (two of three, three of four) must agree on identity, headers, deposit sets and
+counts. Finality is checked at the highest height a majority reports final, comparing its hash at
+that same height; head differences alone do not prevent agreement. Empty log sets count only when
+the answering provider also returns the range's last block.
+
+A failed or dissenting provider raises `custody_rpc_provider_failed` or
+`custody_rpc_provider_disagreed`, keyed by provider name and operation. Loss of quorum immediately
+raises Critical `custody_rpc_quorum_lost` and pauses crediting while trading continues. Operations
+retry on the next poll; recovery resolves the matching alerts. Credentials never appear in alerts.
+The local scenario uses three proxies to one Anvil process, for fault injection only; the proxy
+ports default to 18545–18547 and can be overridden with `RPC_A_PORT`, `RPC_B_PORT`, `RPC_C_PORT`.
+`SCENARIO_LOG_DIR` preserves its logs. `config/anvil.toml` expects local endpoints on 8545–8547 when
+run directly; the scenario rewrites these to its proxy ports.
 
 A vault deposit credits the trading account its event names: the caller for `deposit`, or the
 account `depositFor` names. The vault refuses deposits under 10 USDC or over 1e9 USDC. A trading
@@ -273,9 +295,10 @@ account must be able to sign requests with its own key, since the engine accepts
 signatures: a contract wallet funds a key that signs for it through `depositFor`, and a balance
 credited to a contract account can be recovered only through the exit (#48).
 
-The adapter trusts its RPC endpoint's answers as far as the chain of block hashes it proves up to
-the finality tag, and the vault's deposit count, bound them. It takes the vault, its token, and the
-finality tag from the host-supplied config, and keeps its cursor on host storage. Reorganisations
+The adapter trusts a strict majority of the configured independent RPC providers. The chain of
+block hashes up to the agreed finality block and the vault's agreed deposit count further bound
+those answers. A compromised provider cannot fabricate a credited deposit by itself. It takes the
+vault, its token, and the finality tag from the host-supplied config, and keeps its cursor on host storage. Reorganisations
 of Arbitrum One that undo a block after its batch reached Ethereum, the finality it waits for, are
 outside its threat model.
 

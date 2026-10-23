@@ -83,7 +83,7 @@ fn rpc_at(url: &str) -> VaultRpc {
         .replace("rpc_url = \"http://127.0.0.1:1\"", &format!("rpc_url = \"{url}\""))
         .replace("rpc_timeout = \"1s\"", "rpc_timeout = \"200ms\"");
     let cfg: EvmCustodySection = toml::from_str(&toml).unwrap();
-    VaultRpc::new(&cfg, VAULT).unwrap()
+    VaultRpc::new(&cfg, &cfg.providers[0].rpc_url, VAULT).unwrap()
 }
 
 /// A vault log in block 7 at log index 2.

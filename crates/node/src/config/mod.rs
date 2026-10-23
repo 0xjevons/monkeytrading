@@ -25,7 +25,7 @@ use serde::de::Error;
 use serde::{Deserialize, Deserializer};
 
 mod custody;
-pub use custody::{EvmCustodySection, FinalityTag, SecretUrl};
+pub use custody::{EvmCustodySection, FinalityTag, RpcProviderSection, SecretUrl};
 mod telemetry;
 pub use crate::config::telemetry::*;
 
@@ -412,7 +412,7 @@ impl HistorySection {
 }
 
 /// A TOML error reduced to its message and line. The error's own text quotes the offending
-/// source line, which may hold a credential such as `custody.evm.rpc_url`.
+/// source line, which may hold a credential such as `custody.evm.providers[].rpc_url`.
 fn parse_error(e: &toml::de::Error, text: &str) -> anyhow::Error {
     let line = e.span().map(|span| text[..span.start].matches('\n').count() + 1);
     match line {
@@ -444,6 +444,8 @@ fn public_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<VerifyingKey
 mod test_keys;
 mod validation;
 
+#[cfg(test)]
+mod custody_tests;
 #[cfg(test)]
 mod telemetry_tests;
 #[cfg(test)]

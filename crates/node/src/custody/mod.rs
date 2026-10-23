@@ -23,6 +23,8 @@ mod credit;
 mod cursor;
 mod evm;
 use crate::custody::evm::DepositWatcher;
+mod quorum;
+use crate::custody::quorum::Quorum;
 mod rpc;
 use crate::custody::rpc::VaultRpc;
 mod sizing;
@@ -38,12 +40,12 @@ pub enum Custody {
     /// No chain: deposits come from the dev endpoint and withdrawals are only logged.
     Mock,
     /// Credits final vault deposits from an EVM chain.
-    Evm(Box<DepositWatcher<VaultRpc>>),
+    Evm(Box<DepositWatcher<Quorum<VaultRpc>>>),
 }
 
 impl Custody {
     /// Sets up the configured provider without touching the network: the deposit watcher checks
-    /// the endpoint's chain and the vault's token on its first poll. `log_seq` is the last seq of
+    /// the providers' chain and the vault's token on every poll. `log_seq` is the last seq of
     /// the recovered log, which the deposit cursor must not have read past.
     /// Error cases:
     /// - EVM custody without its `[custody.evm]` section, which config validation rules out
@@ -56,7 +58,7 @@ impl Custody {
         }
         let evm = cfg.evm.as_ref().context("custody.provider = \"evm\" needs [custody.evm]")?;
         let vault: Address = cfg.vault.parse().context("custody.vault")?;
-        let rpc = VaultRpc::new(evm, vault)?;
+        let rpc = Quorum::connect(evm, vault)?;
         let watcher = DepositWatcher::start(rpc, evm, cfg.chain_id, vault, log_seq)?;
         warn!("EVM custody: deposits are credited; withdrawals are refused until on-chain payouts exist");
         Ok(Custody::Evm(Box::new(watcher)))

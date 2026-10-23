@@ -13,6 +13,7 @@ mod cursor;
 mod fakes;
 mod reorg;
 use crate::custody::tests::fakes::*;
+mod quorum;
 mod rpc;
 
 #[test]
