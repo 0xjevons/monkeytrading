@@ -276,7 +276,10 @@ production; configuration cannot prove operator independence. Each URL must use 
 is a literal loopback address and must serve state back to `custody.evm.start_block` (an archive
 node). The old single `custody.evm.rpc_url` config is rejected and must be migrated before restart.
 A strict majority (two of three, three of four) must agree on identity, headers, deposit sets and
-counts. Finality is checked at the highest height a majority reports final, comparing its hash at
+counts. Each poll admits only providers agreeing with its identity majority, which the watcher
+checks against the configured chain and vault token. All subsequent reads exclude other providers;
+a failed identity vote clears admission. The threshold stays fixed against all configured providers,
+including those excluded or unavailable. Recovery requires a new successful identity poll. Finality is checked at the highest height a majority reports final, comparing its hash at
 that same height; head differences alone do not prevent agreement. Empty log sets count only when
 the answering provider also returns the range's last block.
 

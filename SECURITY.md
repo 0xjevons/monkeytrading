@@ -112,7 +112,11 @@ scale it; the enclave's signing key does not yet survive a restart; the custody 
 majority of at least three configured independent RPC providers to agree on deposits, block hashes
 and finality, with reads compared at the same block height and empty log responses requiring the
 answering provider to serve the range's final block. A dissenting or unavailable provider alerts;
-lost quorum raises a Critical alert and pauses crediting while trading continues. It still trusts
+lost quorum raises a Critical alert and pauses crediting while trading continues. Providers excluded
+by that poll's identity vote cannot supply later votes, and exclusion never lowers the configured
+majority threshold. This also rejects a detected wrong-chain provider paired with a malicious
+provider mirroring its transcript. The single-fault guarantee still assumes an honest majority
+serves the intended chain and token; endpoint independence alone cannot establish that. It still trusts
 a compromised majority, operator independence is not machine-verifiable, and it takes the vault,
 its token, provider endpoints and finality tag from the
 host-supplied configuration, and keeps its deposit cursor on host storage, where a cursor moved

@@ -1,7 +1,10 @@
 //! Strict-majority custody reads. Each vote compares the same block or range; an empty log
 //! response counts only after that provider also returns the range's last block. Finality tags
 //! can advance between requests, so providers vote at the highest height a majority declares
-//! final, with its hash independently read there. No answer is reused after losing quorum.
+//! final, with its hash independently read there. Every read requires admission by the current
+//! poll's identity majority; identity failure clears admission. The watcher checks that majority
+//! against its configured chain/token before further reads. The configured majority threshold
+//! never shrinks with admission or availability. No answer is reused after losing quorum.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -20,8 +23,8 @@ use crate::custody::rpc::VaultRpc;
 pub(crate) struct Quorum<R> {
     pub(super) providers: Vec<(String, R)>,
     required: usize,
-    // VaultReader uses shared references. This lock only guards synchronous alert transitions,
-    // never IO; all network futures finish before it is acquired.
+    // The watcher owns this reader and polls serially. VaultReader uses shared references;
+    // this lock guards synchronous admission/alert transitions and is never held across IO.
     alerts: Mutex<Alerts>,
 }
 
@@ -29,6 +32,7 @@ pub(crate) struct Quorum<R> {
 struct Alerts {
     providers: BTreeSet<(usize, &'static str, &'static str)>,
     lost: BTreeSet<&'static str>,
+    eligible: BTreeSet<usize>,
 }
 
 impl Quorum<VaultRpc> {
@@ -54,6 +58,16 @@ impl<R> Quorum<R> {
             bail!("custody quorum needs at least three providers");
         }
         Ok(Self { required: providers.len() / 2 + 1, providers, alerts: Mutex::default() })
+    }
+
+    /// Refuses reads until this poll's identity majority has admitted the provider.
+    /// Error cases:
+    /// - identity has not succeeded, failed, or excluded this provider
+    fn qualified(&self, index: usize) -> anyhow::Result<()> {
+        if !self.alerts.lock().expect("quorum alert lock poisoned").eligible.contains(&index) {
+            bail!("provider is outside this poll's identity quorum");
+        }
+        Ok(())
     }
 
     /// Selects one identical answer with a strict majority and records alert transitions.
@@ -124,14 +138,22 @@ impl<R: VaultReader + Sync> VaultReader for Quorum<R> {
     /// Error cases:
     /// - no quorum
     async fn identity(&self) -> anyhow::Result<VaultIdentity> {
-        self.vote("identity", join_all(self.providers.iter().map(|(_, r)| r.identity())).await).map(|v| v.0)
+        self.alerts.lock().expect("quorum alert lock poisoned").eligible.clear();
+        let (identity, voters) =
+            self.vote("identity", join_all(self.providers.iter().map(|(_, r)| r.identity())).await)?;
+        self.alerts.lock().expect("quorum alert lock poisoned").eligible.extend(voters);
+        Ok(identity)
     }
 
     /// The highest common final height and its majority hash, with conservative head diagnostics.
     /// Error cases:
     /// - no quorum for finality or the block hash at the common height
     async fn finality(&self) -> anyhow::Result<Finality> {
-        let mut answers = join_all(self.providers.iter().map(|(_, r)| r.finality())).await;
+        let mut answers = join_all(self.providers.iter().enumerate().map(|(i, (_, r))| async move {
+            self.qualified(i)?;
+            r.finality().await
+        }))
+        .await;
         let mut heights: Vec<_> = answers
             .iter()
             .filter_map(|a| a.as_ref().ok().filter(|f| f.tagged.is_none_or(|b| b.number <= f.head)))
@@ -190,14 +212,20 @@ impl<R: VaultReader + Sync> VaultReader for Quorum<R> {
     /// Error cases:
     /// - no quorum
     async fn headers(&self, from: u64, to: u64) -> anyhow::Result<Vec<BlockLink>> {
-        self.vote("headers", join_all(self.providers.iter().map(|(_, r)| r.headers(from, to))).await).map(|v| v.0)
+        let answers = join_all(self.providers.iter().enumerate().map(|(i, (_, r))| async move {
+            self.qualified(i)?;
+            r.headers(from, to).await
+        }))
+        .await;
+        self.vote("headers", answers).map(|v| v.0)
     }
 
     /// Identical complete log sets and end-block hashes; a lagging absence cannot vote.
     /// Error cases:
     /// - no quorum, or a provider cannot return the range's last block
     async fn deposits(&self, from: u64, to: u64) -> anyhow::Result<Vec<VaultDeposit>> {
-        let answers = join_all(self.providers.iter().map(|(_, r)| async move {
+        let answers = join_all(self.providers.iter().enumerate().map(|(i, (_, r))| async move {
+            self.qualified(i)?;
             let header = last_header(r.headers(to, to).await?, to)?;
             Ok((header.hash, r.deposits(from, to).await?))
         }))
@@ -209,7 +237,12 @@ impl<R: VaultReader + Sync> VaultReader for Quorum<R> {
     /// Error cases:
     /// - no quorum
     async fn deposit_count(&self, at: BlockRef) -> anyhow::Result<u64> {
-        self.vote("deposit_count", join_all(self.providers.iter().map(|(_, r)| r.deposit_count(at))).await).map(|v| v.0)
+        let answers = join_all(self.providers.iter().enumerate().map(|(i, (_, r))| async move {
+            self.qualified(i)?;
+            r.deposit_count(at).await
+        }))
+        .await;
+        self.vote("deposit_count", answers).map(|v| v.0)
     }
 }
 
