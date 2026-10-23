@@ -10,7 +10,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 
 ## Features
 
-- Single-owner sequencer on a dedicated blocking thread: commands are logged and flushed before any client sees their effect
+- Single-owner sequencer on a dedicated OS thread: commands are logged and flushed before any client sees their effect
 - Genesis all or nothing: the engine checks every genesis command at config load and again before
   any is written, and recovery refuses a log whose genesis stopped short of its closing checkpoint
 - Signed checkpoints and withdrawals, bound to the chain id and vault, from an attested key
@@ -507,3 +507,11 @@ Node-owned thread exclusion does not isolate the CPU from unrelated host process
 work. Production scheduler/cgroup isolation must keep competing host work off the logged CPU.
 macOS development measurements provide no Linux CPU-isolation evidence. Linux CI checks worker
 mask inheritance, sequencer binding, calling-mask restoration and single-CPU refusal.
+
+The sequencer owns an OS thread and reports its result through a supervised channel. Dropping its
+supervisor requests cancellation at an async boundary, including startup-error and drain-timeout
+paths. Its affinity cannot leak into Tokio's reusable blocking pool. Runtime teardown uses the
+non-waiting shutdown path after node/alert draining, so a blocked storage syscall cannot extend
+that drain deadline through runtime destruction. On a fatal drain error the CLI returns an error
+and exits, terminating any remaining OS threads. An embedded caller must likewise terminate its
+process after an uncancellable drain failure; a blocked thread is not safe to restart beside.

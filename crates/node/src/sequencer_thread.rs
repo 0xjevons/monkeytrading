@@ -1,11 +1,55 @@
-//! Linux CPU binding for the dedicated sequencer thread.
+//! The sequencer owns its OS thread; Linux workers exclude its reserved CPU.
 
-#[cfg(target_os = "linux")]
+use std::future::Future;
+
 use anyhow::Context;
 #[cfg(target_os = "linux")]
 use tracing::info;
 #[cfg(not(target_os = "linux"))]
 use tracing::warn;
+
+use tokio::sync::oneshot;
+
+/// A supervised OS thread, cancelled at an async boundary whenever its supervisor drops it.
+pub(crate) struct Worker {
+    pub(crate) outcome: oneshot::Receiver<anyhow::Result<()>>,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+impl Worker {
+    pub(crate) fn start<F>(future: F, cpu: Option<usize>) -> anyhow::Result<Self>
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let runtime = tokio::runtime::Handle::current();
+        let (done, outcome) = oneshot::channel();
+        let (cancel, stopped) = oneshot::channel();
+        std::thread::Builder::new()
+            .name("sequencer".into())
+            .spawn(move || {
+                let result = pin(cpu).and_then(|()| {
+                    runtime.block_on(async {
+                        tokio::select! {
+                            biased;
+                            _ = stopped => anyhow::bail!("sequencer cancelled after supervisor stopped"),
+                            result = future => result,
+                        }
+                    })
+                });
+                let _ = done.send(result);
+            })
+            .context("start sequencer thread")?;
+        Ok(Self { outcome, cancel: Some(cancel) })
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
 
 /// Builds the node runtime after reserving a CPU, so its workers inherit the remaining mask.
 /// Error cases:
@@ -17,12 +61,17 @@ pub fn run_dedicated(cfg: crate::NodeConfig, telemetry: crate::Telemetry) -> any
     let cpu = Some(reservation.core);
     #[cfg(not(target_os = "linux"))]
     let cpu = None;
-    let result = (|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        runtime.block_on(crate::node::run_with_cpu(cfg, telemetry, cpu))
-    })();
+    let result = with_runtime(|runtime| runtime.block_on(crate::node::run_with_cpu(cfg, telemetry, cpu)));
     #[cfg(target_os = "linux")]
     reservation.restore()?;
+    result
+}
+
+/// Stops runtime-owned tasks without waiting indefinitely for an uncancellable host syscall.
+fn with_runtime(run: impl FnOnce(&tokio::runtime::Runtime) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let result = run(&runtime);
+    runtime.shutdown_background();
     result
 }
 
@@ -80,6 +129,82 @@ pub(crate) fn pin(_cpu: Option<usize>) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+
+    struct Dropped(Option<oneshot::Sender<()>>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_supervisor_cancels_its_worker_at_a_safe_async_boundary() {
+        let (entered, ready) = oneshot::channel();
+        let (dropped, finished) = oneshot::channel();
+        let worker = super::Worker::start(
+            async move {
+                let _dropped = Dropped(Some(dropped));
+                entered.send(()).unwrap();
+                std::future::pending::<anyhow::Result<()>>().await
+            },
+            None,
+        )
+        .unwrap();
+        ready.await.unwrap();
+        drop(worker);
+        tokio::time::timeout(Duration::from_secs(1), finished).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_completion_and_panic_are_both_reported_to_the_supervisor() {
+        let mut finished = super::Worker::start(async { Ok(()) }, None).unwrap();
+        (&mut finished.outcome).await.unwrap().unwrap();
+        let panic = std::future::poll_fn(|_| -> std::task::Poll<anyhow::Result<()>> {
+            panic!("sequencer worker panic probe");
+        });
+        let mut failed = super::Worker::start(panic, None).unwrap();
+        assert!((&mut failed.outcome).await.is_err());
+    }
+
+    #[test]
+    fn fatal_runtime_teardown_returns_while_a_blocking_storage_task_is_stalled() {
+        let (entered, ready) = mpsc::channel();
+        let (running, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let (returned, result) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let outcome = super::with_runtime(|runtime| {
+                runtime.spawn_blocking(move || {
+                    running.send(()).unwrap();
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    finished.send(()).unwrap();
+                });
+                started.recv_timeout(Duration::from_secs(5)).unwrap();
+                Err(anyhow::anyhow!("sequencer did not drain in time"))
+            });
+            returned.send(outcome).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let returned_in_time = result.recv_timeout(Duration::from_secs(1));
+        // Release the simulated syscall even when a teardown regression would wait for it.
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        owner.join().unwrap();
+        assert_eq!(returned_in_time.unwrap().unwrap_err().to_string(), "sequencer did not drain in time");
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     #[test]
@@ -113,17 +238,33 @@ mod tests {
             }
             let reservation = super::Reservation::new().unwrap();
             assert!(!sched_getaffinity(Pid::from_raw(0)).unwrap().is_set(reservation.core).unwrap());
-            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
             runtime.block_on(async {
                 let worker = tokio::spawn(async { sched_getaffinity(Pid::from_raw(0)).unwrap() }).await.unwrap();
                 assert!(!worker.is_set(reservation.core).unwrap());
                 let core = reservation.core;
-                let sequencer = tokio::task::spawn_blocking(move || {
-                    super::pin(Some(core)).unwrap();
-                    sched_getaffinity(Pid::from_raw(0)).unwrap()
-                })
-                .await
+                let pool_before =
+                    tokio::task::spawn_blocking(|| sched_getaffinity(Pid::from_raw(0)).unwrap()).await.unwrap();
+                let (selected, observed) = tokio::sync::oneshot::channel();
+                let mut owner = super::Worker::start(
+                    async move {
+                        selected.send(sched_getaffinity(Pid::from_raw(0)).unwrap()).unwrap();
+                        Ok(())
+                    },
+                    Some(core),
+                )
                 .unwrap();
+                let sequencer = observed.await.unwrap();
+                (&mut owner.outcome).await.unwrap().unwrap();
+                drop(owner);
+                let pool_after =
+                    tokio::task::spawn_blocking(|| sched_getaffinity(Pid::from_raw(0)).unwrap()).await.unwrap();
+                assert_eq!(pool_before, pool_after, "sequencer affinity must not leak into the blocking pool");
                 assert!(sequencer.is_set(core).unwrap());
                 assert_eq!((0..CpuSet::count()).filter(|cpu| sequencer.is_set(*cpu).unwrap()).count(), 1);
             });
