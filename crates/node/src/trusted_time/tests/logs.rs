@@ -28,6 +28,7 @@ impl Logs {
     /// Captures lines at `debug` and above on this thread until the guard drops. A current-thread
     /// runtime polls every spawned task on this thread, so their lines are captured too.
     pub fn capture() -> (Self, DefaultGuard) {
+        crate::test_support::keep_callsites_interested();
         let logs = Self::default();
         let writer = logs.clone();
         let subscriber =

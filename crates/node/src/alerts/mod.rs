@@ -389,6 +389,7 @@ pub fn capture(f: impl FnOnce()) -> Vec<AlertLine> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::registry;
 
+    crate::test_support::keep_callsites_interested();
     let (layer, router) = channel(Routes::default(), Arc::new(Metrics::new()));
     with_default(registry().with(layer.with_filter(filter_fn(is_alert_callsite))), f);
     router.queued()

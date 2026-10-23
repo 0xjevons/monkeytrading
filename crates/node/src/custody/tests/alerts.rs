@@ -31,6 +31,7 @@ use crate::sequencer::Request;
 /// refused deposit is its own subject, so each one pages.
 #[tokio::test(start_paused = true)]
 async fn custody_alerts_keep_one_key_per_subject_and_resolve_under_it() {
+    crate::test_support::keep_callsites_interested();
     let (layer, router) = channel(Routes::default(), Arc::new(Metrics::new()));
     let _logging = set_default(registry().with(layer.with_filter(filter_fn(is_alert_callsite))));
 

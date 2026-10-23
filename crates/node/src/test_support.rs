@@ -35,6 +35,7 @@ use crate::log::{self, LogEntry, LogReader, Manifest, Offset, SegmentedLog};
 use crate::metrics::Metrics;
 use crate::sequencer::{Request, Sequencer, SequencerConfig, SignedWithdrawal, StreamMsg};
 use crate::tee::EnclaveKey;
+pub use crate::test_tracing::keep_callsites_interested;
 use crate::trusted_time::Sample;
 
 pub const DEV_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/dev.toml");
@@ -216,6 +217,7 @@ pub async fn assert_a_dropped_read_keeps_its_permit(permits: &Semaphore, read: i
 /// Routes this thread's logs to an alert collector until the guard drops. `#[tokio::test]` runs
 /// every task on the test's thread, so the alerts of the tasks a test spawns all arrive.
 pub fn capture_alerts() -> (DefaultGuard, mpsc::UnboundedReceiver<Alert>) {
+    keep_callsites_interested();
     let (tx, rx) = mpsc::unbounded_channel();
     (tracing::subscriber::set_default(Registry::default().with(AlertLayer(tx))), rx)
 }
@@ -317,6 +319,7 @@ pub fn file_entries(path: &Path) -> Vec<LogEntry> {
 /// - the index cannot be opened, or does not match the log (see `HistoryCheck::finish`)
 /// - the log cannot be read
 pub fn open_history(cfg: &HistorySection, dir: &Path) -> anyhow::Result<History> {
+    keep_callsites_interested();
     let mut check = HistoryCheck::open(cfg)?;
     SegmentedLog::open(dir, |entry| {
         check.observe(&entry);

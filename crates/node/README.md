@@ -122,6 +122,9 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   resumes, and one ahead of it, contradicting it, damaged, or pruned under another retention is
   rebuilt
 - `src/test_support.rs` — the shared test harness, including the capture of alerts and their levels
+- `src/test_tracing.rs` — the tracing setup the test collectors share: one process-wide
+  interested subscriber, so no callsite can be cached uninteresting and a collector never
+  silently misses an alert or line
 - `src/tee.rs` — the enclave key, signatures, and attestation providers
 - `src/trusted_time/mod.rs` — the trusted time task: queries the Roughtime servers, backs off
   failing ones, and turns agreeing replies into a sample

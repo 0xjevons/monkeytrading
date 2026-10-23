@@ -20,6 +20,7 @@ const TRUE_MS: Millis = 1_792_502_815_000;
 /// share an episode, and the line that ends the condition resolves it under that key.
 #[tokio::test]
 async fn trusted_time_alerts_keep_one_key_per_subject_and_resolve_under_it() {
+    crate::test_support::keep_callsites_interested();
     let (layer, router) = channel(Routes::default(), Arc::new(Metrics::new()));
     let _logging = set_default(registry().with(layer.with_filter(filter_fn(is_alert_callsite))));
     let now = Instant::now();
