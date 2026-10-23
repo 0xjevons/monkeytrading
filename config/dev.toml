@@ -147,6 +147,7 @@ retention = "365d"
 listen = "127.0.0.1:9464"
 
 [alerts]
+outbox = { dir = "data/dev/alerts", max_pages = 2048, max_bytes = 16777216, max_age = "1h" }
 no_price_after = "5s"
 episode_quiet = "15m"
 # Post Critical alerts as JSON to the URL in an environment variable:

@@ -208,6 +208,8 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/alerts/episodes.rs` — one page per episode start and end
 - `src/alerts/webhook.rs` — webhook routes, the TLS client, and one delivery task per route, with
   retries
+- `src/alerts/outbox.rs` — the single-owner durable SQLite outbox and disk/row validation
+- `src/alerts/outbox/tests.rs` — restart, bounds, corruption and storage-failure tests
 - `src/alerts/tests.rs` — alert routing tests
 - `examples/reference_log.rs` — writes a protocol version's node reference log from engine-core's
 - `tests/reference_logs.rs` — replays every committed node reference log, events included
@@ -445,16 +447,40 @@ severity's webhook:
 `status` is `firing` or `resolved`, and `key` is the same for both, so a receiver can match a
 resolve to its alert and drop duplicates. `context` names the spans the line was logged in, such
 as `command{id=42}`. Repeats of a key do not page again until it has been quiet for
-`alerts.episode_quiet`. Each severity's webhook has its own queue, and delivery never blocks the
-code that logged the alert. A page is retried from 1s, doubling to a minute, until the webhook
-answers 2xx; a redirect, or a 4xx other than 408 or 429, refuses it, and it is given up an hour
-after its first attempt. A route holds up to 1024 pages; past that, a page is dropped, logged, and
-counted. Episodes and pending pages live in memory: pages still queued or retrying when the node
-stops are lost once the shutdown grace runs out, though their alert lines remain in the log; after
-a restart an alert still firing pages again, and one that cleared while the node was down sends no
-resolve. Pages that survive a restart are tracked in
-[#102](https://github.com/0xjevons/monkeytrading/issues/102). The HTTP client's own logs are held
-at `warn` whatever `logging.level` says, since a webhook URL is a credential.
+`alerts.episode_quiet`. Each severity's webhook delivers its oldest pending page first. The
+sequencer only tries a bounded channel send; disk writes and webhook retries run on supervised
+workers. A page is committed with SQLite `synchronous=FULL` before its first POST, and removed
+only after 2xx acceptance, permanent refusal (redirects and 4xx except 408/429), or its age/retry
+budget expires. Retries start at 1s and double to a minute. Each run retries for at most an hour;
+`alerts.outbox.max_age` bounds the entire lifetime, including queueing and time across restarts.
+Shutdown leaves committed pending pages for the next start, in their original route order.
+
+`alerts.outbox` is required: `dir` must be a sibling of `node.log_dir` on the private data disk,
+`max_pages` bounds retained rows across both routes, `max_bytes` bounds their combined serialized
+payload bytes, and `max_age` bounds their age. Dev configs use 2048 pages, 16 MiB, and one hour;
+one serialized row is additionally capped at 64 KiB. SQLite reuses freed pages. Its database file is capped at
+`ceil(max_bytes / page_size) + 4 * max_pages + 16` SQLite pages, including indexes and retained
+free pages; the temporary rollback journal requires
+additional space for at most those database pages plus journal record headers. No outbox file enters the public
+log archive. Both directories must resolve to distinct siblings. Keep one node per outbox; an
+exclusive SQLite lock refuses another owner. Back up and restore the outbox with the log.
+
+Capacity refusal leaves older pages intact, counts `engine_alert_outbox_overflows_total`, and
+forgets the refused episode so a repeat can retry admission. The external Prometheus rule
+`EngineAlertOutboxOverflow` pages a separate receiver; line-queue drops and permanent delivery
+failures have their own rules. Storage errors stop the supervised node; corrupt data, changed
+bounds that exclude retained rows, or removing a route with pending pages refuse startup without
+discarding pages. Operators must retain the route/bounds until those pages drain.
+
+Delivery is at least once: a crash after receiver acceptance but before durable deletion may
+repeat the same page. Receivers can deduplicate `(key, status, ts_ms)`; `key` alone also joins an
+alert to its resolve and later episodes. Episode suppression remains in memory. An alert line
+still waiting for the router when the process is killed can be lost before becoming a durable
+page. SQLite schema/integrity checks and page bounds reject damaged input; they do not detect
+host deletion or rollback. Integrity-protected, rollback-resistant storage is still required to
+bound a hostile host. Across restarts, retention uses host wall time; a backward clock refuses
+future-dated rows, but trusted time is not sealed with the outbox. The webhook URL remains a
+host-supplied credential, and HTTP client logs stay at `warn` regardless of `logging.level`.
 
 ## Configuration
 
@@ -474,6 +500,9 @@ unset. A node whose TEE or custody provider is not `mock` refuses to start witho
 
 ```bash
 cargo test -p engine-node
+
+# Alert outbox SIGKILL/restart scenario, offline with a loopback receiver
+./scripts/dev-alert-outbox.sh
 
 # The trusted time dev scenario, offline against loopback Roughtime servers
 cargo test -p engine-node trusted_time::tests::scenario

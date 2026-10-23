@@ -106,6 +106,7 @@ sed -e "s|^listen = \"127.0.0.1:8080\"|listen = \"127.0.0.1:$api_port\"|" \
   -e "s|^listen = \"127.0.0.1:9464\"|listen = \"127.0.0.1:$metrics_port\"|" \
   -e "s|^log_dir = .*|log_dir = \"$work/log\"|" \
   -e "s|^dir = \"data/dev/history\"|dir = \"$work/history\"|" \
+  -e "s|dir = \"data/dev/alerts\"|dir = \"$work/alerts\"|" \
   -e 's|^no_price_after = .*|no_price_after = "3s"|' \
   -e "s|{ market = 1, mid = \"100000\" }|{ market = 1, mid = \"100000\", stop_after = \"${stop_after}s\" }|" \
   "$root/config/dev.toml" > "$work/node.toml"

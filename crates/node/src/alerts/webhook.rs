@@ -12,17 +12,16 @@ use reqwest::{Client, StatusCode};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 use tracing::{debug, error, info, warn};
 
+use crate::alerts::outbox::Outbox;
 use crate::alerts::{Page, Severity};
 use crate::config::{AlertsSection, WebhookRoute, WebhookUrl};
 use crate::metrics::{DeliveryLabels, Metrics, SeverityLabel};
 
 /// Deadline for one POST, connection included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Pages waiting on one route: as many as there can be tracked episodes.
-const PAGE_QUEUE: usize = 1024;
 /// Retries for production: from 1s, doubling to a minute, for up to an hour from the first attempt.
 pub const RETRY: Retry =
     Retry { first: Duration::from_secs(1), max: Duration::from_secs(60), give_up_after: Duration::from_secs(3600) };
@@ -43,10 +42,11 @@ pub struct Retry {
     pub give_up_after: Duration,
 }
 
-/// The page queue of each routed severity.
+/// Coalesced wakeups for each routed severity, backed by the durable outbox.
 pub struct Queues {
-    pub(super) critical: Option<mpsc::Sender<Page>>,
-    pub(super) warning: Option<mpsc::Sender<Page>>,
+    pub(super) critical: Option<mpsc::Sender<()>>,
+    pub(super) warning: Option<mpsc::Sender<()>>,
+    pub(super) outbox: Outbox,
 }
 
 impl Routes {
@@ -73,27 +73,38 @@ impl Routes {
 }
 
 impl Queues {
-    /// Spawns one delivery task per route on `tasks`, retrying per `retry`, and returns their
-    /// queues.
+    /// Spawns one delivery task per route, returning its coalesced wakeup sender.
     pub fn start(
         routes: Routes,
         client: Client,
         metrics: &Arc<Metrics>,
         retry: Retry,
+        outbox: Outbox,
         tasks: &mut JoinSet<()>,
     ) -> Self {
-        let mut start = |url: Option<WebhookUrl>| {
+        let mut start = |severity, url: Option<WebhookUrl>| {
             url.map(|url| {
-                let (tx, rx) = mpsc::channel(PAGE_QUEUE);
-                tasks.spawn(deliver(rx, client.clone(), url, metrics.clone(), retry));
+                let (tx, rx) = mpsc::channel(1);
+                let worker = outbox.clone();
+                let metrics = metrics.clone();
+                let client = client.clone();
+                tasks.spawn(async move {
+                    if let Err(e) = deliver(rx, worker, severity, client, url, metrics, retry).await {
+                        error!(severity = severity.as_str(), "alert delivery stopped: {e:#}");
+                    }
+                });
                 tx
             })
         };
-        Queues { critical: start(routes.critical), warning: start(routes.warning) }
+        Queues {
+            critical: start(Severity::Critical, routes.critical),
+            warning: start(Severity::Warning, routes.warning),
+            outbox,
+        }
     }
 
     /// The queue for `severity`, if it has a route.
-    pub fn get(&self, severity: Severity) -> Option<&mpsc::Sender<Page>> {
+    pub fn get(&self, severity: Severity) -> Option<&mpsc::Sender<()>> {
         match severity {
             Severity::Critical => self.critical.as_ref(),
             Severity::Warning => self.warning.as_ref(),
@@ -101,7 +112,7 @@ impl Queues {
     }
 
     /// Every routed severity and its queue.
-    pub fn all(&self) -> impl Iterator<Item = (Severity, &mpsc::Sender<Page>)> {
+    pub fn all(&self) -> impl Iterator<Item = (Severity, &mpsc::Sender<()>)> {
         [(Severity::Critical, &self.critical), (Severity::Warning, &self.warning)]
             .into_iter()
             .filter_map(|(severity, queue)| queue.as_ref().map(|queue| (severity, queue)))
@@ -130,31 +141,52 @@ pub fn client() -> anyhow::Result<Client> {
         .context("building the webhook client")
 }
 
-/// Posts one route's pages in order until the router stops.
-pub async fn deliver(
-    mut pages: mpsc::Receiver<Page>,
+/// Posts committed pages in route order, retaining them if the worker is cancelled.
+/// Error cases:
+/// - an outbox read or acknowledgement fails
+pub(super) async fn deliver(
+    mut wake: mpsc::Receiver<()>,
+    outbox: Outbox,
+    severity: Severity,
     client: Client,
     url: WebhookUrl,
     metrics: Arc<Metrics>,
     retry: Retry,
-) {
-    while let Some(page) = pages.recv().await {
+) -> anyhow::Result<()> {
+    loop {
+        let Some(pending) = outbox.next(severity).await? else {
+            if wake.recv().await.is_none() {
+                return Ok(());
+            }
+            continue;
+        };
+        let page = &pending.page;
         let failed =
-            metrics.alert_attempts_failed.get_or_create(&SeverityLabel { severity: page.severity.as_str() }).clone();
-        let outcome = match post(&client, &url, &page, retry, &failed).await {
+            metrics.alert_attempts_failed.get_or_create(&SeverityLabel { severity: severity.as_str() }).clone();
+        let remaining = pending.remaining();
+        let result = if remaining.is_zero() {
+            Err(anyhow!("page expired in the durable outbox"))
+        } else {
+            let retry = Retry { give_up_after: remaining.min(retry.give_up_after), ..retry };
+            timeout(remaining, post(&client, &url, page, retry, &failed))
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("page expired while posting")))
+        };
+        let outcome = match result {
             Ok(()) => {
                 info!(key = %page.key, status = ?page.status, context = %page.context, "alert page sent");
                 "sent"
             }
             Err(e) => {
-                // No `alert` field: a failed page must not queue another page.
                 error!(key = %page.key, status = ?page.status, context = %page.context, "alert page not delivered: {e:#}");
                 "failed"
             }
         };
-        let severity = page.severity.as_str();
-        metrics.alert_deliveries.get_or_create(&DeliveryLabels { severity, outcome }).inc();
-        metrics.alert_pages_pending.get_or_create(&SeverityLabel { severity }).dec();
+        // Acceptance followed by a crash before this commit can redeliver the same episode key.
+        outbox.remove(pending.id).await.inspect_err(|e| {
+            error!(key = %page.key, context = %page.context, "alert page acknowledgement failed: {e:#}");
+        })?;
+        metrics.alert_deliveries.get_or_create(&DeliveryLabels { severity: severity.as_str(), outcome }).inc();
     }
 }
 

@@ -40,3 +40,10 @@ groups:
           severity: critical
         annotations:
           summary: "Engine node {{ $labels.instance }} dropped alert lines before routing them"
+
+      - alert: EngineAlertOutboxOverflow
+        expr: increase(engine_alert_outbox_overflows_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Engine node {{ $labels.instance }} refused pages at its durable alert outbox size bound"

@@ -77,3 +77,32 @@ fn a_webhook_url_comes_from_its_variable_and_never_prints() {
         assert!(!err.to_string().contains("secret-token"), "{err}");
     }
 }
+
+#[test]
+fn outbox_bounds_are_nonzero_and_its_directory_is_beside_the_public_log() {
+    let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+    for dir in ["data/dev/log", "data/dev/log/alerts", "data/elsewhere/alerts", "data/dev/../alerts"] {
+        cfg.alerts.outbox.dir = dir.into();
+        assert!(cfg.alerts.outbox.validate_location(&cfg.node.log_dir).is_err(), "{dir}");
+    }
+    cfg.alerts.outbox.dir = "data/dev/alerts".into();
+    cfg.alerts.outbox.validate_location(&cfg.node.log_dir).unwrap();
+    cfg.alerts.outbox.max_pages = 0;
+    assert!(cfg.alerts.outbox.validate().unwrap_err().to_string().contains("max_pages"));
+    cfg.alerts.outbox.max_pages = 1;
+    cfg.alerts.outbox.max_bytes = 0;
+    assert!(cfg.alerts.outbox.validate().unwrap_err().to_string().contains("max_bytes"));
+    cfg.alerts.outbox.max_bytes = 1;
+    cfg.alerts.outbox.max_age = Duration::ZERO;
+    assert!(cfg.alerts.outbox.validate().unwrap_err().to_string().contains("max_age"));
+}
+
+#[test]
+fn an_outbox_symlink_into_the_public_log_is_refused() {
+    let dir = crate::test_support::scratch_dir("outbox-symlink");
+    std::fs::create_dir_all(dir.join("log")).unwrap();
+    std::os::unix::fs::symlink(dir.join("log"), dir.join("alerts")).unwrap();
+    let mut cfg = NodeConfig::load(Path::new(DEV)).unwrap();
+    cfg.alerts.outbox.dir = dir.join("alerts");
+    assert!(cfg.alerts.outbox.check_disk_location(&dir.join("log")).unwrap_err().to_string().contains("overlaps"));
+}
