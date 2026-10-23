@@ -13,7 +13,8 @@
 //! every path that moves cash and the refusal of out-of-range amounts, order numbers, and quotes;
 //! under `V6` a close-out that no price triggered; under `V12` a resting order filled by a command
 //! with neither prices nor an order, which `V2` never fills; under `V13`, which runs as `V12` does,
-//! a stress change; and under `V14` its cap and missing rates; so the checks cannot pass vacuously.
+//! a stress change; under `V14` its cap and missing rates; and under `V15` a reducing order
+//! resting below the minimum; so the checks cannot pass vacuously.
 
 mod charges;
 #[path = "../common/mod.rs"]
@@ -116,8 +117,8 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
                 if version >= ProtocolVersion::V14 {
                     check_v14(&h.engine, &cmd, &events).map_err(fail)?;
                 }
-                if version >= ProtocolVersion::V15 {
-                    check_v15(&h.engine, &cmd, &events).map_err(fail)?;
+                if version >= ProtocolVersion::V15 && check_v15(&h.engine, &cmd, &events).map_err(fail)? {
+                    paths.insert("reducing order rests below the minimum");
                 }
             }
         }
@@ -176,6 +177,7 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
     .chain([(ProtocolVersion::V14, QUIET_RESTING_FILL), (ProtocolVersion::V14, YEN_FILL)])
     .chain([(ProtocolVersion::V15, QUIET_RESTING_FILL), (ProtocolVersion::V15, YEN_FILL)])
     .chain([(ProtocolVersion::V13, "stress changed")])
+    .chain([(ProtocolVersion::V15, "reducing order rests below the minimum")])
     .chain(v14_only.iter().map(|path| (ProtocolVersion::V14, *path)))
     .filter(|(version, path)| !paths(*version).contains(path))
     .collect();
@@ -366,27 +368,28 @@ fn check_v14(engine: &Engine, cmd: &Command, events: &[Event]) -> Result<(), Str
 /// at its FX market's mark in any other, an FX market with no mark leaving no dollar value — can
 /// only reduce its account's position in that market: opposite side, quantity at most the
 /// position. An order that filled or was cancelled as it was placed no longer rests, and what it
-/// did is governed by the fill's own checks; the account's position is the placement's.
+/// did is governed by the fill's own checks; the account's position is the placement's. Returns
+/// true when such a below-minimum resting reduction was seen, so the run can require the path.
 /// Error cases:
 /// - a resting order accepted below the minimum, or with no dollar value, could add risk
-fn check_v15(engine: &Engine, cmd: &Command, events: &[Event]) -> Result<(), String> {
-    let Command::PlaceOrder(req) = cmd else { return Ok(()) };
+fn check_v15(engine: &Engine, cmd: &Command, events: &[Event]) -> Result<bool, String> {
+    let Command::PlaceOrder(req) = cmd else { return Ok(false) };
     let price = match req.kind {
         OrderKind::Limit { price } | OrderKind::Stop { price } => price,
-        OrderKind::Market { .. } => return Ok(()),
+        OrderKind::Market { .. } => return Ok(false),
     };
     if req.reduce_only {
-        return Ok(());
+        return Ok(false);
     }
     let Some(order_id) = events.iter().find_map(|event| match event {
         Event::OrderAccepted { order_id, .. } => Some(*order_id),
         _ => None,
     }) else {
-        return Ok(());
+        return Ok(false);
     };
     let rests = engine.accounts().get(&req.account).is_some_and(|acct| acct.orders.contains_key(&order_id));
     if !rests {
-        return Ok(());
+        return Ok(false);
     }
     let market = &engine.markets()[&req.market];
     let currency = market.spec.quote_currency;
@@ -398,7 +401,7 @@ fn check_v15(engine: &Engine, cmd: &Command, events: &[Event]) -> Result<(), Str
         fx => currency.to_usd(req.qty.mul(price), fx.flatten(), Rounding::Down) < market.spec.min_order_notional,
     };
     if !below_min {
-        return Ok(());
+        return Ok(false);
     }
     let pos = engine.accounts()[&req.account].position(req.market);
     let reduces_only = pos.qty.signum() == -req.side.sign() && req.qty <= pos.qty.abs();
@@ -408,7 +411,7 @@ fn check_v15(engine: &Engine, cmd: &Command, events: &[Event]) -> Result<(), Str
             market.spec.min_order_notional, req.market
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Cash the events moved across the engine's boundary: deposits and house capital in, approved

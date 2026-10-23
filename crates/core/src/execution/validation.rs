@@ -4,6 +4,7 @@ use crate::Fixed;
 use crate::command::{OrderKind, OrderRequest};
 use crate::engine::Engine;
 use crate::event::Reject;
+use crate::execution::growth;
 use crate::fixed::Rounding;
 use crate::protocol::ProtocolVersion;
 
@@ -46,15 +47,16 @@ impl Engine {
                 return Err(Reject::TooManyOrders { max: params.max_resting_orders });
             }
             // A reduce-only order never adds risk, as a reducing fill pays no minimum; from `V15`
-            // neither does an order that can only reduce the account's position in this market, its
-            // side opposing the position and its qty at most it, the same slice a fill checks:
-            // `price` charges the minimum only on what grows |position|. The order is valued at its
+            // neither does an order that can only reduce the account's position in this market. A
+            // fill checks the minimum only on the slice that grows |position| (`price`), so the
+            // exemption is the same `growth` slice with nothing growing. The order is valued at its
             // own price, converted as its fill would be: a market that converts at its own index, as
             // USD-JPY does, at that price, and any other at its FX market's last mark.
             let reduces_only = req.reduce_only
                 || (self.protocol_version >= ProtocolVersion::V15 && {
                     let pos = acct.position(req.market);
-                    pos.qty.signum() == -req.side.sign() && req.qty <= pos.qty.abs()
+                    let (from, to) = growth(pos.qty, req.side.signed(req.qty));
+                    to <= from
                 });
             if !reduces_only {
                 let currency = market.spec.quote_currency;

@@ -133,7 +133,6 @@ this crate and reproduce the signed state roots exactly.
 - `tests/fixtures/merkle.json` — state tree vectors computed with Foundry's `cast`: keys, leaf ABI
   encodings and value hashes, a root, and proofs
 - `examples/reference_log/` — writes the reference log for a new protocol version: the session
-- `examples/reference_log/` — writes the reference log for a new protocol version: the session
   (`main.rs`), the requests and event names it uses (`helpers.rs`), its `V10` to `V12` parts
   (`v10.rs`, `v11.rs`, `v12.rs`), its `V13` part (`stress.rs`), its `V14` part (`v14.rs`), and its
   `V15` part (`v15.rs`)
