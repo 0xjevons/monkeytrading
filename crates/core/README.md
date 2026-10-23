@@ -82,6 +82,9 @@ this crate and reproduce the signed state roots exactly.
   the window before a halt still count after the reopening, so a move across a halt shorter than
   the window raises fast-move stress as it would without the halt
 
+- From protocol `V18`, dated decimal benchmark histories select each missed rollover's rate by its
+  local date; observations older than five weekdays still apply and produce a stale status
+
 ## Repository Structure
 
 - `src/lib.rs` — module index and the protocol summary
@@ -93,6 +96,7 @@ this crate and reproduce the signed state roots exactly.
 - `src/markouts.rs` — each fill's markout, queued and then marked against the index after its
   horizon, and toxicity scores
 - `src/closeout.rs` — account close-out and bad-debt write-off
+- `src/benchmark.rs` — dated publisher snapshots, effective-date lookup, staleness, and retention
 - `src/funds.rs` — deposits, withdrawals, house capital, and overnight financing
 - `src/admin.rs` — operator commands and signed admin commands
 - `src/stress.rs` — stress levels: the automatic triggers, the move window, and the floors
@@ -187,6 +191,8 @@ operator's next nonce; `engine admin`, in `engine-node`, signs and submits it.
 
 `SIGNER_KEY`: the account's private key, hex, for the `sign_request` example.
 
+`tests/benchmarks.rs` covers dated financing, catch-up, snapshots, staleness, and replay.
+
 ## Testing
 
 ```bash
@@ -253,6 +259,8 @@ and caps each account's resting orders; its log is `v14.jsonl`. `V15` lets an or
 reduce the account's position in its market skip the minimum-notional check at placement; its log is
 `v15.jsonl`. `V16` clamps every account's toxicity history when parameters set a lower memory; its
 log is `v16.jsonl`. `V17` keeps a market's move window across a halt; its log is `v17.jsonl`.
+`V18` adds dated benchmark snapshots and per-date catch-up. Its reference-log session is in
+`examples/reference_log/v18.rs`.
 For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in

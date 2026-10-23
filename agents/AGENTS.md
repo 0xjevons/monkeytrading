@@ -11,7 +11,7 @@ an index: load only the rule whose hint matches the current action.
 
 - **crates/core/** — `engine-core`: the protocol state machine. Covers pricing against the index,
   size and stress spreads, margin and close-out, the profit fee, overnight financing, trading
-  sessions, house exposure caps, toxicity scoring, signed client requests (EIP-712, per-account
+  sessions, dated benchmark histories (`benchmark.rs`), house exposure caps, toxicity scoring, signed client requests (EIP-712, per-account
   nonces, and expiries), USD settlement of markets quoted in other currencies, admin commands signed
   by the operator key the log records, protocol versions, and the state tree (a keccak-256 sparse
   Merkle tree over the state, with account proofs, in `merkle/`). It does no IO and uses no clocks,
@@ -26,6 +26,7 @@ an index: load only the rule whose hint matches the current action.
   replay`, `engine admin` (the operator's signing client), the REST API with the operator's admin
   route and account proofs, and the resumable WebSocket stream (TLS from an attested in-enclave key,
   with rate limits and connection caps), the account history index (SQLite, derived from the log),
+  dated benchmark ingestion (`benchmarks/` and the separate `admin/benchmark_feed.rs` signing worker),
   TEE attestation (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime
   servers, the custody adapter (mock, or EVM vault deposits over alloy), checkpoint posting and collateral
   reconciliation (`checkpoints/`), with strict signature replay and startup checks against the
@@ -53,8 +54,11 @@ an index: load only the rule whose hint matches the current action.
   did not apply in full. `node.auth`, with `custody.chain_id` and `custody.vault` under `eip712`, and
   `operator.public_key`, with the same chain id and vault, are recorded in the log when it first
   activates the protocol versions that need them, so changing either needs a fresh log.
-  `test-keys.toml` lists the keys whose private keys the repo publishes for development (the dev
-  configs' operator key, explicit published mock enclave signer, and Anvil's default accounts); a node whose TEE is not the mock refuses them
+  `benchmark-publishers.toml` supplies the optional benchmark section with official publisher endpoints;
+  a separate `engine admin ... sync-benchmarks --watch` worker signs daily snapshots and releases
+  startup synchronization before catch-up. `test-keys.toml` lists the keys whose private keys the repo
+  publishes for development (the dev configs' operator key, explicit published mock enclave signer,
+  and Anvil's default accounts); a node whose TEE is not the mock refuses them
   as its operator key, and a dev config or script that adds such a key lists it there.
   `production-genesis.toml` is the production `[genesis]` section alone: the launch markets with
   their venue calendars, each calendar's sources and unpublished gaps, their quote currencies, and

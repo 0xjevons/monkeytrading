@@ -24,6 +24,8 @@ use k256::ecdsa;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
 
+mod benchmarks;
+pub use benchmarks::{BenchmarkSection, BenchmarkSource, Publisher};
 mod custody;
 pub use custody::{EvmCustodySection, FinalityTag, RpcProviderSection, SecretUrl};
 mod checkpoints;
@@ -94,6 +96,8 @@ pub struct NodeConfig {
     pub history: HistorySection,
     pub metrics: MetricsSection,
     pub alerts: AlertsSection,
+    /// Enables startup synchronization with an external signed publisher worker.
+    pub benchmarks: Option<BenchmarkSection>,
     /// Sequenced as admin commands after protocol activation on a log's first boot, all or nothing,
     /// so the rules every fill ran under are part of the public record.
     pub genesis: Genesis,

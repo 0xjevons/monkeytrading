@@ -104,11 +104,13 @@ pub enum ProtocolVersion {
     /// raises fast-move stress as it would without the halt. Before `V17` an open cleared the
     /// window.
     V17,
+    /// Dated benchmark histories select each rollover's rate by its local date, including catch-up.
+    V18,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V17;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V18;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

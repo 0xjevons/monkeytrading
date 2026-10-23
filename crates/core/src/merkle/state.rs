@@ -10,6 +10,7 @@ use sha3::{Digest, Keccak256};
 use crate::Fixed;
 use crate::account::Position;
 use crate::auth::{ClientAuth, Operator};
+use crate::benchmark::BenchmarkHistory;
 use crate::engine::{Engine, Markout};
 use crate::merkle::{
     AccountLeaf, AccountProof, MarketLeaf, MarketProof, PositionProof, SparseMerkleTree, account_key,
@@ -76,6 +77,8 @@ struct Globals<'a> {
     operator: &'a Option<Operator>,
     global_reduce_only: bool,
     markout_base: u64,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    benchmark_history: &'a BenchmarkHistory,
 }
 
 impl Engine {
@@ -306,6 +309,7 @@ impl Engine {
             operator,
             global_reduce_only,
             markout_base,
+            benchmark_history,
             changed: _,
             tree: _,
             hot_indexes: _,
@@ -324,6 +328,7 @@ impl Engine {
             operator,
             global_reduce_only: *global_reduce_only,
             markout_base: *markout_base,
+            benchmark_history,
         }
     }
 }

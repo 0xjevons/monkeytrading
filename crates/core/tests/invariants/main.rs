@@ -396,6 +396,8 @@ fn path(event: &Event) -> &'static str {
         Event::Financing { .. } => "financing",
         Event::StressChanged { .. } => "stress changed",
         Event::BenchmarkRateMissing { .. } => "benchmark rate missing",
+        Event::BenchmarkRateObserved { .. } => "benchmark rate observed",
+        Event::BenchmarkRateUndated { .. } => "benchmark rate undated",
         Event::OrderRejected { reason: Reject::TooManyOrders { .. }, .. } => "resting order cap",
         Event::OrderRejected { reason: Reject::InvalidOrder { reason }, .. } if reason.ends_with("out of range") => {
             "order out of range"

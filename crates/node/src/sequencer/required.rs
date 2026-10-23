@@ -8,13 +8,19 @@ use engine_core::command::{AdminCommand, Command};
 use engine_core::params::NotionalWeighting;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::types::Millis;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Genesis;
 use crate::sequencer::Sequencer;
 use crate::sequencer::genesis::{GENESIS_REF, check_genesis, genesis_commands, rejection};
 
 impl Sequencer {
+    /// Requires the external operator worker's first signed snapshot before ordinary sequencing.
+    pub fn wait_for_benchmarks(&mut self) {
+        self.benchmark_sync = true;
+        warn!(alert = "benchmark_sync_pending", "waiting for signed publisher history before catch-up");
+    }
+
     /// The seq of the last command in the log, if any.
     pub fn last_seq(&self) -> Option<u64> {
         self.engine.last_seq()

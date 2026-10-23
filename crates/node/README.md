@@ -10,6 +10,8 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 
 ## Features
 
+- Dated publisher ingestion with a separate signing worker, startup synchronization, and per-date
+  rollover catch-up under V18
 - Single-owner sequencer on a dedicated OS thread: commands are logged and flushed before any client sees their effect
 - Genesis all or nothing: the engine checks every genesis command at config load and again before
   any is written, and recovery refuses a log whose genesis stopped short of its closing checkpoint
@@ -66,6 +68,8 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/main.rs` — the `engine` binary: `run`, `replay`, and `admin`
 - `src/lib.rs` — module index
 - `src/admin/mod.rs` — `engine admin`: the operator key, the commands it signs, and submission
+- `src/admin/benchmark_feed.rs` — the separate signed publisher worker and its daily retry cadence
+- `src/benchmarks/` — official CSV fetching (`mod.rs`), exact decimal parsing (`parse.rs`), and tests
 - `src/admin/tls.rs` — the TLS connection to a node, pinned to its attested key
 - `src/admin/tests.rs` — `engine admin` tests: key sources, commands, signing, and pins
 - `src/node/mod.rs` — startup, task supervision, and shutdown
@@ -108,6 +112,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   and the checks on what it reads
 - `src/api/mod.rs` — REST routes, request signature checks, and the request span
 - `src/api/admin.rs` — the operator's admin route, checked before it is sequenced
+- `src/api/benchmark_tests.rs` — deterministic publisher/TLS/API restart and financing dev scenario
 - `src/api/admin_tests.rs` — admin route tests, and the operator channel dev scenario through
   `engine admin`
 - `src/api/stream/mod.rs` — the WebSocket stream: backfill from disk, then live, under the
@@ -154,6 +159,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/tls/tests/stream.rs` — the stream end to end over TLS: the subscriber and message caps
 - `src/limits.rs` — request rate limits, connection caps, and the stream subscriber cap
 - `src/config/mod.rs` — the node config schema and loading
+- `src/config/benchmarks.rs` — publisher endpoints, cadence, timeout, and catalogue coverage
 - `src/config/checkpoints.rs` — checkpoint relayer config and validation
 - `src/config/custody.rs` — the `[custody.evm]` section, independent RPC providers, redacted
   URLs, and custody checks
@@ -644,6 +650,50 @@ The alert webhook URLs are credentials, so config names the environment variable
 unless it is HTTP to a loopback address, and the node refuses to start when a named variable is
 unset. A node whose TEE or custody provider is not `mock` refuses to start without
 `[alerts.critical]`, since its Critical alerts would otherwise page no one.
+
+### Dated benchmark worker
+
+Append `config/benchmark-publishers.toml` to a complete node config to enable publisher ingestion.
+The sources cover SOFR (NY Fed), ESTR (ECB), SONIA (Bank of England), AONIA (RBA), and TONA (BOJ).
+Endpoints use the official publishers' certificate chains against compiled-in roots; redirects and
+proxies are disabled. Loopback HTTP endpoints are accepted only with a mock TEE.
+
+Start the node with this config, verify its attestation, then run a separate operator service:
+
+```sh
+engine admin --config /path/to/node.toml --pin <attested-tls-hash> sync-benchmarks --watch
+```
+
+Give `OPERATOR_KEY_FILE` to that worker alone. The node retains only the operator public key.
+Without `--watch`, the command fetches and signs one snapshot. The config's interval must be at
+most 24 hours; the example polls hourly to retry failures and pick up publications before rollover.
+The worker shares the operator nonce with other admin clients and re-reads it for each snapshot.
+
+With `[benchmarks]` present, each startup refuses ordinary sequencing until an authorized snapshot
+has attempted every listed benchmark. Trusted time still gates genesis, activation, and the snapshot.
+The public `GET /v1/benchmarks` returns the next rollover and retained rate history, so the worker
+fetches histories covering downtime before a missed rollover is charged. A restart regenerates the
+TLS key: verify its attestation and restart the worker with the new pin before sequencing resumes.
+
+Each signed snapshot logs effective dates and annual fractions, retaining sub-basis-point precision.
+Each rollover selects the latest observation on or before its local date. Weekdays mean Monday to
+Friday; an observation older than five weekdays raises `benchmark_rate_stale` at Critical severity
+and still applies. With no observation or inherited rate, `benchmark_rate_missing` is Critical and
+that benchmark accrues no financing. An inherited undated rate still applies and raises
+`benchmark_rate_undated` until a dated observation covers the rollover. Fetch errors retain previously
+sequenced history; the separate worker logs `benchmark_fetch_failed` and retries at its next interval.
+
+Monitor both processes. A configured node waiting for its worker logs `benchmark_sync_pending`;
+the worker must run after every restart. SONIA's free database has the publisher's publication delay.
+For long outages, size `api.max_body_bytes` for the signed history (the protocol allows 16,384
+observations per snapshot); a rejected or lost HTTP submission leaves startup synchronization pending.
+After catch-up, histories retain the predecessor required for the next rollover. Previously charged
+dates are not billed again when a publisher revises a rate.
+
+Protocol activation is one-way: a build predating V18 cannot replay a log that activated it.
+Run the deterministic dev scenario with
+`cargo test -p engine-node dev_scenario_benchmark_worker` and protocol coverage with
+`cargo test -p engine-core --test benchmarks`; both run in the existing crate CI lanes.
 
 ## Testing
 

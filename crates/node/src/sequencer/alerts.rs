@@ -72,7 +72,29 @@ pub(super) fn alert_on(event: &Event) {
         }
         // The day goes uncharged, and nothing charges it later.
         Event::BenchmarkRateMissing { benchmark, markets } => {
-            error!(alert = "benchmark_rate_missing", benchmark, ?markets, "no benchmark rate; no financing charged");
+            error!(
+                alert = "benchmark_rate_missing",
+                benchmark, "no benchmark rate for markets {markets:?}; no financing charged"
+            );
+        }
+        Event::BenchmarkRateUndated { benchmark } => {
+            error!(
+                alert = "benchmark_rate_undated",
+                benchmark, "legacy benchmark has no publisher date; financing still applies"
+            );
+        }
+        Event::BenchmarkRateObserved { benchmark, effective_date, rollover_date, stale } => {
+            info!(alert_resolved = "benchmark_rate_undated", benchmark, "benchmark has a publisher date");
+            info!(alert_resolved = "benchmark_rate_missing", benchmark, "benchmark has an effective rate");
+            if *stale {
+                error!(
+                    alert = "benchmark_rate_stale",
+                    benchmark,
+                    "rate effective {effective_date} is older than five business days at {rollover_date}; financing still applies"
+                );
+            } else {
+                info!(alert_resolved = "benchmark_rate_stale", benchmark, "benchmark is current");
+            }
         }
         _ => {}
     }
@@ -88,6 +110,36 @@ mod tests {
         let (logs, _guard) = Logs::capture();
         alert_on(&Event::BenchmarkRateMissing { benchmark: "Sofr".into(), markets: vec![11] });
         assert_eq!(logs.critical("benchmark_rate_missing"), 1);
-        assert_eq!(logs.count("benchmark=\"Sofr\" markets=[11]"), 1);
+        assert_eq!(logs.count("benchmark=\"Sofr\""), 1);
+    }
+}
+
+#[cfg(test)]
+mod benchmark_tests {
+    use super::*;
+    use crate::trusted_time::tests::logs::Logs;
+
+    #[test]
+    fn stale_and_undated_rates_raise_critical_alerts_and_current_rates_resolve_them() {
+        let (logs, _guard) = Logs::capture();
+        let effective_date = "2026-10-20".parse().unwrap();
+        let rollover_date = "2026-10-28".parse().unwrap();
+        alert_on(&Event::BenchmarkRateUndated { benchmark: "SOFR".into() });
+        alert_on(&Event::BenchmarkRateObserved {
+            benchmark: "SOFR".into(),
+            effective_date,
+            rollover_date,
+            stale: true,
+        });
+        assert_eq!(logs.critical("benchmark_rate_undated"), 1);
+        assert_eq!(logs.critical("benchmark_rate_stale"), 1);
+        alert_on(&Event::BenchmarkRateObserved {
+            benchmark: "SOFR".into(),
+            effective_date: rollover_date,
+            rollover_date,
+            stale: false,
+        });
+        assert_eq!(logs.critical("benchmark_rate_stale"), 1);
+        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_stale\""), 1);
     }
 }

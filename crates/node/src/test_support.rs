@@ -455,6 +455,8 @@ pub fn every_event() -> Vec<Event> {
             | Event::BadDebt { .. }
             | Event::Financing { .. }
             | Event::BenchmarkRateMissing { .. }
+            | Event::BenchmarkRateObserved { .. }
+            | Event::BenchmarkRateUndated { .. }
             | Event::MarketOpened { .. }
             | Event::MarketClosed { .. }
             | Event::StressChanged { .. }

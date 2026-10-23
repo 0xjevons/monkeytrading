@@ -1,0 +1,35 @@
+# Append this section to a complete node config to enable the signed benchmark worker.
+# Run `engine admin --config <config> --pin <attested TLS hash> sync-benchmarks --watch`
+# as a separate operator service. Only that process receives OPERATOR_KEY_FILE.
+[benchmarks]
+interval = "1h"
+timeout = "20s"
+
+# Effective Date / Rate (%); official API: https://markets.newyorkfed.org/static/docs/markets-api.html
+[[benchmarks.sources]]
+publisher = "sofr"
+endpoint = "https://markets.newyorkfed.org/api/rates/secured/sofr/search.csv"
+
+# EST.B.EU000A2X2A25.WT: the overnight rate, not the compounded averages.
+# https://data.ecb.europa.eu/data/datasets/EST
+[[benchmarks.sources]]
+publisher = "estr"
+endpoint = "https://data-api.ecb.europa.eu/service/data/EST/B.EU000A2X2A25.WT"
+
+# Official statistical database series IUDSOIA. Freely available with the publisher's delay.
+# https://www.bankofengland.co.uk/statistics/details/further-details-about-wholesale-interbank-sterling-market-data
+[[benchmarks.sources]]
+publisher = "sonia"
+endpoint = "https://www.bankofengland.co.uk/boeapps/database/_iadb-fromshowcolumns.asp?csv.x=yes&SeriesCodes=IUDSOIA&CSVF=TN&UsingCodes=Y&VPD=Y&VFD=N"
+
+# FIRMMCRID: the realized overnight cash rate, not the cash-rate target.
+# https://www.rba.gov.au/statistics/tables/
+[[benchmarks.sources]]
+publisher = "aonia"
+endpoint = "https://www.rba.gov.au/statistics/tables/csv/f1-data.csv"
+
+# FM01'STRDCLUCON: uncollateralized overnight call rate, daily average.
+# https://www.stat-search.boj.or.jp/ssi/mtshtml/strdclucon_en.html
+[[benchmarks.sources]]
+publisher = "tona"
+endpoint = "https://www.stat-search.boj.or.jp/ssi/mtshtml/csv/fm01_d_1_en.csv"

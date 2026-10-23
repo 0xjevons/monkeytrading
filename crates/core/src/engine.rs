@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::Fixed;
 use crate::account::{Account, Position};
 use crate::auth::{ClientAuth, Operator};
-use crate::command::{Command, Sequenced};
+use crate::benchmark::BenchmarkHistory;
+use crate::command::{AdminCommand, Command, Sequenced};
 use crate::event::{Event, Reject};
 use crate::fixed::Rounding;
 use crate::market::MarketSpec;
@@ -74,6 +75,9 @@ pub struct Engine {
     /// The state tree's index for the front markout: 0 before `V9`, then one more per markout.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) markout_base: u64,
+    /// Dated annual rates from V18; omitted while empty to preserve older roots.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) benchmark_history: BenchmarkHistory,
     // Not state and not encoded; an engine rebuilt without them hashes every leaf at its first root.
     /// Markouts, positions, and resting orders changed since the last state root.
     #[serde(skip)]
@@ -192,7 +196,12 @@ impl Engine {
             };
             self.advance_markets(priced, &mut events);
         }
-        self.run_rollovers(&mut events);
+        let benchmark_batch = self.protocol_version >= ProtocolVersion::V18 && sequenced.cmd.is_benchmark_batch();
+        let activating_dated_rates = matches!(sequenced.cmd,
+            Command::Admin(AdminCommand::ActivateProtocol { version }) if version >= ProtocolVersion::V18);
+        if !benchmark_batch && !activating_dated_rates {
+            self.run_rollovers(&mut events);
+        }
         match &sequenced.cmd {
             // From `V12` the quotes are stored and processed above.
             Command::Prices { .. } if v12 => {}
@@ -213,6 +222,9 @@ impl Engine {
                 Ok(()) => events.push(Event::AdminApplied),
                 Err(reason) => events.push(Event::AdminRejected { reason }),
             },
+        }
+        if benchmark_batch && events.contains(&Event::AdminApplied) {
+            self.run_rollovers(&mut events);
         }
         self.refresh_all_stress(&sequenced.cmd, &mut events);
         // After the command, so a price arriving at the horizon is the one marked against.

@@ -164,6 +164,9 @@ async fn serve_node(
     .await?;
     let mut seq = Sequencer::recover_from(log, seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
+    if cfg.benchmarks.is_some() {
+        seq.wait_for_benchmarks();
+    }
     // Protocol activation and genesis wait, like any command, for a stamp trusted time admits;
     // with no sample yet, they are queued. Parameters an older log set take the config's toxicity
     // notional weighting first, which the latest version needs.

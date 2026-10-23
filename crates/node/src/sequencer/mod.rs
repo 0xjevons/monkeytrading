@@ -60,6 +60,8 @@ pub struct Sequencer {
     metrics: Arc<Metrics>,
     gate: Option<Gate>,
     accounting: Accounting,
+    /// Startup waits for a signed, complete publisher fetch attempt before catch-up.
+    benchmark_sync: bool,
 }
 
 pub struct SequencerConfig<'a> {
@@ -167,7 +169,16 @@ impl Sequencer {
             warn!(alert = "withdrawals_paused", "withdrawal refused until custody reconciles");
             return Ok(None);
         }
-        self.stamp(ts, cmd).map(Some)
+        if self.benchmark_sync && !matches!(&cmd, Command::SignedAdmin(req) if req.command.is_benchmark_snapshot()) {
+            return Ok(None);
+        }
+        let snapshot = cmd.is_benchmark_batch();
+        let events = self.stamp(ts, cmd)?;
+        if self.benchmark_sync && snapshot && events.contains(&Event::AdminApplied) {
+            self.benchmark_sync = false;
+            info!(alert_resolved = "benchmark_sync_pending", "publisher snapshot installed; sequencing resumed");
+        }
+        Ok(Some(events))
     }
 
     /// Takes `sample` as the latest trusted time, and sequences any queued required commands it

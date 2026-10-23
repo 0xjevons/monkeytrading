@@ -51,6 +51,7 @@
 pub mod account;
 mod admin;
 pub mod auth;
+pub mod benchmark;
 mod closeout;
 pub mod command;
 pub mod eip712;

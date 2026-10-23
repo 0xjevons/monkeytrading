@@ -193,6 +193,7 @@ impl Sequencer {
                 gate
             }),
             accounting,
+            benchmark_sync: false,
         };
         {
             let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
