@@ -33,6 +33,8 @@ const FIRST: Millis = 1_792_530_000_000; // 20 Oct 2026 21:00 UTC = 22:00 London
 const RESTART: Millis = FIRST + 2 * 86_400_000 + 1;
 const TRADER: AccountId = AccountId([0xaa; 20]);
 
+type WatchCase = (&'static str, &'static str, fn() -> Millis, usize);
+
 #[derive(Parser)]
 struct Cli {
     #[command(flatten)]
@@ -131,9 +133,40 @@ endpoint = "{publisher}/estr"
 
 #[tokio::test]
 async fn benchmark_watch_retries_and_prefetches_before_rollover_then_cancels_in_flight() {
-    type WatchCase = (&'static str, &'static str, fn() -> Millis, usize);
     let cases: [WatchCase; 2] = [("periodic", "10ms", || START, 3), ("preflight", "24h", || FIRST - 34_000 - 50, 2)];
-    for (name, interval, clock, pending_request) in cases {
+    run_watch_cases(&cases, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn benchmark_watch_interrupts_inflight_fetch_after_one_sigint() {
+    const CHILD: &str = "ENGINE_GH33_BENCHMARK_SIGINT_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        run_watch_cases(&[("sigint", "24h", || FIRST - 50_000 - 50, 2)], true).await;
+        return;
+    }
+    let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "api::benchmark_tests::benchmark_watch_interrupts_inflight_fetch_after_one_sigint",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .kill_on_drop(true)
+        .output();
+    let output =
+        tokio::time::timeout(Duration::from_secs(15), child).await.expect("isolated SIGINT test completes").unwrap();
+    assert!(
+        output.status.success(),
+        "SIGINT child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Runs bounded publisher retries/preflight, then cancels a pending request by task or SIGINT.
+async fn run_watch_cases(cases: &[WatchCase], interrupt: bool) {
+    for &(name, interval, clock, pending_request) in cases {
         let dir = scratch_dir(&format!("benchmark-watch-{name}"));
         fs::create_dir_all(&dir).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -171,11 +204,12 @@ async fn benchmark_watch_retries_and_prefetches_before_rollover_then_cancels_in_
         });
         let cfg_path = dir.join("node.toml");
         let mut text = fs::read_to_string(crate::test_support::DEV_CONFIG).unwrap();
+        let publisher_timeout = if interrupt { "10s" } else { "2s" };
         text.push_str(&format!(
             r#"
     [benchmarks]
     interval = "{interval}"
-    timeout = "2s"
+    timeout = "{publisher_timeout}"
     [[benchmarks.sources]]
     publisher = "sofr"
     endpoint = "{publisher}/sofr"
@@ -200,7 +234,7 @@ async fn benchmark_watch_retries_and_prefetches_before_rollover_then_cancels_in_
         .unwrap()
         .args;
         let env = KeyEnv { key_file: None, key: Some(HexKey("42".repeat(32))) };
-        let worker = tokio::spawn(admin::run_with_clock(args, env, clock));
+        let mut worker = tokio::spawn(admin::run_with_clock(args, env, clock));
         let observed = tokio::time::timeout(Duration::from_secs(10), async {
             let mut seen = Vec::new();
             for _ in 0..pending_request {
@@ -209,8 +243,22 @@ async fn benchmark_watch_retries_and_prefetches_before_rollover_then_cancels_in_
             seen
         })
         .await;
-        worker.abort();
-        let worker_result = worker.await;
+        let signal_result = if interrupt {
+            Some(
+                tokio::process::Command::new("/bin/kill")
+                    .args(["-INT", &std::process::id().to_string()])
+                    .status()
+                    .await,
+            )
+        } else {
+            worker.abort();
+            None
+        };
+        let worker_result = tokio::time::timeout(Duration::from_secs(3), &mut worker).await;
+        if worker_result.is_err() {
+            worker.abort();
+            let _ = worker.await;
+        }
         release.notify_one();
         let _ = shutdown.send(());
         let publisher_result = tokio::time::timeout(Duration::from_secs(5), &mut publishers).await;
@@ -222,7 +270,16 @@ async fn benchmark_watch_retries_and_prefetches_before_rollover_then_cancels_in_
 
         let expected: Vec<_> = (1..=pending_request).map(Some).collect();
         assert_eq!(observed.expect("watch reaches its pending fetch"), expected, "{name}");
-        assert!(matches!(worker_result, Err(err) if err.is_cancelled()), "worker must remain in its pending fetch");
+        let returned = if let Some(sent) = signal_result {
+            assert!(sent.unwrap().success(), "the child sends exactly one SIGINT to itself");
+            Some(worker_result.expect("SIGINT interrupts the in-flight fetch before its timeout").unwrap().unwrap())
+        } else {
+            assert!(
+                matches!(worker_result, Ok(Err(err)) if err.is_cancelled()),
+                "worker must remain in its pending fetch"
+            );
+            None
+        };
         publisher_result.expect("publisher shutdown completes").unwrap().unwrap();
         let entries = log_entries(&dir);
         let snapshots: Vec<_> = entries
@@ -236,6 +293,9 @@ async fn benchmark_watch_retries_and_prefetches_before_rollover_then_cancels_in_
             })
             .collect();
         assert_eq!(snapshots.len(), pending_request - 1, "only completed snapshots may be sequenced: {name}");
+        if let Some(request) = returned {
+            assert!(entries.iter().any(|entry| matches!(entry, LogEntry::Command(c) if c.sequenced.cmd == Command::SignedAdmin(Box::new(request.clone())))), "SIGINT returns the last successfully sequenced snapshot");
+        }
         for batch in &snapshots {
             assert_eq!(batch.checked.len(), 2);
             assert!(batch.checked.contains("SOFR") && batch.checked.contains("ESTR"));

@@ -60,5 +60,5 @@ nix.workspace = true
 [dev-dependencies]
 chrono.workspace = true
 chrono-tz.workspace = true
-tokio = { workspace = true, features = ["io-util", "test-util"] }
+tokio = { workspace = true, features = ["io-util", "process", "test-util"] }
 tower.workspace = true

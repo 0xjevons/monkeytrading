@@ -39,6 +39,8 @@ pub(super) async fn run(
     let mut rollover = None;
     let mut preflight = None;
     let mut last = None;
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
             _ = ticks.tick() => {},
@@ -47,7 +49,7 @@ pub(super) async fn run(
                     sleep_until(at).await;
                 }
             }, if watch && preflight.is_some() => {},
-            stopped = tokio::signal::ctrl_c(), if watch => {
+            stopped = &mut shutdown, if watch => {
                 stopped?;
                 return last.context("benchmark worker stopped before its first snapshot");
             }
@@ -74,8 +76,15 @@ pub(super) async fn run(
             }
             info!(nonce = next_nonce, "signed benchmark snapshot sequenced");
             anyhow::Ok(req)
-        }
-        .await;
+        };
+        let attempt = tokio::select! {
+            biased;
+            stopped = &mut shutdown, if watch => {
+                stopped?;
+                return last.context("benchmark worker stopped before its first snapshot");
+            }
+            result = attempt => result,
+        };
         match attempt {
             Ok(request) if !watch => return Ok(request),
             Ok(request) => last = Some(request),
