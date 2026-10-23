@@ -275,3 +275,47 @@ The monkeytrading contributors
 ## License
 
 Licensed under the Apache License, Version 2.0; see `LICENSE`.
+
+## Sequencer command latency
+
+Price updates use transient account-by-market and trigger-price indexes. Triggered orders retain
+order-id priority, including limit orders whose spread prevents an immediate fill. Both indexes
+are excluded from serialization and state roots, and rebuilt from accounts after recovery. They
+apply to every historical protocol version without changing its events or roots.
+
+Run `cargo test -p engine-core --test hot_path_benchmark --locked -- --ignored --nocapture`
+in a quiet CPU window. The optimized dev profile benchmarks 100 samples per scenario; setup and
+index recovery are outside steady-state timings. It measures `Engine::apply`, including event
+allocation and drop, but excludes log I/O, signatures and checkpoint hashing. These figures are
+command-processing regression guards, not an end-to-end service latency promise.
+
+| Scenario | Accounts | p99 budget |
+| --- | ---: | ---: |
+| Dispersed book, one account in the repriced market | 1,000 and 100,000 | 200 us |
+| Every account holds the repriced market | 100,000 | 250 ms |
+| Dormant resting orders in the repriced market | 100,000 | 200 us |
+| Daily rollover with financing on every position | 100,000 | 500 ms |
+
+A concentrated price update still visits every holder, and a rollover still finances and checks
+all positions. Triggered orders still require work per candidate, including orders retained when
+the spread prevents their limit fill. The index adds memory proportional to positions and resting
+orders; its one-time recovery cost is proportional to that authoritative state.
+
+Measured on 23 October 2026 with rustc 1.96.0, the repository's optimized dev profile, incremental
+compilation disabled, and two build jobs on a Mac17,9 with 15 logical CPUs and 24 GiB RAM:
+
+| Scenario | Before p50 / p99 (us) | After p50 / p99 (us) |
+| --- | ---: | ---: |
+| Dispersed 1k | 3 / 6 | 1 / 5 |
+| Dispersed 100k | 1,287 / 1,733 | <1 / 1 |
+| Concentrated 100k | 22,631 / 23,597 | 20,554 / 24,040 |
+| Dormant resting 100k | 12,656 / 16,346 | <1 / <1 |
+| Financed rollover 100k | 33,341 / 37,129 | 32,669 / 34,991 |
+
+The baseline is main commit `e4b4f5cf79816f1167fb4c0e17dcd2ff0024cdb0`, with the same benchmark
+source copied into its test directory. Measurements ran sequentially with competing workspace
+builds paused. Budgets allow hosted-runner variation while rejecting the former dispersed-book
+and dormant-order scans. They need verification on the PR's Linux runner before readiness.
+When sharing a Cargo target across worktrees, ensure each crate actually recompiles from the
+intended source: touching `crates/core/src/lib.rs` before each build avoids stale mtime-based
+fingerprints. Verify the compile path in the build log.

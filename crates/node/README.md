@@ -10,7 +10,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 
 ## Features
 
-- Single-task sequencer: commands are logged and flushed before any client sees their effect
+- Single-owner sequencer on a dedicated OS thread: commands are logged and flushed before any client sees their effect
 - Genesis all or nothing: the engine checks every genesis command at config load and again before
   any is written, and recovery refuses a log whose genesis stopped short of its closing checkpoint
 - Signed checkpoints and withdrawals, bound to the chain id and vault, from an attested key
@@ -489,3 +489,29 @@ The monkeytrading contributors
 ## License
 
 Licensed under the Apache License, Version 2.0; see `LICENSE`.
+
+## Sequencer CPU binding
+
+The `engine run` entry point reserves the last CPU in its initial Linux affinity mask before
+creating the Tokio runtime. The main thread, runtime workers and blocking workers inherit a mask
+excluding that CPU; the sequencer alone binds back to it on its dedicated thread. Linux startup
+requires at least two allowed CPUs and refuses failed mask reads or updates. The calling thread's
+original mask is restored after runtime shutdown. Other platforms retain a dedicated thread and
+log that strict CPU pinning requires Linux.
+
+The public `run_dedicated` entry point owns this runtime setup. The asynchronous `run` entry point
+is retained for embedded/test callers that supply their own runtime; it does not reserve a CPU
+away from that runtime's existing workers.
+
+Node-owned thread exclusion does not isolate the CPU from unrelated host processes or kernel
+work. Production scheduler/cgroup isolation must keep competing host work off the logged CPU.
+macOS development measurements provide no Linux CPU-isolation evidence. Linux CI checks worker
+mask inheritance, sequencer binding, calling-mask restoration and single-CPU refusal.
+
+The sequencer owns an OS thread and reports its result through a supervised channel. Dropping its
+supervisor requests cancellation at an async boundary, including startup-error and drain-timeout
+paths. Its affinity cannot leak into Tokio's reusable blocking pool. Runtime teardown uses the
+non-waiting shutdown path after node/alert draining, so a blocked storage syscall cannot extend
+that drain deadline through runtime destruction. On a fatal drain error the CLI returns an error
+and exits, terminating any remaining OS threads. An embedded caller must likewise terminate its
+process after an uncancellable drain failure; a blocked thread is not safe to restart beside.

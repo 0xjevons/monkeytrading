@@ -61,6 +61,7 @@ mod execution;
 pub mod fixed;
 pub use fixed::Fixed;
 mod funds;
+mod hot_indexes;
 pub mod market;
 mod markouts;
 mod marks;

@@ -32,6 +32,7 @@ humantime-serde = "1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+nix = { version = "0.31.3", default-features = false, features = ["sched"] }
 prometheus-client = "0.25"
 proptest = { version = "1.12", default-features = false, features = ["std"] }
 rand = "0.8"

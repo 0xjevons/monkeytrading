@@ -25,11 +25,22 @@ use crate::types::{AccountId, MarketId, Side};
 impl Engine {
     /// Closes out every account holding a position in `market_id` that has fallen below the
     /// close-out level.
-    ///
-    /// TODO: this scans every account on each price update or, from `V12`, index change; index
-    /// accounts by market before the account count makes the scan a cost on the sequencer path.
     pub(crate) fn check_closeouts(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
-        self.close_out_where(|acct| acct.positions.contains_key(&market_id), events);
+        self.ensure_hot_indexes();
+        let accounts: Vec<_> = self
+            .hot_indexes
+            .as_ref()
+            .expect("initialized")
+            .holders
+            .get(&market_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        let level_bps = self.params.as_ref().expect("callers check params are set").closeout_level_bps;
+        for account in accounts {
+            self.close_out(account, level_bps, events);
+        }
     }
 
     /// Closes out every account holding any position that has fallen below the close-out level.

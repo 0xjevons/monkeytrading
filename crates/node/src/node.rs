@@ -46,12 +46,19 @@ type TaskResult = (&'static str, anyhow::Result<()>);
 /// Error cases:
 /// - see `serve_node`
 pub async fn run(cfg: NodeConfig, telemetry: Telemetry) -> anyhow::Result<()> {
+    run_with_cpu(cfg, telemetry, None).await
+}
+
+/// Runs the node with the CPU reserved before its runtime was created.
+/// Error cases:
+/// - see `run`
+pub(crate) async fn run_with_cpu(cfg: NodeConfig, telemetry: Telemetry, cpu: Option<usize>) -> anyhow::Result<()> {
     let Telemetry { metrics, alerts, pages_critical } = telemetry;
     if !pages_critical {
         warn!("no alerts.critical webhook: Critical alerts are only logged");
     }
     let mut routing = alerts.spawn(cfg.alerts.episode_quiet)?;
-    let outcome = serve_node(cfg, metrics, &mut routing).await;
+    let outcome = serve_node(cfg, metrics, &mut routing, cpu).await;
     routing.drain(SHUTDOWN_GRACE).await;
     outcome
 }
@@ -66,7 +73,12 @@ pub async fn run(cfg: NodeConfig, telemetry: Telemetry) -> anyhow::Result<()> {
 ///   binding a listener fails
 /// - the engine would reject a genesis command
 /// - any supervised task stops or panics, or the sequencer cannot drain in time
-async fn serve_node(cfg: NodeConfig, metrics: Arc<Metrics>, routing: &mut Routing) -> anyhow::Result<()> {
+async fn serve_node(
+    cfg: NodeConfig,
+    metrics: Arc<Metrics>,
+    routing: &mut Routing,
+    cpu: Option<usize>,
+) -> anyhow::Result<()> {
     if cfg.operator.rotation_enabled {
         bail!("operator rotation is not implemented yet; set operator.rotation_enabled = false");
     }
@@ -133,8 +145,7 @@ async fn serve_node(cfg: NodeConfig, metrics: Arc<Metrics>, routing: &mut Routin
     history.catch_up_to(seq.last_seq());
 
     let (tx, rx) = mpsc::channel::<Request>(CHANNEL_CAPACITY);
-    // TODO: pin the sequencer to a dedicated core once latency matters.
-    let mut sequencer = tokio::spawn(seq.run(rx));
+    let mut sequencer = crate::sequencer_thread::Worker::start(seq.run(rx), cpu)?;
     let mut tasks: JoinSet<TaskResult> = JoinSet::new();
 
     let tick = cfg.node.tick;
@@ -221,7 +232,7 @@ async fn serve_node(cfg: NodeConfig, metrics: Arc<Metrics>, routing: &mut Routin
             error!(alert = "task_stopped", "{err:#}");
             Err(err)
         }
-        joined = &mut sequencer => {
+        joined = &mut sequencer.outcome => {
             tasks.shutdown().await;
             sequencer_outcome(joined)?;
             bail!("sequencer stopped");
@@ -230,7 +241,7 @@ async fn serve_node(cfg: NodeConfig, metrics: Arc<Metrics>, routing: &mut Routin
     };
     // Stopping the other tasks drops every sender, so the sequencer drains and checkpoints.
     tasks.shutdown().await;
-    let drained = timeout(SHUTDOWN_GRACE, sequencer).await.context("sequencer did not drain in time")?;
+    let drained = timeout(SHUTDOWN_GRACE, &mut sequencer.outcome).await.context("sequencer did not drain in time")?;
     sequencer_outcome(drained)?;
     outcome
 }
@@ -287,8 +298,8 @@ fn stopped_task(joined: Option<Result<TaskResult, JoinError>>) -> anyhow::Error 
 /// The sequencer's own result, or its panic.
 /// Error cases:
 /// - the sequencer panicked, or returned an error (a log write failure)
-fn sequencer_outcome(joined: Result<anyhow::Result<()>, JoinError>) -> anyhow::Result<()> {
-    joined.context("sequencer task panicked")?.inspect_err(|e| error!(alert = "sequencer_failed", "{e:#}"))
+fn sequencer_outcome(joined: Result<anyhow::Result<()>, tokio::sync::oneshot::error::RecvError>) -> anyhow::Result<()> {
+    joined.context("sequencer thread panicked")?.inspect_err(|e| error!(alert = "sequencer_failed", "{e:#}"))
 }
 
 #[cfg(test)]

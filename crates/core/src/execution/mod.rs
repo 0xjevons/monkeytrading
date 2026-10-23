@@ -111,6 +111,7 @@ impl Engine {
                     kind: req.kind,
                     reduce_only: req.reduce_only,
                 };
+                self.index_order(req.account, &order, true);
                 self.accounts.get_mut(&req.account).expect("validated").orders.insert(order_id, order);
                 self.markets.get_mut(&req.market).expect("validated").resting.insert(order_id, req.account);
                 self.record_order(req.account, order_id);
@@ -148,8 +149,8 @@ impl Engine {
     /// everything that gapped through, at that price.
     pub(crate) fn trigger_resting(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
         let Some(mid) = self.trigger_mid(market_id) else { return };
-        let resting: Vec<(OrderId, AccountId)> =
-            self.markets[&market_id].resting.iter().map(|(o, a)| (*o, *a)).collect();
+        self.ensure_hot_indexes();
+        let resting = self.hot_indexes.as_ref().expect("initialized").triggered(market_id, mid);
         for (order_id, account) in resting {
             self.trigger_order(order_id, account, mid, events);
         }
@@ -416,6 +417,7 @@ impl Engine {
     /// Removes a resting order from its account and its market's book.
     fn remove_order(&mut self, account: AccountId, order_id: OrderId) -> Option<RestingOrder> {
         let order = self.accounts.get_mut(&account)?.orders.remove(&order_id)?;
+        self.index_order(account, &order, false);
         if let Some(market) = self.markets.get_mut(&order.market) {
             market.resting.remove(&order_id);
         }

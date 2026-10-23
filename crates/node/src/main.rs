@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use engine_core::auth::{ClientAuth, Operator};
 use engine_node::admin::{self, AdminArgs, HexKey, KeyEnv};
-use engine_node::{NodeConfig, init_logging, init_telemetry, replay_path, run};
+use engine_node::{NodeConfig, init_logging, init_telemetry, replay_path, run_dedicated};
 
 #[derive(Subcommand)]
 enum Cmd {
@@ -42,13 +42,12 @@ struct Cli {
 /// - the log is missing or cannot be read, fails its manifest check or verification, or holds no
 ///   command or no checkpoint
 /// - an admin command cannot be signed or submitted, or the engine rejects it
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Run { config } => {
             let cfg = NodeConfig::load(&config)?;
             let telemetry = init_telemetry(&cfg, |var| std::env::var(var).ok())?;
-            run(cfg, telemetry).await
+            run_dedicated(cfg, telemetry)
         }
         Cmd::Replay { log: path } => {
             init_logging("info")?;
@@ -85,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
                 key_file: std::env::var_os("OPERATOR_KEY_FILE").map(PathBuf::from),
                 key: std::env::var("OPERATOR_KEY").ok().map(HexKey),
             };
-            admin::run(args, env).await.map(drop)
+            tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(admin::run(args, env)).map(drop)
         }
     }
 }
