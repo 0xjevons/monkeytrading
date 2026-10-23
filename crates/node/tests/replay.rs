@@ -25,6 +25,32 @@ fn a_log_written_before_protocol_versions_replays_to_its_roots() {
     assert_eq!(root, "0xeb7239777dc18152f4e4a75cd902800dbb918b1e6da35da6171d391d649df535");
 }
 
+/// A log segment altered to carry a stamp past the end of 9999, the latest the engine accepts, is
+/// refused with an error naming the entry's seq, not a panic: recovery and `engine replay` treat
+/// every logged field as untrusted. The altered entry is seq 6, not 0, so the named seq is the one
+/// refused. One stamp, `i64::MAX`, is one chrono cannot represent at all; the other,
+/// `253_402_300_800_000`, is the first millisecond past the range's end.
+#[test]
+fn replay_refuses_a_stamp_outside_the_range_the_engine_accepts() {
+    let fixture = fs::read_to_string(V1_DEV).unwrap();
+    let lines: Vec<serde_json::Value> = fixture.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let dir = scratch("stamp-out-of-range");
+    for (i, ts) in [i64::MAX, 253_402_300_800_000].into_iter().enumerate() {
+        let mut entries = lines[..=6].to_vec();
+        entries[6]["ts"] = serde_json::json!(ts);
+        let stamped: String = entries.iter().map(|e| format!("{}\n", serde_json::to_string(e).unwrap())).collect();
+        fs::write(dir.join(format!("stamp-{i}.jsonl")), &stamped).unwrap();
+        fs::create_dir_all(dir.join(format!("stamp-dir-{i}"))).unwrap();
+        fs::write(dir.join(format!("stamp-dir-{i}/00000000000000000000.jsonl")), &stamped).unwrap();
+        for case in [format!("stamp-{i}.jsonl"), format!("stamp-dir-{i}")] {
+            let err = replay_path(&dir.join(&case)).err().unwrap_or_else(|| panic!("{case} verified"));
+            let msg = format!("{err:#}");
+            assert!(msg.contains("applying seq 6"), "{case}: {msg}");
+            assert!(msg.contains("is past the end of 9999"), "{case}: {msg}");
+        }
+    }
+}
+
 /// `engine replay` verifies only a log it finds and checks against a signed root: a missing path,
 /// an empty log, and a log of commands with no checkpoint all fail, as a file and as a directory.
 #[test]

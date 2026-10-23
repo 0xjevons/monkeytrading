@@ -317,8 +317,9 @@ impl Rollover {
     /// The first rollover strictly after `ts`. In a DST gap, where the wall time does not exist,
     /// the rollover happens an hour later in wall-clock terms.
     pub fn next_after(&self, ts: Millis) -> Millis {
-        // The sequencer stamps from the system clock, which is always inside chrono's range.
-        let local = DateTime::<Utc>::from_timestamp_millis(ts).expect("timestamp in range").with_timezone(&self.tz);
+        // `Engine::apply` refuses stamps past `types::MAX_STAMP_MS`, so the calendar always has a
+        // representable next day here, whatever the time zone or a DST gap does to the wall clock.
+        let local = DateTime::<Utc>::from_timestamp_millis(ts).expect("engine time in range").with_timezone(&self.tz);
         let mut date = local.date_naive();
         loop {
             // `validate` rules out an hour or minute that does not exist.
