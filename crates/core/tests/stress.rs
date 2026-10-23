@@ -8,16 +8,17 @@ use std::cell::RefCell;
 
 use common::events::fills;
 use common::stress::{
-    BOUNDED, at_a_million_nav, bounded, diverge, divergence_only, divergence_params, with_divergence_shares,
+    BOUNDED, at_a_million_nav, bounded, diverge, divergence_only, divergence_params, halted_us_equities,
+    with_divergence_shares,
 };
-use common::{AAPL, BTC, DE40, ETH, EURUSD, Harness, UNLISTED, acct, de40, f, market, ny, params, us_equities};
+use common::{AAPL, BTC, DE40, ETH, EURUSD, Harness, UNLISTED, acct, de40, f, market, ny, params};
 use engine_core::Fixed;
 use engine_core::command::{AdminCommand, Command, OrderKind};
 use engine_core::event::Event;
 use engine_core::market::MarketSpec;
 use engine_core::params::{ProtocolParams, StressLevel, StressTrigger};
 use engine_core::protocol::ProtocolVersion;
-use engine_core::session::{Period, Schedule};
+use engine_core::session::Schedule;
 use engine_core::types::{AssetClass, Millis, Side};
 use proptest::collection::vec;
 use proptest::prop_oneof;
@@ -300,7 +301,7 @@ fn a_divergence_share_above_zero_and_a_zero_bound_market_are_refused_together() 
 }
 
 #[test]
-fn a_move_across_a_halt_shorter_than_the_window_raises_the_level() {
+fn a_move_across_a_halt_shorter_than_the_window_raises_the_level_from_v17() {
     // AAPL, halted 20s by a dated closure 10s after its last price. The 3% move across the halt
     // raises the level from V17, which keeps the move window across the reopening; before it the
     // open cleared the window, so the same move counts from nothing.
@@ -327,7 +328,7 @@ fn a_move_across_a_halt_shorter_than_the_window_raises_the_level() {
 #[test]
 fn a_move_across_a_halt_longer_than_the_window_does_not_count() {
     // AAPL, halted 70s, its last price 80s before the reopening: the halt has outlasted the
-    // window, so neither version counts the move, and V17's kept window holds no bucket newer
+    // window, so neither version counts the move, and V17's kept window holds no bucket older
     // than the window.
     for (version, mut h) in [(ProtocolVersion::V15, Harness::v15()), (ProtocolVersion::V17, Harness::v17())] {
         let schedule = halted_us_equities("2026-10-20T12:00:00", "2026-10-20T12:01:10");
@@ -365,13 +366,17 @@ fn a_market_keeps_its_level_while_its_fx_pair_has_no_price() {
         let ev = h.price(DE40, "19400");
         assert!(!ev.iter().any(|e| matches!(e, Event::StressChanged { .. })), "{version:?}: {ev:?}");
         assert_eq!(h.engine.markets()[&DE40].stress.level, 1);
-        // Past the 300s cooldown the level still holds: no reading, no step down.
+        // Past the 300s cooldown the level still holds: with Germany 40's own quotes also stale,
+        // the tick reads nothing, and there is no step down.
         h.advance(300_000);
         let ev = h.cmd(Command::Tick);
         assert!(!ev.iter().any(|e| matches!(e, Event::StressChanged { market: DE40, .. })), "{version:?}: {ev:?}");
         assert_eq!(h.engine.markets()[&DE40].stress.level, 1);
-        // Fresh quotes, then a fresh EUR-USD index: the aged-out window leaves the move behind.
-        h.price(DE40, "19400");
+        // Germany 40's quotes are fresh again and EUR-USD's are still quiet: still no reading.
+        let ev = h.price(DE40, "19400");
+        assert!(!ev.iter().any(|e| matches!(e, Event::StressChanged { .. })), "{version:?}: {ev:?}");
+        assert_eq!(h.engine.markets()[&DE40].stress.level, 1);
+        // A fresh EUR-USD index restores the reading: the aged-out window leaves the move behind.
         let ev = h.price(EURUSD, "1.1");
         assert!(ev.contains(&Event::StressChanged { market: DE40, level: 0 }), "{version:?}: {ev:?}");
     }
@@ -410,19 +415,4 @@ fn the_move_window_stays_bounded_however_often_prices_arrive() {
     // A minute of prices every 250ms is 240 mids, kept as the range of each tenth of the window.
     let window = &h.engine.markets()[&BTC].stress.move_window;
     assert!(window.len() <= 12, "{}", window.len());
-}
-
-// ── Helpers ──
-
-/// US equities hours with one dated closure, for the across-halt tests.
-fn halted_us_equities(from: &str, to: &str) -> Schedule {
-    let Schedule::Weekly { tz, windows, .. } = us_equities() else { unreachable!("US equities keep weekly hours") };
-    let at = |local: &str| local.parse().expect("a local date and time");
-    Schedule::Weekly {
-        tz,
-        windows,
-        closed_dates: vec![],
-        closures: vec![Period { from: at(from), to: at(to) }],
-        special_sessions: vec![],
-    }
 }

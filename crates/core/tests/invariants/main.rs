@@ -14,7 +14,7 @@
 //! that moves cash and the refusal of out-of-range amounts, order numbers, and quotes; under `V6`
 //! a close-out that no price triggered; under `V12` a resting order filled by a command with
 //! neither prices nor an order, which `V2` never fills; under `V13`, which runs as `V12` does, a
-//! stress change; under `V14` alone its cap and missing rates; under `V15` a reducing order
+//! stress change, as under `V17`; under `V14` alone its cap and missing rates; under `V15` a reducing order
 //! resting below the minimum; and under `V16` a history clamped by a lowered memory; so the
 //! checks cannot pass vacuously.
 

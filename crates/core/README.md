@@ -200,7 +200,7 @@ Two suites guard replay and accounting:
   deletes a committed log.
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
   under `V2`, `V6`, `V7` with markets quoted in other currencies, `V11`, and `V12` and `V13` with
-  those markets and signed operator commands, where `V13` must reach a stress change, and `V14`,
+  those markets and signed operator commands, where `V13` and `V17` must reach a stress change, and `V14`,
   `V15`, `V16`, and `V17`.
   Each mixes client, feed, custody, and operator commands,
   with values inside and outside the input bounds, and checks after every command that nothing
@@ -216,7 +216,7 @@ Two suites guard replay and accounting:
   version, the same sessions check that roots computed from what changed, at random points, equal a
   root hashed from scratch, and that every account's proof verifies against them. Under `V14` it
   also checks that resting orders keep to the cap, that placing an order fills or cancels no other,
-  and that no market is financed at a rollover that records its benchmark as having no rate; under
+  and that no market is financed at a rollover that records its benchmark as having no rate; from
   `V15` it also checks that a resting order accepted below its market's minimum notional, or with no
   dollar value, can only reduce its account's position in that market; under `V16`, that no
   account's toxicity history exceeds the memory in force.

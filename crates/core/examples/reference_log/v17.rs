@@ -3,10 +3,10 @@
 use engine_core::command::{AdminCommand, Command};
 use engine_core::event::Event;
 use engine_core::protocol::ProtocolVersion;
-use engine_core::session::{Period, Schedule};
 use engine_core::types::{AssetClass, MarketId};
 
-use crate::common::{Harness, market, ny, us_equities};
+use crate::common::stress::halted_us_equities;
+use crate::common::{Harness, market, ny};
 
 /// A market the part lists for the across-halt move.
 const NVDA: MarketId = 21;
@@ -15,15 +15,7 @@ const NVDA: MarketId = 21;
 /// fast-move stress: the pre-halt price is still inside the move window.
 pub(crate) fn session(h: &mut Harness) {
     h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V17 });
-    let Schedule::Weekly { tz, windows, .. } = us_equities() else { unreachable!("US equities keep weekly hours") };
-    let at = |local: &str| local.parse().expect("a local date and time");
-    let schedule = Schedule::Weekly {
-        tz,
-        windows,
-        closed_dates: vec![],
-        closures: vec![Period { from: at("2026-10-29T13:00:00"), to: at("2026-10-29T13:00:20") }],
-        special_sessions: vec![],
-    };
+    let schedule = halted_us_equities("2026-10-29T13:00:00", "2026-10-29T13:00:20");
     h.operator_admin(AdminCommand::UpsertMarket(market(NVDA, "NVDA", AssetClass::Equity, schedule, 2_000)));
 
     // The last pre-halt price, 10s before a 20s halt; the reopening price is 3% down, 30s after it.
