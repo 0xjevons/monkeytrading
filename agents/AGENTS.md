@@ -54,7 +54,7 @@ an index: load only the rule whose hint matches the current action.
   `operator.public_key`, with the same chain id and vault, are recorded in the log when it first
   activates the protocol versions that need them, so changing either needs a fresh log.
   `test-keys.toml` lists the keys whose private keys the repo publishes for development (the dev
-  configs' operator key and Anvil's default accounts); a node whose TEE is not the mock refuses them
+  configs' operator key, explicit published mock enclave signer, and Anvil's default accounts); a node whose TEE is not the mock refuses them
   as its operator key, and a dev config or script that adds such a key lists it there.
   `production-genesis.toml` is the production `[genesis]` section alone: the launch markets with
   their venue calendars, each calendar's sources and unpublished gaps, their quote currencies, and

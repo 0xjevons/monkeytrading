@@ -4,6 +4,8 @@
 # it here too; the node compiles this file in.
 
 operator_public_keys = [
+  # Explicit mock enclave signer: 32 bytes of 0x43 (tee.use_published_mock_key).
+  "0x047f31ebc5462c1fdce1b737ecff52d37d75dea43ce11c74d25aa297165faa2007282870f68031e8772062f4f63cd3ecbf834846787f512738ba15664990af4e20",
   # operator.public_key in dev.toml and anvil.toml: the local test key 0x4242…42
   # (32 bytes of 0x42).
   "0x0424653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c119fc5009a032aa9fe47f5e149bb8442f71f884ccb516590686d8ff6ab91c613",

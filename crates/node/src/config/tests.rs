@@ -44,6 +44,7 @@ fn unsigned_requests_need_the_mock_tee_and_mock_custody() {
         let mut signed: NodeConfig = toml::from_str(&signed).unwrap();
         // Real attestation also refuses the dev configs' published operator key.
         signed.operator.public_key = own_operator_key();
+        signed.tee.use_published_mock_key = false;
         signed.validate().unwrap();
     }
 }

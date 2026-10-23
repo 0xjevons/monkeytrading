@@ -15,9 +15,15 @@ pub(super) async fn finish_preflight<R: CheckpointChain>(
     recovery: Option<(&crate::sequencer::ReplayedLog, &crate::sequencer::SequencerConfig<'_>)>,
 ) -> anyhow::Result<History> {
     if let Some((log, cfg)) = recovery {
-        log.validate_recovery(cfg)?;
+        log.validate_recovery(cfg)
+            .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
         if let Some((poster, _)) = checkpoint {
-            log.validate_submission(cfg.checkpoint_parent, poster.chain.reserved_checkpoint()?.as_ref())?;
+            let reserved = poster
+                .chain
+                .reserved_checkpoint()
+                .inspect_err(|e| error!(alert = "checkpoint_startup_failed", "refusing to serve: {e:#}"))?;
+            log.validate_submission(cfg.checkpoint_parent, reserved.as_ref())
+                .inspect_err(|e| error!(alert = "checkpoint_startup_failed", "refusing to serve: {e:#}"))?;
         }
     }
     if let Some((poster, anchor)) = checkpoint {

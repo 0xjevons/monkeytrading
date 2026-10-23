@@ -115,7 +115,8 @@ account history index is read from host disk with only its schema checked, and i
 by one command, the newest it has taken, though SQLite reads it in defensive mode and each event it
 serves names its place in the log, where anyone can check it; the sequencer, which bounds its host's
 clock with signed time, trusts the guest's monotonic clock without yet checking that the host cannot
-scale it; the enclave's signing key does not yet survive a restart; the custody adapter requires a strict
+scale it; hardware enclave signing keys do not yet survive a restart; the dev configurations explicitly
+use a published mock-only signer, which real attestation refuses; the custody adapter requires a strict
 majority of at least three configured independent RPC providers to agree on deposits, block hashes
 and finality, with reads compared at the same block height and empty log responses requiring the
 answering provider to serve the range's final block. A dissenting or unavailable provider alerts;

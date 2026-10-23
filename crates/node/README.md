@@ -354,8 +354,13 @@ It signs and
 pays gas for relays; only the attested enclave's signature authorizes a vault commitment. Reads
 pin signer, root, deposit count, and USDC balance to one canonical block hash. This RPC's chain view
 is trusted pending independent verification. The immutable `Vault` constructor signer must match
-the enclave key. Key persistence and rotation remain separate work: startup fails closed when a
-restart generates a different key. Before any history SQLite open-for-write, schema creation,
+the enclave key. The shipped dev and Anvil configs explicitly set `tee.use_published_mock_key = true`,
+using the public development signer listed in `config/test-keys.toml` so actual process restarts
+retain independent checkpoint and withdrawal authority. This option defaults false and is refused
+with real attestation, including runtime callers which skipped config validation. It must never
+protect real funds. All signature, domain and changed-authority checks still apply; logs created
+under another key require that retained authority, with no migration or self-named signer fallback.
+Real key persistence and rotation remain separate work: a fresh different key fails closed. Before any history SQLite open-for-write, schema creation,
 WAL recovery, or repair, the node authenticates the replay and finalized anchor. History preflight
 uses immutable read-only access; a crash WAL is conservatively rebuilt only after authorization. The Anvil test provisions its generated signer before deploying
 the vault; this is a local harness, not a production key-provisioning workflow. Withdrawals still

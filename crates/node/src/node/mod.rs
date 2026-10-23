@@ -96,10 +96,13 @@ async fn serve_node(
         }
         TeeProvider::ConfigfsTsm => Box::new(ConfigfsTsm::default()),
     };
-    #[cfg(not(test))]
-    let key = Arc::new(EnclaveKey::generate());
-    #[cfg(test)]
-    let key = Arc::new(EnclaveKey::test_key());
+    let key = Arc::new(
+        EnclaveKey::for_config(&cfg.tee)
+            .inspect_err(|e| error!(alert = "enclave_key_failed", "refusing to serve: {e:#}"))?,
+    );
+    if cfg.tee.use_published_mock_key {
+        warn!("using the public development signing key: mock attestation only");
+    }
     let tls = TlsIdentity::generate()?;
     let attestation = Arc::new(
         attest_key(attestor.as_ref(), &key, &tls.public_key_sha256).context("attesting the enclave and TLS keys")?,

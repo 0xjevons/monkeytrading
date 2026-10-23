@@ -164,6 +164,7 @@ async fn wrong_recovery_deployment_preserves_history_wal_and_log_bytes() {
     )
     .unwrap();
     for wrong_operator in [false, true] {
+        let (_guard, mut alerts) = crate::test_support::capture_alerts();
         let before = files(&root);
         let (log, plan) = crate::node::read_log_and_history_observe(
             &cfg,
@@ -184,6 +185,8 @@ async fn wrong_recovery_deployment_preserves_history_wal_and_log_bytes() {
         let error = finish_preflight::<Chain>(plan, None, Some((&log, &seq_cfg))).await.err().unwrap();
         assert!(error.to_string().contains(if wrong_operator { "operator" } else { "client auth" }));
         assert_eq!(files(&root), before);
+        let alert = alerts.try_recv().expect("recovery refusal raises Critical");
+        assert_eq!((alert["alert"].as_str(), alert["level"].as_str()), ("log_recovery_failed", "ERROR"));
     }
     drop(db);
 }
@@ -196,6 +199,7 @@ async fn incomplete_genesis_and_missing_checkpoint_service_preserve_history_byte
     use tokio::sync::{broadcast, mpsc, watch};
 
     for incomplete_genesis in [false, true] {
+        let (_guard, mut alerts) = crate::test_support::capture_alerts();
         let root = scratch_dir(&format!("preflight-pure-genesis-{incomplete_genesis}"));
         let mut cfg = dev_config();
         cfg.node.log_dir = root.join("log");
@@ -259,6 +263,8 @@ async fn incomplete_genesis_and_missing_checkpoint_service_preserve_history_byte
             "{error:#}"
         );
         assert_eq!(files(&root), before);
+        let alert = alerts.try_recv().expect("pure recovery refusal raises Critical");
+        assert_eq!((alert["alert"].as_str(), alert["level"].as_str()), ("log_recovery_failed", "ERROR"));
         drop(db);
     }
 }
@@ -281,6 +287,7 @@ impl CheckpointChain for ReservedChain {
 
 #[tokio::test]
 async fn reserved_signature_missing_from_recovered_log_refuses_before_history_mutation() {
+    let (_guard, mut alerts) = crate::test_support::capture_alerts();
     let root = scratch_dir("preflight-reserved-signature");
     let mut cfg = dev_config();
     cfg.node.log_dir = root.join("log");
@@ -330,6 +337,8 @@ async fn reserved_signature_missing_from_recovered_log_refuses_before_history_mu
     };
     let error = finish_preflight(plan, Some((&poster, None)), Some((&log, &seq_cfg))).await.err().unwrap();
     assert!(error.to_string().contains("absent"), "{error:#}");
+    let alert = alerts.try_recv().expect("reservation refusal raises Critical");
+    assert_eq!((alert["alert"].as_str(), alert["level"].as_str()), ("checkpoint_startup_failed", "ERROR"));
     assert_eq!(files(&root), before);
     drop(db);
 }

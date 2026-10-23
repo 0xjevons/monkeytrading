@@ -169,6 +169,9 @@ pub struct LoggingSection {
 #[serde(deny_unknown_fields)]
 pub struct TeeSection {
     pub provider: TeeProvider,
+    /// Uses the public development signer only with simulated attestation.
+    #[serde(default)]
+    pub use_published_mock_key: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -453,3 +456,6 @@ mod custody_tests;
 mod telemetry_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod mock_key_tests;

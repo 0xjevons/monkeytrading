@@ -25,6 +25,7 @@ fn only_a_mock_node_may_run_without_a_critical_route() {
     let parse = |text: &str| {
         let mut cfg: NodeConfig = toml::from_str(text).unwrap();
         cfg.operator.public_key = own_operator_key();
+        cfg.tee.use_published_mock_key = false;
         if cfg.custody.provider == crate::config::CustodyProvider::Evm
             && cfg.tee.provider != crate::config::TeeProvider::Mock
         {

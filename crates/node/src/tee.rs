@@ -1,6 +1,7 @@
 //! Enclave identity and remote attestation.
 //!
-//! At boot the enclave generates a secp256k1 key that never leaves it. It puts the key's EVM
+//! At boot a hardware enclave generates a secp256k1 key that never leaves it. Mock configurations
+//! can explicitly select a published development key; hardware configurations refuse that option. It puts the key's EVM
 //! address in the attestation report data, so a hardware quote proves "this address belongs to an
 //! enclave running this measurement". The vault contract and anyone reading the log trust
 //! signatures from that address and nothing else. The report data also carries the hash of the
@@ -10,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use engine_core::Fixed;
 use engine_core::eip712::{self, B256};
 use engine_core::types::AccountId;
@@ -99,10 +100,26 @@ impl EnclaveKey {
         Self { key: SigningKey::random(&mut OsRng) }
     }
 
-    /// Reproducible authority for isolated tests; never available to a running node.
+    /// Selects an explicitly configured public mock authority or generates a private fresh key.
+    /// Error cases:
+    /// - a published development key is requested beside real attestation
+    pub(crate) fn for_config(cfg: &crate::config::TeeSection) -> anyhow::Result<Self> {
+        ensure!(
+            !cfg.use_published_mock_key || cfg.provider == crate::config::TeeProvider::Mock,
+            "tee.use_published_mock_key requires tee.provider = \"mock\""
+        );
+        Ok(if cfg.use_published_mock_key { Self::published_mock_key() } else { Self::generate() })
+    }
+
+    /// Public 0x4343…43 development key, listed in config/test-keys.toml. Never a hardware identity.
+    fn published_mock_key() -> Self {
+        Self { key: SigningKey::from_bytes((&[0x43; 32]).into()).expect("valid public development key") }
+    }
+
+    /// The same explicit public authority used by the committed mock configurations.
     #[cfg(test)]
     pub(crate) fn test_key() -> Self {
-        Self { key: SigningKey::from_bytes((&[0x43; 32]).into()).expect("valid fixture key") }
+        Self::published_mock_key()
     }
 
     /// The key's EVM address: the last 20 bytes of keccak-256 over the uncompressed public key.
