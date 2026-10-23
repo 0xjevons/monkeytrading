@@ -77,6 +77,10 @@ this crate and reproduce the signed state roots exactly.
 - From protocol `V16`, parameters that set a smaller toxicity memory clamp every account's toxicity
   history to it, so a lowered memory already weighs the next markout against no more history than
   the memory, instead of that markout still weighing the history the account built
+- From protocol `V17`, reopening a market keeps its trailing move window: prices observed within
+  the window before a halt still count after the reopening, so a move across a halt shorter than
+  the window raises fast-move stress as it would without the halt; a market whose FX pair has no
+  price keeps its stress level, since nothing fills there
 
 ## Repository Structure
 
@@ -139,7 +143,7 @@ this crate and reproduce the signed state roots exactly.
 - `examples/reference_log/` — writes the reference log for a new protocol version: the session
   (`main.rs`), the requests and event names it uses (`helpers.rs`), its `V10` to `V12` parts
   (`v10.rs`, `v11.rs`, `v12.rs`), its `V13` part (`stress.rs`), its `V14` part (`v14.rs`), and its
-  `V15` and `V16` parts (`v15.rs`, `v16.rs`)
+  `V15`, `V16`, and `V17` parts (`v15.rs`, `v16.rs`, `v17.rs`)
 - `examples/sign_request.rs` — a client signing a request body for the API
 - `examples/verify_proof.rs` — checks an account proof from the API against a root
 
@@ -197,7 +201,7 @@ Two suites guard replay and accounting:
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
   under `V2`, `V6`, `V7` with markets quoted in other currencies, `V11`, and `V12` and `V13` with
   those markets and signed operator commands, where `V13` must reach a stress change, and `V14`,
-  `V15`, and `V16`.
+  `V15`, `V16`, and `V17`.
   Each mixes client, feed, custody, and operator commands,
   with values inside and outside the input bounds, and checks after every command that nothing
   panicked, cash is conserved, and every market's aggregates match its accounts' positions. From
@@ -247,7 +251,8 @@ follow its inputs; its log is `v13.jsonl`. `V14` finances only markets whose ben
 and caps each account's resting orders; its log is `v14.jsonl`. `V15` lets an order that can only
 reduce the account's position in its market skip the minimum-notional check at placement; its log is
 `v15.jsonl`. `V16` clamps every account's toxicity history when parameters set a lower memory; its
-log is `v16.jsonl`. For each later version:
+log is `v16.jsonl`. `V17` keeps a market's move window across a halt; its log is `v17.jsonl`.
+For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log/main.rs` so it activates the new version and exercises the new rules.

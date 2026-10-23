@@ -182,6 +182,13 @@ impl Harness {
         h
     }
 
+    /// `v16`, then `V17`, which keeps a market's move window across a halt.
+    pub fn v17() -> Self {
+        let mut h = Harness::v16();
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V17 });
+        h
+    }
+
     /// No commands yet, at the harness start time.
     fn empty() -> Self {
         Harness {

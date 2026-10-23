@@ -375,7 +375,9 @@ impl Engine {
         }
     }
 
-    /// Updates a market's open flag from its schedule, emitting the transition.
+    /// Updates a market's open flag from its schedule, emitting the transition. Before `V17` an
+    /// open cleared the market's move window; from `V17` the window survives the halt, so prices
+    /// observed within it before the halt still count after the reopening.
     pub(crate) fn refresh_session(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
         let now = self.now;
         let Some(market) = self.markets.get(&market_id) else { return };
@@ -386,8 +388,12 @@ impl Engine {
         let market = self.markets.get_mut(&market_id).expect("found above");
         market.open = open;
         if open {
-            market.stress.move_ref = None;
-            market.stress.move_window.clear();
+            // Before V17 an open restarted the move window; from V17 a halt shorter than the
+            // window keeps the prices observed before it counted for their window.
+            if self.protocol_version < ProtocolVersion::V17 {
+                market.stress.move_ref = None;
+                market.stress.move_window.clear();
+            }
             events.push(Event::MarketOpened { market: market_id });
         } else {
             events.push(Event::MarketClosed { market: market_id });

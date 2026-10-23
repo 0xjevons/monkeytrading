@@ -14,6 +14,7 @@ mod v12;
 mod v14;
 mod v15;
 mod v16;
+mod v17;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -99,8 +100,8 @@ fn main() -> anyhow::Result<()> {
 /// out, each processed before the next command acts. Then, under `V13`, stress that follows its
 /// inputs (`stress.rs`), and, under `V14`, the part in `v14.rs`, and, under `V15`, the part in
 /// `v15.rs`. Then, under `V16`, a lowered toxicity memory clamps the history a score weighs
-/// (`v16.rs`). Every client request is signed by its account's key unless the comment says
-/// otherwise.
+/// (`v16.rs`), and under `V17`, the move window survives a halt (`v17.rs`). Every client request
+/// is signed by its account's key unless the comment says otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -488,5 +489,6 @@ fn session() -> Vec<Sequenced> {
     v14::session(&mut h);
     v15::session(&mut h);
     v16::session(&mut h);
+    v17::session(&mut h);
     h.log
 }

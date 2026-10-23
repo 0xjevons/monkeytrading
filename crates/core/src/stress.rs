@@ -1,6 +1,7 @@
 //! Stress levels. Each market's automatic level rises at once when any reading meets a level's
 //! trigger and steps down only after the cooldown; its effective level is the highest of that and
-//! the operator's floors.
+//! the operator's floors. From `V17`, a market's move window survives a halt: prices observed
+//! within the window before the market closed still count after it reopens.
 
 use std::collections::VecDeque;
 

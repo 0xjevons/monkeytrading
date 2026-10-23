@@ -99,11 +99,15 @@ pub enum ProtocolVersion {
     /// next markout after a lowered memory still weighs the history it had built under the old one;
     /// that markout caps the history at the memory then in force.
     V16,
+    /// Reopening a market keeps the trailing move window prices observed before the halt counted
+    /// for their window, so a move across a halt shorter than the window raises fast-move stress
+    /// as it would without the halt. Before `V17` an open cleared the window.
+    V17,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V16;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V17;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

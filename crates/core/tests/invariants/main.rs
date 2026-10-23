@@ -79,13 +79,18 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
             h.list_fx();
             h
         };
-        let latest = || {
+        let v16 = || {
             let mut h = Harness::v16();
             h.list_fx();
             h
         };
+        let latest = || {
+            let mut h = Harness::v17();
+            h.list_fx();
+            h
+        };
         for genesis in
-            [Harness::new(), Harness::v6(), Harness::fx(), Harness::v11(), v12(), v13(), v14(), v15(), latest()]
+            [Harness::new(), Harness::v6(), Harness::fx(), Harness::v11(), v12(), v13(), v14(), v15(), v16(), latest()]
         {
             let mut h = funded(genesis, &session);
             let version = h.engine.protocol_version();
