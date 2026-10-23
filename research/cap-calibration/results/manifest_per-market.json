@@ -1,8 +1,6 @@
 {
  "command": [
-  "per-market",
-  "--workers",
-  "4"
+  "all"
  ],
  "scenario": {
   "name": "baseline",
@@ -10,7 +8,7 @@
   "seed": 1,
   "days": 90,
   "flow_scale": 1.0,
-  "hedged_share": null,
+  "hedged_scale": 1.0,
   "leverage_mapping": "capped",
   "vol_scale": 1.0,
   "block_weeks": 4,
@@ -26,15 +24,17 @@
   "batch_paths": 500
  },
  "derived_sha256": {
+  "benchmarks.csv": "16e04c781473c39d",
   "hourly_bars.npz": "d742bab6c751e973",
   "market_mix.csv": "cbf00cf20cf6fde8",
   "market_stats.csv": "5c590a0c86a90c0a",
-  "papertrade_daily.csv": "295c2cd9fe38756b",
-  "papertrade_flow.csv": "80d20e5b76f09a05",
+  "papertrade_daily.csv": "38379b23e276390f",
+  "papertrade_flow.csv": "fe24885aaaa069e5",
   "papertrade_holding.csv": "bf066bbc49e19029",
-  "papertrade_sizes.csv": "aa8a8141f2bdbcf2",
-  "papertrade_summary.json": "c5b04a82fbf0c5ba"
+  "papertrade_leverage.csv": "fd05f25e9538d410",
+  "papertrade_sizes.csv": "341fd8a0af63fdce",
+  "papertrade_summary.json": "875fc6c89820321a"
  },
  "workers": 4,
- "seconds": 2196
+ "seconds": 970
 }

@@ -3,68 +3,74 @@
 ## Summary
 
 Two measures of insolvency set very different floors, and the owner's choice between them decides
-the launch floors. Over 90 days from a house with no capital, on 2,000 simulated paths:
+the launch floors. Over 90 days from a house with no capital, on 2,000 simulated paths, each cell
+giving the measured share of paths with the one-sided 95% upper bound beside it:
 
 | Target | NAV never below zero | House cash never below zero (the vault covers client balances) |
 |---|---|---|
-| 1% | $37M in total: $1M on every market (0.84%). Refuses 50% of launch-week opening notional, 25% over 90 days. | $370M in total: $10M on every market (0.60%). Refuses 0.1% in the launch week. |
-| 0.1% | $562k in total: BTC-USD $562k, every other market $0 (0.05%). Refuses 83% in the launch week, 39% over 90 days. | $2.79M in total: BTC-USD $1.78M, ETH-USD $1M, SOL-USD $10k, every other market $0 (below 0.01%). Refuses 73% in the launch week. |
-| 0.01% | $316k in total: BTC-USD $316k, every other market $0 (below 0.01%, extrapolated). Refuses 86% in the launch week. | $0: nothing opens. |
+| 1% | $37M in total: $1M on every market (1.00%; 20 paths, bound <1.45%). Refuses 47% of launch-week opening notional, 20% over 90 days. | $240M in total: $10M on most markets, $17.8M on US500 and US100, $5.62M on ETH-USD and SOL-USD, $3.16M on every share (0.80%; 16 paths, bound <1.21%). Refuses 0.3% in the launch week, 0.1% over 90 days. |
+| 0.1% | $0 in total: nothing opens. The best candidate with any floor, $100k on every market, already measures 0.20% (bound <0.46%). | $0 in total: nothing opens, at the same 0.20%. |
+| 0.01% | $0 in total: nothing opens. | $0 in total: nothing opens. |
 
-The 1% row for NAV comes from the sensitivity stage's baseline at x0.1 (1,000 paths). The
-risk-level method below
-picks $562k on BTC-USD alone for it, refusing 83% of launch-week notional. That method sets each
-market's floor from the market run alone, where a small market's own fees cannot absorb its gap
-losses. With every market at $1M, pooled crypto fees carry the small markets, and the same target
-refuses 50%. No uniform floor below $1M was run, so 0.1% and 0.01% keep the method's choice.
+The 1% row for NAV is the uniform family: $1M on every market. The risk-level method below sets
+each market's floor from the market run alone, where a small market's own fees cannot absorb its
+gap losses; alone, no market stays at or below 0.3% at any floor, so at those levels the family
+puts $0 on every market and nothing opens. Its 1% choice is $49.4k on two markets, refusing 92% of
+launch-week notional; with every market at $1M, pooled crypto fees carry the small markets, the
+same target measures 1.00%, and it refuses 47%. For 0.1% and 0.01%, every candidate with any floor
+measures above the target, so the recommendation is $0. The house-cash 1% row is the binding
+point: each market at the floor where its refusals end.
 
 - **Early dips are common, shallow, and short.** With $10M on every market, NAV
-  falls below zero at some hour in 7.9% of paths, at a median of 0.2 days after launch, before fees
-  have built any capital. It falls below -$100k in 0.9% of paths and never below -$1M. House cash
-  goes below zero in 0.6%, no withdrawal ever waits in the #49 queue, and NAV ends the 90 days at a
-  median of $29M.
+  falls below zero at some hour in 18.75% of paths (375 of 2,000), at a median of 0.2 days after
+  launch, before fees have built any capital. It falls below -$100k in 3.4% of paths and never
+  below -$1M. House cash goes below zero in 0.85% (17 paths), no withdrawal ever waits in the #49
+  queue, and NAV ends the 90 days at a median of $26.2M.
 - **Order size, not exposure, is what small floors refuse.** An order larger than the cap is
   refused whatever flows around it. At 200:1, orders up to $1M carry only 40% of papertrade's
-  margin, so a floor under a few million refuses most launch flow; $10M, papertrade's position cap,
-  admits all of it.
-- **Along the risk-level allocations, the dip rises quickly with the floors.** From 0.25% at $2.6M
-  in total (8 markets with floors), it reaches 4.3% at $5.3M, 6.0% at $8.9M, and 7.4% at $143M. The
-  method's 1% choice stops at $562k because the level at $1.29M measures 1.05%, inside sampling error
-  of the target; $2.6M at 0.25% also meets it.
-- **Pooling carries the small markets.** Each market alone at $10M dips below zero in 16% (USD-JPY)
-  to 63% (UK 100) of paths, because its own fees are small next to its gap losses. Together, the
-  crypto markets' fees (about $12M of the $28.7M) fund the others' risk.
+  margin, so a floor under a few million refuses most launch flow — 80% of launch-week notional at
+  $100k a market, 47% at $1M — while $10M a market, papertrade's position cap, refuses 2%.
+- **Along the risk-level allocations, the dip rises quickly with the floors.** From 0.55% at $49.4k
+  in total (two markets with floors), it passes 1.70% at $7.78M and 7.10% at $98.1M, reaching
+  19.7% at $240M, where every market sits at its refusal-ending floor. At 0.3% and below the
+  family sets $0 on every market, since alone no market stays at or below the level.
+- **Pooling carries the small markets.** Each market alone, at the floor where its refusals end,
+  dips below zero in 39.5% (XAU-USD) to 73.0% (DE40) of paths, because its own fees are small next
+  to its gap losses. Together at $10M a market the house earns a mean of $25.3M of fees over the 90
+  days, and the crypto markets fund the others' risk.
 - **The total floor does not bind.** At the chosen per-market floors, a total floor at 25% to 100%
-  of their sum changes neither risk nor refusals.
+  of their sum changes neither risk nor refusals — at $1M a market ($37M sum) from $9.25M to $37M,
+  and at the house-cash choice ($240M sum) from $60M to $240M.
 
-The assumptions that move these numbers most, each at $10M on every market, on 1,000 paths (the
-baseline's own seeds give NAV below zero 7.7% and house cash below zero 0.65%):
+The assumptions that move these numbers most, each at the house-cash 1% choice ($240M of floors),
+on 1,000 paths (the baseline gives NAV below zero 18.0% and house cash below zero 1.2%):
 
 | Assumption | NAV<0 ever | Cash<0 | NAV<-$100k | Bad debt mean |
 |---|---|---|---|---|
-| Baseline | 7.7% | 0.65% | 1.2% | $766k |
-| No farming (no hedged flow) | 67.5% | 17.6% | 43.0% | $413k |
-| One client direction for all markets | 12.8% | 2.1% | 3.3% | $766k |
-| Farmers hold 10% of their pairs through every closure | 12.4% | 5.0% | 6.0% | $7.7M |
-| Volatility x2 | 11.4% | 1.0% | 5.6% | $2.4M |
-| Markets bootstrapped independently | 3.6% | 0.30% | 0.40% | $767k |
-| Farming share x2 | 0.31% | 0.67% | 0 | $1.06M |
-| Flow x0.25 / x4 | 8.2% / 3.0% | 0.65% / 0.45% | 0 / 0.30% | $192k / $3.1M |
+| Baseline | 18.0% | 1.2% | 3.3% | $633k |
+| No farming (no hedged flow) | 79.1% | 29.3% | 44.5% | $173k |
+| One client direction for all markets | 27.6% | 4.4% | 7.9% | $633k |
+| Farmers hold 10% of their pairs through every closure | 24.3% | 8.6% | 10.5% | $8M |
+| Volatility x2 | 21.3% | 1.2% | 9.4% | $2M |
+| Markets bootstrapped independently | 7.6% | 0.30% | 0.60% | $631k |
+| Farming share x2 | 2.4% | 0 | 0 | $1.09M |
+| Flow x0.25 / x4 | 18.5% / 4.7% | 1.2% / 0.60% | 0.20% / 1.20% | $158k / $2.52M |
 
 - **Farming is what makes the house solvent early.** Hedged flow pays about a third of the fees.
-  Without it, NAV dips below zero in two thirds of paths and house cash in one in six.
+  Without it, NAV dips below zero in 79% of paths and house cash in 29%.
 - **Correlated client direction is among the largest market risks.** When clients lean the same way in
   every market, the house's net exposure adds up across markets instead of netting.
 - **Pairs held through closures are a risk floors barely touch.** A pair adds no net exposure, so a
   cap limits it only through the size of its orders, while a gap past a leg's balance is bad debt:
-  $7.7M over 90 days in this stress. Margin over closures, not floors, controls it.
+  $8M over 90 days in this stress. Margin over closures, not floors, controls it.
 
 Decisions for the owner:
 
 1. **The measure and the target.** NAV below zero at any hour is strict: with no capital, every
    floor that lets the house trade risks an early dip. House cash below zero is what clients feel:
    the vault holding less than their balances. A depth tolerance, such as NAV never below -$100k,
-   sits between them: $10M on every market gives about 1% (0.9% on 2,000 paths, 1.2% on 1,000).
+   sits between them: $10M on every market gives 3.4% on 2,000 paths, the NAV measure's 1%
+   recommendation keeps it at zero, and the house-cash measure's reaches it in 3.6%.
 2. **Whether to seed the house.** The early dip happens before fees accrue. Seed capital, not
    floors, removes it.
 3. **Leverage on gap-prone markets.** Bad debt from gaps past 100:1 and 200:1 margin (oil, silver,
@@ -315,7 +321,8 @@ directional notional over the 90 days. At the choice for 1%, a second run sets t
 
 `results/report.md` holds every table: the data summaries, each market alone, all markets
 together at each risk level with the floors chosen per target, the total-floor sweep, and the
-sensitivities. The two tables below are all markets together.
+sensitivities. The three tables below are all markets together: the risk-level floors for each
+measure, then the same floor on every market.
 
 Floors set for NAV below zero at some hour (each market's floor at the largest of its own tested
 floors that stays at or below the level when the market runs alone):
@@ -323,33 +330,42 @@ floors that stays at or below the level when the market runs alone):
 | Level | Total floor | Markets with a floor | NAV<0 ever | Cash<0 | NAV<-$100k | Refused, week 1 | Refused, 90 days | NAV day 90 p50 | Fees mean | Bad debt mean |
 |---|---|---|---|---|---|---|---|---|---|---|
 | 0 | $0 | 0 | 0 | 0 | 0 | 100% | 100% | $0 | $0 | $0 |
-| 0.01%, 0.03% | $316k | 1 | <0.01% | <0.01% | 0 | 85.8% | 41.0% | $16.9M | $16.5M | $326k |
-| 0.1% to 1% | $562k | 1 | 0.05% | <0.01% | 0 | 83.2% | 38.7% | $17.6M | $17.3M | $342k |
-| 3% | $1.29M | 4 | 1.05% | 0.10% | 0 | 78.6% | 35.6% | $18.7M | $18.3M | $361k |
-| 10% | $2.63M | 8 | 0.25% | <0.01% | 0 | 70.6% | 33.3% | $19.2M | $18.8M | $375k |
-| 20% | $5.29M | 10 | 4.30% | <0.01% | 0 | 61.2% | 29.4% | $20.4M | $19.9M | $397k |
-| 30% | $8.91M | 13 | 5.95% | 0.08% | 0 | 52.6% | 26.0% | $21.3M | $20.8M | $417k |
-| 50% | $143M | 19 | 7.40% | 0.61% | 0.75% | 1.8% | 0.7% | $28.8M | $28.4M | $766k |
-| binding | $370M | 37 | 7.85% | 0.60% | 0.90% | 0.1% | 0.0% | $29.0M | $28.7M | $774k |
+| 0.01% to 0.3% | $0 | 0 | 0 | 0 | 0 | 100% | 100% | $0 | $0 | $0 |
+| 1% | $49.4k | 2 | 0.55% | 0.55% | 0 | 92.4% | 34.0% | $19.4M | $18.3M | $400k |
+| 3% | $740k | 2 | 0.80% | 0.80% | 0 | 80.2% | 28.8% | $20.8M | $19.7M | $434k |
+| 10% | $3.6M | 12 | 0.65% | 0.70% | 0 | 61.3% | 23.9% | $21.9M | $20.8M | $462k |
+| 20% | $7.78M | 15 | 1.70% | 0.55% | 0 | 47.5% | 20.5% | $22.6M | $21.4M | $480k |
+| 30% | $13.5M | 17 | 2.55% | 0.50% | 0 | 35.9% | 17.3% | $23.2M | $22.0M | $501k |
+| 50% | $98.1M | 29 | 7.10% | 0.55% | 0.05% | 7.6% | 3.8% | $25.8M | $24.8M | $626k |
+| binding | $240M | 37 | 19.7% | 0.80% | 3.60% | 0.3% | 0.1% | $26.2M | $25.3M | $632k |
 
 Floors set for house cash below zero at some hour:
 
 | Level | Total floor | Markets with a floor | NAV<0 ever | Cash<0 | NAV<-$100k | Refused, week 1 | Refused, 90 days | NAV day 90 p50 |
 |---|---|---|---|---|---|---|---|---|
 | 0 | $0 | 0 | 0 | 0 | 0 | 100% | 100% | $0 |
-| 0.01%, 0.03% | $1.03M | 2 | 0.90% | 0.05% | 0 | 79.5% | 35.7% | $18.6M |
-| 0.1% | $1.10M | 2 | 0.60% | <0.01% | 0 | 78.4% | 35.3% | $18.8M |
-| 0.3% | $1.18M | 2 | 0.70% | <0.01% | 0 | 77.9% | 35.1% | $18.8M |
-| 1% | $2.79M | 3 | 8.40% | <0.01% | 0 | 73.1% | 31.9% | $20.0M |
-| 3% | $5.57M | 7 | 12.0% | 0.50% | 0 | 65.1% | 29.2% | $20.7M |
-| 10% | $46.1M | 11 | 12.5% | 0.27% | 1.30% | 35.0% | 17.0% | $23.9M |
-| 20% | $140M | 17 | 8.15% | 0.60% | 1.20% | 1.6% | 0.5% | $28.7M |
-| 30% | $150M | 19 | 8.10% | 0.60% | 1.20% | 1.6% | 0.5% | $28.7M |
-| 50% | $340M | 34 | 7.95% | 0.60% | 0.90% | 0.5% | 0.1% | $29.0M |
-| binding | $370M | 37 | 7.85% | 0.60% | 0.90% | 0.1% | 0.0% | $29.0M |
+| 0.01% to 0.3% | $0 | 0 | 0 | 0 | 0 | 100% | 100% | $0 |
+| 1% | $49.4k | 2 | 0.55% | 0.55% | 0 | 92.4% | 34.0% | $19.4M |
+| 3% | $662k | 2 | 1.15% | 1.15% | 0 | 81.2% | 29.1% | $20.7M |
+| 10% | $6.31M | 12 | 11.75% | 1.45% | 0 | 57.1% | 22.0% | $22.4M |
+| 20% | $63.2M | 20 | 14.1% | 0.65% | 0.90% | 6.5% | 2.9% | $25.9M |
+| 30% | $176M | 26 | 19.75% | 0.80% | 3.70% | 0.9% | 0.3% | $26.2M |
+| 50%, binding | $240M | 37 | 19.7% | 0.80% | 3.60% | 0.3% | 0.1% | $26.2M |
 
-"<0.01%" is an extrapolation from the tail, below what 2,000 paths can count. Refused shares are
-of opening notional, directional flow and churn.
+The same floor on every market:
+
+| Floor | Total floor | Markets with a floor | NAV<0 ever | Cash<0 | NAV<-$100k | Refused, week 1 | Refused, 90 days | NAV day 90 p50 | Fees mean | Bad debt mean |
+|---|---|---|---|---|---|---|---|---|---|---|
+| $100k | $3.7M | 37 | 0.20% | 0.20% | 0 | 79.7% | 28.9% | $20.7M | $19.6M | $438k |
+| $300k | $11.1M | 37 | 0.25% | 0.25% | 0 | 68.2% | 25.4% | $21.6M | $20.5M | $460k |
+| $1M | $37M | 37 | 1.00% | 0.40% | 0 | 47.0% | 19.8% | $23.1M | $21.9M | $498k |
+| $3M | $111M | 37 | 8.90% | 0.75% | 0.05% | 23.8% | 12.1% | $24.7M | $23.6M | $572k |
+| $10M | $370M | 37 | 18.75% | 0.85% | 3.40% | 1.9% | 1.0% | $26.2M | $25.3M | $631k |
+
+Each probability is the share of the 2,000 paths, and a candidate meets a target only when its
+exact one-sided 95% upper bound is at or below it: with zero failing paths that bound is 0.15% on
+2,000 paths (0.30% on the 1,000-path sensitivity runs). Refused shares are of opening notional,
+directional flow and churn.
 
 ## Limits
 
