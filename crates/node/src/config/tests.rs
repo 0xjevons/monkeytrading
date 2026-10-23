@@ -89,6 +89,15 @@ fn genesis_values_the_engine_would_refuse_fail_the_boot() {
     let rate = |bps: i64| {
         dev.replace("{ name = \"SOFR\", annual_bps = 400 }", &format!("{{ name = \"SOFR\", annual_bps = {bps} }}"))
     };
+    let cap = |orders: usize| dev.replace("max_resting_orders = 100", &format!("max_resting_orders = {orders}"));
+    // A market names "Sofr" while genesis rates "SOFR".
+    let misspelt = dev.replacen("benchmark = \"SOFR\"", "benchmark = \"Sofr\"", 1);
+    // Genesis rates no benchmark at all, leaving every rate to the rate feed.
+    let unrated = {
+        let start = dev.find("benchmarks = [").unwrap();
+        let end = start + dev[start..].find("]\n").unwrap() + 1;
+        format!("{}benchmarks = []{}", &dev[..start], &dev[end..])
+    };
     let total_floor = dev.replace("house_total_cap_floor = \"2000000\"", "house_total_cap_floor = \"-1\"");
     let market_floor = dev.replace("house_cap_floor = \"300000\"", "house_cap_floor = \"-1\"");
     // Each genesis command: the parameters, a benchmark rate, a market, and the house capital.
@@ -111,14 +120,18 @@ fn genesis_values_the_engine_would_refuse_fail_the_boot() {
             dev.replacen("max_divergence_bps = 25", "max_divergence_bps = 0", 1),
             "genesis market BTC-USD: the engine rejects it: a divergence share above zero can never fire",
         ),
+        (cap(0), "genesis.params: the engine rejects it: max_resting_orders must be in 1..=1000"),
+        (cap(1_001), "genesis.params: the engine rejects it: max_resting_orders must be in 1..=1000"),
+        (misspelt, "the engine rejects it: benchmark Sofr has no rate"),
     ];
     for (text, expected) in &refused {
         assert_ne!(text, &dev, "the replacement must change the config");
         let err = toml::from_str::<NodeConfig>(text).unwrap().validate().unwrap_err();
         assert!(format!("{err:#}").contains(expected), "expected {expected:?}, got {err:#}");
     }
-    // A house that starts with no capital, and the rate limit itself, are accepted.
-    for text in [capital("0"), rate(-10_000)] {
+    // A house that starts with no capital, the rate and resting-order limits themselves, and a
+    // genesis that rates no benchmark are accepted.
+    for text in [capital("0"), rate(-10_000), cap(1_000), unrated] {
         assert_ne!(text, dev, "the replacement must change the config");
         toml::from_str::<NodeConfig>(&text).unwrap().validate().unwrap();
     }

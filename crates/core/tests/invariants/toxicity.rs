@@ -18,7 +18,8 @@ use proptest::sample::select;
 use proptest::strategy::{Just, Strategy};
 use proptest::test_runner::{Config, RngSeed, TestCaseError, TestRunner};
 
-use crate::common::{BTC, Harness, acct, fills, params};
+use crate::common::events::fills;
+use crate::common::{BTC, Harness, acct, params};
 
 const SEED: u64 = 0x5eed_0006;
 const CASES: u32 = 256;

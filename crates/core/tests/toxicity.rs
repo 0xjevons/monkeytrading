@@ -5,7 +5,8 @@
 
 mod common;
 
-use common::{AAPL, BTC, DE40, ETH, EURUSD, Harness, USDJPY, acct, f, fills, ny, operator, params};
+use common::events::fills;
+use common::{AAPL, BTC, DE40, ETH, EURUSD, Harness, USDJPY, acct, f, ny, operator, params};
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command};
 use engine_core::event::{Event, Fill};

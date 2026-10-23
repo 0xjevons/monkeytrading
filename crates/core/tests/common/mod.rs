@@ -15,10 +15,11 @@ use chrono::TimeZone;
 use engine_core::auth::{ClientAuth, Operator, RequestAuth};
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::eip712::{self, B256, cancel_hash, order_hash, withdrawal_hash};
-use engine_core::event::{Event, Fill, Reject};
+use engine_core::event::Event;
 use engine_core::market::{FinancingSpec, MarketSpec, PriceRules, QuoteCurrency, Tier};
 use engine_core::params::{
-    NotionalWeighting, ProtocolParams, Rollover, StressLevel, StressTrigger, ToxicityParams, ToxicityTier,
+    DEFAULT_MAX_RESTING_ORDERS, NotionalWeighting, ProtocolParams, Rollover, StressLevel, StressTrigger,
+    ToxicityParams, ToxicityTier,
 };
 use engine_core::price::SourceQuote;
 use engine_core::protocol::ProtocolVersion;
@@ -155,6 +156,14 @@ impl Harness {
     pub fn v13() -> Self {
         let mut h = Harness::v12();
         h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V13 });
+        h
+    }
+
+    /// `v13`, then `V14`, which finances only markets whose benchmark has a rate and caps each
+    /// account's resting orders.
+    pub fn v14() -> Self {
+        let mut h = Harness::v13();
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V14 });
         h
     }
 
@@ -416,6 +425,7 @@ pub fn params() -> ProtocolParams {
         },
         rollover: Rollover { tz: chrono_tz::Europe::London, hour: 22, minute: 0 },
         house_total_cap_floor: Fixed::ZERO,
+        max_resting_orders: DEFAULT_MAX_RESTING_ORDERS,
     }
 }
 
@@ -469,32 +479,4 @@ pub fn ny(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> Millis {
     chrono_tz::America::New_York.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().timestamp_millis()
 }
 
-/// The fills among `events`.
-pub fn fills(events: &[Event]) -> Vec<&Fill> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            Event::Fill(fill) => Some(fill),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The one fill among `events`; panics unless there is exactly one.
-pub fn only_fill(events: &[Event]) -> &Fill {
-    match fills(events)[..] {
-        [fill] => fill,
-        _ => panic!("expected one fill, got {events:?}"),
-    }
-}
-
-/// The order rejection among `events`; panics if there is none.
-pub fn rejection(events: &[Event]) -> &Reject {
-    events
-        .iter()
-        .find_map(|e| match e {
-            Event::OrderRejected { reason, .. } => Some(reason),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("expected a rejection, got {events:?}"))
-}
+pub mod events;

@@ -5,7 +5,8 @@
 
 mod common;
 
-use common::{DE40, EURUSD, Harness, USDJPY, acct, de40, f, fills, ny, only_fill, params, rejection};
+use common::events::{fills, only_fill, rejection};
+use common::{DE40, EURUSD, Harness, USDJPY, acct, de40, f, ny, params};
 use engine_core::Fixed;
 use engine_core::command::{AdminCommand, Command, OrderKind};
 use engine_core::event::{Event, Reject};

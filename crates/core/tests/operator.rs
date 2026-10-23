@@ -3,9 +3,8 @@
 
 mod common;
 
-use common::{
-    AAPL, BTC, CHAIN_ID, Client, DE40, ETH, EURUSD, Harness, USDJPY, VAULT, acct, f, fills, market, operator, rejection,
-};
+use common::events::{fills, rejection};
+use common::{AAPL, BTC, CHAIN_ID, Client, DE40, ETH, EURUSD, Harness, USDJPY, VAULT, acct, f, market, operator};
 use engine_core::Engine;
 use engine_core::auth::{ClientAuth, MAX_EXPIRY_AHEAD_MS, Operator};
 use engine_core::command::{AdminCommand, AdminRequest, Command, OrderKind, Sequenced};

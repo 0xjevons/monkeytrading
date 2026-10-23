@@ -3,6 +3,8 @@
 //! Cash is conserved: client balances plus house cash always equal deposits plus house capital,
 //! less approved withdrawals. Every movement below debits one side and credits the other.
 
+use std::collections::BTreeMap;
+
 use crate::Fixed;
 use crate::account::Position;
 use crate::auth::RequestAuth;
@@ -107,8 +109,25 @@ impl Engine {
     }
 
     /// One day of overnight financing on every open position. Longs pay benchmark + markup; shorts
-    /// receive benchmark - markup.
+    /// receive benchmark - markup. From `V14` each benchmark with no rate is recorded with the markets
+    /// that use it, which accrue nothing.
     fn charge_financing(&mut self, events: &mut Vec<Event>) {
+        if self.protocol_version >= ProtocolVersion::V14 {
+            let unrated = self
+                .markets
+                .iter()
+                .filter(|(_, market)| !self.benchmarks.contains_key(&market.spec.financing.benchmark))
+                .fold(BTreeMap::<&str, Vec<MarketId>>::new(), |mut unrated, (id, market)| {
+                    unrated.entry(&market.spec.financing.benchmark).or_default().push(*id);
+                    unrated
+                });
+            events.extend(
+                unrated.into_iter().map(|(benchmark, markets)| Event::BenchmarkRateMissing {
+                    benchmark: benchmark.to_owned(),
+                    markets,
+                }),
+            );
+        }
         let charges: Vec<(AccountId, MarketId, Fixed)> = self
             .accounts
             .iter()
@@ -126,15 +145,19 @@ impl Engine {
     }
 
     /// One day's financing on `pos` in USD, positive when the account pays, or `None` when the market
-    /// has no mark to value it at. A benchmark with no published rate counts as zero. From `V5` the
-    /// amount rounds up, so a charge rounds against the account and a credit toward zero; before
-    /// `V5` it truncates. A market quoted in another currency converts the amount to USD rounded up,
-    /// the same way.
+    /// has no mark to value it at or, from `V14`, its benchmark has no rate. Before `V14` a benchmark
+    /// with no rate counts as zero. From `V5` the amount rounds up, so a charge rounds against the
+    /// account and a credit toward zero; before `V5` it truncates. A market quoted in another
+    /// currency converts the amount to USD rounded up, the same way.
     fn daily_financing(&self, market_id: MarketId, pos: Position) -> Option<Fixed> {
         let market = self.markets.get(&market_id)?;
         let mark = market.mark?;
         let financing = &market.spec.financing;
-        let benchmark = self.benchmarks.get(&financing.benchmark).copied().unwrap_or(0);
+        let benchmark = match self.benchmarks.get(&financing.benchmark) {
+            Some(rate) => *rate,
+            None if self.protocol_version >= ProtocolVersion::V14 => return None,
+            None => 0,
+        };
         let annual_bps =
             if pos.qty.is_positive() { benchmark + financing.markup_bps } else { financing.markup_bps - benchmark };
         let amount = if self.protocol_version < ProtocolVersion::V5 {

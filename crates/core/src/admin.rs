@@ -12,7 +12,7 @@ use crate::command::{AdminCommand, AdminRequest};
 use crate::engine::{Engine, MarketState};
 use crate::event::{Event, Reject};
 use crate::market::MarketSpec;
-use crate::params::MAX_BENCHMARK_BPS;
+use crate::params::{DEFAULT_MAX_RESTING_ORDERS, MAX_BENCHMARK_BPS};
 use crate::protocol::ProtocolVersion;
 use crate::types::MarketId;
 
@@ -26,11 +26,12 @@ impl Engine {
     /// Error cases:
     /// - `SetParams` with parameters that fail `ProtocolParams::validate_for` the version in force,
     ///   from `V8` that fail `ProtocolParams::check_closing_spread`, from `V11` that fail
-    ///   `ProtocolParams::check_notional_weighting`, or from `V13` with a divergence share a listed
-    ///   market can never reach
+    ///   `ProtocolParams::check_notional_weighting`, from `V13` with a divergence share a listed
+    ///   market can never reach, or with a resting-order cap other than the default before `V14`
     /// - `UpsertMarket` with a spec that fails `MarketSpec::validate` or `check_quote_currency`, with
-    ///   dated closures or special sessions before `V4`, or from `V13` with a bound no divergence
-    ///   share in force can be reached at
+    ///   dated closures or special sessions before `V4`, from `V13` with a bound no divergence share
+    ///   in force can be reached at, or from `V14`, once any benchmark has a rate, that lists a
+    ///   market, or moves one, onto a benchmark with none
     /// - `SetBenchmarkRate` outside ±10000 bps a year
     /// - `SetStressFloor` before parameters are set, at a level that does not exist, or for an
     ///   unknown market
@@ -56,6 +57,11 @@ impl Engine {
                 if self.protocol_version >= ProtocolVersion::V13 {
                     self.markets.values().try_for_each(|market| params.check_divergence_reachable(&market.spec))?;
                 }
+                if params.max_resting_orders != DEFAULT_MAX_RESTING_ORDERS
+                    && self.protocol_version < ProtocolVersion::V14
+                {
+                    return Err(format!("a resting-order cap needs protocol {:?}", ProtocolVersion::V14));
+                }
                 self.next_rollover = Some(params.rollover.next_after(self.now));
                 self.params = Some(params.clone());
                 self.restress_all(events);
@@ -74,6 +80,18 @@ impl Engine {
                 self.check_quote_currency(spec)?;
                 if let Some(params) = self.params.as_ref().filter(|_| self.protocol_version >= ProtocolVersion::V13) {
                     params.check_divergence_reachable(spec)?;
+                }
+                // Before any benchmark has a rate, as in a genesis that leaves every rate to the feed,
+                // a listing may name any; after, a new name must be one with a rate.
+                let benchmark = &spec.financing.benchmark;
+                let named =
+                    self.markets.get(&spec.id).is_none_or(|market| market.spec.financing.benchmark != *benchmark);
+                if self.protocol_version >= ProtocolVersion::V14
+                    && named
+                    && !self.benchmarks.is_empty()
+                    && !self.benchmarks.contains_key(benchmark)
+                {
+                    return Err(format!("benchmark {benchmark} has no rate"));
                 }
                 let currency_changed =
                     self.markets.get(&spec.id).is_some_and(|market| market.spec.quote_currency != spec.quote_currency);

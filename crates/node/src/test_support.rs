@@ -364,6 +364,7 @@ pub fn every_event() -> Vec<Event> {
         Reject::InsufficientMargin { equity: amount, required: amount },
         Reject::InsufficientFunds { available: amount },
         Reject::HouseCapacity,
+        Reject::TooManyOrders { max: 100 },
         Reject::InvalidAmount,
         Reject::DuplicateReference,
         Reject::MissingSignature,
@@ -385,6 +386,7 @@ pub fn every_event() -> Vec<Event> {
             | Reject::InsufficientMargin { .. }
             | Reject::InsufficientFunds { .. }
             | Reject::HouseCapacity
+            | Reject::TooManyOrders { .. }
             | Reject::InvalidAmount
             | Reject::DuplicateReference
             | Reject::MissingSignature
@@ -424,6 +426,7 @@ pub fn every_event() -> Vec<Event> {
         Event::CloseOut { account, equity: amount, margin: amount },
         Event::BadDebt { account, amount },
         Event::Financing { account, market, amount: -amount },
+        Event::BenchmarkRateMissing { benchmark: "SOFR".into(), markets: vec![market] },
         Event::MarketOpened { market },
         Event::MarketClosed { market },
         Event::StressChanged { market, level: 2 },
@@ -445,6 +448,7 @@ pub fn every_event() -> Vec<Event> {
             | Event::CloseOut { .. }
             | Event::BadDebt { .. }
             | Event::Financing { .. }
+            | Event::BenchmarkRateMissing { .. }
             | Event::MarketOpened { .. }
             | Event::MarketClosed { .. }
             | Event::StressChanged { .. }

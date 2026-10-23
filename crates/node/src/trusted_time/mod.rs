@@ -385,4 +385,4 @@ fn ceil_millis(d: Duration) -> Millis {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

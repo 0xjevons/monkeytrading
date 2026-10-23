@@ -10,7 +10,7 @@
 //! while its FX market has a price, and its realised PnL converts to USD at that FX index.
 
 use crate::Fixed;
-use crate::account::RestingOrder;
+use crate::account::{Account, RestingOrder};
 use crate::auth::RequestAuth;
 use crate::command::{OrderKind, OrderRequest};
 use crate::eip712::{cancel_hash, order_hash};
@@ -62,7 +62,8 @@ struct Priced {
 
 impl Engine {
     /// Authorises the request, then fills a market order now or rests a limit or stop order,
-    /// emitting acceptance or rejection.
+    /// emitting acceptance or rejection. A resting order is checked against the live price at once:
+    /// from `V14` only that order, and before `V14` the market's whole book.
     pub(crate) fn place_order(&mut self, req: &OrderRequest, events: &mut Vec<Event>) {
         let reject = |reason, events: &mut Vec<Event>| {
             events.push(Event::OrderRejected { account: req.account, client_id: req.client_id, reason })
@@ -114,7 +115,11 @@ impl Engine {
                 self.markets.get_mut(&req.market).expect("validated").resting.insert(order_id, req.account);
                 self.record_order(req.account, order_id);
                 events.push(Event::OrderAccepted { account: req.account, client_id: req.client_id, order_id });
-                self.trigger_resting(req.market, events);
+                if self.protocol_version < ProtocolVersion::V14 {
+                    self.trigger_resting(req.market, events);
+                } else if let Some(mid) = self.trigger_mid(req.market) {
+                    self.trigger_order(order_id, req.account, mid, events);
+                }
             }
         }
     }
@@ -142,14 +147,11 @@ impl Engine {
     /// its FX market has no price, nothing triggers, so the first fresh price after that fills
     /// everything that gapped through, at that price.
     pub(crate) fn trigger_resting(&mut self, market_id: MarketId, events: &mut Vec<Event>) {
-        let market = &self.markets[&market_id];
-        if !market.open || self.live_fx(market_id).is_err() {
-            return;
-        }
-        let Ok(index) = compute_index(&market.quotes, &market.spec.price_rules, self.now) else { return };
-        let resting: Vec<(OrderId, AccountId)> = market.resting.iter().map(|(o, a)| (*o, *a)).collect();
+        let Some(mid) = self.trigger_mid(market_id) else { return };
+        let resting: Vec<(OrderId, AccountId)> =
+            self.markets[&market_id].resting.iter().map(|(o, a)| (*o, *a)).collect();
         for (order_id, account) in resting {
-            self.trigger_order(order_id, account, index.mid, events);
+            self.trigger_order(order_id, account, mid, events);
         }
     }
 
@@ -189,34 +191,14 @@ impl Engine {
         id
     }
 
-    /// Checks an order can be considered at all.
-    /// Error cases:
-    /// - protocol params not set yet
-    /// - an unknown market
-    /// - a qty, quoted price, or trigger price at or below zero or above `Fixed::MAX_INPUT`
-    /// - an account that has never been credited
-    fn validate_order(&self, req: &OrderRequest) -> Result<(), Reject> {
-        let invalid = |reason: &str| Err(Reject::InvalidOrder { reason: reason.into() });
-        if self.params.is_none() {
-            return invalid("protocol params not set");
+    /// The live mid resting orders in `market_id` trigger against, or `None` while the market is
+    /// closed, has no valid index, or its FX market has no price.
+    fn trigger_mid(&self, market_id: MarketId) -> Option<Fixed> {
+        let market = &self.markets[&market_id];
+        if !market.open || self.live_fx(market_id).is_err() {
+            return None;
         }
-        if !self.markets.contains_key(&req.market) {
-            return Err(Reject::UnknownMarket);
-        }
-        if !req.qty.is_valid_input() {
-            return invalid("qty out of range");
-        }
-        let price = match req.kind {
-            OrderKind::Market { quoted, .. } => quoted,
-            OrderKind::Limit { price } | OrderKind::Stop { price } => price,
-        };
-        if !price.is_valid_input() {
-            return invalid("price out of range");
-        }
-        if !self.accounts.contains_key(&req.account) {
-            return Err(Reject::InsufficientFunds { available: Fixed::ZERO });
-        }
-        Ok(())
+        compute_index(&market.quotes, &market.spec.price_rules, self.now).ok().map(|index| index.mid)
     }
 
     /// Fills one resting order if `mid` has reached its trigger. A limit the spread keeps out of
@@ -349,7 +331,9 @@ impl Engine {
         let market = &self.markets[&exec.market];
         let usd = |amount, rounding| market.spec.quote_currency.to_usd(amount, priced.fx, rounding);
 
-        let mut sim = self.accounts[&exec.account].clone();
+        // Margin reads only cash and positions, so the resting orders are not copied.
+        let acct = &self.accounts[&exec.account];
+        let mut sim = Account { balance: acct.balance, positions: acct.positions.clone(), ..Account::default() };
         let version = self.protocol_version;
         let realised = sim.positions.entry(exec.market).or_default().apply(priced.delta, priced.price, version);
         let realised = usd(realised, Rounding::Down);
@@ -464,6 +448,8 @@ fn profit_fee(realised: Fixed, fee_bps: i64, version: ProtocolVersion) -> Fixed 
         realised.mul_bps(fee_bps)
     }
 }
+
+mod validation;
 
 #[cfg(test)]
 mod tests;

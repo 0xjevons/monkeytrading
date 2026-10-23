@@ -3,7 +3,8 @@
 
 mod common;
 
-use common::{AAPL, BTC, ETH, Harness, acct, f, fills, market, ny, operator, params, rejection, us_equities};
+use common::events::{fills, rejection};
+use common::{AAPL, BTC, ETH, Harness, acct, f, market, ny, operator, params, us_equities};
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest, Sequenced};
 use engine_core::event::{Event, Reject};

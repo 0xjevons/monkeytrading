@@ -3,7 +3,8 @@
 
 mod common;
 
-use common::{BTC, CHAIN_ID, Client, Harness, VAULT, f, fills, rejection};
+use common::events::{fills, rejection};
+use common::{BTC, CHAIN_ID, Client, Harness, VAULT, f};
 use engine_core::auth::{ClientAuth, MAX_EXPIRY_AHEAD_MS};
 use engine_core::command::{AdminCommand, CancelRequest, Command, OrderKind, OrderRequest, WithdrawalRequest};
 use engine_core::eip712;

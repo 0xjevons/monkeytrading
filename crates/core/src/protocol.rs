@@ -83,11 +83,17 @@ pub enum ProtocolVersion {
     /// window, and a divergence trigger is a share of each market's divergence bound. Activation
     /// turns absolute divergence triggers into shares of the widest listed bound.
     V13,
+    /// A market whose benchmark has no rate accrues no financing, and each rollover records the
+    /// benchmarks that have none; once any benchmark has a rate, no market is listed or moved onto
+    /// one that has none. An account rests at most `max_resting_orders` orders, which parameters
+    /// may set only from here, a resting order that may add risk meets its market's minimum notional
+    /// at its own price, and placing one checks only that order against the live price.
+    V14,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V13;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V14;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

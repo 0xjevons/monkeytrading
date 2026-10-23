@@ -75,7 +75,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/sequencer/genesis.rs` — the genesis commands, the check that the engine accepts every one
   before any is written, and how far a replayed log got through genesis
 - `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must
-  look at, and house NAV below zero
+  look at, benchmarks with no rate, and house NAV below zero
 - `src/sequencer/tests/mod.rs` — sequencer, activation, recovery, and replay tests
 - `src/sequencer/tests/genesis.rs` — genesis tests: a rejected genesis writes nothing, and a log
   whose genesis did not apply in full is refused at recovery

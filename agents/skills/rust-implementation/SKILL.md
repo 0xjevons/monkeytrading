@@ -238,7 +238,7 @@ Import sections appear in this order, separated by a blank line. In `lib.rs` / `
 - Import only what you need, using absolute paths (`use crate::module::function`, not `use super::function`). Same for usage: `use tracing::info;` then `info!(...)`, not `tracing::info!(...)`.
 - Test-only imports belong inside the `#[cfg(test)] mod tests { … }` block, not at module top level as `#[cfg(test)] use …;`. Inside test modules and test files, `use super::*` is fine.
 - Organize source logically: a small module is a single file in `src`; a larger one gets its own subdirectory with a `mod.rs`.
-- `impl Engine` may span several files (`engine.rs` for dispatch, time, funds, and admin; `execution.rs` for orders, pricing, and risk) when each holds one cohesive area.
+- `impl Engine` may span several files (`engine.rs` for dispatch, time, funds, and admin; `execution/` for orders, pricing, and risk) when each holds one cohesive area.
 
 ## File line cap and module splits
 

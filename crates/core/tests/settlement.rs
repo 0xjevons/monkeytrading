@@ -4,7 +4,8 @@
 
 mod common;
 
-use common::{BTC, DE40, EURUSD, Harness, UNLISTED, USDJPY, acct, de40, f, fills, market, ny, only_fill, rejection};
+use common::events::{fills, only_fill, rejection};
+use common::{BTC, DE40, EURUSD, Harness, UNLISTED, USDJPY, acct, de40, f, market, ny};
 use engine_core::Fixed;
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command};

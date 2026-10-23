@@ -1,5 +1,5 @@
-//! The alerts the sequencer raises: for engine rejections an operator must look at, and for a house
-//! in deficit.
+//! The alerts the sequencer raises: for engine events an operator must look at, and for a house in
+//! deficit.
 
 use engine_core::Fixed;
 use engine_core::event::Event;
@@ -55,7 +55,7 @@ impl DeficitAlert {
     }
 }
 
-/// Raises an alert for an engine rejection an operator must look at.
+/// Raises an alert for an engine event an operator must look at.
 pub(super) fn alert_on(event: &Event) {
     match event {
         // A finalised deposit the engine will not credit leaves user funds in the vault and
@@ -70,6 +70,24 @@ pub(super) fn alert_on(event: &Event) {
         Event::BadDebt { account, amount } => {
             warn!(alert = "bad_debt", %account, %amount, "loss beyond balance written off against the house");
         }
+        // The day goes uncharged, and nothing charges it later.
+        Event::BenchmarkRateMissing { benchmark, markets } => {
+            error!(alert = "benchmark_rate_missing", benchmark, ?markets, "no benchmark rate; no financing charged");
+        }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trusted_time::tests::logs::Logs;
+
+    #[test]
+    fn a_benchmark_with_no_rate_raises_a_critical_alert() {
+        let (logs, _guard) = Logs::capture();
+        alert_on(&Event::BenchmarkRateMissing { benchmark: "Sofr".into(), markets: vec![11] });
+        assert_eq!(logs.critical("benchmark_rate_missing"), 1);
+        assert_eq!(logs.count("benchmark=\"Sofr\" markets=[11]"), 1);
     }
 }

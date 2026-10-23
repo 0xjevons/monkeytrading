@@ -5,7 +5,8 @@
 
 mod common;
 
-use common::{AAPL, BTC, ETH, Harness, acct, f, fills, market, ny, params, rejection};
+use common::events::{fills, rejection};
+use common::{AAPL, BTC, ETH, Harness, acct, f, market, ny, params};
 use engine_core::Fixed;
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command};

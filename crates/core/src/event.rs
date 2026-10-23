@@ -68,6 +68,12 @@ pub enum Event {
         market: MarketId,
         amount: Fixed,
     },
+    /// At a rollover from `V14`, a benchmark with no rate and the markets that use it, which accrue no
+    /// financing for that day.
+    BenchmarkRateMissing {
+        benchmark: String,
+        markets: Vec<MarketId>,
+    },
     MarketOpened {
         market: MarketId,
     },
@@ -124,6 +130,10 @@ pub enum Reject {
         available: Fixed,
     },
     HouseCapacity,
+    /// A limit or stop order from an account that already rests `max`, the parameters' cap.
+    TooManyOrders {
+        max: usize,
+    },
     /// An amount at or below zero, or above `Fixed::MAX_INPUT`.
     InvalidAmount,
     /// A custody reference that was already credited.
