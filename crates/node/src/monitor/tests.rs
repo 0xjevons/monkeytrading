@@ -222,8 +222,9 @@ fn no_price_alerts_once_after_the_threshold_and_resolves_when_priced() {
     assert!(check(priced(), 32).is_empty());
 }
 
-/// Nothing on the node can price a market no configured feed prices, so it is named once in a
-/// Warning and never pages; a market a feed prices still pages when it loses its price.
+/// Nothing on the node can price a market no configured feed prices, so each is named once in its
+/// own `market_unfed` Warning and never pages; a market a feed prices still pages when it loses its
+/// price.
 #[test]
 fn a_market_no_configured_feed_prices_is_named_once_and_never_pages() {
     let after = Duration::from_secs(5);
@@ -236,9 +237,16 @@ fn a_market_no_configured_feed_prices_is_named_once_and_never_pages() {
     let mut no_price = NoPrice::new(BTreeSet::from([1]));
     let mut check = |sample: Sample, secs| capture(|| no_price.check(&sample, at(secs), after));
 
-    let [unfed] = check(markets(&[1, 2, 3], true), 0).try_into().unwrap();
-    assert_eq!((unfed.key(), unfed.severity), ("market_unfed{}".to_owned(), Some(Severity::Warning)));
-    assert_eq!(unfed.summary, "no configured feed prices M2, M3: they cannot trade, and do not page market_no_price");
+    // Each unfed market raises its own Warning, keyed by the market, so one listing is not
+    // swallowed by another's quiet window.
+    let [m2, m3] = check(markets(&[1, 2, 3], true), 0).try_into().unwrap();
+    for (line, market) in [(m2, 2), (m3, 3)] {
+        assert_eq!((line.key(), line.severity), (format!("market_unfed{{market={market}}}"), Some(Severity::Warning)));
+        assert_eq!(
+            line.summary,
+            format!("no configured feed prices M{market}: it cannot trade, and does not page market_no_price")
+        );
+    }
     let [alert] = check(markets(&[1, 2, 3], true), 5).try_into().unwrap();
     assert_eq!((alert.key(), alert.severity), ("market_no_price{market=1}".to_owned(), Some(Severity::Critical)));
     // A session close and reopen pages nothing for the unfed markets.
@@ -250,10 +258,13 @@ fn a_market_no_configured_feed_prices_is_named_once_and_never_pages() {
     assert_eq!(again.key(), alert.key());
     assert!(check(markets(&[1, 2, 3], true), 120).is_empty());
 
-    // A market listed later with no feed is named once, on its own.
+    // Markets listed later with no feed are each named once, in their own episode.
     let [listed] = check(markets(&[1, 2, 3, 4], true), 121).try_into().unwrap();
-    assert_eq!(listed.summary, "no configured feed prices M4: they cannot trade, and do not page market_no_price");
+    assert_eq!((listed.key(), listed.severity), ("market_unfed{market=4}".to_owned(), Some(Severity::Warning)));
     assert!(check(markets(&[1, 2, 3, 4], true), 180).is_empty());
+    let [second] = check(markets(&[1, 2, 3, 4, 5], true), 181).try_into().unwrap();
+    assert_eq!((second.key(), second.severity), ("market_unfed{market=5}".to_owned(), Some(Severity::Warning)));
+    assert!(check(markets(&[1, 2, 3, 4, 5], true), 240).is_empty());
 }
 
 #[test]

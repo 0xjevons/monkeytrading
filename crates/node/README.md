@@ -418,8 +418,8 @@ Critical `market_no_price` once it has had no usable price for `alerts.no_price_
 index, or for a market quoted in another currency the FX index it converts at), and a
 sequencer that answers no sample for as long raises `sequencer_stalled`. A market that no configured
 feed prices, such as the non-crypto markets of `config/dev.toml` with `feeds.provider = "venues"`,
-cannot trade; the node names such markets once, in the Warning `market_unfed`, and never pages for
-them.
+cannot trade; the node names each such market once, in its own Warning `market_unfed`, and never
+pages for them.
 
 An alert is a log line at `error` (Critical) or `warn` (Warning) carrying `alert = "<name>"`; a line
 carrying `alert_resolved = "<name>"` and the same fields ends it. With `[alerts.critical]` or
