@@ -14,6 +14,7 @@ mod fakes;
 mod reorg;
 use crate::custody::tests::fakes::*;
 mod quorum;
+mod quorum_diagnostics;
 mod rpc;
 
 #[test]

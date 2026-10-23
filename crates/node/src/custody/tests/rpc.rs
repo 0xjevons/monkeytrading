@@ -97,3 +97,47 @@ fn log(data: LogData) -> Log {
         ..Log::default()
     }
 }
+
+#[test]
+fn null_and_wrong_height_headers_are_typed_content_errors_and_valid_headers_keep_their_values() {
+    use crate::custody::rpc::{InvalidRpcResponse, decode_header};
+    let mut header: alloy::rpc::types::Header = Default::default();
+    header.inner.number = 7;
+    header.hash = B256::repeat_byte(7);
+    header.inner.parent_hash = B256::repeat_byte(6);
+    let decoded = decode_header(Some(header.clone()), 7).unwrap();
+    assert_eq!((decoded.number, decoded.hash, decoded.parent_hash), (7, header.hash, header.parent_hash));
+    for result in [None, Some(header)] {
+        let err = decode_header(result, 8).unwrap_err();
+        assert!(err.is::<InvalidRpcResponse>(), "{err:#}");
+        assert!(format!("{err:#}").contains('8'));
+    }
+}
+
+#[tokio::test]
+async fn malformed_successful_header_payloads_are_content_errors_but_timeouts_are_not() {
+    use crate::custody::rpc::InvalidRpcResponse;
+    use axum::{Json, Router, routing::post};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().route(
+        "/",
+        post(|Json(request): Json<serde_json::Value>| async move {
+            let replies: Vec<_> = request.as_array().unwrap().iter().map(|request| {
+            serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":{"number":"not-a-number"}})
+        }).collect();
+            Json(replies)
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let err = rpc_at(&url).headers(1, 1).await.unwrap_err();
+    server.abort();
+    let _ = server.await;
+    assert!(err.is::<InvalidRpcResponse>(), "{err:#}");
+    let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let err = rpc_at(&format!("http://{}", silent.local_addr().unwrap())).headers(1, 1).await.unwrap_err();
+    assert!(!err.is::<InvalidRpcResponse>(), "{err:#}");
+    assert!(format!("{err:#}").contains("timed out"));
+}

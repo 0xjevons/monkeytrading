@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use crate::config::EvmCustodySection;
 use crate::custody::chain::BlockLink;
 use crate::custody::evm::{BlockRef, Finality, HeadSupport, VaultDeposit, VaultIdentity, VaultReader};
-use crate::custody::rpc::VaultRpc;
+use crate::custody::rpc::{InvalidRpcResponse, VaultRpc};
 
 /// Independent providers and their alert identities; the watcher owns the reader.
 pub(crate) struct Quorum<R> {
@@ -185,7 +185,13 @@ impl<R: VaultReader + Sync> VaultReader for Quorum<R> {
                     }
                     match (common, f.tagged) {
                         (Some(number), Some(tagged)) if tagged.number >= number => {
-                            let header = last_header(reader.headers(number, number).await?, number)?;
+                            let header = reader
+                                .headers(number, number)
+                                .await
+                                .and_then(|headers| last_header(headers, number))
+                                .inspect_err(|cause| {
+                                    contradicted |= cause.is::<InvalidRpcResponse>();
+                                })?;
                             if tagged.number == number && tagged.hash != header.hash {
                                 contradicted = true;
                                 bail!("finality tag disagrees with the provider's header");
@@ -286,9 +292,9 @@ fn majority<T: PartialEq>(answers: &[anyhow::Result<T>], required: usize) -> Opt
 /// Error cases:
 /// - a missing, extra, or wrong-height header
 fn last_header(headers: Vec<BlockLink>, number: u64) -> anyhow::Result<BlockLink> {
-    let header = headers.first().copied().context("provider has no requested block")?;
+    let header = headers.first().copied().ok_or(InvalidRpcResponse).context("provider has no requested block")?;
     if headers.len() != 1 || header.number != number {
-        bail!("provider returned the wrong header range");
+        return Err(anyhow::Error::new(InvalidRpcResponse).context("provider returned the wrong header range"));
     }
     Ok(header)
 }

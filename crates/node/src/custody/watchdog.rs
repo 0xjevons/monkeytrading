@@ -12,12 +12,18 @@ use tracing::{error, info};
 use crate::clock::now_ms;
 use crate::custody::evm::HeadSupport;
 
+/// One provider's baseline and retained valid advancement during the current finality anchor.
+struct HeadProgress {
+    baseline: Option<u64>,
+    advanced: bool,
+}
+
 /// The highest final block seen, the head when it was, and since when the head has moved on
 /// without the final block rising.
 struct FinalitySeen {
     highest: Option<u64>,
     head: u64,
-    heads: Vec<Option<u64>>,
+    heads: Vec<HeadProgress>,
     moving_since: Option<Instant>,
     alerted: bool,
 }
@@ -117,7 +123,11 @@ impl Watchdog {
             self.finality = Some(FinalitySeen {
                 highest: final_block,
                 head,
-                heads: support.map(|s| s.heads.clone()).unwrap_or_default(),
+                heads: support
+                    .map(|s| {
+                        s.heads.iter().copied().map(|baseline| HeadProgress { baseline, advanced: false }).collect()
+                    })
+                    .unwrap_or_default(),
                 moving_since: None,
                 alerted: false,
             });
@@ -127,15 +137,19 @@ impl Watchdog {
         let advanced = if let Some(support) = support {
             // Provider indices belong to one immutable Quorum owned by this watcher.
             assert_eq!(seen.heads.len(), support.heads.len(), "custody provider set is immutable");
-            let mut advancing = 0;
-            for (baseline, current) in seen.heads.iter_mut().zip(&support.heads) {
-                match (*baseline, *current) {
-                    (Some(before), Some(now)) if now > before => advancing += 1,
-                    (None, Some(now)) => *baseline = Some(now),
+            for (progress, current) in seen.heads.iter_mut().zip(&support.heads) {
+                match (progress.baseline, *current) {
+                    (Some(before), Some(now)) if now > before => progress.advanced = true,
+                    (None, Some(now)) => progress.baseline = Some(now),
                     _ => {}
                 }
             }
-            advancing >= support.required
+            seen.heads
+                .iter()
+                .zip(&support.heads)
+                .filter(|(progress, current)| progress.advanced && current.is_some())
+                .count()
+                >= support.required
         } else {
             head > seen.head
         };

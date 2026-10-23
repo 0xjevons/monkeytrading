@@ -410,7 +410,7 @@ async fn a_newly_admitted_head_sets_its_baseline_without_fabricating_progress() 
 // ── Helpers ──
 
 /// Three independent fake chains, all final through block one.
-fn chains() -> [FakeChain; 3] {
+pub(super) fn chains() -> [FakeChain; 3] {
     std::array::from_fn(|_| {
         let chain = FakeChain::default();
         chain.set_final(Some(1));
@@ -420,14 +420,14 @@ fn chains() -> [FakeChain; 3] {
 }
 
 /// A quorum that keeps the tests' handles to each provider.
-async fn quorum(chains: &[FakeChain; 3]) -> Quorum<FakeChain> {
+pub(super) async fn quorum(chains: &[FakeChain; 3]) -> Quorum<FakeChain> {
     let quorum = Quorum::new(chains.iter().enumerate().map(|(i, c)| (format!("p{i}"), c.clone())).collect()).unwrap();
     quorum.identity().await.unwrap();
     quorum
 }
 
 /// A real watcher and sequencer around quorum reads.
-fn watcher(chains: &[FakeChain; 3], dir: &std::path::Path) -> DepositWatcher<Quorum<FakeChain>> {
+pub(super) fn watcher(chains: &[FakeChain; 3], dir: &std::path::Path) -> DepositWatcher<Quorum<FakeChain>> {
     let cfg: EvmCustodySection = toml::from_str(&evm_toml(dir, 100)).unwrap();
     DepositWatcher::start(
         Quorum::new(chains.iter().enumerate().map(|(i, c)| (format!("p{i}"), c.clone())).collect()).unwrap(),

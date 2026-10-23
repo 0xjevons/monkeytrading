@@ -37,6 +37,15 @@ pub(super) const USDC: u64 = 1_000_000;
 #[derive(Clone, Default)]
 pub(super) struct FakeChain(pub(super) Arc<Mutex<ChainState>>);
 
+/// Successful header payload faults, distinct from a failed transport.
+#[derive(Clone, Copy)]
+pub(super) enum BadHeaders {
+    Missing,
+    Empty,
+    WrongHeight,
+    Extra,
+}
+
 #[derive(Default)]
 pub(super) struct ChainState {
     /// What the endpoint reports; the configured chain and token when `None`.
@@ -50,6 +59,7 @@ pub(super) struct ChainState {
     pub(super) tag_hash: Option<B256>,
     /// Header reads to fail before they answer again.
     pub(super) header_failures: u32,
+    pub(super) bad_headers: Option<BadHeaders>,
     /// Refuse header batches of more blocks than this, like a provider's batch limit.
     pub(super) header_batch_cap: Option<u64>,
     /// Header reads to fail, by their order among all header reads.
@@ -129,9 +139,25 @@ impl VaultReader for FakeChain {
             0 => B256::ZERO,
             _ => chain.hash_at(number - 1),
         };
-        Ok((from..=to)
+        let mut headers: Vec<_> = (from..=to)
             .map(|number| BlockLink { number, hash: chain.hash_at(number), parent_hash: parent(number) })
-            .collect())
+            .collect();
+        match chain.bad_headers {
+            Some(BadHeaders::Missing) => return crate::custody::rpc::decode_header(None, from).map(|h| vec![h]),
+            Some(BadHeaders::Empty) => headers.clear(),
+            Some(BadHeaders::WrongHeight) => {
+                if let Some(header) = headers.first_mut() {
+                    header.number ^= 1;
+                }
+            }
+            Some(BadHeaders::Extra) => {
+                if let Some(header) = headers.first().copied() {
+                    headers.push(header);
+                }
+            }
+            None => {}
+        }
+        Ok(headers)
     }
 
     async fn deposits(&self, from: u64, to: u64) -> anyhow::Result<Vec<VaultDeposit>> {

@@ -176,6 +176,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   refuses
 - `src/custody/tests/fakes.rs` — the fake chain, test sequencer, log capture, and fixtures
 - `src/custody/tests/quorum.rs` — fabrication, disagreement, lag, outages, and quorum recovery
+- `src/custody/tests/quorum_diagnostics.rs` — malformed header exclusion, transport independence, and retained watchdog progress
 - `src/custody/tests/rpc.rs` — the RPC adapter's log decoding, deadlines, and URL scrubbing
 - `src/custody/tests/reorg.rs` — reorgs and forked answers against the proven chain
 - `src/feeds/mod.rs` — the feed index and the mock feed
