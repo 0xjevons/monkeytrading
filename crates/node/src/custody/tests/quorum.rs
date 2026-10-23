@@ -266,6 +266,49 @@ async fn every_query_requires_current_identity_eligibility_and_failed_identity_c
     assert!(quorum.deposit_count(BlockRef { number: 1, hash: other_hash }).await.is_err());
 }
 
+#[tokio::test]
+async fn minority_head_and_timestamp_extremes_cannot_override_majority_diagnostics() {
+    let chains = chains();
+    let quorum = quorum(&chains).await;
+    for (minority_head, minority_time, expected_head, expected_time) in [(1, 1, 10, 100), (999, 999_999, 11, 101)] {
+        for (i, chain) in chains.iter().take(2).enumerate() {
+            let mut state = chain.0.lock().unwrap();
+            state.head = 10 + i as u64;
+            state.head_time = Some(100 + i as u64);
+        }
+        chains[2].0.lock().unwrap().head = minority_head;
+        chains[2].0.lock().unwrap().head_time = Some(minority_time);
+        let finality = quorum.finality().await.unwrap();
+        assert_eq!((finality.head, finality.head_time), (expected_head, expected_time));
+        assert_eq!(finality.tagged.unwrap().hash, canonical_hash(1));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_pinned_head_cannot_hide_a_genuine_finality_stall_and_recovery_resolves_it() {
+    let dir = scratch("quorum-pinned-head");
+    let node = Node::start(&dir);
+    let chains = chains();
+    let mut watcher = watcher(&chains, &dir);
+    let (logs, _guard) = Logs::capture();
+    for chain in &chains[..2] {
+        chain.0.lock().unwrap().head = 10;
+    }
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Read { .. })));
+    for chain in &chains[..2] {
+        chain.0.lock().unwrap().head = 11;
+    }
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    assert_eq!(logs.lines_with("alert=\"custody_finality_stalled\"").len(), 1);
+    for chain in &chains[..2] {
+        chain.set_final(Some(2));
+    }
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Read { .. })));
+    assert_eq!(logs.lines_with("alert_resolved=\"custody_finality_stalled\"").len(), 1);
+}
+
 // ── Helpers ──
 
 /// Three independent fake chains, all final through block one.

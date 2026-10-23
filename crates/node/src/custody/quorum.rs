@@ -203,8 +203,8 @@ impl<R: VaultReader + Sync> VaultReader for Quorum<R> {
         }
         let (tagged, voters) = self.vote("finality", votes)?;
         let heads = voters.iter().map(|&i| answers[i].as_ref().expect("a finality vote has an answer"));
-        let head = heads.clone().map(|f| f.head).min().expect("a quorum is nonempty");
-        let head_time = heads.map(|f| f.head_time).min().expect("a quorum is nonempty");
+        let head = quorum_lower_bound(heads.clone().map(|f| f.head), self.required);
+        let head_time = quorum_lower_bound(heads.map(|f| f.head_time), self.required);
         Ok(Finality { head, head_time, tagged })
     }
 
@@ -244,6 +244,13 @@ impl<R: VaultReader + Sync> VaultReader for Quorum<R> {
         .await;
         self.vote("deposit_count", answers).map(|v| v.0)
     }
+}
+
+/// A diagnostic lower bound supported by the full configured majority, ignoring minority extremes.
+fn quorum_lower_bound(values: impl Iterator<Item = u64>, required: usize) -> u64 {
+    let mut values: Vec<_> = values.collect();
+    values.sort_unstable_by(|a, b| b.cmp(a));
+    *values.get(required - 1).expect("successful finality voters meet the configured threshold")
 }
 
 /// The first value with enough identical successful answers; strict majorities cannot tie.

@@ -235,6 +235,8 @@ wait_for trader_balance 1377
 mine 3
 stays trader_balance 1377
 
+# Ordinary deposits, restarts, rescans and reorgs must remain free of alerts in both modes.
+if grep -q 'alert=' "$work/node.log"; then fail "unexpected alert before fault injection: $(grep -m 1 'alert=' "$work/node.log")"; fi
 expected_deposits=5
 if [[ "${RPC_QUORUM_SCENARIO:-0}" == "1" ]]; then
   step "A fictional deposit from one provider is ignored and alerted"
@@ -281,7 +283,12 @@ deposits="$(jq -c 'select(.entry == "command" and (.cmd.type == "deposit" or .cm
 [[ "$deposits" == "$expected_deposits" ]] || fail "expected $expected_deposits deposit commands in the log, found $deposits"
 "$engine" replay --log "$work/log" | grep -q '^verified' || fail "the log does not replay"
 # Restarts, the rescan, and the reorg are all expected: none of them may raise an alert.
-if [[ "${RPC_QUORUM_SCENARIO:-0}" != "1" ]] && grep -q 'alert=' "$work/node.log"; then fail "unexpected alert: $(grep -m 1 'alert=' "$work/node.log")"; fi
+if [[ "${RPC_QUORUM_SCENARIO:-0}" == "1" ]]; then
+  unexpected="$(grep 'alert=' "$work/node.log" | grep -Ev 'alert="(custody_rpc_provider_failed|custody_rpc_provider_disagreed|custody_rpc_quorum_lost|custody_rpc_failed)"' || true)"
+  [[ -z "$unexpected" ]] || fail "unexpected fault-phase alert: $unexpected"
+elif grep -q 'alert=' "$work/node.log"; then
+  fail "unexpected alert: $(grep -m 1 'alert=' "$work/node.log")"
+fi
 
 echo "PASS: every deposit credited once after finality; house NAV equals house deposits"
 if [[ "${RPC_QUORUM_SCENARIO:-0}" == "1" ]]; then
