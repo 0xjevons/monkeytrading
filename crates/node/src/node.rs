@@ -57,7 +57,8 @@ pub(crate) async fn run_with_cpu(cfg: NodeConfig, telemetry: Telemetry, cpu: Opt
     if !pages_critical {
         warn!("no alerts.critical webhook: Critical alerts are only logged");
     }
-    let mut routing = alerts.spawn(cfg.alerts.episode_quiet)?;
+    cfg.alerts.outbox.check_disk_location(&cfg.node.log_dir)?;
+    let mut routing = alerts.spawn(cfg.alerts.episode_quiet, &cfg.alerts.outbox).await?;
     let outcome = serve_node(cfg, metrics, &mut routing, cpu).await;
     routing.drain(SHUTDOWN_GRACE).await;
     outcome
@@ -337,6 +338,7 @@ mod tests {
         let last = commands.next_back().expect("the log holds commands");
 
         let mut cfg = dev_config();
+        cfg.alerts.outbox.dir = scratch_dir(&format!("node-outbox-{}", rand::random::<u64>()));
         (cfg.node.log_dir, cfg.history.dir, cfg.history.retention) = (dir, index, RETENTION);
         let (_guard, mut alerts) = capture_alerts();
         let (_, history) = read_log_and_history(&cfg).unwrap();
@@ -352,6 +354,7 @@ mod tests {
         let (kept, index) = index_ahead_of_log("node-history-ahead").await;
         let held = net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut cfg = dev_config();
+        cfg.alerts.outbox.dir = scratch_dir(&format!("node-outbox-{}", rand::random::<u64>()));
         (cfg.node.log_dir, cfg.history.dir) = (kept.clone(), index.clone());
         cfg.node.listen = held.local_addr().unwrap();
         cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
@@ -381,6 +384,7 @@ mod tests {
         let before = files(&kept);
 
         let mut cfg = dev_config();
+        cfg.alerts.outbox.dir = scratch_dir(&format!("node-outbox-{}", rand::random::<u64>()));
         (cfg.node.log_dir, cfg.history.dir) = (kept.clone(), index);
         cfg.node.listen = "127.0.0.1:0".parse().unwrap();
         cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
@@ -410,6 +414,7 @@ mod tests {
         let before = files(&dir);
 
         let mut cfg = dev_config();
+        cfg.alerts.outbox.dir = scratch_dir(&format!("node-outbox-{}", rand::random::<u64>()));
         (cfg.node.log_dir, cfg.history.dir) = (dir.clone(), index);
         cfg.node.listen = "127.0.0.1:0".parse().unwrap();
         cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
@@ -426,6 +431,7 @@ mod tests {
     async fn a_genesis_the_engine_would_reject_stops_the_node_with_an_alert_and_writes_nothing() {
         let (dir, index) = (scratch_dir("node-genesis-refused"), scratch_dir("node-genesis-refused-index"));
         let mut cfg = dev_config();
+        cfg.alerts.outbox.dir = scratch_dir(&format!("node-outbox-{}", rand::random::<u64>()));
         (cfg.node.log_dir, cfg.history.dir) = (dir.clone(), index);
         cfg.node.listen = "127.0.0.1:0".parse().unwrap();
         cfg.genesis.benchmarks[0].annual_bps = 40_000;

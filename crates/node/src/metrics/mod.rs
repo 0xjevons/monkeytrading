@@ -98,6 +98,7 @@ pub struct Metrics {
     pub market_priced: Family<MarketLabel, Gauge>,
     pub quote_timestamp_seconds: Family<QuoteLabels, FloatGauge>,
     pub alerts_dropped: Counter,
+    pub alert_outbox_overflows: Counter,
     pub alert_deliveries: Family<DeliveryLabels, Counter>,
     pub alert_attempts_failed: Family<SeverityLabel, Counter>,
     pub alert_pages_pending: Family<SeverityLabel, Gauge>,
@@ -124,11 +125,17 @@ impl Metrics {
             market_priced: Family::default(),
             quote_timestamp_seconds: Family::default(),
             alerts_dropped: Counter::default(),
+            alert_outbox_overflows: Counter::default(),
             alert_deliveries: Family::default(),
             alert_attempts_failed: Family::default(),
             alert_pages_pending: Family::default(),
         };
         let r = &mut metrics.registry;
+        r.register(
+            "alert_outbox_overflows",
+            "Pages refused by durable outbox size bounds",
+            metrics.alert_outbox_overflows.clone(),
+        );
         r.register("commands", "Commands sequenced", metrics.commands.clone());
         r.register(
             "sequencer_batch_seconds",

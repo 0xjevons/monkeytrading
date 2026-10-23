@@ -17,7 +17,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{fmt, registry};
 
 use crate::alerts::webhook::Retry;
-use crate::config::{AlertsSection, WebhookRoute, WebhookUrl};
+use crate::config::{AlertsSection, OutboxSection, WebhookRoute, WebhookUrl};
 use crate::metrics::SeverityLabel;
 use crate::test_support::Written;
 
@@ -132,7 +132,7 @@ async fn routing_posts_one_page_per_episode_start_and_end_to_its_severitys_webho
     let metrics = Arc::new(Metrics::new());
     let routes = routes(Some(&receiver.url("/hook/secret-token")), None);
     let (layer, router) = channel(routes, metrics.clone());
-    let routing = router.spawn(Duration::from_secs(3600)).unwrap();
+    let routing = router.spawn(Duration::from_secs(3600), &outbox_config()).await.unwrap();
     for line in [alert("market_no_price", 1), alert("market_no_price", 1), warning("bad_debt", 1)] {
         layer.lines.send(line).await.unwrap();
     }
@@ -159,7 +159,7 @@ async fn an_untracked_resolve_goes_to_every_route() {
     let (critical, warning) = (Receiver::start(vec![]).await, Receiver::start(vec![]).await);
     let routes = routes(Some(&critical.url("/c")), Some(&warning.url("/w")));
     let (layer, router) = channel(routes, Arc::new(Metrics::new()));
-    let routing = router.spawn(Duration::from_secs(3600)).unwrap();
+    let routing = router.spawn(Duration::from_secs(3600), &outbox_config()).await.unwrap();
     layer.lines.send(resolve("market_no_price", 1)).await.unwrap();
     routing.drain(Duration::from_secs(10)).await;
     for (receiver, severity) in [(critical, "critical"), (warning, "warning")] {
@@ -168,28 +168,28 @@ async fn an_untracked_resolve_goes_to_every_route() {
     }
 }
 
-#[test]
-fn a_page_for_a_full_route_queue_is_dropped_counted_and_its_episode_forgotten() {
-    let metrics = Metrics::new();
+#[tokio::test]
+async fn a_full_outbox_refuses_the_page_counts_overflow_and_forgets_its_episode() {
+    let metrics = Arc::new(Metrics::new());
     let mut episodes = Episodes::new(Duration::from_secs(3600));
     let t0 = Instant::now();
-    let (queue, mut queued) = mpsc::channel(1);
-    let queues = Queues { critical: Some(queue), warning: None };
-    let lines = capture(|| {
-        for market in 0..3 {
-            let Some(Routed::One(page)) = episodes.on_line(alert("flood", market), t0) else { panic!() };
-            enqueue(&queues, &mut episodes, page, &metrics);
-        }
-    });
-    // The drop is logged without an `alert` field, so it queues no page of its own.
-    assert!(lines.is_empty(), "{lines:?}");
-    assert_eq!(queued.try_recv().unwrap().key, "flood{market=0}");
+    let (queue, _queued) = mpsc::channel(1);
+    let mut tasks = JoinSet::new();
+    let cfg = OutboxSection { max_pages: 1, ..outbox_config() };
+    let outbox = Outbox::start(cfg, [true, false], metrics.clone(), &mut tasks).await.unwrap();
+    let queues = Queues { critical: Some(queue), warning: None, outbox };
+    for market in 0..3 {
+        let Some(Routed::One(page)) = episodes.on_line(alert("flood", market), t0) else { panic!() };
+        enqueue(&queues, &mut episodes, page, &metrics).await.unwrap();
+    }
+    assert_eq!(queues.outbox.next(Severity::Critical).await.unwrap().unwrap().page.key, "flood{market=0}");
     assert_eq!(delivered(&metrics, "critical", "dropped"), 2);
-    // Only the queued page is pending; the dropped ones are counted as dropped instead.
+    assert_eq!(metrics.alert_outbox_overflows.get(), 2);
     assert_eq!(pending(&metrics, "critical"), 1);
-    // A dropped page's episode pages again; a queued one's does not.
     assert!(matches!(episodes.on_line(alert("flood", 1), t0), Some(Routed::One(_))));
     assert_eq!(episodes.on_line(alert("flood", 0), t0), None);
+    drop(queues);
+    while tasks.join_next().await.is_some() {}
 }
 
 /// Every way a post can end, through the route queue and its delivery task: the page is counted
@@ -263,22 +263,21 @@ async fn a_routing_task_that_dies_is_reported_and_drain_still_returns() {
     }
 }
 
-#[test]
-fn a_page_for_a_route_whose_delivery_stopped_is_dropped_counted_and_logged() {
-    let metrics = Metrics::new();
+#[tokio::test]
+async fn a_stopped_route_leaves_its_committed_page_pending_and_stops_the_router() {
+    let metrics = Arc::new(Metrics::new());
+    let mut tasks = JoinSet::new();
+    let outbox = Outbox::start(outbox_config(), [true, false], metrics.clone(), &mut tasks).await.unwrap();
     let mut episodes = Episodes::new(Duration::from_secs(3600));
-    let (queue, delivery) = mpsc::channel(8);
+    let (queue, delivery) = mpsc::channel(1);
     drop(delivery);
-    let queues = Queues { critical: Some(queue), warning: None };
-    let written = Written::default();
-    let logging = registry().with(fmt::layer().with_writer(written.clone()).with_ansi(false));
-    with_default(logging, || {
-        let Some(Routed::One(page)) = episodes.on_line(alert("flood", 1), Instant::now()) else { panic!() };
-        enqueue(&queues, &mut episodes, page, &metrics);
-    });
-    assert_eq!((delivered(&metrics, "critical", "dropped"), pending(&metrics, "critical")), (1, 0));
-    let text = written.text();
-    assert!(text.contains("alert page dropped: the route's delivery task has stopped"), "{text}");
+    let queues = Queues { critical: Some(queue), warning: None, outbox };
+    let Some(Routed::One(page)) = episodes.on_line(alert("flood", 1), Instant::now()) else { panic!() };
+    assert!(enqueue(&queues, &mut episodes, page, &metrics).await.unwrap_err().to_string().contains("stopped"));
+    assert_eq!(pending(&metrics, "critical"), 1);
+    assert_eq!(queues.outbox.next(Severity::Critical).await.unwrap().unwrap().page.key, "flood{market=1}");
+    drop(queues);
+    while tasks.join_next().await.is_some() {}
 }
 
 #[tokio::test]
@@ -300,9 +299,9 @@ async fn drain_gives_up_after_its_grace_and_stops_the_tasks() {
     let written = Written::default();
     let _logging = set_default(registry().with(fmt::layer().with_writer(written.clone()).with_ansi(false)));
     routing.drain(Duration::from_millis(10)).await;
-    // The loss is logged with how many pages it was.
+    // The retained pending count is logged.
     let text = written.text();
-    assert!(text.contains("alert pages lost at shutdown") && text.contains("critical=2 warning=0"), "{text}");
+    assert!(text.contains("committed pages remain in the outbox") && text.contains("critical=2 warning=0"), "{text}");
     // Each task's sender is dropped only when the task is aborted.
     let stopped = |rx: oneshot::Receiver<()>| timeout(Duration::from_secs(5), rx);
     assert!(matches!(stopped(router_stopped).await, Ok(Err(_))));
@@ -346,6 +345,7 @@ fn status(routed: Option<Routed>) -> Option<Status> {
 /// Routes to `critical` and `warning`, through environment variables.
 fn routes(critical: Option<&str>, warning: Option<&str>) -> Routes {
     let cfg = AlertsSection {
+        outbox: outbox_config(),
         no_price_after: Duration::from_secs(5),
         episode_quiet: Duration::from_secs(60),
         critical: critical.map(|_| WebhookRoute { url_env: "CRITICAL".into() }),
@@ -367,9 +367,10 @@ fn secret(url: &str) -> WebhookUrl {
 /// delivery task.
 async fn deliver_through_route(url: &str, metrics: &Arc<Metrics>, retry: Retry) {
     let mut tasks = JoinSet::new();
-    let queues = Queues::start(routes(Some(url), None), client().unwrap(), metrics, retry, &mut tasks);
+    let outbox = Outbox::start(outbox_config(), [true, false], metrics.clone(), &mut tasks).await.unwrap();
+    let queues = Queues::start(routes(Some(url), None), client().unwrap(), metrics, retry, outbox, &mut tasks);
     let mut episodes = Episodes::new(Duration::from_secs(60));
-    enqueue(&queues, &mut episodes, page(), metrics);
+    enqueue(&queues, &mut episodes, page(), metrics).await.unwrap();
     drop(queues);
     while tasks.join_next().await.is_some() {}
 }
@@ -432,4 +433,38 @@ async fn accept(State(state): State<Arc<Mutex<ReceiverState>>>, Json(body): Json
     }
     state.bodies.push(body);
     StatusCode::OK
+}
+
+/// Separate on-disk state for each caller, including table-driven test rows.
+fn outbox_config() -> OutboxSection {
+    OutboxSection {
+        dir: crate::test_support::scratch_dir(&format!("alert-outbox-{}", rand::random::<u64>())),
+        max_pages: 1024,
+        max_bytes: 1_048_576,
+        max_age: Duration::from_secs(3600),
+    }
+}
+
+#[tokio::test]
+async fn restart_delivers_committed_pages_in_route_order_with_their_original_episode_keys() {
+    let cfg = outbox_config();
+    let mut tasks = JoinSet::new();
+    let outbox = Outbox::start(cfg.clone(), [true, true], Arc::new(Metrics::new()), &mut tasks).await.unwrap();
+    for (market, severity) in [(1, Severity::Critical), (2, Severity::Warning), (3, Severity::Critical)] {
+        let line = alert("offline", market);
+        outbox.add(Page::new(line.clone(), line.key(), Status::Firing, severity)).await.unwrap();
+    }
+    drop(outbox);
+    while tasks.join_next().await.is_some() {}
+    let (critical, warning) = (Receiver::start(vec![]).await, Receiver::start(vec![]).await);
+    let metrics = Arc::new(Metrics::new());
+    let (_layer, router) = channel(routes(Some(&critical.url("/c")), Some(&warning.url("/w"))), metrics.clone());
+    router.spawn(Duration::from_secs(60), &cfg).await.unwrap().drain(Duration::from_secs(10)).await;
+    assert_eq!(
+        critical.bodies().iter().map(|b| b["key"].as_str().unwrap()).collect::<Vec<_>>(),
+        ["offline{market=1}", "offline{market=3}"]
+    );
+    assert_eq!(warning.bodies()[0]["key"], "offline{market=2}");
+    assert!(critical.bodies().iter().all(|b| b["ts_ms"] == 1_700_000_000_000_i64));
+    assert_eq!((pending(&metrics, "critical"), pending(&metrics, "warning")), (0, 0));
 }

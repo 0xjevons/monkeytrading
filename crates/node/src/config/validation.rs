@@ -96,6 +96,8 @@ impl NodeConfig {
         if let Some(s) = servers.iter().find(|s| !is_host_port(&s.address)) {
             anyhow::bail!("time.servers address {:?} is not host:port", s.address);
         }
+        self.alerts.outbox.validate()?;
+        self.alerts.outbox.validate_location(&self.node.log_dir)?;
         self.history.retention_ms().context("history.retention")?;
         self.validate_custody()?;
         // Without a Critical webhook, Critical alerts reach only the node's own log, so a node

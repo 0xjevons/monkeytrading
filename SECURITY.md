@@ -102,6 +102,8 @@ finding that breaks one of these guarantees, or gets past one of those checks, i
 it starts from an operator's key. Some of the checks behind them are still being built: `engine
 replay` does not yet verify checkpoint signatures; the node does not yet check the log it recovers
 from against anything its host cannot rewrite, so it accepts a truncated or rewritten one; the
+alert outbox persists pages on host disk, whose schema and rows it checks but whose deletion or
+rollback it cannot detect, and its cross-restart age budget uses an unsealed host clock; the
 account history index is read from host disk with only its schema checked, and is matched to the log
 by one command, the newest it has taken, though SQLite reads it in defensive mode and each event it
 serves names its place in the log, where anyone can check it; the sequencer, which bounds its host's

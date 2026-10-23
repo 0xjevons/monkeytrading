@@ -29,7 +29,7 @@ an index: load only the rule whose hint matches the current action.
   TEE attestation (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime
   servers, the custody adapter (mock, or EVM vault deposits over alloy), price feeds: live crypto
   venue WebSockets (`feeds/`, one adapter per venue) and a mock, Prometheus metrics on an operator
-  listener, and alert routing to webhooks. `tests/reference/` holds the node-format reference log
+  listener, and alert routing to webhooks with a bounded durable outbox outside the public log. `tests/reference/` holds the node-format reference log
   per protocol version, with events, written once by `examples/reference_log.rs`. Its `README.md`
   lists every file.
 - **contracts/** — Foundry project for the custody vault. `src/Vault.sol` takes USDC deposits of
@@ -63,14 +63,16 @@ an index: load only the rule whose hint matches the current action.
   public data it studies, inside `research/` and its PR only.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate;
   `check-reference-logs.sh`, which fails a branch that changes a committed reference log;
-  `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil; and `dev-metrics-alerts.sh`,
-  the metrics and alert routing dev scenario.
+  `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil; `dev-metrics-alerts.sh`,
+  the metrics and alert routing dev scenario; `dev-alert-outbox.sh`, the isolated alert retry
+  kill/restart scenario.
 - **ops/** — operator assets: `grafana/engine-node.json`, the node's Grafana dashboard, and
   `prometheus/engine-node-rules.yml`, the alerting rules for a down node or failing alert pages.
 - **.github/workflows/** — `ci.yaml`: fmt, the file line cap, clippy, tests, the reference-log
   replay and invariant tests on x86_64 and aarch64 Linux, the unchanged-reference-log check,
   `cargo-deny`, the contracts' `forge fmt --check` / build / test, the vault deposit dev scenario,
-  and the metrics and alert routing dev scenario, on every push to `main` and every PR. Actions are
+  the metrics and alert routing dev scenario, and the alert outbox kill/restart scenario, on every push to `main` and
+  every PR. Actions are
   pinned by commit SHA. `ci-passed` is the one CI check branch rules require: it passes only when
   every other job succeeded, so each new job must be added to its `needs`. The test job also checks
   command latency budgets against 100k-account fixtures.
@@ -122,6 +124,8 @@ Run from the repo root:
   log directory, a downloaded archive, or a single log file
 - Contracts, from `contracts/`: `forge soldeer install` (once, fetches the pinned dependencies),
   then `forge fmt --check`, `forge build`, and `forge test`
+- Alert outbox kill/restart dev scenario: `./scripts/dev-alert-outbox.sh` (needs `python3`,
+  `curl`, and `jq`; uses loopback endpoints and private temporary data)
 - Vault deposit dev scenario: `./scripts/dev-vault-deposits.sh` (starts Anvil, deploys the vault
   and a mock USDC, runs a node on `config/anvil.toml`, and checks each deposit credits once)
 - Sign and submit an admin command as the operator: `cargo run -p engine-node -- admin --pin <the

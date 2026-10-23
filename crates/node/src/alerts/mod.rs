@@ -5,9 +5,10 @@
 //! episodes, keyed by name and fields, and queues one page when an episode starts and one when it
 //! is resolved. Each routed severity has its own queue and delivery task, which posts its pages in
 //! order to that severity's webhook.
-//! Episodes live in memory: after a restart, an alert still firing pages again under the same key,
-//! and one that cleared while the node was down sends no resolve. Pages still queued or retrying
-//! when the shutdown grace runs out are lost; their alert lines remain in the log.
+//! Episodes live in memory; pending pages live in a bounded SQLite outbox outside the public log.
+//! After restart, pending pages resume in route order under their original episode key. A crash
+//! after receiver acceptance but before removal can repeat a page; receivers de-duplicate its key,
+//! status and timestamp. Alert lines not yet committed to the outbox can still be lost on a kill.
 //!
 //! The host controls the network and can drop pages. `ops/prometheus/engine-node-rules.yml` has the
 //! operator's Prometheus page when scrapes stop or posts fail, which catches an outage but not a
@@ -24,8 +25,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use engine_core::types::Millis;
-use serde::Serialize;
-use tokio::sync::mpsc::error::TrySendError;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, timeout};
@@ -37,6 +37,9 @@ use tracing_subscriber::registry::{Extensions, LookupSpan};
 
 mod episodes;
 use crate::alerts::episodes::{Episodes, Routed};
+mod outbox;
+use crate::alerts::outbox::Outbox;
+use crate::config::OutboxSection;
 mod webhook;
 pub use crate::alerts::webhook::Routes;
 use crate::alerts::webhook::{Queues, RETRY, client};
@@ -46,14 +49,14 @@ use crate::metrics::{DeliveryLabels, Metrics, SeverityLabel};
 /// Alert lines waiting for the router.
 const LINE_QUEUE: usize = 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Critical,
     Warning,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Firing,
@@ -77,7 +80,7 @@ pub struct AlertLine {
 
 /// What a webhook receives: an episode starting or ending. `key` is the same for both, so a
 /// receiver can match a resolve to its alert and drop duplicates.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Page {
     pub status: Status,
     pub severity: Severity,
@@ -258,10 +261,12 @@ impl LineFields {
 impl Router {
     /// Starts the router and delivery tasks.
     /// Error cases:
-    /// - the webhook HTTP client cannot be built
-    pub fn spawn(self, episode_quiet: Duration) -> anyhow::Result<Routing> {
+    /// - opening or validating the outbox, or building the webhook client fails
+    pub async fn spawn(self, episode_quiet: Duration, cfg: &OutboxSection) -> anyhow::Result<Routing> {
         let mut deliveries = JoinSet::new();
-        let queues = Queues::start(self.routes, client()?, &self.metrics, RETRY, &mut deliveries);
+        let routes = [self.routes.has(Severity::Critical), self.routes.has(Severity::Warning)];
+        let outbox = Outbox::start(cfg.clone(), routes, self.metrics.clone(), &mut deliveries).await?;
+        let queues = Queues::start(self.routes, client()?, &self.metrics, RETRY, outbox, &mut deliveries);
         let (drain_tx, drain_rx) = oneshot::channel();
         let episodes = Episodes::new(episode_quiet);
         let router = tokio::spawn(route(self.lines, queues, episodes, drain_rx, self.metrics.clone()));
@@ -270,7 +275,7 @@ impl Router {
 }
 
 impl Routing {
-    /// Resolves if any task stops before `drain`, which only a panic causes.
+    /// Reports any router, delivery, or outbox owner task that stops before shutdown.
     pub async fn stopped(&mut self) -> anyhow::Error {
         let joined = tokio::select! {
             joined = &mut self.router => ("alert router", joined),
@@ -298,7 +303,7 @@ impl Routing {
             let pending = |severity| self.metrics.alert_pages_pending.get_or_create(&SeverityLabel { severity }).get();
             let (critical, warning) = (pending("critical"), pending("warning"));
             // No `alert` field: routing is stopping, so it could not be paged.
-            error!(critical, warning, "alert pages lost at shutdown: still queued or being posted");
+            error!(critical, warning, "alert shutdown grace ended; committed pages remain in the outbox");
             self.router.abort();
             self.deliveries.abort_all();
         }
@@ -335,11 +340,17 @@ async fn route(
             line = lines.recv() => {
                 let Some(line) = line else { return };
                 match episodes.on_line(line, Instant::now()) {
-                    Some(Routed::One(page)) => enqueue(&queues, &mut episodes, page, &metrics),
-                    Some(Routed::Every(line, key)) => queues.all().for_each(|(severity, _)| {
+                    Some(Routed::One(page)) => {
+                        if let Err(e) = enqueue(&queues, &mut episodes, page, &metrics).await {
+                            error!("alert router stopped: {e:#}"); return;
+                        }
+                    },
+                    Some(Routed::Every(line, key)) => for (severity, _) in queues.all() {
                         let page = Page::new(line.clone(), key.clone(), Status::Resolved, severity);
-                        enqueue(&queues, &mut episodes, page, &metrics);
-                    }),
+                        if let Err(e) = enqueue(&queues, &mut episodes, page, &metrics).await {
+                            error!("alert router stopped: {e:#}"); return;
+                        }
+                    },
                     None => {}
                 }
             }
@@ -351,26 +362,28 @@ async fn route(
     }
 }
 
-/// Queues `page` for its severity's route, if it has one, counting it as pending until delivery
-/// finishes with it. When that queue is full, or its delivery task has stopped, the page is dropped,
-/// logged, and counted, and its episode forgotten so that a repeat pages again.
-fn enqueue(queues: &Queues, episodes: &mut Episodes, page: Page, metrics: &Metrics) {
-    let Some(queue) = queues.get(page.severity) else { return };
+/// Commits a page before waking its route. Capacity refusal forgets the episode so it may retry.
+/// Error cases:
+/// - the outbox cannot commit, or the route's supervised delivery task has stopped
+async fn enqueue(queues: &Queues, episodes: &mut Episodes, page: Page, metrics: &Metrics) -> anyhow::Result<()> {
+    let Some(queue) = queues.get(page.severity) else { return Ok(()) };
     let severity = page.severity.as_str();
-    let pending = metrics.alert_pages_pending.get_or_create(&SeverityLabel { severity }).clone();
-    // Counted before it is queued, so delivery cannot finish with it first.
-    pending.inc();
-    if let Err(refused) = queue.try_send(page) {
-        pending.dec();
-        let (page, why) = match refused {
-            TrySendError::Full(page) => (page, "the route's queue is full"),
-            TrySendError::Closed(page) => (page, "the route's delivery task has stopped"),
-        };
-        // No `alert` field: a dropped page must not queue another page.
-        error!(key = %page.key, severity, context = %page.context, "alert page dropped: {why}");
-        episodes.forget(&page.key);
+    let key = page.key.clone();
+    let context = page.context.clone();
+    if queues.outbox.add(page).await.inspect_err(|e| {
+        error!(key, severity, %context, "alert page persistence failed: {e:#}");
+    })? {
+        if queue.is_closed() {
+            return Err(anyhow!("alert delivery task stopped"));
+        }
+        // One wake is enough: delivery reads all committed rows before sleeping again.
+        let _ = queue.try_send(());
+    } else {
+        error!(key, severity, %context, "alert page refused: durable outbox size bound exceeded");
+        episodes.forget(&key);
         metrics.alert_deliveries.get_or_create(&DeliveryLabels { severity, outcome: "dropped" }).inc();
     }
+    Ok(())
 }
 
 /// `name{fields}` for a span with recorded fields, or else `name`.
