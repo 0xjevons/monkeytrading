@@ -330,6 +330,83 @@ async fn detected_tag_contradictions_cannot_supply_diagnostics_even_when_finalit
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn changing_minority_contributors_cannot_hide_majority_progress_from_unequal_baselines() {
+    let dir = scratch("quorum-changing-contributors");
+    let node = Node::start(&dir);
+    let chains = chains();
+    chains[1].set_final(Some(0));
+    let mut watcher = watcher(&chains, &dir);
+    let (logs, _guard) = Logs::capture();
+    for (chain, head) in chains.iter().zip([10, 100, 999]) {
+        chain.0.lock().unwrap().head = head;
+    }
+    chains[2].0.lock().unwrap().head_time = Some(u64::MAX);
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Read { .. })));
+    for (chain, head) in chains.iter().zip([11, 101, 1]) {
+        chain.0.lock().unwrap().head = head;
+    }
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    for (chain, head) in chains.iter().zip([12, 102, 1]) {
+        chain.0.lock().unwrap().head = head;
+    }
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    assert_eq!(logs.lines_with("alert=\"custody_finality_stalled\"").len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn minority_only_progress_cannot_start_the_watchdog_and_a_later_majority_can() {
+    let dir = scratch("quorum-minority-only-progress");
+    let node = Node::start(&dir);
+    let chains = chains();
+    let mut watcher = watcher(&chains, &dir);
+    let (logs, _guard) = Logs::capture();
+    for (chain, head) in chains.iter().zip([10, 100, 1]) {
+        chain.0.lock().unwrap().head = head;
+    }
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Read { .. })));
+    chains[2].0.lock().unwrap().head = 999;
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    assert_eq!(logs.lines_with("alert=\"custody_finality_stalled\"").len(), 0);
+    for chain in &chains[..2] {
+        chain.0.lock().unwrap().head += 1;
+    }
+    chains[2].0.lock().unwrap().head = 1;
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    assert_eq!(logs.lines_with("alert=\"custody_finality_stalled\"").len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_newly_admitted_head_sets_its_baseline_without_fabricating_progress() {
+    let dir = scratch("quorum-new-head-baseline");
+    let node = Node::start(&dir);
+    let chains = chains();
+    chains[0].0.lock().unwrap().head = 10;
+    chains[1].0.lock().unwrap().head = 1000;
+    chains[1].0.lock().unwrap().failing = true;
+    chains[2].0.lock().unwrap().head = 100;
+    let mut watcher = watcher(&chains, &dir);
+    let (logs, _guard) = Logs::capture();
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Read { .. })));
+    chains[1].0.lock().unwrap().failing = false;
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    assert_eq!(logs.lines_with("alert=\"custody_finality_stalled\"").len(), 0);
+    for index in [0, 2] {
+        chains[index].0.lock().unwrap().head += 1;
+    }
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Waiting)));
+    assert_eq!(logs.lines_with("alert=\"custody_finality_stalled\"").len(), 1);
+}
+
 // ── Helpers ──
 
 /// Three independent fake chains, all final through block one.

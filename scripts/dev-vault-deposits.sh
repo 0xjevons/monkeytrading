@@ -159,8 +159,24 @@ for port in "$rpc_a_port" "$rpc_b_port" "$rpc_c_port"; do
 done
 
 step "A first boot without trusted time stores the deposit cursor while the log is empty"
-sed -e "s#data/anvil#$work#g" -e "s#127.0.0.1:8545#127.0.0.1:$rpc_a_port#" -e "s#127.0.0.1:8546#127.0.0.1:$rpc_b_port#" -e "s#127.0.0.1:8547#127.0.0.1:$rpc_c_port#" -e "s#127.0.0.1:8080#127.0.0.1:$api_port#" \
-  -e "s#127.0.0.1:9464#127.0.0.1:$metrics_port#" config/anvil.toml >"$work/anvil.toml"
+# Rewrite original config tokens once so destination ports cannot cascade into later matches.
+python3 - "$root/config/anvil.toml" "$work" "$rpc_a_port" "$rpc_b_port" "$rpc_c_port" "$api_port" "$metrics_port" >"$work/anvil.toml" <<'PY_CONFIG'
+import re
+import sys
+from pathlib import Path
+
+source, work, rpc_a, rpc_b, rpc_c, api, metrics = sys.argv[1:]
+replacements = {
+    "data/anvil": work,
+    "127.0.0.1:8545": "127.0.0.1:" + rpc_a,
+    "127.0.0.1:8546": "127.0.0.1:" + rpc_b,
+    "127.0.0.1:8547": "127.0.0.1:" + rpc_c,
+    "127.0.0.1:8080": "127.0.0.1:" + api,
+    "127.0.0.1:9464": "127.0.0.1:" + metrics,
+}
+pattern = "|".join(map(re.escape, replacements))
+print(re.sub(pattern, lambda match: replacements[match[0]], Path(source).read_text()), end="")
+PY_CONFIG
 # Every Roughtime server points at a closed local port, so no sample arrives and nothing is
 # sequenced, while the watcher reads the blocks so far and stores its cursor. That boot's time
 # alerts are expected, so it logs apart from node.log.

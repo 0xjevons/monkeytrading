@@ -74,6 +74,7 @@ impl VaultReader for VaultRpc {
             .await?
             .context("the RPC has no latest block")?;
         Ok(Finality {
+            head_support: None,
             head: head.header.number,
             head_time: head.header.timestamp,
             tagged: tagged.map(|block| BlockRef { number: block.header.number, hash: block.header.hash }),

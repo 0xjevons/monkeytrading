@@ -70,11 +70,11 @@ async fn custody_alerts_keep_one_key_per_subject_and_resolve_under_it() {
     advance(Duration::from_secs(1)).await;
     watchdog.observe_read(false, 6, 9);
     watchdog.observe_read(true, 9, 9);
-    watchdog.observe(10, now_s() - 86_400, Some(9));
-    watchdog.observe(11, now_s(), Some(9));
+    watchdog.observe(10, now_s() - 86_400, Some(9), None);
+    watchdog.observe(11, now_s(), Some(9), None);
     advance(Duration::from_secs(1)).await;
-    watchdog.observe(12, now_s(), Some(9));
-    watchdog.observe(13, now_s(), Some(12));
+    watchdog.observe(12, now_s(), Some(9), None);
+    watchdog.observe(13, now_s(), Some(12), None);
 
     let lines: Vec<(String, bool)> = router.queued().iter().map(|line| (line.key(), line.severity.is_none())).collect();
     let fired = |key: &str| (key.to_owned(), false);

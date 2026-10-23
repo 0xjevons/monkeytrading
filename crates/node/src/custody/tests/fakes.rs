@@ -107,7 +107,7 @@ impl VaultReader for FakeChain {
         let tagged = chain
             .final_block
             .map(|number| BlockRef { number, hash: chain.tag_hash.unwrap_or_else(|| chain.hash_at(number)) });
-        Ok(Finality { head: chain.head, head_time, tagged })
+        Ok(Finality { head: chain.head, head_time, tagged, head_support: None })
     }
 
     async fn headers(&self, from: u64, to: u64) -> anyhow::Result<Vec<BlockLink>> {

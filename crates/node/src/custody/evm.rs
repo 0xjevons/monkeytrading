@@ -63,14 +63,23 @@ pub struct BlockRef {
     pub hash: B256,
 }
 
+/// Identity-qualified head observations for a fixed configured provider population.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadSupport {
+    pub required: usize,
+    pub heads: Vec<Option<u64>>,
+}
+
 /// The chain's head, and the block the finality tag names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finality {
     pub head: u64,
     /// The head block's timestamp, in seconds since the epoch.
     pub head_time: u64,
     /// `None` while the chain has no block at the tag yet.
     pub tagged: Option<BlockRef>,
+    /// Per-provider diagnostics; raw single-provider readers leave this unset.
+    pub head_support: Option<HeadSupport>,
 }
 
 /// Which chain an endpoint serves and which token its vault holds.
@@ -190,7 +199,7 @@ impl<V: VaultReader> DepositWatcher<V> {
         }
         let finality = self.vault.finality().await.map_err(PollError::rpc)?;
         let final_block = finality.tagged.and_then(|tagged| tagged.number.checked_sub(self.confirmations));
-        self.watchdog.observe(finality.head, finality.head_time, final_block);
+        self.watchdog.observe(finality.head, finality.head_time, final_block, finality.head_support.as_ref());
         let (Some(tagged), Some(final_block)) = (finality.tagged, final_block) else {
             debug!(head = finality.head, "no block is final yet");
             return Ok(Polled::Waiting);

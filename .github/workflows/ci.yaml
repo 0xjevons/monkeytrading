@@ -159,6 +159,7 @@ jobs:
       - name: Run the vault deposit and RPC quorum dev scenario
         env:
           RPC_QUORUM_SCENARIO: "1"
+          RPC_A_PORT: "8546" # Exercise a destination matching provider B's original config port.
         run: ./scripts/dev-vault-deposits.sh
 
   dev-metrics-alerts:

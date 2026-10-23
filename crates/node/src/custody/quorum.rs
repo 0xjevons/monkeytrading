@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::config::EvmCustodySection;
 use crate::custody::chain::BlockLink;
-use crate::custody::evm::{BlockRef, Finality, VaultDeposit, VaultIdentity, VaultReader};
+use crate::custody::evm::{BlockRef, Finality, HeadSupport, VaultDeposit, VaultIdentity, VaultReader};
 use crate::custody::rpc::VaultRpc;
 
 /// Independent providers and their alert identities; the watcher owns the reader.
@@ -224,7 +224,9 @@ impl<R: VaultReader + Sync> VaultReader for Quorum<R> {
         let (tagged, _) = self.vote("finality", votes)?;
         let head = quorum_lower_bound(diagnostics.iter().flatten().map(|d| d.0), self.required);
         let head_time = quorum_lower_bound(diagnostics.iter().flatten().map(|d| d.1), self.required);
-        Ok(Finality { head, head_time, tagged })
+        let head_support =
+            Some(HeadSupport { required: self.required, heads: diagnostics.iter().map(|d| d.map(|d| d.0)).collect() });
+        Ok(Finality { head, head_time, tagged, head_support })
     }
 
     /// Identical ordered headers over the same height range.

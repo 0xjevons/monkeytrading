@@ -10,12 +10,14 @@ use tokio::time::Instant;
 use tracing::{error, info};
 
 use crate::clock::now_ms;
+use crate::custody::evm::HeadSupport;
 
 /// The highest final block seen, the head when it was, and since when the head has moved on
 /// without the final block rising.
 struct FinalitySeen {
     highest: Option<u64>,
     head: u64,
+    heads: Vec<Option<u64>>,
     moving_since: Option<Instant>,
     alerted: bool,
 }
@@ -46,9 +48,15 @@ impl Watchdog {
     }
 
     /// Checks one finality read: the head block and its timestamp in seconds, and the final block.
-    pub(super) fn observe(&mut self, head: u64, head_time: u64, final_block: Option<u64>) {
+    pub(super) fn observe(
+        &mut self,
+        head: u64,
+        head_time: u64,
+        final_block: Option<u64>,
+        support: Option<&HeadSupport>,
+    ) {
         self.check_head(head, head_time);
-        self.check_finality(head, final_block);
+        self.check_finality(head, final_block, support);
     }
 
     /// Checks one range read, or one header batch of a proof that keeps the next read short of
@@ -93,10 +101,10 @@ impl Watchdog {
     }
 
     /// Alerts when the budget has passed since the head first moved on without the highest final
-    /// block rising. A final block reported lower than before is no progress, and the clock starts
-    /// only when the head moves, so an idle chain raises nothing and its first block gets the
-    /// whole budget.
-    fn check_finality(&mut self, head: u64, final_block: Option<u64>) {
+    /// block rising. Quorum progress needs a configured majority advancing against their own
+    /// baselines; scalar bounds may change contributors between polls. A lower final block is
+    /// no progress. An idle chain raises nothing and its first majority movement gets the budget.
+    fn check_finality(&mut self, head: u64, final_block: Option<u64>, support: Option<&HeadSupport>) {
         let now = Instant::now();
         let rose = self.finality.as_ref().is_none_or(|seen| final_block > seen.highest);
         if rose {
@@ -106,11 +114,32 @@ impl Watchdog {
                     "the final block is advancing again: {final_block:?}"
                 );
             }
-            self.finality = Some(FinalitySeen { highest: final_block, head, moving_since: None, alerted: false });
+            self.finality = Some(FinalitySeen {
+                highest: final_block,
+                head,
+                heads: support.map(|s| s.heads.clone()).unwrap_or_default(),
+                moving_since: None,
+                alerted: false,
+            });
             return;
         }
         let seen = self.finality.as_mut().expect("set when the final block rose");
-        if head > seen.head && seen.moving_since.is_none() {
+        let advanced = if let Some(support) = support {
+            // Provider indices belong to one immutable Quorum owned by this watcher.
+            assert_eq!(seen.heads.len(), support.heads.len(), "custody provider set is immutable");
+            let mut advancing = 0;
+            for (baseline, current) in seen.heads.iter_mut().zip(&support.heads) {
+                match (*baseline, *current) {
+                    (Some(before), Some(now)) if now > before => advancing += 1,
+                    (None, Some(now)) => *baseline = Some(now),
+                    _ => {}
+                }
+            }
+            advancing >= support.required
+        } else {
+            head > seen.head
+        };
+        if advanced && seen.moving_since.is_none() {
             seen.moving_since = Some(now);
         }
         let Some(moving_since) = seen.moving_since else { return };
