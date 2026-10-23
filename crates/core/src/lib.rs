@@ -38,6 +38,9 @@
 //!   one no market is listed onto a benchmark without; each account's resting orders are capped, a
 //!   resting order that may add risk meets its market's minimum notional, and placing one checks
 //!   only that order against the live price.
+//! - From `V15`, a resting order that can only reduce the account's position in its market —
+//!   opposite side, quantity at most the position — skips the minimum-notional check, as a
+//!   reduce-only order does, so any position can be closed with a plain order.
 
 pub mod account;
 mod admin;

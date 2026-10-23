@@ -15,9 +15,11 @@ impl Engine {
     /// - a qty, quoted price, or trigger price at or below zero or above `Fixed::MAX_INPUT`
     /// - an account that has never been credited
     /// - from `V14`, a limit or stop order from an account already resting the parameters' cap, or
-    ///   one that is not reduce-only whose notional at its own price, in USD at that price in a
-    ///   market that converts at its own index and at its FX market's last mark in any other, is
-    ///   below the market's minimum, or whose FX market has no mark yet
+    ///   one whose notional at its own price, in USD at that price in a market that converts at its
+    ///   own index and at its FX market's last mark in any other, is below the market's minimum, or
+    ///   whose FX market has no mark yet; a reduce-only order is never checked, and from `V15`
+    ///   neither is one that can only reduce the account's position in that market — opposite side,
+    ///   quantity at most the position
     pub(super) fn validate_order(&self, req: &OrderRequest) -> Result<(), Reject> {
         let invalid = |reason: &str| Err(Reject::InvalidOrder { reason: reason.into() });
         let Some(params) = &self.params else {
@@ -43,10 +45,18 @@ impl Engine {
             if acct.orders.len() >= params.max_resting_orders {
                 return Err(Reject::TooManyOrders { max: params.max_resting_orders });
             }
-            // A reduce-only order never adds risk, as a reducing fill pays no minimum. The order is
-            // valued at its own price, converted as its fill would be: a market that converts at its
-            // own index, as USD-JPY does, at that price, and any other at its FX market's last mark.
-            if !req.reduce_only {
+            // A reduce-only order never adds risk, as a reducing fill pays no minimum; from `V15`
+            // neither does an order that can only reduce the account's position in this market, its
+            // side opposing the position and its qty at most it, the same slice a fill checks:
+            // `price` charges the minimum only on what grows |position|. The order is valued at its
+            // own price, converted as its fill would be: a market that converts at its own index, as
+            // USD-JPY does, at that price, and any other at its FX market's last mark.
+            let reduces_only = req.reduce_only
+                || (self.protocol_version >= ProtocolVersion::V15 && {
+                    let pos = acct.position(req.market);
+                    pos.qty.signum() == -req.side.sign() && req.qty <= pos.qty.abs()
+                });
+            if !reduces_only {
                 let currency = market.spec.quote_currency;
                 // Listing checks the FX market is listed, and no market is ever removed.
                 let fx_at = |fx_market| {

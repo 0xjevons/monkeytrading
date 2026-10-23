@@ -12,6 +12,7 @@ mod v10;
 mod v11;
 mod v12;
 mod v14;
+mod v15;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -95,8 +96,8 @@ fn main() -> anyhow::Result<()> {
 /// round up; and under `V11`, markouts averaged by notional and scored at a valid index. Then, under
 /// `V12`, gapped opens, quotes ageing out, a session close, a leading venue, and an FX index ageing
 /// out, each processed before the next command acts. Then, under `V13`, stress that follows its
-/// inputs (`stress.rs`), and, under `V14`, the part in `v14.rs`. Every client request is signed by
-/// its account's key unless the comment says otherwise.
+/// inputs (`stress.rs`), and, under `V14`, the part in `v14.rs`, and, under `V15`, the part in
+/// `v15.rs`. Every client request is signed by its account's key unless the comment says otherwise.
 fn session() -> Vec<Sequenced> {
     let mut h = Harness::signed();
     let (a, b, c, d, t, e) = (h.signer(1), h.signer(2), h.signer(3), h.signer(4), h.signer(5), h.signer(6));
@@ -482,5 +483,6 @@ fn session() -> Vec<Sequenced> {
     v12::session(&mut h);
     stress::session(&mut h);
     v14::session(&mut h);
+    v15::session(&mut h);
     h.log
 }

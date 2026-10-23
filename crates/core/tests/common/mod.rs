@@ -167,6 +167,14 @@ impl Harness {
         h
     }
 
+    /// `v14`, then `V15`, which lets an order that can only reduce the account's position in its
+    /// market skip the minimum-notional check at placement.
+    pub fn v15() -> Self {
+        let mut h = Harness::v14();
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V15 });
+        h
+    }
+
     /// No commands yet, at the harness start time.
     fn empty() -> Self {
         Harness {
