@@ -26,6 +26,8 @@ use serde::{Deserialize, Deserializer};
 
 mod custody;
 pub use custody::{EvmCustodySection, FinalityTag, RpcProviderSection, SecretUrl};
+mod checkpoints;
+pub use checkpoints::CheckpointSection;
 mod telemetry;
 pub use crate::config::telemetry::*;
 
@@ -86,6 +88,7 @@ pub struct NodeConfig {
     pub tee: TeeSection,
     pub operator: OperatorSection,
     pub custody: CustodySection,
+    pub checkpoints: Option<CheckpointSection>,
     pub feeds: FeedsSection,
     pub time: TimeSection,
     pub history: HistorySection,

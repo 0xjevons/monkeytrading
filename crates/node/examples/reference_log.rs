@@ -57,14 +57,33 @@ fn main() -> anyhow::Result<()> {
             let (chain_id, vault, signature) = (31337, AccountId([0; 20]), "0x".to_owned());
             write(
                 &mut writer,
-                &LogEntry::Withdrawal(SignedWithdrawal { account, amount, nonce, chain_id, vault, signature }),
+                &LogEntry::Withdrawal(SignedWithdrawal {
+                    account,
+                    amount,
+                    nonce,
+                    chain_id,
+                    vault,
+                    signature,
+                    approved_seq: None,
+                }),
             )?;
         }
         if (n + 1).is_multiple_of(CHECKPOINT_EVERY) || n + 1 == lines.len() {
             let seq = engine.last_seq().context("a command was applied")?;
             let root = format!("0x{}", hex::encode(engine.state_root()));
             let (signature, signer) = ("0x".to_owned(), "0x".to_owned());
-            write(&mut writer, &LogEntry::Checkpoint(Checkpoint { seq, root, signature, signer }))?;
+            write(
+                &mut writer,
+                &LogEntry::Checkpoint(Checkpoint {
+                    parent: None,
+                    seq,
+                    root,
+                    signature,
+                    signer,
+                    domain: None,
+                    deferred_withdrawals: false,
+                }),
+            )?;
         }
     }
     writer.flush().with_context(|| format!("writing {}", out.display()))

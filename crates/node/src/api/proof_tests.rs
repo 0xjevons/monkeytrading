@@ -25,7 +25,7 @@ use crate::clock::test_clock::TestClock;
 use crate::config::RateLimit;
 use crate::history::INDEX_FILE;
 use crate::log::LogEntry;
-use crate::sequencer::{Sequencer, SequencerConfig, replay, replay_path};
+use crate::sequencer::{Sequencer, SequencerConfig, replay};
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
 use crate::test_support::{dev_config, log_entries, sample_around, scratch_dir, sequencer_config};
 
@@ -103,7 +103,8 @@ async fn dev_scenario_checkpoint_work_follows_changes_a_proof_verifies_and_old_l
     assert_eq!(replayed.activations, [(ProtocolVersion::LATEST, 2)]);
 
     for path in OLD_LOGS {
-        let mut replayed = replay_path(path.as_ref()).unwrap_or_else(|e| panic!("{path}: {e:#}"));
+        let mut replayed = replay(&crate::sequencer::fixture_tests::signed_fixture(path.as_ref()))
+            .unwrap_or_else(|e| panic!("{path}: {e:#}"));
         assert!(replayed.checkpoints > 0 && replayed.engine.protocol_version() < ProtocolVersion::V9, "{path}");
         // Its accounts have no proofs: their roots hash the state encoding.
         let held = *replayed.engine.accounts().keys().next().expect("the log credits an account");
@@ -154,6 +155,8 @@ impl Node {
         let cfg = SequencerConfig {
             segment_commands: 10_000,
             checkpoint_every: CHECKPOINT_EVERY,
+            checkpoint_parent: Default::default(),
+            checkpoints: None,
             clock: stamps.clone(),
             ..sequencer_config(&dir, manifest_tx)
         };

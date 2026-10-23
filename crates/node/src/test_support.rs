@@ -247,6 +247,8 @@ pub fn sequencer_config(dir: &Path, manifest: watch::Sender<Manifest>) -> Sequen
         segment_commands: SEGMENT_COMMANDS,
         manifest,
         checkpoint_every: CHECKPOINT_EVERY,
+        checkpoint_parent: Default::default(),
+        checkpoints: None,
         chain_id: 31337,
         vault: AccountId([0; 20]),
         clock: Arc::new(SystemClock),

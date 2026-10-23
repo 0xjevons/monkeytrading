@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use engine_core::protocol::ProtocolVersion;
-use engine_node::replay_path;
+use engine_core::types::AccountId;
+use engine_node::log::CheckpointDomain;
+use engine_node::{replay_path, replay_path_in_domain};
 
 /// Written by the node before protocol versions existed (commit 452ec1b), on `config/dev.toml`
 /// with two mock-priced markets and `checkpoint_every = 40`: genesis, prices and ticks, a deposit,
@@ -16,7 +18,9 @@ const V1_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v1-dev
 
 #[test]
 fn a_log_written_before_protocol_versions_replays_to_its_roots() {
-    let mut replayed = replay_path(Path::new(V1_DEV)).unwrap();
+    let mut replayed =
+        replay_path_in_domain(Path::new(V1_DEV), Some(CheckpointDomain { chain_id: 31337, vault: AccountId([0; 20]) }))
+            .unwrap();
     assert_eq!((replayed.commands, replayed.checkpoints), (63, 3));
     assert_eq!(replayed.engine.protocol_version(), ProtocolVersion::V2);
     assert!(replayed.activations.is_empty());
@@ -88,7 +92,18 @@ fn engine_replay_exits_non_zero_on_a_missing_log() {
     assert!(!String::from_utf8_lossy(&refused.stdout).contains("verified"), "{refused:?}");
     assert!(String::from_utf8_lossy(&refused.stderr).contains("no readable log at"), "{refused:?}");
 
-    let verified = run(Path::new(V1_DEV)).unwrap();
+    let verified = Command::new(env!("CARGO_BIN_EXE_engine"))
+        .args([
+            "replay",
+            "--log",
+            V1_DEV,
+            "--chain-id",
+            "31337",
+            "--vault",
+            "0x0000000000000000000000000000000000000000",
+        ])
+        .output()
+        .unwrap();
     assert!(verified.status.success(), "{verified:?}");
     assert!(
         String::from_utf8_lossy(&verified.stdout).starts_with("verified: 63 commands, 3 checkpoints"),

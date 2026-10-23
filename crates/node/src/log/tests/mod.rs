@@ -376,11 +376,20 @@ fn withdrawal(nonce: u64) -> LogEntry {
         chain_id: 1,
         vault: AccountId([2; 20]),
         signature: "0x01".into(),
+        approved_seq: None,
     })
 }
 
 fn checkpoint(seq: u64) -> LogEntry {
-    LogEntry::Checkpoint(Checkpoint { seq, root: "0x00".into(), signature: "0x01".into(), signer: "0x02".into() })
+    LogEntry::Checkpoint(Checkpoint {
+        parent: None,
+        seq,
+        root: "0x00".into(),
+        signature: "0x01".into(),
+        signer: "0x02".into(),
+        domain: None,
+        deferred_withdrawals: false,
+    })
 }
 
 /// Appends `entries` through a writer reopened on `dir`.

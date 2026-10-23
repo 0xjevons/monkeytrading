@@ -100,6 +100,7 @@ impl NodeConfig {
         self.alerts.outbox.validate_location(&self.node.log_dir)?;
         self.history.retention_ms().context("history.retention")?;
         self.validate_custody()?;
+        self.validate_checkpoints()?;
         // Without a Critical webhook, Critical alerts reach only the node's own log, so a node
         // beside a real enclave or real funds must have one.
         if self.alerts.critical.is_none()

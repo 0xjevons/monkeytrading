@@ -14,6 +14,9 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - Genesis all or nothing: the engine checks every genesis command at config load and again before
   any is written, and recovery refuses a log whose genesis stopped short of its closing checkpoint
 - Signed checkpoints and withdrawals, bound to the chain id and vault, from an attested key
+- Strict checkpoint signature verification in replay and recovery, with explicit domains for early logs
+- Optional checkpoint relaying, signed-parent vault commitments, startup rollback checks, and collateral
+  reconciliation that pauses withdrawal signatures while trading continues
 - Attestation through Linux configfs-tsm, covering TDX and SEV-SNP, or a clearly marked mock
 - Trusted time: every stamp is checked against signed Roughtime readings that independent servers
   agree on, and nothing, genesis included, is stamped before the first; sequencing halts with a
@@ -65,10 +68,15 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/admin/mod.rs` — `engine admin`: the operator key, the commands it signs, and submission
 - `src/admin/tls.rs` — the TLS connection to a node, pinned to its attested key
 - `src/admin/tests.rs` — `engine admin` tests: key sources, commands, signing, and pins
-- `src/node.rs` — startup, task supervision, and shutdown
+- `src/node/mod.rs` — startup, task supervision, and shutdown
+- `src/node/tests.rs` — startup, history recovery, and incomplete-genesis tests
 - `src/telemetry.rs` — the log subscriber, which feeds alert lines to the router, and the metrics
   registry, set up before the node runs
-- `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, and metrics
+- `src/sequencer/mod.rs` — the sequencer, checkpoints, and metrics
+- `src/sequencer/messages.rs` — sequencer requests, stream messages, and signed withdrawals
+- `src/sequencer/checkpoints.rs` — custody reconciliation and withdrawal signature release
+- `src/sequencer/checkpoint_tests.rs` — confirmed-prefix signature gating and restart tests
+- `src/sequencer/fixture_tests.rs` — test-only signing of copies of placeholder protocol fixtures
 - `src/sequencer/replay.rs` — log replay, which recovery and `engine replay` share
 - `src/sequencer/required.rs` — client auth, the operator, protocol activation, and genesis, which
   wait for trusted time
@@ -77,6 +85,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must
   look at, benchmarks with no rate, and house NAV below zero
 - `src/sequencer/tests/mod.rs` — sequencer, activation, recovery, and replay tests
+- `src/sequencer/tests/replay.rs` — root, sequence, and pre-event log replay tests
 - `src/sequencer/tests/genesis.rs` — genesis tests: a rejected genesis writes nothing, and a log
   whose genesis did not apply in full is refused at recovery
 - `src/sequencer/tests/operator.rs` — recovery, activation, and replay with the operator the log
@@ -143,6 +152,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/tls/tests/stream.rs` — the stream end to end over TLS: the subscriber and message caps
 - `src/limits.rs` — request rate limits, connection caps, and the stream subscriber cap
 - `src/config/mod.rs` — the node config schema and loading
+- `src/config/checkpoints.rs` — checkpoint relayer config and validation
 - `src/config/custody.rs` — the `[custody.evm]` section, independent RPC providers, redacted
   URLs, and custody checks
 - `src/config/telemetry.rs` — the metrics listener and alert webhook config, and the redacting
@@ -154,6 +164,12 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/config/validation.rs` — the checks a parsed config must also pass
 - `src/config/test_keys.rs` — the published test keys from `config/test-keys.toml`, which a node
   with real attestation refuses, and their tests
+- `src/checkpoints/mod.rs` — posting, retry, signed-parent commitment checks, and collateral reconciliation
+- `src/checkpoints/signature.rs` — shared strict checkpoint signature and domain verification
+- `src/checkpoints/rpc.rs` — pinned-block vault reads and transaction relay through a signing RPC
+- `src/checkpoints/setup.rs` — chain anchor lookup before log recovery writes
+- `src/checkpoints/tests.rs` — signature mutations, rollback, retry, and reconciliation tests
+- `src/checkpoints/scenario.rs` — the isolated Anvil checkpoint dev scenario
 - `src/custody/mod.rs` — the custody providers (mock and EVM) and the USDC-to-`Fixed` conversion
 - `src/custody/evm.rs` — the deposit watcher: the chain and token check, range reads from blocks
   proven to lead to the tagged final block, the completeness check, and stall alerts
@@ -269,6 +285,9 @@ jq -r '.file' archive/manifest.jsonl |
 
 # Also fabricate a deposit at one provider, stop two providers, and recover quorum
 RPC_QUORUM_SCENARIO=1 ./scripts/dev-vault-deposits.sh
+
+# Run checkpoint posting, tampered replay, truncation, and shortfall checks on isolated Anvil
+./scripts/dev-checkpoints.sh
 ```
 
 EVM custody requires at least three entries in `custody.evm.providers`, each with a unique
@@ -292,6 +311,47 @@ The local scenario uses three proxies to one Anvil process, for fault injection 
 ports default to 18545–18547 and can be overridden with `RPC_A_PORT`, `RPC_B_PORT`, `RPC_C_PORT`.
 `SCENARIO_LOG_DIR` preserves its logs. `config/anvil.toml` expects local endpoints on 8545–8547 when
 run directly; the scenario rewrites these to its proxy ports.
+
+On-chain checkpoint posting uses an optional `[checkpoints]` section, required with hardware EVM
+custody. `node.checkpoint_every` sets the periodic frequency; every approved withdrawal also forces
+a checkpoint. Each root is durable locally before the relayer sends it, and the node releases no
+withdrawal signature until its approval is covered by a confirmed on-chain prefix and collateral
+reconciles. The queue is bounded; exhaustion stops the node with the durable log available for
+recovery. Failed posts retry after `retry_interval` and emit `checkpoint_post_failed`. A conflicting
+posted root or signer stops the node with a Critical alert. A collateral mismatch emits Critical
+`collateral_mismatch` and pauses withdrawals; ordinary trading commands continue. Deposits not yet
+credited also defer withdrawal release until a checkpoint includes their credits; a mismatch
+lasting `custody.evm.stall_critical_after` raises a Critical alert.
+
+```toml
+[checkpoints]
+rpc_url = "http://127.0.0.1:8545"
+relayer = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+retry_interval = "2s"
+rpc_timeout = "10s"
+```
+
+The endpoint must support `eth_sendTransaction` for the configured funded relayer. It signs and
+pays gas for relays; only the attested enclave's signature authorizes a vault commitment. Reads
+pin signer, root, deposit count, and USDC balance to one canonical block hash. This RPC's chain view
+is trusted pending independent verification. The immutable `Vault` constructor signer must match
+the enclave key. Key persistence and rotation remain separate work: startup fails closed when a
+restart generates a different key. The Anvil test provisions its generated signer before deploying
+the vault; this is a local harness, not a production key-provisioning workflow. Withdrawals still
+have no on-chain payout path, so reconciliation counts every approval as unpaid. Payout settlement
+must subtract confirmed payouts when that feature is added.
+
+New on-chain checkpoints use `engine.checkpoint.v2`, signing the domain tag, chain id (u64 big
+endian), vault (20 bytes), sequence (u64 big endian), root (32 bytes), parent-present byte,
+parent sequence (u64 big endian), and parent root (32 bytes). The vault atomically compares the
+signed parent with its latest commitment; two same-key instances cannot publish divergent
+extensions of one parent. An absent parent is encoded as false/zero/zero. Historical checkpoints
+keep the original `engine.checkpoint.v1` digest and remain replayable, but cannot authorize v2
+vault posts. Domains come from the checkpoint or the log's recorded operator/client authentication. For earlier genuine logs, supply
+`replay --chain-id <id> --vault <address>`; recovery uses the configured deployment and refuses a
+conflicting recorded domain. `replay --signer <address>` pins the enclave signer to an address
+obtained from an independently verified attestation or the vault. Protocol reference fixtures
+contain placeholder enclave signatures; fixture tests check their roots/events separately, while `engine replay` rejects their placeholders.
 
 A vault deposit credits the trading account its event names: the caller for `deposit`, or the
 account `depositFor` names. The vault refuses deposits under 10 USDC or over 1e9 USDC. A trading

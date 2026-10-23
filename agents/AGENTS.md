@@ -27,7 +27,9 @@ an index: load only the rule whose hint matches the current action.
   route and account proofs, and the resumable WebSocket stream (TLS from an attested in-enclave key,
   with rate limits and connection caps), the account history index (SQLite, derived from the log),
   TEE attestation (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime
-  servers, the custody adapter (mock, or EVM vault deposits over alloy), price feeds: live crypto
+  servers, the custody adapter (mock, or EVM vault deposits over alloy), checkpoint posting and collateral
+  reconciliation (`checkpoints/`), with strict signature replay and startup checks against the
+  vault's latest commitment, price feeds: live crypto
   venue WebSockets (`feeds/`, one adapter per venue) and a mock, Prometheus metrics on an operator
   listener, and alert routing to webhooks with a bounded durable outbox outside the public log. `tests/reference/` holds the node-format reference log
   per protocol version, with events, written once by `examples/reference_log.rs`. Its `README.md`
@@ -38,6 +40,8 @@ an index: load only the rule whose hint matches the current action.
   mock tokens and a contract wallet in `test/mocks/`.
   Dependencies (forge-std, OpenZeppelin) come from the Soldeer registry, pinned with checksums in
   `soldeer.lock` and installed into the gitignored `dependencies/`; there are no git submodules.
+  The vault stores increasing state checkpoints whose signed parents match its latest commitment,
+  authorized by its immutable enclave signer; the constructor requires that attestation-verified signer as its second argument.
 - **config/** — node configs. `dev.toml` runs the TEE, custody and feeds as mocks on one machine,
   and checks the clock against public Roughtime servers, citing each server's key source;
   `feeds.provider = "venues"` prices its crypto markets from live venues instead, leaving the others

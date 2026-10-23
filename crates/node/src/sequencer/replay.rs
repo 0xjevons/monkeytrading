@@ -1,7 +1,7 @@
 //! Log replay: re-applies a log as it is read and checks it against what the open-source engine
 //! produces.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
@@ -11,7 +11,7 @@ use engine_core::protocol::ProtocolVersion;
 use engine_core::types::{AccountId, Millis};
 use engine_core::{Engine, Fixed};
 
-use crate::log::{self, LogEntry, SegmentedLog};
+use crate::log::{self, CheckpointDomain, LogEntry, SegmentedLog};
 use crate::sequencer::GenesisProgress;
 
 /// The result of replaying a log.
@@ -28,6 +28,12 @@ pub struct Replayed {
     pub genesis: GenesisProgress,
     /// Sequenced time of the command the last checkpoint covers.
     pub last_checkpoint_ts: Option<Millis>,
+    /// Approvals whose custody checkpoints precede their signature release.
+    pub deferred: Vec<(u64, AccountId, Fixed, u64)>,
+    /// Approved funds still owed by custody; payout settlement is not implemented yet.
+    pub unpaid: Fixed,
+    /// Named checkpoint signers, for comparison with independently trusted attestations.
+    pub checkpoint_signers: BTreeSet<AccountId>,
 }
 
 /// Re-applies a log entry by entry, as it is read, and checks every checkpoint root, logged event,
@@ -46,9 +52,17 @@ pub(super) struct Replay {
     logs_events: bool,
     genesis: GenesisProgress,
     last_checkpoint_ts: Option<Millis>,
+    deferred: Vec<(u64, AccountId, Fixed, u64)>,
+    unpaid: Fixed,
+    domain: Option<CheckpointDomain>,
+    checkpoint_signers: BTreeSet<AccountId>,
 }
 
 impl Replay {
+    /// Creates a strict verifier with an explicit domain for early historical signatures.
+    pub(super) fn in_domain(domain: Option<CheckpointDomain>) -> Self {
+        Self { domain, ..Self::default() }
+    }
     /// Applies the log's next entry.
     /// Error cases:
     /// - a command out of sequence, with time running backwards, or stamped past the range the
@@ -85,16 +99,32 @@ impl Replay {
                         _ => None,
                     })
                     .collect();
+                self.unpaid += self.approved.iter().map(|(_, amount, _)| *amount).sum::<Fixed>();
                 self.logs_events = c.events.is_some();
                 self.commands += 1;
             }
             LogEntry::Withdrawal(w) => {
+                if let Some(seq) = w.approved_seq {
+                    let at = self
+                        .deferred
+                        .iter()
+                        .position(|value| *value == (seq, w.account, w.amount, w.nonce))
+                        .context("deferred withdrawal was not approved")?;
+                    self.deferred.remove(at);
+                    return Ok(());
+                }
                 if self.approved.pop_front() != Some((w.account, w.amount, w.nonce)) {
                     bail!("withdrawal {} nonce {} was not approved at seq {:?}", w.account, w.nonce, engine.last_seq());
                 }
             }
             LogEntry::Checkpoint(cp) => {
-                ensure_signed(self.logs_events, &self.approved, engine.last_seq())?;
+                if cp.deferred_withdrawals {
+                    self.deferred.extend(
+                        self.approved.drain(..).map(|(account, amount, nonce)| (cp.seq, account, amount, nonce)),
+                    );
+                } else {
+                    ensure_signed(self.logs_events, &self.approved, engine.last_seq())?;
+                }
                 if engine.last_seq() != Some(cp.seq) {
                     bail!("checkpoint for seq {} found after seq {:?}", cp.seq, engine.last_seq());
                 }
@@ -102,6 +132,8 @@ impl Replay {
                 if root != cp.root {
                     bail!("state root mismatch at seq {}: log says {}, replay gives {root}", cp.seq, cp.root);
                 }
+                crate::checkpoints::signature::verify_with_domain(cp, engine, self.domain)?;
+                self.checkpoint_signers.insert(cp.signer.parse()?);
                 self.checkpoints += 1;
                 self.genesis.checkpoint();
                 // The checkpoint covers the last command applied, whose stamp is the engine's time.
@@ -116,7 +148,18 @@ impl Replay {
         let unsigned = if self.logs_events { self.approved.into() } else { Vec::new() };
         let (engine, commands, checkpoints, activations, genesis, last_checkpoint_ts) =
             (self.engine, self.commands, self.checkpoints, self.activations, self.genesis, self.last_checkpoint_ts);
-        Replayed { engine, commands, checkpoints, unsigned, activations, genesis, last_checkpoint_ts }
+        Replayed {
+            engine,
+            commands,
+            checkpoints,
+            unsigned,
+            activations,
+            genesis,
+            last_checkpoint_ts,
+            deferred: self.deferred,
+            unpaid: self.unpaid,
+            checkpoint_signers: self.checkpoint_signers,
+        }
     }
 }
 
@@ -136,8 +179,15 @@ pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
 /// - the log fails its manifest check (see `SegmentedLog::open`) or replay (see `Replay::apply`)
 /// - the log holds no command, or no checkpoint
 pub fn replay_path(path: &Path) -> anyhow::Result<Replayed> {
+    replay_path_in_domain(path, None)
+}
+
+/// Replays signatures in an explicit deployment, including logs that predate domain recording.
+/// Error cases:
+/// - the log fails replay or conflicts with `domain` (see `replay_path`)
+pub fn replay_path_in_domain(path: &Path, domain: Option<CheckpointDomain>) -> anyhow::Result<Replayed> {
     let found = fs::metadata(path).with_context(|| format!("no readable log at {}", path.display()))?;
-    let mut replay = Replay::default();
+    let mut replay = Replay::in_domain(domain);
     if found.is_dir() {
         SegmentedLog::open(path, |entry| replay.apply(&entry))?;
     } else {

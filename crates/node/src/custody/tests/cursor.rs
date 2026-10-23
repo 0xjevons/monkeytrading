@@ -54,6 +54,7 @@ async fn the_cursor_moves_only_after_the_log_is_synced_past_the_credits() {
                     cursor_at_sync.push((stored.next_block, stored.crediting.is_some()));
                     let _ = reply.send(engine.last_seq());
                 }
+                Request::CheckpointStatus { .. } => unreachable!("no checkpoint worker in this test"),
                 Request::TimeSample(_) => unreachable!("custody sends no time samples"),
             }
         }

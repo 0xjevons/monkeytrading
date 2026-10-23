@@ -9,7 +9,7 @@ const V9_REFERENCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference
 fn an_existing_log_without_notional_weighting_is_refused_the_latest_version() {
     let dir = scratch_dir("activation-v1-unweighted");
     fs::create_dir_all(&dir).unwrap();
-    fs::copy(V1_DEV, dir.join("00000000000000000000.jsonl")).unwrap();
+    crate::sequencer::fixture_tests::copy_fixture(V1_DEV, dir.join("00000000000000000000.jsonl"));
     let err = recover(&dir, &signed(31_337)).activate_protocol().unwrap_err();
     assert!(format!("{err:#}").contains("toxicity needs notional weighting"), "{err:#}");
     // Once its parameters have the weighting, a restart carries nothing more.
@@ -28,7 +28,7 @@ fn an_existing_log_without_notional_weighting_is_refused_the_latest_version() {
 fn a_funded_log_under_the_operator_takes_the_weighting_unsigned_and_activates_the_latest_version() {
     let dir = scratch_dir("activation-v9-funded");
     fs::create_dir_all(&dir).unwrap();
-    fs::copy(V9_REFERENCE, dir.join("00000000000000000000.jsonl")).unwrap();
+    crate::sequencer::fixture_tests::copy_fixture(V9_REFERENCE, dir.join("00000000000000000000.jsonl"));
     let before = replay(&log_entries(&dir)).unwrap();
     // From `V8` an unsigned operator command is refused once funds are credited, as they are here.
     let operator = *before.engine.operator().expect("the log records the operator");
@@ -41,6 +41,8 @@ fn a_funded_log_under_the_operator_takes_the_weighting_unsigned_and_activates_th
     let cfg = SequencerConfig {
         client_auth: signed(31_337),
         operator,
+        vault: operator.vault,
+        chain_id: operator.chain_id,
         clock: stamps.clone(),
         ..sequencer_config(&dir, manifest)
     };

@@ -226,6 +226,8 @@ impl Node {
         let cfg = SequencerConfig {
             segment_commands: 1_000,
             checkpoint_every: 1_000,
+            checkpoint_parent: Default::default(),
+            checkpoints: None,
             chain_id: CHAIN_ID,
             vault: TRADER,
             ..sequencer_config(&log_dir, watch::channel(Manifest::default()).0)
@@ -320,6 +322,7 @@ pub(super) fn refusing_sequencer(answer_syncs: bool, refusals: usize) -> mpsc::S
                     let _ = reply.send(engine.last_seq());
                 }
                 Request::Sync(_) => {}
+                Request::CheckpointStatus { .. } => unreachable!("no checkpoint worker in this test"),
                 Request::TimeSample(_) => unreachable!("custody sends no time samples"),
             }
         }

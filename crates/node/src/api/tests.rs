@@ -21,8 +21,8 @@ use crate::log::{LogEntry, MANIFEST, Manifest, Offset, SegmentedLog, segment_seq
 use crate::sequencer::replay_path;
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
 use crate::test_support::{
-    SEGMENT_COMMANDS, TRADER, TestHistory, TestSequencer, deposit, dev_config, file_entries, log_messages,
-    logged_history, scratch_dir, withdraw,
+    SEGMENT_COMMANDS, TRADER, TestHistory, TestSequencer, deposit, dev_config, log_messages, logged_history,
+    scratch_dir, withdraw,
 };
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -137,7 +137,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
         .unwrap()
         .into_writer(SEGMENT_COMMANDS, watch::channel(Manifest::default()).0)
         .unwrap();
-    let reference = file_entries(Path::new(REFERENCE_LOG));
+    let reference = crate::sequencer::fixture_tests::signed_fixture(Path::new(REFERENCE_LOG));
     for entry in &reference {
         log.append(entry).unwrap();
     }

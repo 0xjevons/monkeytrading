@@ -9,9 +9,9 @@ house, in turn, is issued to the people who trade with it.
 
 > **Pre-launch.** The engine runs end to end on a single machine, with a mock enclave, mock
 > custody, and simulated prices, or live crypto prices from three venues; vault deposits also run
-> against a local chain. On-chain withdrawals, hardware attestation, live prices for other asset
-> classes, and the house equity token are under
-> construction. Nothing here holds real funds.
+> against a local chain. Signed checkpoint posting and rollback checks also run against Anvil.
+> On-chain withdrawals, hardware attestation, live prices for other asset classes, and the house
+> equity token are under construction. Nothing here holds real funds.
 
 ## How it works
 
@@ -81,9 +81,9 @@ accounts, markets, and the rest of the state, so each checkpoint rehashes only w
 account can fetch a proof of its balance and positions against the last checkpoint's root and check
 it without the node. `engine replay` re-applies a log from the beginning and checks the root at
 every checkpoint against the state the published code computes, and fails a log it cannot find or
-that holds no checkpoint; checking the signatures themselves arrives with
-[#24](https://github.com/0xjevons/monkeytrading/issues/24). Replay reads a node's log directory or
-the archive the node serves: its completed log segments, with a manifest of their seq ranges and
+that holds no checkpoint, has a missing or invalid signature, or names an inconsistent deployment.
+Early logs that predate domain recording require explicit `--chain-id` and `--vault`. Replay reads
+a node's log directory or the archive the node serves: its completed log segments, with a manifest of their seq ranges and
 SHA-256 hashes. A stream subscriber can start or resume at any message offset, and gets the log from
 disk and then live, each message once.
 

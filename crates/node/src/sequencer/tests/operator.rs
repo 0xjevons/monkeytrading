@@ -5,13 +5,14 @@ use super::*;
 #[test]
 fn a_v7_log_records_the_operator_and_activates_the_latest_version_at_its_next_seq() {
     let dir = scratch_dir("activation-v7");
+    let client_auth = ClientAuth::Eip712 { chain_id: 31337, vault: AccountId([0; 20]) };
     let v7 = vec![
-        Command::Admin(AdminCommand::SetClientAuth(signed(31_337))),
+        Command::Admin(AdminCommand::SetClientAuth(client_auth.clone())),
         Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V3 }),
         Command::Admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V7 }),
     ];
-    recover(&dir, &signed(31_337)).sequence_required("V7 activation", v7).unwrap();
-    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
+    recover(&dir, &client_auth).sequence_required("V7 activation", v7).unwrap();
+    recover(&dir, &client_auth).activate_protocol().unwrap();
     let written = log_entries(&dir);
     let cmds = commands(&written);
     assert_eq!(

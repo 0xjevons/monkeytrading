@@ -4,6 +4,7 @@ use engine_core::command::{OrderKind, OrderRequest};
 use engine_core::price::SourceQuote;
 use engine_core::types::Side;
 
+use tokio::sync::oneshot;
 use tokio::time::advance;
 
 use crate::alerts::capture;
@@ -162,7 +163,23 @@ async fn a_house_deficit_resolves_once_nav_stays_at_or_above_zero() {
 // ── Helpers ──
 
 fn checkpoint(seq: u64, root: String) -> LogEntry {
-    LogEntry::Checkpoint(Checkpoint { seq, root, signature: String::new(), signer: String::new() })
+    let key = EnclaveKey::generate();
+    let domain = crate::log::CheckpointDomain { chain_id: 31337, vault: AccountId([0; 20]) };
+    let signature = key.sign_checkpoint(
+        domain.chain_id,
+        &domain.vault.0,
+        seq,
+        &root.parse::<engine_core::eip712::B256>().unwrap_or_default().0,
+    );
+    LogEntry::Checkpoint(Checkpoint {
+        parent: None,
+        seq,
+        root,
+        signature,
+        signer: key.address_hex(),
+        domain: Some(domain),
+        deferred_withdrawals: false,
+    })
 }
 
 /// A market buy of `qty` BTC by `TRADER` at the test mid.

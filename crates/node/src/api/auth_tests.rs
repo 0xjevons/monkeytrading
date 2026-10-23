@@ -298,6 +298,11 @@ impl Node {
         let cfg = SequencerConfig {
             chain_id: CHAIN_ID,
             vault: VAULT,
+            operator: engine_core::auth::Operator {
+                chain_id: CHAIN_ID,
+                vault: VAULT,
+                ..dev_config().operator().unwrap()
+            },
             clock: stamps.clone(),
             client_auth: auth.clone(),
             ..sequencer_config(&dir, manifest_tx)

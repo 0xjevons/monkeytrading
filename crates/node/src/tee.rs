@@ -114,6 +114,18 @@ impl EnclaveKey {
         self.sign_digest(checkpoint_digest(chain_id, vault, seq, root))
     }
 
+    /// Signs an atomic extension of the exact prior vault commitment.
+    pub fn sign_checkpoint_v2(
+        &self,
+        chain_id: u64,
+        vault: &[u8; 20],
+        seq: u64,
+        root: &[u8; 32],
+        parent: crate::log::CheckpointParent,
+    ) -> String {
+        self.sign_digest(checkpoint_digest_v2(chain_id, vault, seq, root, parent))
+    }
+
     /// Signs an approved withdrawal for the vault on `chain_id` to pay out.
     ///
     /// TODO: move to EIP-712 typed data once the vault contract is written.
@@ -163,8 +175,28 @@ pub fn attest_key(
     })
 }
 
+/// V2 binds the exact parent so two authorized publishers cannot extend divergent forks.
+pub(crate) fn checkpoint_digest_v2(
+    chain_id: u64,
+    vault: &[u8; 20],
+    seq: u64,
+    root: &[u8; 32],
+    parent: crate::log::CheckpointParent,
+) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    h.update(b"engine.checkpoint.v2");
+    h.update(chain_id.to_be_bytes());
+    h.update(vault);
+    h.update(seq.to_be_bytes());
+    h.update(root);
+    h.update([u8::from(parent.has_checkpoint)]);
+    h.update(parent.seq.to_be_bytes());
+    h.update(parent.root.0);
+    h.finalize().into()
+}
+
 /// The digest a checkpoint signature covers: domain tag, chain id, vault, seq, and root.
-fn checkpoint_digest(chain_id: u64, vault: &[u8; 20], seq: u64, root: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn checkpoint_digest(chain_id: u64, vault: &[u8; 20], seq: u64, root: &[u8; 32]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(b"engine.checkpoint.v1");
     h.update(chain_id.to_be_bytes());
