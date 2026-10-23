@@ -70,6 +70,10 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   registry, set up before the node runs
 - `src/sequencer/mod.rs` — the sequencer, stream messages, checkpoints, and metrics
 - `src/sequencer/replay.rs` — log replay, which recovery and `engine replay` share
+- `src/sequencer/snapshots.rs` — authenticated snapshot selection, suffix replay, and cache writes
+- `src/sequencer/snapshots/tests.rs` — restart, fallback, and growing-log history dev scenarios
+- `src/snapshot/mod.rs` — signed snapshot envelopes, size limits, atomic publication, and retention
+- `src/snapshot/tests.rs` — snapshot authentication, deployment binding, retention, and corruption
 - `src/sequencer/required.rs` — client auth, the operator, protocol activation, and genesis, which
   wait for trusted time
 - `src/sequencer/genesis.rs` — the genesis commands, the check that the engine accepts every one
@@ -298,7 +302,7 @@ without its `events` key.
 
 The log is a directory (`node.log_dir`) of segment files named for their first seq, plus
 `manifest.jsonl`, which gets one line per completed segment with its seq range, size, and SHA-256.
-The node loads the manifest at recovery, after checking it against the segment files, and then holds
+The node loads the manifest at recovery, checking the segments it reads, and then holds
 it in memory, adding each segment it completes. The archive serves that copy, not the file on disk.
 Backfill reads up to 256 messages at a time and keeps them until the subscriber takes them. It
 checks a completed segment against the manifest in one pass the first time it reads from it, then
@@ -310,9 +314,40 @@ reaches a subscriber from disk. While it reads a batch, a subscriber holds one o
 1 MiB chunk of a segment. If a new segment cannot be created, the current one keeps growing and the
 node warns (`log_rotation_failed`) until it can. A log written as one file before segments existed
 continues as the first segment: move it to `<log_dir>/00000000000000000000.jsonl`. Every segment is
-kept, since recovery replays the log from genesis. It replays as it reads, one segment and one line
-at a time, so its memory does not grow with the log, and replays nothing of a completed segment
-before checking it against the manifest; `engine replay` reads the log the same way.
+kept for audit, fallback recovery, and rebuilding history. Full recovery replays as it reads, one
+segment and one line at a time, and replays nothing of a completed segment before checking it
+against the manifest. `engine replay` always audits the entire log, including with snapshots enabled.
+
+`[snapshots]` is optional; omitting it uses full replay. Its required fields are `dir` (a separate
+cache directory), `retain` (a positive count), `max_bytes` (a positive envelope size limit), and
+`trusted_signers` (EVM addresses independently verified through enclave attestation). The dev
+config has a commented example retaining three caches of at most 64 MiB each, with empty signer pins. Empty pins
+allow writing caches but recovery uses full replay. The enclave key is fresh on every boot: after
+verifying a new attestation, provision that address alongside the signers of retained caches.
+Never discover trust from a snapshot, its self-reported signer, or a manifest on host storage.
+
+At each checkpoint the sequencer syncs the log, signs the complete snapshot with a separate
+deployment-bound domain, syncs a staging file, renames it, syncs the directory, and prunes older
+caches. Recovery tries caches newest first, checks their signatures against the configured pins,
+recomputes the state root, checks the checkpoint signature, finds that exact checkpoint in its log
+segment, then replays every physical entry in the suffix. Recognized interrupted staging files are
+reclaimed during startup and before writes. Failed publication removes its staging file. Corrupt,
+truncated, oversized, untrusted, or mismatched caches emit `snapshot_rejected` Warning alerts and fall back
+to another cache or genesis. A failed cache write emits `snapshot_write_failed` and keeps the
+authoritative log usable. Failed log syncs remain fatal.
+
+The recovery work is snapshot state reconstruction plus the checkpoint segment and command suffix;
+manifest loading and file listing still grow with segment count. History readiness also requires a
+full SQLite event/index integrity scan, which grows with retained history. Snapshot size grows with
+engine state. Signatures establish integrity, not freshness: rollback prevention still needs the
+on-chain checkpoint check in #24. The skipped historical prefix is checked by full `engine replay` or when
+history/backfill reads its segments. Snapshots do not permit deleting the public log.
+
+Run the isolated restart scenario with
+`cargo test -p engine-node snapshot_restart_scenario -- --nocapture`. It grows retained account
+history from 1,000 to 10,000 commands while keeping engine state size stable, restarts from a
+checkpoint, corrupts the newest cache, and checks the bounded suffix, root, withdrawal recovery,
+and every history event against full replay. It prints timings without a flaky elapsed-time gate.
 
 With `auth = "eip712"`, each order, cancel, and withdrawal body carries
 `"auth": { "nonce": <next nonce>, "expires_at": <ms>, "signature": "0x…" }`: the account's EIP-712
@@ -359,17 +394,21 @@ so the sequencer never waits for it; once caught up, history trails the log by t
 for the writer, and reads from disk whatever it falls behind the live log by. Each write stores the
 account events of a batch of commands, keyed by cursor, and the last command taken, in one
 transaction. Events whose command is older than `history.retention`, counted back from the newest
-command in the index, leave it; the log keeps them. The node reads its log once at startup,
-replaying it as it reads, and before recovery writes anything, the index checks that this read held
-the last command the index took, unchanged, and resumes after it. Since the index is derived from the log,
+command in the index, leave it; the log keeps them. Before recovery writes anything, the index
+checks the last command it took against the log and resumes after it. Without snapshots the check
+shares replay's read; snapshot mode reads only the cursor's segment. Since the index is derived from the log,
 an index that fails that check is discarded with a Warning (`history_index_discarded`) and rebuilt
 from the log's segments, and the route answers 503 until the rebuild has taken the log's tip. The
 log ends before that command after a power loss, since neither the log nor the index syncs every
 write, or after the log was rolled back or truncated; it holds another command there after it was
-replaced. An index is rebuilt the same way when SQLite's integrity check finds its file damaged,
-when the file holds another schema, or when `history.retention` has changed since its events were
-pruned. The node refuses to start (`history_recovery_failed`) only when it cannot open a fresh
-index. The check compares that one command, so a log forged to end with it passes; a host able to
+replaced. An index is rebuilt the same way when opening it detects damage to its tables or secondary
+indexes, when the file holds another schema, or when `history.retention` has changed since its events were
+pruned. Every recovery mode performs the full SQLite integrity scan before readiness, including
+checking event/secondary-index consistency. This scan grows with retained history. Event pages and
+index writes keep their defensive schema and row checks. Missing or unusable history needs a full
+rebuild before it serves, even when engine recovery used a snapshot. The node refuses to start
+(`history_recovery_failed`) when it cannot open a fresh index or verify its cursor's log segment.
+The check compares that one command, so a log forged to end with it passes; a host able to
 forge the log can rewrite the index as well. SQLite opens the file in defensive mode, with triggers
 and views off, its schema untrusted, and cell sizes checked, and every write and read refuses,
 inside its own transaction, a schema this code did not create. Removing `history.dir` while the node

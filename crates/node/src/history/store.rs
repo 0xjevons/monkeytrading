@@ -90,10 +90,8 @@ pub struct Reader {
 }
 
 impl Writer {
-    /// Opens the index at `path`, creating its directory, the file, and the schema if missing, and
-    /// returns it with what it has taken. One transaction checks the schema and the integrity of
-    /// the whole file, and reads that. Events leave the index `retention_ms` before the newest
-    /// command it holds.
+    /// Opens or creates the index, checks its schema and full integrity, and returns its cursor.
+    /// Retention is counted back from the newest indexed command's time.
     /// Error cases:
     /// - the directory or the file cannot be created or opened, or the file is not a SQLite database
     /// - the file holds another version of the schema, or a schema this code did not create
@@ -122,8 +120,6 @@ impl Writer {
             other => bail!("{} holds history schema {other}, not {SCHEMA_VERSION}", path.display()),
         }
         check_schema(&tx, &schema, path)?;
-        // A torn page, or an index that no longer matches its table, would fail a later write or
-        // serve another row; one bad entry is enough to refuse the file.
         let integrity: String =
             tx.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0)).context("checking the history index")?;
         ensure!(integrity == "ok", "{} is damaged: {integrity}", path.display());

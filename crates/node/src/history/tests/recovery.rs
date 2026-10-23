@@ -11,6 +11,45 @@ fn the_writer_refuses_another_schema_version() {
     assert!(format!("{err:#}").contains("history schema 1, not 2"), "{err:#}");
 }
 
+/// Missing secondary-index entries cannot make retained events disappear from successful pages.
+#[tokio::test]
+async fn snapshot_history_rebuilds_when_a_secondary_index_omits_events() {
+    for index_name in ["events_by_account", "events_by_account_kind", "events_by_ts"] {
+        let (dir, index) = (scratch_dir("history-index-omission"), index_dir("index-omission"));
+        indexed_log(&dir, &index, 1).await;
+        let path = file(&index);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let root: u32 = conn
+            .query_row("SELECT rootpage FROM sqlite_schema WHERE name = ?1", [index_name], |row| row.get(0))
+            .unwrap();
+        let page_size: u32 = conn.pragma_query_value(None, "page_size", |row| row.get(0)).unwrap();
+        drop(conn);
+        let mut bytes = fs::read(&path).unwrap();
+        let page = ((root - 1) * page_size) as usize;
+        assert_eq!(bytes[page], 10, "fixture index fits on a leaf page");
+        bytes[page + 1..page + page_size as usize].fill(0);
+        bytes[page + 5..page + 7].copy_from_slice(&(page_size as u16).to_be_bytes());
+        fs::write(&path, bytes).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let cursor_integrity: String =
+            conn.query_row("PRAGMA integrity_check(progress)", [], |row| row.get(0)).unwrap();
+        assert_eq!(cursor_integrity, "ok");
+        let retained: u32 =
+            conn.query_row("SELECT count(event) FROM events NOT INDEXED", [], |row| row.get(0)).unwrap();
+        assert!(retained > 0, "event data remains intact");
+        drop(conn);
+        let cfg = HistorySection { dir: index, retention: RETENTION };
+        let mut check = HistoryCheck::open_cursor(&cfg).unwrap();
+        check.check_log(&dir, Some(last_command_seq(&dir))).unwrap();
+        let mut history = check.finish().unwrap();
+        assert_eq!(history.resume_at(), Offset::start_of(0), "{index_name} must trigger rebuilding");
+        history.catch_up_to(Some(last_command_seq(&dir)));
+        let query = PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 200 };
+        assert!(history.reader().page(query).await.unwrap().is_none(), "rebuild is unavailable until caught up");
+    }
+}
+
 /// Pages wait until the index has taken every command the log held when it started: a rebuild over
 /// a logged history and a restart behind the log answer `None` until then, while a restart with
 /// nothing left to take serves at once.

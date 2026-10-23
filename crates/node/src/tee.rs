@@ -136,7 +136,7 @@ impl EnclaveKey {
     }
 
     /// 65-byte `r || s || v` with `v` in {27, 28}, as `ecrecover` expects.
-    fn sign_digest(&self, digest: [u8; 32]) -> String {
+    pub(crate) fn sign_digest(&self, digest: [u8; 32]) -> String {
         format!("0x{}", hex::encode(eip712::sign(&self.key, &B256::from(digest))))
     }
 }
@@ -164,7 +164,7 @@ pub fn attest_key(
 }
 
 /// The digest a checkpoint signature covers: domain tag, chain id, vault, seq, and root.
-fn checkpoint_digest(chain_id: u64, vault: &[u8; 20], seq: u64, root: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn checkpoint_digest(chain_id: u64, vault: &[u8; 20], seq: u64, root: &[u8; 32]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(b"engine.checkpoint.v1");
     h.update(chain_id.to_be_bytes());

@@ -19,6 +19,7 @@ mod node;
 pub use node::run;
 mod roughtime;
 pub mod sequencer;
+mod snapshot;
 pub use sequencer::{replay, replay_path};
 mod telemetry;
 pub use telemetry::{Telemetry, init_logging, init_telemetry};

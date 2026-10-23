@@ -21,10 +21,12 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::clock::Clock;
+use crate::config::SnapshotSection;
 use crate::log::{Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
 use crate::metrics::Metrics;
 use crate::sequencer::alerts::{DeficitAlert, alert_on};
 use crate::sequencer::replay::Replay;
+use crate::snapshot::Progress;
 use crate::tee::EnclaveKey;
 use crate::trusted_time::{Sample, TimeGate};
 
@@ -98,6 +100,8 @@ pub struct Sequencer {
     deficit: DeficitAlert,
     operator: Operator,
     metrics: Arc<Metrics>,
+    snapshots: Option<SnapshotSection>,
+    progress: Progress,
 }
 
 pub struct SequencerConfig<'a> {
@@ -118,12 +122,21 @@ pub struct SequencerConfig<'a> {
     pub operator: Operator,
     /// Where the sequencer records its metrics.
     pub metrics: Arc<Metrics>,
+    pub snapshots: Option<&'a SnapshotSection>,
 }
 
 /// A log read from disk and replayed, before anything is written to it.
 pub struct ReplayedLog {
     log: SegmentedLog,
     replayed: Replayed,
+    snapshot_seq: Option<u64>,
+}
+
+impl ReplayedLog {
+    /// The last command recovery applied, including the authenticated snapshot prefix.
+    pub(crate) fn last_seq(&self) -> Option<u64> {
+        self.replayed.engine.last_seq()
+    }
 }
 
 impl StreamMsg {
@@ -155,7 +168,7 @@ impl Sequencer {
         stream: broadcast::Sender<Arc<StreamMsg>>,
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
-        let log = Self::read_log(cfg.log_dir, |_| {})?;
+        let log = Self::read_log_with_snapshots(cfg.log_dir, cfg.snapshots, cfg.chain_id, cfg.vault)?;
         Self::recover_from(log, cfg, key, stream, withdrawals)
     }
 
@@ -170,7 +183,7 @@ impl Sequencer {
             observe(&entry);
             replay.apply(&entry)
         })?;
-        Ok(ReplayedLog { log, replayed: replay.finish() })
+        Ok(ReplayedLog { log, replayed: replay.finish(), snapshot_seq: None })
     }
 
     /// As `recover`, from `log`, which `read_log` read and replayed.
@@ -185,8 +198,8 @@ impl Sequencer {
         stream: broadcast::Sender<Arc<StreamMsg>>,
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
-        let ReplayedLog { log, replayed } = log;
-        let Replayed { engine, commands, checkpoints, unsigned, genesis, last_checkpoint_ts, .. } = replayed;
+        let ReplayedLog { log, replayed, snapshot_seq } = log;
+        let Replayed { engine, commands, checkpoints, unsigned, genesis, activations, last_checkpoint_ts } = replayed;
         // A config naming another client auth or operator, and so another chain, vault, or admin key,
         // is the wrong one for this log: refuse before anything is written or signed under it.
         if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
@@ -196,7 +209,7 @@ impl Sequencer {
             bail!("the log records operator {recorded:?}, but the config gives {:?}", cfg.operator);
         }
         genesis.ensure_closed()?;
-        info!(commands, checkpoints, "recovered from log");
+        info!(commands, checkpoints, snapshot_seq, "recovered from log");
         if let Some(ts) = last_checkpoint_ts {
             cfg.metrics.last_checkpoint_seconds.set(ts as f64 / 1000.0);
         }
@@ -220,6 +233,8 @@ impl Sequencer {
             deficit: DeficitAlert::default(),
             operator: cfg.operator,
             metrics: cfg.metrics,
+            snapshots: cfg.snapshots.cloned(),
+            progress: Progress { genesis, activations, checkpoints },
         };
         {
             let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
@@ -344,7 +359,12 @@ impl Sequencer {
     fn stamp(&mut self, ts: Millis, cmd: Command) -> anyhow::Result<Vec<Event>> {
         let sequenced = Sequenced { seq: self.next_seq, ts, cmd };
         let _span = info_span!("command", id = sequenced.seq).entered();
+        let version = self.engine.protocol_version();
         let events = self.engine.apply(&sequenced).context("sequencer produced an invalid sequence")?;
+        self.progress.genesis.command(&sequenced, &events);
+        if self.engine.protocol_version() != version {
+            self.progress.activations.push((self.engine.protocol_version(), sequenced.seq));
+        }
         self.next_seq += 1;
         self.last_ts = ts;
         self.record(LogEntry::Command(CommandEntry { sequenced, events: Some(events.clone()) }))?;
@@ -405,7 +425,10 @@ impl Sequencer {
             signature: self.key.sign_checkpoint(self.chain_id, &self.vault.0, seq, &root),
             signer: self.key.address_hex(),
         };
-        self.record(LogEntry::Checkpoint(cp))?;
+        self.record(LogEntry::Checkpoint(cp.clone()))?;
+        self.progress.genesis.checkpoint();
+        self.progress.checkpoints += 1;
+        self.store_snapshot(cp)?;
         self.last_checkpoint = Some(seq);
         self.metrics.last_checkpoint_seconds.set(self.last_ts as f64 / 1000.0);
         Ok(())
@@ -432,6 +455,7 @@ impl Sequencer {
 
 mod alerts;
 pub(crate) mod genesis;
+mod snapshots;
 pub use genesis::{GenesisProgress, genesis_commands};
 mod required;
 

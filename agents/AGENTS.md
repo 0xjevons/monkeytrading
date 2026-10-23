@@ -26,6 +26,7 @@ an index: load only the rule whose hint matches the current action.
   replay`, `engine admin` (the operator's signing client), the REST API with the operator's admin
   route and account proofs, and the resumable WebSocket stream (TLS from an attested in-enclave key,
   with rate limits and connection caps), the account history index (SQLite, derived from the log),
+  optional checkpoint snapshots authenticated by pinned attested signers for suffix recovery,
   TEE attestation (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime
   servers, the custody adapter (mock, or EVM vault deposits over alloy), price feeds: live crypto
   venue WebSockets (`feeds/`, one adapter per venue) and a mock, Prometheus metrics on an operator

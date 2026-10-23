@@ -1,7 +1,8 @@
 //! Account history: every event that names an account, indexed from the log the sequencer
 //! publishes and served newest first. The index is derived from the log alone, never from engine
 //! state, so it can always be rebuilt from the log's segments. On a restart it resumes after the
-//! last command it took, once that command is found unchanged in the log; an index the log does not
+//! last command it took, once that command is found unchanged in the log; snapshot recovery reads
+//! only that command's segment. An index the log does not
 //! match, one pruned under another retention, or a damaged file is discarded and rebuilt instead. It
 //! serves pages only once it has taken every command the log held at startup. History is public,
 //! like the log it comes from.
@@ -18,7 +19,7 @@
 mod store;
 pub use store::Reader;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
 use engine_core::event::Event;
@@ -31,7 +32,7 @@ use tracing::{info, warn};
 use crate::api::Feed;
 use crate::config::HistorySection;
 use crate::history::store::{Writer, discard};
-use crate::log::{CommandEntry, LogEntry, Offset};
+use crate::log::{CommandEntry, LogEntry, LogReader, Manifest, Offset};
 use crate::sequencer::StreamBody;
 
 /// The `type` of every event that names an account: what the `kind` filter accepts.
@@ -158,6 +159,28 @@ impl History {
 }
 
 impl HistoryCheck {
+    /// Checks only the cursor's segment after snapshot recovery, bounded by that segment's size.
+    /// Error cases:
+    /// - the cursor's segment or manifest cannot be read or checked
+    pub(crate) fn check_log(&mut self, dir: &Path, tip: Option<u64>) -> anyhow::Result<()> {
+        let Ok((_, Some(last))) = &self.opened else {
+            return Ok(());
+        };
+        let seq = last.sequenced.seq;
+        if tip.is_none_or(|tip| seq > tip) {
+            return Ok(());
+        }
+        let manifest = Manifest {
+            flushed: Some(Offset { seq: tip.expect("checked tip"), index: u32::MAX }),
+            ..Manifest::load(dir)?
+        };
+        let mut reader = LogReader::open(dir, Offset::start_of(seq), watch::channel(manifest).1)?;
+        if let Some((_, entry)) = reader.next_entry()? {
+            self.observe(&entry);
+        }
+        Ok(())
+    }
+
     /// Opens the index in `cfg.dir`, creating it if missing, to be checked against the log recovery
     /// replays next (see `finish`). An index whose file is damaged or holds another schema, or
     /// whose rows were pruned under another retention than `cfg` gives, is left for `finish` to
@@ -182,6 +205,13 @@ impl HistoryCheck {
             opened => opened,
         };
         Ok(Self { dir: cfg.dir.clone(), retention_ms, opened, found: None })
+    }
+
+    /// Checks the full event/index integrity before snapshot recovery checks the cursor segment.
+    /// Error cases:
+    /// - as `open`
+    pub(crate) fn open_cursor(cfg: &HistorySection) -> anyhow::Result<Self> {
+        Self::open(cfg)
     }
 
     /// Notes the next entry of the log recovery reads.

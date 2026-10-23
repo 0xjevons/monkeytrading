@@ -114,6 +114,7 @@ async fn serve_node(cfg: NodeConfig, metrics: Arc<Metrics>, routing: &mut Routin
         client_auth: client_auth.clone(),
         operator,
         metrics: metrics.clone(),
+        snapshots: cfg.snapshots.as_ref(),
     };
     let mut seq = Sequencer::recover_from(log, seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
@@ -235,17 +236,31 @@ async fn serve_node(cfg: NodeConfig, metrics: Arc<Metrics>, routing: &mut Routin
     outcome
 }
 
-/// Reads the log once, a segment at a time: recovery replays that read, and the history index is
-/// checked against it, and rebuilt if it does not match, before recovery writes anything, so no
-/// other copy of the log can come between the check and the replay.
+/// Recovers before any append, checking history against that read during full replay or against
+/// its cursor's segment after authenticated snapshot recovery. A mismatched index is rebuilt.
 /// Error cases:
 /// - the history index cannot be opened, nor a fresh one in its place (see `HistoryCheck`)
 /// - the log cannot be read or replayed (see `Sequencer::read_log`)
 fn read_log_and_history(cfg: &NodeConfig) -> anyhow::Result<(ReplayedLog, History)> {
     let history_failed = |e: &anyhow::Error| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}");
-    let mut check = HistoryCheck::open(&cfg.history).inspect_err(history_failed)?;
-    let log = Sequencer::read_log(&cfg.node.log_dir, |entry| check.observe(entry))
-        .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
+    let open_history = if cfg.snapshots.is_some() { HistoryCheck::open_cursor } else { HistoryCheck::open };
+    let mut check = open_history(&cfg.history).inspect_err(history_failed)?;
+    let mut read = || {
+        if cfg.snapshots.is_some() {
+            let vault = cfg.custody.vault.parse().context("custody.vault")?;
+            let log = Sequencer::read_log_with_snapshots(
+                &cfg.node.log_dir,
+                cfg.snapshots.as_ref(),
+                cfg.custody.chain_id,
+                vault,
+            )?;
+            check.check_log(&cfg.node.log_dir, log.last_seq())?;
+            Ok(log)
+        } else {
+            Sequencer::read_log(&cfg.node.log_dir, |entry| check.observe(entry))
+        }
+    };
+    let log = read().inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
     let history = check.finish().inspect_err(history_failed)?;
     Ok((log, history))
 }

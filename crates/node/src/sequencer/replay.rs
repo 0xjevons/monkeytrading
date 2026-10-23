@@ -13,6 +13,7 @@ use engine_core::{Engine, Fixed};
 
 use crate::log::{self, LogEntry, SegmentedLog};
 use crate::sequencer::GenesisProgress;
+use crate::snapshot::{Progress, Snapshot};
 
 /// The result of replaying a log.
 pub struct Replayed {
@@ -49,6 +50,23 @@ pub(super) struct Replay {
 }
 
 impl Replay {
+    /// Resumes only a verified, completely signed checkpoint, preserving replay's prefix facts.
+    pub(super) fn from_snapshot(engine: Engine, snapshot: Snapshot) -> Self {
+        let Snapshot { progress: Progress { genesis, activations, checkpoints }, .. } = snapshot;
+        let commands = engine.last_seq().expect("verified snapshot has a sequence") + 1;
+        let last_checkpoint_ts = Some(engine.now());
+        Self {
+            engine,
+            commands,
+            checkpoints,
+            activations,
+            genesis,
+            last_checkpoint_ts,
+            approved: VecDeque::new(),
+            logs_events: true,
+        }
+    }
+
     /// Applies the log's next entry.
     /// Error cases:
     /// - a command out of sequence, with time running backwards, or stamped past the range the
