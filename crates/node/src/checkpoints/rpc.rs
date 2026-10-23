@@ -189,70 +189,7 @@ impl CheckpointChain for CheckpointRpc {
     /// Error cases:
     /// - authorization, reservation durability/ownership, or an RPC request fails
     async fn post(&self, cp: &Checkpoint) -> anyhow::Result<()> {
-        self.submissions.validate_checkpoint(cp)?;
-        // Serialize nonce selection and sending across posting instances for this log.
-        let _lock = self.submissions.lock()?;
-        let chain_id = self.deadline(self.provider.get_chain_id()).await?;
-        ensure!(chain_id == self.domain.chain_id, "checkpoint endpoint is on another chain");
-        let latest_nonce = self.deadline(self.provider.get_transaction_count(self.relayer)).await?;
-        let mut reservation = match self.submissions.read()? {
-            Some(reservation) if reservation.checkpoint == *cp => reservation,
-            previous => {
-                if let Some(previous) = previous {
-                    ensure!(cp.seq > previous.checkpoint.seq, "checkpoint differs from its nonce reservation");
-                    ensure!(latest_nonce > previous.nonce, "another checkpoint submission is still pending");
-                }
-                let pending_nonce = self.deadline(self.provider.get_transaction_count(self.relayer).pending()).await?;
-                ensure!(
-                    pending_nonce == latest_nonce,
-                    "relayer has unreserved pending transactions; use a dedicated relayer"
-                );
-                ensure!(latest_nonce < u64::MAX, "relayer nonce is exhausted");
-                self.submissions.reserve(cp.clone(), latest_nonce)?
-            }
-        };
-        ensure!(
-            latest_nonce <= reservation.nonce,
-            "reserved nonce is consumed; await canonical checkpoint reconciliation"
-        );
-        let parent = cp.parent.context("legacy checkpoint cannot be posted to a v2 vault")?;
-        let input = postCheckpointCall {
-            seq: cp.seq,
-            root: cp.root.parse()?,
-            hasParent: parent.has_checkpoint,
-            parentSeq: parent.seq,
-            parentRoot: parent.root.0.into(),
-            signature: cp.signature.parse()?,
-        }
-        .abi_encode();
-        let tx = TransactionRequest::default()
-            .with_to(Address::from(self.domain.vault.0))
-            .with_from(self.relayer)
-            .with_chain_id(self.domain.chain_id)
-            .with_nonce(reservation.nonce)
-            .with_input(input);
-        if let Some(hash) = reservation.transaction_hash {
-            let known: Option<TransactionRequest> =
-                self.deadline(self.provider.client().request("eth_getTransactionByHash", (hash,))).await?;
-            if let Some(known) = known {
-                ensure!(
-                    known.from == tx.from
-                        && known.to == tx.to
-                        && known.nonce == tx.nonce
-                        && known.chain_id == tx.chain_id
-                        && known.value.unwrap_or_default() == tx.value.unwrap_or_default()
-                        && known.input.unique_input()? == tx.input.unique_input()?,
-                    "reserved transaction hash identifies another transaction"
-                );
-                return Ok(());
-            }
-        }
-        // A preceding sync failure must not turn a merely visible reservation into a send.
-        self.submissions.sync()?;
-        let hash = self.deadline(self.provider.client().request("eth_sendTransaction", (tx,))).await?;
-        reservation.transaction_hash = Some(hash);
-        self.submissions.store(&reservation)?;
-        Ok(())
+        self.post_reserved(cp).await
     }
 }
 

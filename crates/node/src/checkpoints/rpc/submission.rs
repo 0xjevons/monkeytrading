@@ -16,6 +16,9 @@ use crate::log::{Checkpoint, CheckpointDomain};
 
 const RECORD_LIMIT: u64 = 4096;
 
+mod posting;
+mod progress;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Reservation {
@@ -25,6 +28,8 @@ pub(super) struct Reservation {
     pub checkpoint: Checkpoint,
     pub nonce: u64,
     pub transaction_hash: Option<B256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_through: Option<Checkpoint>,
 }
 
 pub(super) struct SubmissionStore {
@@ -68,6 +73,14 @@ impl SubmissionStore {
         ensure!(bytes.len() as u64 <= RECORD_LIMIT, "checkpoint submission reservation is too large");
         let reservation: Reservation =
             serde_json::from_slice(&bytes).context("decoding checkpoint submission reservation")?;
+        self.validate_reservation(&reservation)?;
+        Ok(Some(reservation))
+    }
+
+    /// Applies the same authority and provenance checks to reads and writes.
+    /// Error cases:
+    /// - format, deployment, nonce, signature, or provenance ordering is invalid
+    fn validate_reservation(&self, reservation: &Reservation) -> anyhow::Result<()> {
         ensure!(reservation.version == 1, "unsupported checkpoint submission reservation version");
         ensure!(
             reservation.domain == self.domain && reservation.relayer == self.relayer,
@@ -75,7 +88,18 @@ impl SubmissionStore {
         );
         ensure!(reservation.nonce < u64::MAX, "reserved relayer nonce is exhausted");
         self.validate_checkpoint(&reservation.checkpoint)?;
-        Ok(Some(reservation))
+        if let Some(obsolete) = &reservation.reused_through {
+            self.validate_checkpoint(obsolete)?;
+            let parent = reservation.checkpoint.parent.context("submission has no signed parent")?;
+            ensure!(
+                parent.has_checkpoint
+                    && obsolete.seq <= parent.seq
+                    && (obsolete.seq != parent.seq
+                        || obsolete.root.parse::<engine_core::eip712::B256>()? == parent.root),
+                "nonce reuse provenance is outside the signed predecessor"
+            );
+        }
+        Ok(())
     }
 
     /// Serializes posting instances sharing this log directory; startup never acquires it.
@@ -95,10 +119,13 @@ impl SubmissionStore {
 
     /// Stores ownership before the signing RPC can observe a transaction.
     /// Error cases:
-    /// - serialization, file write/sync, rename, or directory sync fails
-    pub fn reserve(&self, checkpoint: Checkpoint, nonce: u64) -> anyhow::Result<Reservation> {
-        self.validate_checkpoint(&checkpoint)?;
-        ensure!(nonce < u64::MAX, "relayer nonce is exhausted");
+    /// - authority/provenance validation, serialization, or durable replacement fails
+    pub fn reserve(
+        &self,
+        checkpoint: Checkpoint,
+        nonce: u64,
+        reused_through: Option<Checkpoint>,
+    ) -> anyhow::Result<Reservation> {
         let reservation = Reservation {
             version: 1,
             domain: self.domain,
@@ -106,6 +133,7 @@ impl SubmissionStore {
             checkpoint,
             nonce,
             transaction_hash: None,
+            reused_through,
         };
         self.store(&reservation)?;
         Ok(reservation)
@@ -115,6 +143,7 @@ impl SubmissionStore {
     /// Error cases:
     /// - serialization, write/sync, rename, or directory sync fails
     pub fn store(&self, reservation: &Reservation) -> anyhow::Result<()> {
+        self.validate_reservation(reservation)?;
         let bytes = serde_json::to_vec(reservation).context("encoding checkpoint submission reservation")?;
         ensure!(bytes.len() as u64 <= RECORD_LIMIT, "checkpoint submission reservation is too large");
         let staging = self.path.with_extension("json.tmp");

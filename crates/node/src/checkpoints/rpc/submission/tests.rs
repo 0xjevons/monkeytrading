@@ -17,6 +17,7 @@ use crate::tee::EnclaveKey;
 use crate::test_support::scratch_dir;
 
 mod fakes;
+mod nonce_progress;
 use crate::checkpoints::rpc::submission::tests::fakes::Server;
 
 #[tokio::test]
@@ -103,7 +104,7 @@ async fn dropped_transaction_reuses_nonce_but_consumed_nonce_never_allocates_ano
 }
 
 #[tokio::test]
-async fn pending_owner_blocks_siblings_and_new_work_until_nonce_consumption() {
+async fn pending_owner_blocks_siblings_and_new_work_until_finalized_progress() {
     let dir = scratch_dir("submission-competing-work");
     fs::create_dir_all(&dir).unwrap();
     let server = Server::start(&dir).await;
@@ -118,11 +119,19 @@ async fn pending_owner_blocks_siblings_and_new_work_until_nonce_consumption() {
     assert!(chain.post(&sibling).await.is_err());
     assert_eq!(fs::read(dir.join("checkpoint-submission.json")).unwrap(), record);
     assert_eq!(server.state.lock().unwrap().sent.len(), 1);
-    server.state.lock().unwrap().latest_nonce = 8;
-    chain.post(&checkpoint(11)).await.unwrap();
+    let successor = nonce_progress::successor(&cp, 11);
+    {
+        let mut state = server.state.lock().unwrap();
+        state.latest_nonce = 8;
+        state.latest = Some(cp.clone());
+        state.finalized = Some(cp.clone());
+        state.consumer = Some(state.sent[0].clone());
+    }
+    chain.post(&successor).await.unwrap();
     assert_eq!(read_record(&dir)["nonce"], 8);
     assert_eq!(read_record(&dir)["checkpoint"]["seq"], 11);
-    assert!(chain.post(&cp).await.is_err(), "an old checkpoint never gets a new reservation");
+    chain.post(&cp).await.unwrap();
+    assert_eq!(read_record(&dir)["checkpoint"]["seq"], 11, "latest inclusion never replaces the successor");
     assert_eq!(server.state.lock().unwrap().sent.len(), 2);
 }
 
@@ -182,7 +191,7 @@ fn startup_and_unauthorized_checkpoint_validation_preserve_storage_bytes() {
     let store =
         SubmissionStore::load(&dir, domain(), Address::repeat_byte(3), AccountId(EnclaveKey::test_key().address()))
             .unwrap();
-    let record = store.reserve(checkpoint(10), 7).unwrap();
+    let record = store.reserve(checkpoint(10), 7, None).unwrap();
     let valid = serde_json::to_value(record).unwrap();
     let mut cases = Vec::new();
     for (field, value) in
@@ -315,6 +324,11 @@ fn checkpoint(seq: u64) -> Checkpoint {
 
 /// Builds the actual RPC adapter, independently pinning its fixture authority.
 fn rpc(url: &str, dir: &Path) -> CheckpointRpc {
+    rpc_with_finality(url, dir, FinalityTag::Finalized, 0)
+}
+
+/// Builds the real adapter with the fixture's requested custody finality policy.
+fn rpc_with_finality(url: &str, dir: &Path, finality: FinalityTag, confirmations: u64) -> CheckpointRpc {
     let cfg: CheckpointSection = toml::from_str(&format!(
         "rpc_url = {url:?}\nrelayer = '{:#x}'\nretry_interval = '10ms'\nrpc_timeout = '1s'",
         Address::repeat_byte(3)
@@ -324,8 +338,8 @@ fn rpc(url: &str, dir: &Path) -> CheckpointRpc {
         &cfg,
         domain(),
         Address::repeat_byte(2),
-        FinalityTag::Finalized,
-        0,
+        finality,
+        confirmations,
         dir,
         AccountId(EnclaveKey::test_key().address()),
     )

@@ -28,6 +28,15 @@ pub struct RpcState {
     pub lookup_override: Option<Value>,
     pub lose_response: bool,
     pub block_hash_store: bool,
+    pub reject_send: bool,
+    pub resurface_on_send: Option<Value>,
+    pub signer: alloy::primitives::Address,
+    pub finalized_signer: Option<alloy::primitives::Address>,
+    pub consumer: Option<Value>,
+    pub consumed_at: u64,
+    pub orphan: Option<B256>,
+    pub fail_method: Option<&'static str>,
+    pub wrong_consuming_hash: bool,
     pub latest: Option<Checkpoint>,
     pub finalized: Option<Checkpoint>,
     pub hash: B256,
@@ -52,6 +61,15 @@ impl Server {
             lookup_override: None,
             lose_response: false,
             block_hash_store: false,
+            reject_send: false,
+            resurface_on_send: None,
+            signer: alloy::primitives::Address::from(EnclaveKey::test_key().address()),
+            finalized_signer: None,
+            consumer: None,
+            consumed_at: 6,
+            orphan: None,
+            fail_method: None,
+            wrong_consuming_hash: false,
             latest: None,
             finalized: None,
             hash: B256::repeat_byte(0x33),
@@ -75,10 +93,25 @@ impl Drop for Server {
 async fn answer(State(state): State<Arc<Mutex<RpcState>>>, Json(request): Json<Value>) -> Response {
     let mut state = state.lock().unwrap();
     let params = &request["params"];
-    let result = match request["method"].as_str().unwrap() {
+    let method = request["method"].as_str().unwrap();
+    if state.fail_method == Some(method) {
+        return rpc_error(&request, "injected RPC failure");
+    }
+    let result = match method {
         "eth_chainId" => json!(format!("{:#x}", state.chain_id)),
         "eth_getTransactionCount" => {
-            let nonce = if params[1] == "pending" { state.pending_nonce } else { state.latest_nonce };
+            let nonce = if params[1].is_object() {
+                assert_eq!(params[1]["requireCanonical"], true);
+                let hash: B256 = serde_json::from_value(params[1]["blockHash"].clone()).unwrap();
+                if state.orphan == Some(hash) {
+                    return rpc_error(&request, "header is no longer canonical");
+                }
+                if hash.as_slice()[0] as u64 >= state.consumed_at && state.consumer.is_some() { 8 } else { 7 }
+            } else if params[1] == "pending" {
+                state.pending_nonce
+            } else {
+                state.latest_nonce
+            };
             json!(format!("{nonce:#x}"))
         }
         "eth_sendTransaction" => {
@@ -89,6 +122,15 @@ async fn answer(State(state): State<Arc<Mutex<RpcState>>>, Json(request): Json<V
             assert_eq!(record["nonce"], nonce, "nonce ownership must exist before send");
             assert!(record["checkpoint"]["signature"].as_str().unwrap().starts_with("0x"));
             state.sent.push(transaction);
+            if state.reject_send {
+                return rpc_error(&request, "rejected before acceptance");
+            }
+            if let Some(consumer) = state.resurface_on_send.take() {
+                state.consumer = Some(consumer);
+                state.latest_nonce = nonce + 1;
+                state.pending_nonce = nonce + 1;
+                return rpc_error(&request, "obsolete predecessor consumed nonce before acceptance");
+            }
             state.pending_nonce = state.pending_nonce.max(nonce + 1);
             if state.block_hash_store {
                 std::fs::create_dir(state.path.with_extension("json.tmp")).unwrap();
@@ -106,11 +148,33 @@ async fn answer(State(state): State<Arc<Mutex<RpcState>>>, Json(request): Json<V
             }
         }
         "eth_getBlockByNumber" => {
-            let finalized = params[0] == "finalized";
-            let mut block: Block = Block::default();
-            block.header.number = if finalized { 8 } else { 10 };
-            block.header.hash = B256::repeat_byte(if finalized { 8 } else { 10 });
-            serde_json::to_value(block).unwrap()
+            let number = match params[0].as_str().unwrap() {
+                "finalized" => 8,
+                "latest" => 10,
+                value => u64::from_str_radix(value.trim_start_matches("0x"), 16).unwrap(),
+            };
+            block(number)
+        }
+        "eth_getBlockByHash" => {
+            let hash: B256 = serde_json::from_value(params[0].clone()).unwrap();
+            let number = hash.as_slice()[0] as u64;
+            let mut result = block(number);
+            if params[1] == true {
+                let transactions = state
+                    .consumer
+                    .iter()
+                    .cloned()
+                    .map(|mut tx| {
+                        tx.as_object_mut().unwrap().entry("value").or_insert(json!("0x0"));
+                        tx
+                    })
+                    .collect::<Vec<_>>();
+                result["transactions"] = json!(transactions);
+                if state.wrong_consuming_hash {
+                    result["hash"] = json!(B256::repeat_byte(0xff));
+                }
+            }
+            result
         }
         "eth_call" => {
             let finalized = params[1]["blockHash"] == json!(B256::repeat_byte(8));
@@ -120,9 +184,8 @@ async fn answer(State(state): State<Arc<Mutex<RpcState>>>, Json(request): Json<V
             let bytes = if selector == hex::encode(usdcCall::SELECTOR) {
                 usdcCall::abi_encode_returns(&alloy::primitives::Address::repeat_byte(2))
             } else if selector == hex::encode(checkpointSignerCall::SELECTOR) {
-                checkpointSignerCall::abi_encode_returns(&alloy::primitives::Address::from(
-                    EnclaveKey::test_key().address(),
-                ))
+                let signer = if finalized { state.finalized_signer.unwrap_or(state.signer) } else { state.signer };
+                checkpointSignerCall::abi_encode_returns(&signer)
             } else if selector == hex::encode(hasCheckpointCall::SELECTOR) {
                 hasCheckpointCall::abi_encode_returns(&checkpoint.is_some())
             } else if selector == hex::encode(latestSeqCall::SELECTOR) {
@@ -140,4 +203,18 @@ async fn answer(State(state): State<Arc<Mutex<RpcState>>>, Json(request): Json<V
         other => panic!("unexpected RPC method {other}"),
     };
     Json(json!({"jsonrpc": "2.0", "id": request["id"], "result": result})).into_response()
+}
+
+/// Returns a canonical block on the fixture's immutable hash-linked chain.
+fn block(number: u64) -> Value {
+    let mut block: Block = Block::default();
+    block.header.number = number;
+    block.header.hash = B256::repeat_byte(number as u8);
+    block.header.parent_hash = B256::repeat_byte(number.saturating_sub(1) as u8);
+    serde_json::to_value(block).unwrap()
+}
+
+/// Returns an ordinary JSON-RPC refusal without changing the fixture's chain state.
+fn rpc_error(request: &Value, message: &str) -> Response {
+    Json(json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32000,"message":message}})).into_response()
 }
