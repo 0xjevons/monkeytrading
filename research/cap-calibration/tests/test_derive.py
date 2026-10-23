@@ -189,11 +189,15 @@ def test_flow_sizes_leverage_and_long_share_come_from_full_days_only(tmp_path):
     assert float(flow["margin_usd"]) == 4000.0
     assert float(flow["long_share"]) == 1.0
 
+    # The hedged kind has no weight in the full-day sample, so the profiles emit no rows for it
+    # (its divide would have no weights); every row that is emitted is finite.
+    size_rows = read_csv(out / "papertrade_sizes.csv")
+    assert {r["kind"] for r in size_rows} == {"directional"}
+    assert all(np.isfinite(float(r["margin_share"])) for r in size_rows)
     # All four full-day positions map to a single notional per schedule, so each margin share
     # jumps straight from 0 to 1; any partial-day leak (at 1e6 or 5e5 of mapped notional) lands
     # in between.
-    shares = [float(r["margin_share"]) for r in read_csv(out / "papertrade_sizes.csv") if r["kind"] == "directional"]
-    assert set(shares) == {0.0, 1.0}
+    assert {float(r["margin_share"]) for r in size_rows} == {0.0, 1.0}
 
     # The leverage profile holds only the 1-50 bin, with all $4k of the full-day margin.
     lev = [r for r in read_csv(out / "papertrade_leverage.csv") if r["kind"] == "directional"]

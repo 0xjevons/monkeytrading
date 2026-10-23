@@ -366,6 +366,8 @@ def size_profile(pos: dict, hedged: np.ndarray, sample: np.ndarray) -> list[dict
     for kind, weight in kinds(hedged):
         margin, leverage = pos["margin"][sample], pos["leverage"][sample].astype(float)
         w = margin * weight[sample]
+        if w.sum() <= 0:
+            continue  # the kind has no weight in the sample: no profile rows to emit
         for mapping in ("capped", "relative"):
             for tiers in launch_schedules():
                 notional = mapped_notional(margin, leverage, tiers, mapping)
@@ -477,7 +479,7 @@ def derive(raw: Path, raw_markets: Path, out: Path) -> None:
         "raw_pnl_over_notional_bps": round(float(raw_pnl[closed].sum() / w.sum() * 1e4), 4),
         "raw_pnl_over_notional_bps_directional": round(float((raw_pnl * (1 - hedged))[closed].sum() / (pos["notional"] * (1 - hedged))[closed].sum() * 1e4), 4),
         "winner_keeps_share_of_raw_gain": round(float(kept.sum() / gains.sum()), 4),
-        "hedged_cost_per_usd_of_loss": round(float(((gains - kept) * hedged).sum() / (losses * hedged).sum()), 4),
+        "hedged_cost_per_usd_of_loss": round(float(((gains - kept) * hedged).sum() / (losses * hedged).sum()), 4) if (losses * hedged).sum() > 0 else 0.0,
         "deposits_usd": round(float(d["deposits"][:, 1].sum()), 0) if len(d["deposits"]) else 0.0,
         "withdrawals_usd": round(float(d["withdrawals"][:, 1].sum()), 0) if len(d["withdrawals"]) else 0.0,
     }

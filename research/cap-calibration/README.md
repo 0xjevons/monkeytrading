@@ -27,7 +27,7 @@ point: each market at the floor where its refusals end.
   below -$1M. House cash goes below zero in 0.85% (17 paths), no withdrawal ever waits in the #49
   queue, and NAV ends the 90 days at a median of $26.2M.
 - **Order size, not exposure, is what small floors refuse.** An order larger than the cap is
-  refused whatever flows around it. At 200:1, orders up to $1M carry only 40% of papertrade's
+  refused whatever flows around it. At 200:1, orders up to $1M carry only 45% of papertrade's
   margin, so a floor under a few million refuses most launch flow — 80% of launch-week notional at
   $100k a market, 47% at $1M — while $10M a market, papertrade's position cap, refuses 2%.
 - **Along the risk-level allocations, the dip rises quickly with the floors.** From 0.55% at $49.4k
@@ -56,7 +56,7 @@ on 1,000 paths (the baseline gives NAV below zero 18.0% and house cash below zer
 | Farming share x2 | 2.4% | 0 | 0 | $1.09M |
 | Flow x0.25 / x4 | 18.5% / 4.7% | 1.2% / 0.60% | 0.20% / 1.20% | $158k / $2.52M |
 
-- **Farming is what makes the house solvent early.** Hedged flow pays about a third of the fees.
+- **Farming is what makes the house solvent early.** Hedged flow pays about two thirds of the fees.
   Without it, NAV dips below zero in 79% of paths and house cash in 29%.
 - **Correlated client direction is among the largest market risks.** When clients lean the same way in
   every market, the house's net exposure adds up across markets instead of netting.
@@ -262,7 +262,9 @@ the side that grows the exposure, and up to that plus twice the exposure for the
 it. A pair's two accounts open first the leg that fits. With no room, as at zero NAV, a zero
 floor, and no exposure, nothing opens. Of what fits, the side that reduces the house's net
 exposure fills in full and the crowded side up to the cap. A pair leaves the house's net exposure
-unchanged, so once its legs fit, no cap refuses it.
+unchanged, but the engine checks each leg in turn and the returning leg lands the exposure back
+where the pair found it, so once that state is past a cap — as when NAV has fallen — no pair
+opens, whichever leg opens first.
 
 **Engine rules** (`model/accounting.py`, each against the engine function it mirrors; the tests
 check them on hand cases from the engine's own tests):
@@ -362,10 +364,12 @@ The same floor on every market:
 | $3M | $111M | 37 | 8.90% | 0.75% | 0.05% | 23.8% | 12.1% | $24.7M | $23.6M | $572k |
 | $10M | $370M | 37 | 18.75% | 0.85% | 3.40% | 1.9% | 1.0% | $26.2M | $25.3M | $631k |
 
-Each probability is the share of the 2,000 paths, and a candidate meets a target only when its
-exact one-sided 95% upper bound is at or below it: with zero failing paths that bound is 0.15% on
-2,000 paths (0.30% on the 1,000-path sensitivity runs). Refused shares are of opening notional,
-directional flow and churn.
+Each probability is the share of the 2,000 paths. The recommendation for a target is the
+candidate whose measured share is at or below it that refuses the least; the one-sided 95% upper
+bound beside each count is the uncertainty on the measurement, not the selection criterion. With
+zero failing paths that bound is 0.15% on 2,000 paths (0.30% on the 1,000-path sensitivity runs),
+so a pick measuring exactly at its target sits within sampling noise of it. Refused shares are of
+opening notional, directional flow and churn.
 
 ## Limits
 
@@ -373,7 +377,7 @@ directional flow and churn.
   markets at 1000:1, crypto-native users, and a launch spike. Holds, leverage, and long share on
   RWA markets, at lower leverage and with closures, are assumptions carried over from it.
 - **Fixed holds.** Each hold class settles at one hold, 1, 4, 16, or 48 hours; papertrade's
-  notional-weighted mean holds within the classes are 1.4, 3.7, 13.7, and 53.6 hours.
+  notional-weighted mean holds within the classes are 1.4, 3.9, 13.8, and 54.3 hours.
 - **Volume.** The flow level assumes this engine draws papertrade's margin. Fees scale with it, so
   the `flow x0.25` and `flow x4` rows bound the effect.
 - **Two years of hourly history and 2,000 paths.** The tails come from 102 weeks (late 2024 to

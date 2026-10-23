@@ -269,18 +269,126 @@ def test_financing_is_charged_at_each_rollover_on_the_marked_notional():
 
 def test_an_order_that_shrinks_the_exposure_fits_whatever_its_size():
     # Half the margin sits in orders of 200, half in orders of 2,000, under a 1,000 cap. With
-    # clients net short 800, buys fit up to 1,800 and sells up to 200: half of each fits. Net short
-    # 1,100, past the cap, a 2,000 buy leaves them 900 long, less exposure than before, so every buy
-    # fits and no sell; a pair opens its buy first.
+    # clients net short 800, buys fit up to 1,800 and sells up to 200: half of each fits, for
+    # pairs as for single orders.
     sizes = (np.array([199.9, 200.0, 1999.9, 2000.0]), np.array([0.0, 0.5, 0.5, 1.0]))
     f = flow()
     f.sizes = {key: sizes for key in f.sizes}
     cap, total_cap = np.full((1, 1, 1), 1000.0), np.full((1, 1), 1e12)
     fits = simulate.order_fits(np.full((1, 1, 1), -800.0), cap, total_cap, f, "capped", ["S"])
-    assert fits["long"][0, 0, 0] == fits["short"][0, 0, 0] == pytest.approx(0.5)
+    assert fits["long"][0, 0, 0] == fits["short"][0, 0, 0] == fits["pair"][0, 0, 0] == pytest.approx(0.5)
+    # Net short 1,100, past the cap: a 2,000 buy leaves clients 900 long, less exposure than
+    # before, so every buy fits and no sell. A pair is refused, whichever leg its accounts open
+    # first — the engine checks each leg in turn, and the returning leg lands the exposure back
+    # at -1,100, past the cap (`execution.rs`, `check_risk`).
     fits = simulate.order_fits(np.full((1, 1, 1), -1100.0), cap, total_cap, f, "capped", ["S"])
-    assert fits["long"][0, 0, 0] == fits["pair"][0, 0, 0] == 1.0
-    assert fits["short"][0, 0, 0] == 0.0
+    assert fits["long"][0, 0, 0] == 1.0
+    assert fits["short"][0, 0, 0] == fits["pair"][0, 0, 0] == 0.0
+
+
+def test_a_pair_past_the_cap_is_refused_whichever_leg_opens_first():
+    # |exposure| > cap is a state the house reaches when NAV falls and the caps shrink below the
+    # exposure. From it the engine refuses a symmetric pair in either order: the restoring leg's
+    # fill leaves the exposure no larger, but the returning leg's lands it back past the cap.
+    f = flow("hedged")
+    f.sizes = {key: TINY_ORDERS for key in f.sizes}
+    cap, total_cap = np.full((1, 1, 1), 1000.0), np.full((1, 1), 1e12)
+    for exposure in (-1100.0, 1100.0):
+        fits = simulate.order_fits(np.full((1, 1, 1), exposure), cap, total_cap, f, "capped", ["S"])
+        assert fits["pair"][0, 0, 0] == 0.0
+    fits = simulate.order_fits(np.full((1, 1, 1), -800.0), cap, total_cap, f, "capped", ["S"])
+    assert fits["pair"][0, 0, 0] == 1.0
+
+
+def test_a_pair_checks_the_total_cap_with_the_other_markets_gross():
+    # Two markets: the first net short 800, the second long 300, under market caps that do not
+    # bind and a total cap of 1,300. The returning leg is checked with the first leg on the books,
+    # so the pair fits while 800 + 300 stays within the total cap; at 1,000 it does not.
+    f = flow("hedged")
+    f.sizes = {key: TINY_ORDERS for key in f.sizes}
+    exposure = np.array([[[-800.0], [300.0]]])
+    cap = np.full((1, 2, 1), 1e12)
+    fits = simulate.order_fits(exposure, cap, np.full((1, 1), 1300.0), f, "capped", ["S", "S"])
+    assert fits["pair"][0, 0, 0] == 1.0
+    fits = simulate.order_fits(exposure, cap, np.full((1, 1), 1000.0), f, "capped", ["S", "S"])
+    assert fits["pair"][0, 0, 0] == 0.0
+
+
+def test_pairs_stop_opening_once_the_exposure_is_past_the_cap():
+    # Longs held a day push the exposure to the 1,000 floor; a 10% rise at hour 10 lifts it to
+    # 1,100, past the cap, and from that hour the engine refuses every order that does not shrink
+    # it — both legs of any pair, whichever opens first — until the day ends with nothing exited.
+    b = bars(gap_at=10, gap=0.10)
+    f = flow(hold_h=24)
+    f.classes = f.classes + [FlowClass(kind="hedged", hold_h=1, bucket=0, margin_share=1.0, mean_hold_h=1.0, mean_sqrt_hold_h=1.0, long_share=0.5)]
+    out = run(b, market(), f, floor=1000.0, days=1)
+    # Hours 0-19 the pairs fit (the last ten hours of them at the cap, which still admits a pair
+    # whose returning leg lands the exposure back within it); hours 10-23 do not open.
+    assert out["refused_hedged"] == pytest.approx(14 * 2 * 100.0, rel=1e-9)
+
+
+@pytest.mark.parametrize(
+    "accumulate,gap,churn_share,expected",
+    # Hours 0-4 accumulate (the churn clipped to the cap), 5-9 idle at it, and 10-23 are past it,
+    # the churn exempt. The short book's gap stays under the 200:1 close-out trigger.
+    [("long", 0.10, 10.75, 7300.0), ("short", 0.002, 10.015, 5830.0)],
+)
+def test_a_shrinking_order_past_the_cap_is_not_refused(accumulate, gap, churn_share, expected):
+    # Clients accumulate positions of one side until a gap at hour 10 takes |exposure| past the
+    # 1,000 floor; churn on the other side then arrives in orders larger than cap + |exposure|,
+    # and the engine exempts every fill that moves the exposure toward zero — also across it —
+    # so the final acceptance stage accepts it in full and counts no refusal.
+    long_side = accumulate == "long"
+    b = bars(gap_at=10, gap=gap)
+    f = flow(hold_h=24, long_share=1.0 if long_side else 0.0)
+    f.classes = f.classes + [
+        FlowClass(kind="directional", hold_h=0, bucket=0, margin_share=churn_share, mean_hold_h=1.0, mean_sqrt_hold_h=1.0, long_share=0.0 if long_side else 1.0)
+    ]
+    out = run(b, market(), f, floor=1000.0, days=1)
+    assert out["refused"] == pytest.approx(expected, rel=1e-9)
+
+
+def test_accepted_share_exempts_a_step_that_moves_the_exposure_toward_zero():
+    cap = np.array([1000.0])
+    # Past the cap, a netted step that moves the exposure toward zero — including across it — is
+    # accepted in full on both sides; a step that grows it clips the crowded side to the cap.
+    long_ok, short_ok = accounting.accepted_share(np.array([-1100.0]), cap, np.array([2150.0]), np.array([0.0]))
+    assert long_ok == pytest.approx(1.0)
+    assert short_ok == pytest.approx(1.0)
+    long_ok, short_ok = accounting.accepted_share(np.array([1100.0]), cap, np.array([0.0]), np.array([2150.0]))
+    assert long_ok == pytest.approx(1.0)
+    assert short_ok == pytest.approx(1.0)
+    long_ok, _ = accounting.accepted_share(np.array([-1100.0]), cap, np.array([3500.0]), np.array([0.0]))
+    assert long_ok == pytest.approx(2100.0 / 3500.0)
+
+
+def test_hedged_churn_pays_the_pair_fee_for_its_two_accounts():
+    # Hedged churn is a pair in two accounts: each account pays the profit fee on its own positive
+    # realised PnL, so per pair the expectation is 0.1 * N * E[max(R,0) + max(-R,0)] = 0.2 * N *
+    # gain for symmetric R — 10% of both legs' expected gain, the same identity `pair_exit`
+    # charges ex post (`execution.rs`, `profit_fee`). The mint basis is the losing leg's loss,
+    # N * E|R| = 2 * N * gain.
+    moves = {h: (0.01, -0.01, 0.0) for h in range(prices.WEEK)}
+    f = flow("hedged", hold_h=0, mean_hold_h=0.25)
+    out = run(bars(hour_moves=moves), market(), f)
+    sigma = 0.02 / np.sqrt(4 * np.log(2))
+    gain = simulate.GAIN_PER_SD * sigma * np.sqrt(0.25)
+    both_legs = 200.0  # the class's whole margin at 200:1, two legs of 100
+    expected = 0.1 * both_legs * gain * prices.WEEK
+    assert out["fee"] == pytest.approx(expected, rel=1e-6)
+    assert out["mint_basis"] == pytest.approx(both_legs * gain * prices.WEEK, rel=1e-6)
+    assert out["deposits"] == pytest.approx(expected, rel=1e-6)  # churners bring what they pay
+
+
+def test_a_kind_missing_its_profiles_opens_nothing():
+    # A kind with no rows in the size and leverage profiles (it had no weight in the derivation
+    # sample) opens nothing rather than crashing on the missing keys.
+    f = flow("hedged")
+    f.sizes = {key: value for key, value in f.sizes.items() if key[0] == "directional"}
+    f.leverage = {key: value for key, value in f.leverage.items() if key[0] == "directional"}
+    out = run(bars(), market(), f)
+    assert out["deposits"] == 0.0
+    assert out["nav_end"] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_churn_takes_no_reopening_gap():

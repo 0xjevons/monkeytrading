@@ -16,8 +16,9 @@ Per hour and market:
    side that reduces the house's net exposure fills in full and the crowded side up to the cap.
    Refused notional is counted.
 5. Hedged flow opens offsetting pairs in two accounts, which leave the house's net exposure
-   unchanged; a pair ends when either leg is closed out (the other leg closes with it) or at its
-   hold.
+   unchanged; each leg is an order the engine checks in turn, so a pair opens only while the
+   returning leg lands the exposure back within the caps. A pair ends when either leg is closed
+   out (the other leg closes with it) or at its hold.
 6. Flow held under an hour (churn) pays the profit fee on its expected gain over its hold, and its
    mean open net notional takes the hour's move from its open.
 7. Cash moves through the vault: exits return proceeds to idle balances, new margin and churn's
@@ -224,7 +225,7 @@ def prepare(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow, 
     margin_rate_hour = np.where(paths.is_open, per_open_hour, 0.0)
 
     n_buckets = max(c.bucket for c in flow.classes) + 1
-    leverage = np.array([[[flow.leverage[(kind, scenario.leverage_mapping, s)][b] for s in markets.schedule] for b in range(n_buckets)] for kind in KINDS])
+    leverage = np.array([[[flow.leverage.get((kind, scenario.leverage_mapping, s), np.ones(n_buckets))[b] for s in markets.schedule] for b in range(n_buckets)] for kind in KINDS])
     reopen = next_open[:, 1:] - np.arange(hours)[None, :, None]
     longest_wait = int(reopen[next_open[:, 1:] < hours].max(initial=1))
     horizon = max(c.hold_h for c in flow.classes) + longest_wait
@@ -370,15 +371,19 @@ def order_fits(exposure, cap, total_cap, flow: Flow, mapping: str, schedules: li
     """Each side's share of margin in orders the engine fills, (paths, markets, lanes): directional
     longs and shorts, and hedged pairs. An order that grows the house's net exposure fills up to
     the room under the market and total caps, one that shrinks it always
-    (`accounting.order_room`); a pair's two accounts open first the leg that fits."""
+    fills (`accounting.order_room`); a pair's legs must both fill, the returning leg checked with
+    the first on the books (`accounting.pair_room`). A kind with no profile rows opens nothing."""
     other_gross = np.abs(exposure).sum(axis=1, keepdims=True) - np.abs(exposure)
-    room_long, room_short = accounting.order_room(exposure, cap, total_cap[:, None, :] - other_gross)
+    total_room = total_cap[:, None, :] - other_gross
+    room_long, room_short = accounting.order_room(exposure, cap, total_room)
+    leg_room = accounting.pair_room(exposure, cap, total_room)
     fits = {}
-    for name, kind, room in (("long", "directional", room_long), ("short", "directional", room_short), ("pair", "hedged", np.maximum(room_long, room_short))):
+    for name, kind, room in (("long", "directional", room_long), ("short", "directional", room_short), ("pair", "hedged", leg_room)):
         fits[name] = np.zeros(exposure.shape)
         for key in dict.fromkeys(schedules):
             cols = [i for i, s in enumerate(schedules) if s == key]
-            fits[name][:, cols] = fit_share(room[:, cols], flow.sizes[(kind, mapping, key)])
+            sizes = flow.sizes.get((kind, mapping, key))
+            fits[name][:, cols] = 0.0 if sizes is None else fit_share(room[:, cols], sizes)
     return fits
 
 
@@ -584,7 +589,11 @@ def run_batch(scenario: Scenario, markets: Markets, bars: np.ndarray, flow: Flow
 
             # Churn pays the profit fee on its expected gain over its hold, and its mean open net
             # notional takes the hour's move from the open, a reopening gap excluded, converted to
-            # USD at the FX index; churners fund what they owe.
+            # USD at the FX index; churners fund what they owe. A hedged churn class is a pair in
+            # two accounts (as `pair_units` settles it): each account pays the fee on its own
+            # positive realised PnL, so per pair the expectation is 10% of both legs' expected
+            # gains — 0.2 * N * gain for leg N, symmetric R — the same identity `pair_exit`
+            # charges ex post (`execution.rs`, `profit_fee`).
             churn_gain = gain_long * long_ok + gain_short * short_ok + gain_hedged
             churn_fee = accounting.profit_fee(churn_gain)
             fx_ratio = paths.fx[:, t] / paths.fx[:, t - 1] if t >= 1 else 1.0

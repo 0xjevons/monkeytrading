@@ -81,18 +81,35 @@ def order_room(exposure, cap, total_room):
     return np.maximum(long_room, 0.0), np.maximum(short_room, 0.0)
 
 
+def pair_room(exposure, cap, total_room):
+    """The largest leg of a hedged pair whose two orders the engine fills at clients' net exposure
+    `exposure`. The accounts open the restoring leg first — it shrinks the absolute exposure,
+    which `check_risk` exempts — and the returning leg is then checked with the first leg on the
+    books; it lands the exposure back where the pair found it, so a pair fits only while that
+    state is within the market cap and `total_room`, and its leg is the state's room plus the
+    restoring leg's. Returns the leg room, 0 when the state is past a cap (`execution.rs`,
+    `check_risk`)."""
+    exposure = np.asarray(exposure, dtype=float)
+    headroom = np.minimum(cap, total_room)
+    return np.where(np.abs(exposure) <= headroom, np.abs(exposure) + np.maximum(headroom, 0.0), 0.0)
+
+
 def accepted_share(exposure, cap, longs, shorts):
     """Share of new long and new short notional accepted when they would take the house's net
     client exposure past `cap`.
 
     The engine checks each order alone and refuses one whose fill would push the absolute net
-    exposure past the cap (`execution.rs`, `check_risk`). Over one step the model nets the step's
-    orders: the side that reduces exposure is accepted in full and the crowded side up to the
-    cap. Returns `(long_share, short_share)`.
+    exposure past the cap (`execution.rs`, `check_risk`), while a fill that does not grow the
+    absolute exposure is never refused. Over one step the model nets the step's orders: a netted
+    step that moves the exposure toward zero — including across it — fills in full, however large
+    the orders; a step that grows it accepts the reducing side in full and clips the crowded side
+    to the cap. Returns `(long_share, short_share)`.
     """
     exposure, cap = np.asarray(exposure, dtype=float), np.asarray(cap, dtype=float)
     longs, shorts = np.asarray(longs, dtype=float), np.asarray(shorts, dtype=float)
     with np.errstate(divide="ignore", invalid="ignore"):
         long_room = np.where(longs > 0, (cap - exposure + shorts) / longs, 1.0)
         short_room = np.where(shorts > 0, (cap + exposure + longs) / shorts, 1.0)
-    return np.clip(long_room, 0.0, 1.0), np.clip(short_room, 0.0, 1.0)
+    long_share, short_share = np.clip(long_room, 0.0, 1.0), np.clip(short_room, 0.0, 1.0)
+    toward_zero = np.abs(exposure + longs - shorts) <= np.abs(exposure)
+    return np.where(toward_zero, 1.0, long_share), np.where(toward_zero, 1.0, short_share)
