@@ -89,11 +89,16 @@ pub enum ProtocolVersion {
     /// may set only from here, a resting order that may add risk meets its market's minimum notional
     /// at its own price, and placing one checks only that order against the live price.
     V14,
+    /// A resting order that can only reduce the account's existing position in its market — its
+    /// side opposing the position, its quantity at most the position's — need not meet the market's
+    /// minimum notional, exactly as a reduce-only order need not, so any position can be closed
+    /// with a plain order.
+    V15,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V14;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V15;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

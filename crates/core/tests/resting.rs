@@ -1,6 +1,7 @@
 //! Resting orders from `V14`: an account rests at most the parameters' cap, a resting order that may
 //! add risk meets its market's minimum notional at its own price, and placing one checks only that
-//! order against the live price.
+//! order against the live price. From `V15`, an order that can only reduce the account's position
+//! skips the minimum, exactly as a reduce-only order does.
 
 mod common;
 
@@ -123,6 +124,100 @@ fn a_resting_order_that_may_add_risk_meets_the_minimum_notional_at_its_own_price
     h.deposit(a, "100000");
     h.price(ETH, "3000");
     accepted(&dust_limit(&mut h, a, ETH));
+}
+
+#[test]
+fn a_resting_order_that_only_reduces_skips_the_minimum_from_v15() {
+    let below = || Reject::InvalidOrder { reason: "below minimum order notional".into() };
+    let mut eth = market(ETH, "ETH-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000);
+    eth.min_order_notional = f("100");
+    for (mut h, skips) in [(Harness::v14(), false), (Harness::v15(), true)] {
+        h.operator_admin(AdminCommand::UpsertMarket(eth.clone()));
+        let (a, b, e) = (acct(1), acct(2), acct(5));
+        h.deposit(a, "100000");
+        h.deposit(b, "100000");
+        h.deposit(e, "100000");
+        h.price(ETH, "3000");
+        h.market_order(a, ETH, Side::Buy, "0.1", "3000");
+        h.market_order(b, ETH, Side::Sell, "0.1", "3000");
+
+        // A plain order below the minimum that can only reduce the position — a sell against the
+        // long of 0.1, a buy against the short — rests from `V15` and is refused before it.
+        let sell = h.order(a, ETH, Side::Sell, "0.02", OrderKind::Limit { price: f("3200") });
+        let buy = h.order(b, ETH, Side::Buy, "0.02", OrderKind::Limit { price: f("2800") });
+        if skips {
+            accepted(&sell);
+            accepted(&buy);
+        } else {
+            assert_eq!(rejection(&sell), &below());
+            assert_eq!(rejection(&buy), &below());
+        }
+        // An order that would flip the position adds risk, and still meets the minimum in both
+        // versions; so does one that adds to the position, and one with no position at all.
+        let flips = h.order(a, ETH, Side::Sell, "0.2", OrderKind::Limit { price: f("400") });
+        assert_eq!(rejection(&flips), &below());
+        let adds = h.order(a, ETH, Side::Buy, "0.01", OrderKind::Limit { price: f("3000") });
+        assert_eq!(rejection(&adds), &below());
+        let naked = h.order(e, ETH, Side::Sell, "0.02", OrderKind::Limit { price: f("3200") });
+        assert_eq!(rejection(&naked), &below());
+        if skips {
+            assert_eq!(h.engine.accounts()[&a].orders.len(), 1);
+            assert_eq!(h.engine.accounts()[&b].orders.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn a_reducing_order_below_the_minimum_fills_at_once_and_rechecks_when_triggered() {
+    let below = || Reject::InvalidOrder { reason: "below minimum order notional".into() };
+    let mut eth = market(ETH, "ETH-USD", AssetClass::Crypto, Schedule::AlwaysOpen, 1_000);
+    eth.min_order_notional = f("100");
+    for (mut h, skips) in [(Harness::v14(), false), (Harness::v15(), true)] {
+        h.operator_admin(AdminCommand::UpsertMarket(eth.clone()));
+        let (a, b, c, d) = (acct(1), acct(2), acct(3), acct(4));
+        h.price(ETH, "3000");
+        for account in [a, b, c, d] {
+            h.deposit(account, "100000");
+            h.market_order(account, ETH, Side::Buy, "0.1", "3000");
+        }
+
+        // Marketable at placement, a plain sell limit at the mid is a reduction: from `V15` it
+        // fills at once; before it the placement itself is refused below the minimum. Closing the
+        // whole position is a reduction too.
+        let marketable = h.order(a, ETH, Side::Sell, "0.02", OrderKind::Limit { price: f("3000") });
+        let closing = h.order(b, ETH, Side::Sell, "0.1", OrderKind::Limit { price: f("500") });
+        if skips {
+            let order_id = accepted(&marketable);
+            assert_eq!(fills(&marketable).iter().map(|fill| fill.order_id).collect::<Vec<_>>(), [order_id]);
+            let order_id = accepted(&closing);
+            assert_eq!(fills(&closing).iter().map(|fill| fill.order_id).collect::<Vec<_>>(), [order_id]);
+            assert!(!h.engine.accounts()[&b].positions.contains_key(&ETH));
+        } else {
+            assert_eq!(rejection(&marketable), &below());
+            assert_eq!(rejection(&closing), &below());
+        }
+
+        // A resting stop that stays reducing fills when triggered; one an earlier fill turned into
+        // an increase is cancelled, the fill-time minimum still refusing it.
+        let reduces = h.order(c, ETH, Side::Sell, "0.02", OrderKind::Stop { price: f("2900") });
+        let flips = h.order(d, ETH, Side::Sell, "0.03", OrderKind::Stop { price: f("2900") });
+        let (reduces_id, flips_id) = if skips {
+            (accepted(&reduces), accepted(&flips))
+        } else {
+            assert_eq!(rejection(&reduces), &below());
+            assert_eq!(rejection(&flips), &below());
+            continue;
+        };
+        // Earlier fills shrink the longs to 0.05 and 0.02: the first stop still only reduces, the
+        // second would now flip.
+        h.market_order(c, ETH, Side::Sell, "0.05", "3000");
+        h.market_order(d, ETH, Side::Sell, "0.08", "3000");
+        let events = h.price(ETH, "2880");
+        let fills: Vec<OrderId> = fills(&events).iter().map(|fill| fill.order_id).collect();
+        let cancelled =
+            |id| events.contains(&Event::OrderCancelled { account: d, order_id: id, reason: CancelReason::Unfillable });
+        assert!(fills.contains(&reduces_id) && cancelled(flips_id), "{events:?}");
+    }
 }
 
 #[test]

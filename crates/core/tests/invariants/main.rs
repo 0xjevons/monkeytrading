@@ -1,19 +1,20 @@
 //! Accounting invariants under generated sessions. Each case sequences random client, feed,
 //! custody, and operator commands, with values inside and outside the engine's input bounds, under
 //! `V2`, the rules every log starts under, and again under `V6`, under `V7` with markets quoted in
-//! `V2`, the rules every log starts under, and again under `V6`, under `V7` with markets quoted in
 //! other currencies, under `V11`, and under `V12` with those markets and the operator signing its
-//! commands, as `V13` and `V14` then do. It checks after every command that it did not panic, that
-//! cash is conserved, and that each market's aggregates match its accounts' positions; under `V12`,
-//! also that every market has processed the index its quotes give at the sequenced time, holds no
-//! quote stamped after it, and was filled only at that index; and under `V14`, that resting orders
-//! keep to the cap, placing an order fills or cancels no other, and no market is financed at a
-//! rollover that records its benchmark as having no rate. Under each version the same sessions must
-//! reach every path that moves cash and the refusal of out-of-range amounts, order numbers, and
-//! quotes; under `V6` a close-out that no price triggered; under `V12` a resting order filled by a
-//! command with neither prices nor an order, which `V2` never fills; under `V13`, which runs as
-//! `V12` does, a stress change; and under `V14` alone its cap and missing rates; so the checks
-//! cannot pass vacuously.
+//! commands, as `V13`, `V14`, and `V15` then do. It checks after every command that it did not
+//! panic, that cash is conserved, and that each market's aggregates match its accounts' positions;
+//! under `V12`, also that every market has processed the index its quotes give at the sequenced
+//! time, holds no quote stamped after it, and was filled only at that index; under `V14`, that
+//! resting orders keep to the cap, placing an order fills or cancels no other, and no market is
+//! financed at a rollover that records its benchmark as having no rate; and under `V15`, that a
+//! resting order accepted below its market's minimum notional, or with no dollar value, can only
+//! reduce its account's position in that market. Under each version the same sessions must reach
+//! every path that moves cash and the refusal of out-of-range amounts, order numbers, and quotes;
+//! under `V6` a close-out that no price triggered; under `V12` a resting order filled by a command
+//! with neither prices nor an order, which `V2` never fills; under `V13`, which runs as `V12` does,
+//! a stress change; under `V14` its cap and missing rates; and under `V15` a reducing order
+//! resting below the minimum; so the checks cannot pass vacuously.
 
 mod charges;
 #[path = "../common/mod.rs"]
@@ -30,6 +31,7 @@ use common::{HOUSE_CAPITAL, Harness, acct};
 use engine_core::command::{Command, OrderKind};
 use engine_core::engine::MarketState;
 use engine_core::event::{Event, Fill, Reject};
+use engine_core::fixed::Rounding;
 use engine_core::market::QuoteCurrency;
 use engine_core::price::compute_index;
 use engine_core::protocol::ProtocolVersion;
@@ -65,11 +67,16 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
             h
         };
         let latest = || {
+            let mut h = Harness::v15();
+            h.list_fx();
+            h
+        };
+        let v14 = || {
             let mut h = Harness::v14();
             h.list_fx();
             h
         };
-        for genesis in [Harness::new(), Harness::v6(), Harness::fx(), Harness::v11(), v12(), v13(), latest()] {
+        for genesis in [Harness::new(), Harness::v6(), Harness::fx(), Harness::v11(), v12(), v13(), v14(), latest()] {
             let mut h = funded(genesis, &session);
             let version = h.engine.protocol_version();
             let mut inflow = h.deposits + Fixed::from_int(HOUSE_CAPITAL);
@@ -110,6 +117,9 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
                 if version >= ProtocolVersion::V14 {
                     check_v14(&h.engine, &cmd, &events).map_err(fail)?;
                 }
+                if version >= ProtocolVersion::V15 && check_v15(&h.engine, &cmd, &events).map_err(fail)? {
+                    paths.insert("reducing order rests below the minimum");
+                }
             }
         }
         Ok(())
@@ -148,6 +158,7 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
         ProtocolVersion::V12,
         ProtocolVersion::V13,
         ProtocolVersion::V14,
+        ProtocolVersion::V15,
     ]
     .into_iter()
     .flat_map(|version| expected.iter().map(move |path| (version, *path)))
@@ -155,14 +166,18 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
         (ProtocolVersion::V6, "close-out without a price"),
         (ProtocolVersion::V12, "close-out without a price"),
         (ProtocolVersion::V14, "close-out without a price"),
+        (ProtocolVersion::V15, "close-out without a price"),
     ])
-    // Only `V7`, `V12`, and `V14` list markets quoted in another currency.
+    // Only `V7`, `V12`, `V14`, and `V15` list markets quoted in another currency.
     .chain([(ProtocolVersion::V7, "fill converted to USD"), (ProtocolVersion::V7, "no FX price")])
     .chain([(ProtocolVersion::V12, "fill converted to USD"), (ProtocolVersion::V12, "no FX price")])
     .chain([(ProtocolVersion::V14, "fill converted to USD"), (ProtocolVersion::V14, "no FX price")])
+    .chain([(ProtocolVersion::V15, "fill converted to USD"), (ProtocolVersion::V15, "no FX price")])
     .chain([(ProtocolVersion::V12, QUIET_RESTING_FILL), (ProtocolVersion::V12, YEN_FILL)])
     .chain([(ProtocolVersion::V14, QUIET_RESTING_FILL), (ProtocolVersion::V14, YEN_FILL)])
+    .chain([(ProtocolVersion::V15, QUIET_RESTING_FILL), (ProtocolVersion::V15, YEN_FILL)])
     .chain([(ProtocolVersion::V13, "stress changed")])
+    .chain([(ProtocolVersion::V15, "reducing order rests below the minimum")])
     .chain(v14_only.iter().map(|path| (ProtocolVersion::V14, *path)))
     .filter(|(version, path)| !paths(*version).contains(path))
     .collect();
@@ -345,6 +360,58 @@ fn check_v14(engine: &Engine, cmd: &Command, events: &[Event]) -> Result<(), Str
         Some(event) => Err(format!("{event:?} in a market with no benchmark rate")),
         None => Ok(()),
     }
+}
+
+/// Fails unless, under `V15`, a limit or stop order that still rests after it was placed, and is
+/// neither reduce-only nor meeting its market's minimum notional at its own price — valued as
+/// `validate_order` values it, in USD at that price in a market that converts at its own index and
+/// at its FX market's mark in any other, an FX market with no mark leaving no dollar value — can
+/// only reduce its account's position in that market: opposite side, quantity at most the
+/// position. An order that filled or was cancelled as it was placed no longer rests, and what it
+/// did is governed by the fill's own checks; the account's position is the placement's. Returns
+/// true when such a below-minimum resting reduction was seen, so the run can require the path.
+/// Error cases:
+/// - a resting order accepted below the minimum, or with no dollar value, could add risk
+fn check_v15(engine: &Engine, cmd: &Command, events: &[Event]) -> Result<bool, String> {
+    let Command::PlaceOrder(req) = cmd else { return Ok(false) };
+    let price = match req.kind {
+        OrderKind::Limit { price } | OrderKind::Stop { price } => price,
+        OrderKind::Market { .. } => return Ok(false),
+    };
+    if req.reduce_only {
+        return Ok(false);
+    }
+    let Some(order_id) = events.iter().find_map(|event| match event {
+        Event::OrderAccepted { order_id, .. } => Some(*order_id),
+        _ => None,
+    }) else {
+        return Ok(false);
+    };
+    let rests = engine.accounts().get(&req.account).is_some_and(|acct| acct.orders.contains_key(&order_id));
+    if !rests {
+        return Ok(false);
+    }
+    let market = &engine.markets()[&req.market];
+    let currency = market.spec.quote_currency;
+    let fx_of = |fx_market: MarketId| {
+        if fx_market == req.market { Some(price) } else { engine.markets()[&fx_market].mark }
+    };
+    let below_min = match currency.fx_market().map(fx_of) {
+        Some(None) => true,
+        fx => currency.to_usd(req.qty.mul(price), fx.flatten(), Rounding::Down) < market.spec.min_order_notional,
+    };
+    if !below_min {
+        return Ok(false);
+    }
+    let pos = engine.accounts()[&req.account].position(req.market);
+    let reduces_only = pos.qty.signum() == -req.side.sign() && req.qty <= pos.qty.abs();
+    if !reduces_only {
+        return Err(format!(
+            "{order_id} rests below the {} minimum in market {} without reducing its account's position",
+            market.spec.min_order_notional, req.market
+        ));
+    }
+    Ok(true)
 }
 
 /// Cash the events moved across the engine's boundary: deposits and house capital in, approved
