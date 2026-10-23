@@ -78,6 +78,9 @@ pub struct Engine {
     /// Markouts, positions, and resting orders changed since the last state root.
     #[serde(skip)]
     pub(crate) changed: Changed,
+    /// Derived account and trigger indexes; rebuilt once after deserialization.
+    #[serde(skip)]
+    pub(crate) hot_indexes: Option<crate::hot_indexes::HotIndexes>,
     /// The state tree as of the last root under `V9`; absent until then.
     #[serde(skip)]
     pub(crate) tree: Option<StateTree>,
@@ -171,6 +174,7 @@ impl Engine {
         if sequenced.ts > MAX_STAMP_MS {
             return Err(SequenceError::StampOutOfRange { seq: sequenced.seq, got: sequenced.ts });
         }
+        self.ensure_hot_indexes();
         self.last_seq = Some(sequenced.seq);
         self.now = sequenced.ts;
 

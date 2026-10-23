@@ -72,7 +72,8 @@ an index: load only the rule whose hint matches the current action.
   `cargo-deny`, the contracts' `forge fmt --check` / build / test, the vault deposit dev scenario,
   and the metrics and alert routing dev scenario, on every push to `main` and every PR. Actions are
   pinned by commit SHA. `ci-passed` is the one CI check branch rules require: it passes only when
-  every other job succeeded, so each new job must be added to its `needs`.
+  every other job succeeded, so each new job must be added to its `needs`. The test job also checks
+  command latency budgets against 100k-account fixtures.
 - **agents/** — this index, `rules/`, and `skills/` (incl. `skills/vendor/` pull-on-demand
   packs); root `AGENTS.md` / `CLAUDE.md` symlink to `agents/AGENTS.md`.
 - **Cargo.toml** — workspace manifest, shared dependencies, and the Cargo profiles (release keeps
@@ -100,6 +101,8 @@ Run from the repo root:
   `cargo test -p engine-node --test reference_logs` replays the node's, events included;
   `./scripts/check-reference-logs.sh [base]` checks none changed since `base` (default
   `origin/main`)
+- Sequencer latency scenario (optimized dev profile, quiet CPU window):
+  `cargo test -p engine-core --test hot_path_benchmark --locked -- --ignored --nocapture`
 - Property tests: `cargo test -p engine-core --test invariants`
 - Production genesis and its calendars: `cargo test -p engine-node --test production_genesis`
 - New protocol version's reference log:

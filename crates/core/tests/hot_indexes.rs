@@ -1,0 +1,71 @@
+//! Derived indexes survive recovery and preserve trigger priority and close-out membership.
+
+mod common;
+
+use common::events::fills;
+use common::{BTC, ETH, Harness, acct, f};
+use engine_core::Engine;
+use engine_core::command::{Command, OrderKind};
+use engine_core::types::Side;
+
+#[test]
+fn crossing_triggers_preserve_time_priority_across_prices_and_order_kinds() {
+    let mut h = Harness::v17();
+    let account = acct(1);
+    h.deposit(account, "1000000");
+    h.price(BTC, "100");
+    for (side, kind) in [
+        (Side::Buy, OrderKind::Stop { price: f("110") }),
+        (Side::Sell, OrderKind::Limit { price: f("105") }),
+        (Side::Buy, OrderKind::Stop { price: f("105") }),
+        (Side::Buy, OrderKind::Limit { price: f("90") }),
+        (Side::Sell, OrderKind::Stop { price: f("90") }),
+    ] {
+        h.order(account, BTC, side, "1", kind);
+    }
+    let ids: Vec<_> = h.engine.accounts()[&account].orders.keys().copied().collect();
+    assert_eq!(ids.len(), 5);
+    let events = h.price(BTC, "110");
+    assert_eq!(fills(&events).iter().map(|fill| fill.order_id).collect::<Vec<_>>(), ids[..3]);
+    let events = h.price(BTC, "90");
+    assert_eq!(fills(&events).iter().map(|fill| fill.order_id).collect::<Vec<_>>(), ids[4..]);
+    // The buy limit remains eligible after the spread prevents an equality-price fill.
+    assert!(h.engine.accounts()[&account].orders.contains_key(&ids[3]));
+    let events = h.price(BTC, "89");
+    assert_eq!(fills(&events).iter().map(|fill| fill.order_id).collect::<Vec<_>>(), ids[3..4]);
+    assert!(h.engine.accounts()[&account].orders.is_empty());
+    assert!(h.engine.markets()[&BTC].resting.is_empty());
+    assert_eq!(fills(&h.price(BTC, "110")).len(), 0);
+}
+
+#[test]
+fn rebuilding_indexes_after_every_command_preserves_events_serialization_and_roots() {
+    let mut h = Harness::v17();
+    let (a, b) = (acct(1), acct(2));
+    h.deposit(a, "100000");
+    h.deposit(b, "100000");
+    h.price(BTC, "100");
+    h.price(ETH, "100");
+    h.market_order(a, BTC, Side::Buy, "10", "100");
+    h.market_order(b, ETH, Side::Buy, "10", "100");
+    h.order(a, BTC, Side::Buy, "1", OrderKind::Stop { price: f("110") });
+    h.order(b, BTC, Side::Sell, "1", OrderKind::Stop { price: f("90") });
+    let cancelled = *h.engine.accounts()[&b].orders.keys().next().unwrap();
+    h.cmd(Command::CancelOrder { account: b, order_id: cancelled, auth: None });
+    h.price(BTC, "110");
+    h.market_order(a, BTC, Side::Sell, "11", "110");
+    h.market_order(a, ETH, Side::Buy, "5", "100");
+    h.price(BTC, "1");
+    h.price(ETH, "1");
+
+    let mut cached = Engine::new();
+    let mut recovered = Engine::new();
+    for command in &h.log {
+        recovered = serde_json::from_slice(&serde_json::to_vec(&recovered).unwrap()).unwrap();
+        assert_eq!(cached.apply(command).unwrap(), recovered.apply(command).unwrap());
+        assert_eq!(serde_json::to_vec(&cached).unwrap(), serde_json::to_vec(&recovered).unwrap());
+        assert_eq!(cached.state_root(), recovered.state_root());
+    }
+    assert!(cached.accounts()[&a].orders.is_empty());
+    assert!(!cached.accounts()[&a].positions.contains_key(&BTC));
+}

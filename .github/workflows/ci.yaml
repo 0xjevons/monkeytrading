@@ -66,6 +66,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Test
         run: cargo test --workspace --locked
+      - name: Check sequencer command latency at 100k accounts
+        run: cargo test -p engine-core --test hot_path_benchmark --locked -- --ignored --nocapture
 
   # Every committed reference log must replay to its roots, and the accounting invariants must hold,
   # on x86_64 and aarch64. The `test` job runs both suites on x86_64 Linux, and this job on aarch64

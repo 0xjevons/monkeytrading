@@ -51,6 +51,9 @@ tracing-subscriber.workspace = true
 webpki-root-certs.workspace = true
 webpki-roots.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 chrono.workspace = true
 chrono-tz.workspace = true

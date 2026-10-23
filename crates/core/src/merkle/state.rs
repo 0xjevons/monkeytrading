@@ -202,6 +202,7 @@ impl Engine {
 
     /// Records that `account`'s position in `market` changed, for the state root.
     pub(crate) fn record_position(&mut self, account: AccountId, market: MarketId) {
+        self.index_position(account, market);
         self.changed.positions.insert((account, market));
     }
 
@@ -307,6 +308,7 @@ impl Engine {
             markout_base,
             changed: _,
             tree: _,
+            hot_indexes: _,
         } = self;
         Globals {
             params,
