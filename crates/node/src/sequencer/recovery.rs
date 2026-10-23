@@ -185,6 +185,7 @@ impl Sequencer {
             required: Vec::new(),
             client_auth: cfg.client_auth,
             deficit: DeficitAlert::default(),
+            benchmark_alerts: BenchmarkAlerts::default(),
             operator: cfg.operator,
             metrics: cfg.metrics,
             gate: cfg.checkpoints.map(|sink| {

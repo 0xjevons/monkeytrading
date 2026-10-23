@@ -28,7 +28,7 @@ use crate::checkpoints::accounting::Accounting;
 use crate::clock::Clock;
 use crate::log::{CommandEntry, LogEntry, LogWriter, Manifest, SegmentedLog};
 use crate::metrics::Metrics;
-use crate::sequencer::alerts::{DeficitAlert, alert_on};
+use crate::sequencer::alerts::{BenchmarkAlerts, DeficitAlert, alert_on};
 use crate::tee::EnclaveKey;
 use crate::trusted_time::{Sample, TimeGate};
 
@@ -56,6 +56,8 @@ pub struct Sequencer {
     client_auth: ClientAuth,
     /// The alert for house NAV below zero.
     deficit: DeficitAlert,
+    /// Benchmark clears already emitted during this process, limited to listed names.
+    benchmark_alerts: BenchmarkAlerts,
     operator: Operator,
     metrics: Arc<Metrics>,
     gate: Option<Gate>,
@@ -227,6 +229,7 @@ impl Sequencer {
 
         for event in &events {
             alert_on(event);
+            self.benchmark_alerts.note(event);
             self.metrics.record(event);
             if let Event::WithdrawalApproved { account, amount, nonce } = event {
                 if let Some(gate) = &mut self.gate {
@@ -240,6 +243,9 @@ impl Sequencer {
                     self.sign_withdrawal(*account, *amount, *nonce)?;
                 }
             }
+        }
+        if events.contains(&Event::AdminApplied) {
+            self.benchmark_alerts.retain_listed(&self.engine);
         }
         self.deficit.note(self.engine.house_nav());
         if self.next_seq.is_multiple_of(self.checkpoint_every)

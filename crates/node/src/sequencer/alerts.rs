@@ -1,8 +1,10 @@
 //! The alerts the sequencer raises: for engine events an operator must look at, and for a house in
 //! deficit.
 
-use engine_core::Fixed;
+use std::collections::{BTreeMap, BTreeSet};
+
 use engine_core::event::Event;
+use engine_core::{Engine, Fixed};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
@@ -16,6 +18,20 @@ pub(super) struct DeficitAlert {
     throttle: Throttle,
     alerted: bool,
     recovered_since: Option<Instant>,
+}
+
+/// Conditions last emitted for benchmarks used by the active catalogue.
+#[derive(Default)]
+pub(super) struct BenchmarkAlerts {
+    tracked: BTreeMap<String, BenchmarkConditions>,
+}
+
+/// Unknown after restart, firing when false, and resolved when true.
+#[derive(Default)]
+struct BenchmarkConditions {
+    missing: Option<bool>,
+    undated: Option<bool>,
+    stale: Option<bool>,
 }
 
 impl DeficitAlert {
@@ -55,6 +71,64 @@ impl DeficitAlert {
     }
 }
 
+impl BenchmarkAlerts {
+    /// Emits firing conditions repeatedly, and each clear once after startup or firing.
+    pub(super) fn note(&mut self, event: &Event) {
+        match event {
+            // The day goes uncharged, and nothing charges it later.
+            Event::BenchmarkRateMissing { benchmark, markets } => {
+                self.tracked.entry(benchmark.clone()).or_default().missing = Some(false);
+                error!(
+                    alert = "benchmark_rate_missing",
+                    benchmark, "no benchmark rate for markets {markets:?}; no financing charged"
+                );
+            }
+            Event::BenchmarkRateUndated { benchmark } => {
+                self.tracked.entry(benchmark.clone()).or_default().undated = Some(false);
+                error!(
+                    alert = "benchmark_rate_undated",
+                    benchmark, "legacy benchmark has no publisher date; financing still applies"
+                );
+            }
+            Event::BenchmarkRateObserved { benchmark, effective_date, rollover_date, stale } => {
+                let conditions = self.tracked.entry(benchmark.clone()).or_default();
+                resolve(&mut conditions.undated, "benchmark_rate_undated", benchmark, "benchmark has a publisher date");
+                resolve(
+                    &mut conditions.missing,
+                    "benchmark_rate_missing",
+                    benchmark,
+                    "benchmark has an effective rate",
+                );
+                if *stale {
+                    conditions.stale = Some(false);
+                    error!(
+                        alert = "benchmark_rate_stale",
+                        benchmark,
+                        "rate effective {effective_date} is older than five business days at {rollover_date}; financing still applies"
+                    );
+                } else {
+                    resolve(&mut conditions.stale, "benchmark_rate_stale", benchmark, "benchmark is current");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Drops retired names after the entire accepted admin command's events were handled.
+    pub(super) fn retain_listed(&mut self, engine: &Engine) {
+        let listed: BTreeSet<_> =
+            engine.markets().values().map(|market| market.spec.financing.benchmark.as_str()).collect();
+        self.tracked.retain(|benchmark, _| listed.contains(benchmark.as_str()));
+    }
+}
+
+/// Emits the first unknown clear and subsequent clears only after the condition fired again.
+fn resolve(condition: &mut Option<bool>, name: &str, benchmark: &str, message: &str) {
+    if condition.replace(true) != Some(true) {
+        info!(alert_resolved = name, benchmark, "{message}");
+    }
+}
+
 /// Raises an alert for an engine event an operator must look at.
 pub(super) fn alert_on(event: &Event) {
     match event {
@@ -70,32 +144,6 @@ pub(super) fn alert_on(event: &Event) {
         Event::BadDebt { account, amount } => {
             warn!(alert = "bad_debt", %account, %amount, "loss beyond balance written off against the house");
         }
-        // The day goes uncharged, and nothing charges it later.
-        Event::BenchmarkRateMissing { benchmark, markets } => {
-            error!(
-                alert = "benchmark_rate_missing",
-                benchmark, "no benchmark rate for markets {markets:?}; no financing charged"
-            );
-        }
-        Event::BenchmarkRateUndated { benchmark } => {
-            error!(
-                alert = "benchmark_rate_undated",
-                benchmark, "legacy benchmark has no publisher date; financing still applies"
-            );
-        }
-        Event::BenchmarkRateObserved { benchmark, effective_date, rollover_date, stale } => {
-            info!(alert_resolved = "benchmark_rate_undated", benchmark, "benchmark has a publisher date");
-            info!(alert_resolved = "benchmark_rate_missing", benchmark, "benchmark has an effective rate");
-            if *stale {
-                error!(
-                    alert = "benchmark_rate_stale",
-                    benchmark,
-                    "rate effective {effective_date} is older than five business days at {rollover_date}; financing still applies"
-                );
-            } else {
-                info!(alert_resolved = "benchmark_rate_stale", benchmark, "benchmark is current");
-            }
-        }
         _ => {}
     }
 }
@@ -108,7 +156,7 @@ mod tests {
     #[test]
     fn a_benchmark_with_no_rate_raises_a_critical_alert() {
         let (logs, _guard) = Logs::capture();
-        alert_on(&Event::BenchmarkRateMissing { benchmark: "Sofr".into(), markets: vec![11] });
+        BenchmarkAlerts::default().note(&Event::BenchmarkRateMissing { benchmark: "Sofr".into(), markets: vec![11] });
         assert_eq!(logs.critical("benchmark_rate_missing"), 1);
         assert_eq!(logs.count("benchmark=\"Sofr\""), 1);
     }
@@ -117,35 +165,161 @@ mod tests {
 #[cfg(test)]
 mod benchmark_tests {
     use super::*;
+
+    use std::sync::Arc;
+
+    use engine_core::auth::ClientAuth;
+    use engine_core::command::{AdminCommand, Command};
+    use engine_core::protocol::ProtocolVersion;
+    use tokio::sync::{broadcast, mpsc, watch};
+
+    use crate::log::Manifest;
+    use crate::sequencer::Sequencer;
+    use crate::tee::EnclaveKey;
+    use crate::test_support::{dev_config, scratch_dir, sequencer_config};
     use crate::trusted_time::tests::logs::Logs;
 
     #[test]
     fn stale_and_undated_rates_raise_critical_alerts_and_current_rates_resolve_them() {
         let (logs, _guard) = Logs::capture();
-        let effective_date = "2026-10-20".parse().unwrap();
-        let rollover_date = "2026-10-28".parse().unwrap();
-        alert_on(&Event::BenchmarkRateMissing { benchmark: "SOFR".into(), markets: vec![1] });
-        alert_on(&Event::BenchmarkRateUndated { benchmark: "SOFR".into() });
-        alert_on(&Event::BenchmarkRateObserved {
-            benchmark: "SOFR".into(),
-            effective_date,
-            rollover_date,
-            stale: true,
-        });
+        let mut alerts = BenchmarkAlerts::default();
+        alerts.note(&Event::BenchmarkRateMissing { benchmark: "SOFR".into(), markets: vec![1] });
+        alerts.note(&Event::BenchmarkRateUndated { benchmark: "SOFR".into() });
+        for _ in 0..3 {
+            alerts.note(&observed("SOFR", true));
+        }
         assert_eq!(logs.critical("benchmark_rate_missing"), 1);
         assert_eq!(logs.critical("benchmark_rate_undated"), 1);
-        assert_eq!(logs.critical("benchmark_rate_stale"), 1);
+        assert_eq!(logs.critical("benchmark_rate_stale"), 3);
         assert_eq!(logs.count("alert_resolved=\"benchmark_rate_undated\""), 1);
         assert_eq!(logs.count("alert_resolved=\"benchmark_rate_missing\""), 1);
-        alert_on(&Event::BenchmarkRateObserved {
-            benchmark: "SOFR".into(),
-            effective_date: rollover_date,
-            rollover_date,
-            stale: false,
-        });
-        assert_eq!(logs.critical("benchmark_rate_stale"), 1);
+        alerts.note(&observed("SOFR", false));
+        alerts.note(&observed("SOFR", false));
+        assert_eq!(logs.critical("benchmark_rate_stale"), 3);
         assert_eq!(logs.count("alert_resolved=\"benchmark_rate_stale\""), 1);
-        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_undated\""), 2);
-        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_missing\""), 2);
+        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_undated\""), 1);
+        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_missing\""), 1);
+        for _ in 0..2 {
+            alerts.note(&observed("SOFR", true));
+        }
+        alerts.note(&observed("SOFR", false));
+        assert_eq!(logs.critical("benchmark_rate_stale"), 5);
+        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_stale\""), 2);
+    }
+
+    #[test]
+    fn repeated_healthy_benchmark_observations_resolve_each_condition_once() {
+        let (logs, _guard) = Logs::capture();
+        let mut alerts = BenchmarkAlerts::default();
+        for benchmark in ["SOFR", "SONIA"] {
+            for _ in 0..100 {
+                alerts.note(&observed(benchmark, false));
+            }
+            assert_eq!(logs.count(&format!("benchmark=\"{benchmark}\"")), 3);
+        }
+        for condition in ["missing", "undated", "stale"] {
+            assert_eq!(logs.count(&format!("alert_resolved=\"benchmark_rate_{condition}\"")), 2);
+            assert_eq!(logs.critical(&format!("benchmark_rate_{condition}")), 0);
+        }
+        assert_eq!(alerts.tracked.len(), 2);
+    }
+
+    #[test]
+    fn missing_and_undated_benchmark_firings_reopen_their_resolution() {
+        let (logs, _guard) = Logs::capture();
+        let mut alerts = BenchmarkAlerts::default();
+        alerts.note(&observed("SOFR", false));
+        for (event, name) in [
+            (Event::BenchmarkRateMissing { benchmark: "SOFR".into(), markets: vec![1] }, "benchmark_rate_missing"),
+            (Event::BenchmarkRateUndated { benchmark: "SOFR".into() }, "benchmark_rate_undated"),
+        ] {
+            for _ in 0..2 {
+                alerts.note(&event);
+                alerts.note(&event);
+                alerts.note(&observed("SOFR", false));
+                alerts.note(&observed("SOFR", false));
+            }
+            assert_eq!(logs.critical(name), 4);
+            assert_eq!(logs.count(&format!("alert_resolved=\"{name}\"")), 3);
+        }
+        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_stale\""), 1);
+    }
+
+    #[test]
+    fn a_fresh_benchmark_tracker_resolves_unknown_conditions_once_again() {
+        let (logs, _guard) = Logs::capture();
+        for _ in 0..2 {
+            let mut alerts = BenchmarkAlerts::default();
+            for _ in 0..10 {
+                alerts.note(&observed("SOFR", false));
+            }
+        }
+        for condition in ["missing", "undated", "stale"] {
+            assert_eq!(logs.count(&format!("alert_resolved=\"benchmark_rate_{condition}\"")), 2);
+        }
+    }
+
+    #[test]
+    fn accepted_market_changes_prune_benchmark_alerts_after_their_rollover_events() {
+        const START: i64 = 1_792_504_800_000;
+        let dir = scratch_dir("benchmark-alert-pruning");
+        let (stream, _) = broadcast::channel(16);
+        let (manifest, _) = watch::channel(Manifest::default());
+        let (withdrawals, _) = mpsc::unbounded_channel();
+        let mut seq =
+            Sequencer::recover(sequencer_config(&dir, manifest), Arc::new(EnclaveKey::generate()), stream, withdrawals)
+                .unwrap();
+        let genesis = dev_config().genesis;
+        let mut market = genesis.markets[0].clone();
+        assert_eq!(market.financing.benchmark, "SOFR");
+        for command in [
+            AdminCommand::SetClientAuth(ClientAuth::Unsigned),
+            AdminCommand::SetOperator(seq.operator),
+            AdminCommand::ActivateProtocol { version: ProtocolVersion::LATEST },
+            AdminCommand::SetParams(genesis.params),
+            AdminCommand::UpsertMarket(market.clone()),
+        ] {
+            let events = seq.stamp(START, Command::Admin(command)).unwrap();
+            assert!(events.contains(&Event::AdminApplied), "{events:?}");
+        }
+        let first = seq.engine.next_rollover().unwrap();
+        seq.stamp(first + 1, Command::Tick).unwrap();
+        assert_eq!(seq.benchmark_alerts.tracked["SOFR"].missing, Some(false));
+
+        market.financing.benchmark = "SONIA".into();
+        let second = seq.engine.next_rollover().unwrap();
+        let events = seq.stamp(second + 1, Command::Admin(AdminCommand::UpsertMarket(market.clone()))).unwrap();
+        assert!(events.contains(&Event::AdminApplied), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::BenchmarkRateMissing { benchmark, .. } if benchmark == "SOFR"))
+        );
+        assert_eq!(seq.engine.markets()[&market.id].spec.financing.benchmark, "SONIA");
+        assert!(seq.benchmark_alerts.tracked.is_empty(), "retired names must not be reinserted by old rollover events");
+
+        let third = seq.engine.next_rollover().unwrap();
+        seq.stamp(third + 1, Command::Tick).unwrap();
+        assert_eq!(seq.benchmark_alerts.tracked.len(), 1);
+        assert_eq!(seq.benchmark_alerts.tracked["SONIA"].missing, Some(false));
+        market.financing.benchmark = "SOFR".into();
+        let events = seq.stamp(third + 1, Command::Admin(AdminCommand::UpsertMarket(market))).unwrap();
+        assert!(events.contains(&Event::AdminApplied), "{events:?}");
+        assert!(seq.benchmark_alerts.tracked.is_empty());
+        let fourth = seq.engine.next_rollover().unwrap();
+        seq.stamp(fourth + 1, Command::Tick).unwrap();
+        let returned = &seq.benchmark_alerts.tracked["SOFR"];
+        assert_eq!(seq.benchmark_alerts.tracked.len(), 1);
+        assert_eq!((returned.missing, returned.undated, returned.stale), (Some(false), None, None));
+    }
+
+    /// A current or stale observation for one rollover-local date.
+    fn observed(benchmark: &str, stale: bool) -> Event {
+        Event::BenchmarkRateObserved {
+            benchmark: benchmark.into(),
+            effective_date: if stale { "2026-10-20" } else { "2026-10-28" }.parse().unwrap(),
+            rollover_date: "2026-10-28".parse().unwrap(),
+            stale,
+        }
     }
 }
