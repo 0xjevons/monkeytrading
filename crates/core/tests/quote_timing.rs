@@ -231,6 +231,30 @@ fn a_market_relisted_to_convert_at_its_own_index_takes_its_fx_mark_at_once() {
 }
 
 #[test]
+fn a_relisted_fx_market_fills_the_resting_orders_of_the_markets_that_convert_at_it() {
+    for (version, mut h) in [(ProtocolVersion::V11, Harness::v11()), (ProtocolVersion::V12, Harness::v12())] {
+        h.list_fx();
+        let a = acct(1);
+        h.deposit(a, "100000");
+        h.price(EURUSD, "1.08");
+        h.price(DE40, "20000");
+        // At stress level 1 the 5bps spread prices a buy limit at the mid above its limit, so it rests.
+        h.operator_admin(AdminCommand::SetStressFloor { market: Some(DE40), level: 1 });
+        let ev = h.order(a, DE40, Side::Buy, "1", OrderKind::Limit { price: f("20000") });
+        assert!(fills(&ev).is_empty(), "{version:?}: {ev:?}");
+        h.operator_admin(AdminCommand::SetStressFloor { market: Some(DE40), level: 0 });
+
+        // Relisted at its unchanged 1.08 index, EUR-USD is Germany 40's price update too, and the
+        // rested limit fills at the mid on that command.
+        let relisted = market(EURUSD, "EUR-USD", AssetClass::Fx, Schedule::AlwaysOpen, 250);
+        let ev = h.operate(AdminCommand::UpsertMarket(relisted));
+        assert_eq!(h.engine.markets()[&EURUSD].mark, Some(f("1.08")), "{version:?}");
+        assert_eq!(fills_by(&ev), [(a, f("20000"))], "{version:?}: {ev:?}");
+        assert!(h.engine.accounts()[&a].orders.is_empty(), "{version:?}");
+    }
+}
+
+#[test]
 fn a_shared_open_fills_resting_orders_in_every_market_before_any_close_out() {
     let mut h = Harness::v12();
     let c = acct(1);
