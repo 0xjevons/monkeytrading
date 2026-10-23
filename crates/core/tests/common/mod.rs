@@ -175,6 +175,13 @@ impl Harness {
         h
     }
 
+    /// `v15`, then `V16`, which clamps each account's toxicity history to a lowered memory.
+    pub fn v16() -> Self {
+        let mut h = Harness::v15();
+        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V16 });
+        h
+    }
+
     /// No commands yet, at the harness start time.
     fn empty() -> Self {
         Harness {

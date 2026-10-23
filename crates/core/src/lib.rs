@@ -41,6 +41,9 @@
 //! - From `V15`, a resting order that can only reduce the account's position in its market —
 //!   opposite side, quantity at most the position — skips the minimum-notional check, as a
 //!   reduce-only order does, so any position can be closed with a plain order.
+//! - From `V16`, parameters that set a smaller toxicity memory clamp every account's toxicity
+//!   history to it, so a lowered memory already weighs the next markout against no more history
+//!   than the memory, instead of that markout still weighing the history the account built.
 
 pub mod account;
 mod admin;
