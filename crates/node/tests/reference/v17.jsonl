@@ -396,11 +396,4 @@
 {"entry":"command","seq":359,"ts":1793293200000,"cmd":{"type":"tick"},"events":[{"type":"market_closed","market":21}]}
 {"entry":"checkpoint","seq":359,"root":"0x743542198f111fd8301d682079621086402b7c29dcc9ff1947aec1b5ec88616b","signature":"0x","signer":"0x"}
 {"entry":"command","seq":360,"ts":1793293220000,"cmd":{"type":"prices","market":21,"quotes":[{"source":"venue0","mid":"223.1","ts":1793293220000},{"source":"venue1","mid":"223.1","ts":1793293220000}]},"events":[{"type":"market_opened","market":21},{"type":"stress_changed","market":21,"level":1}]}
-{"entry":"command","seq":361,"ts":1793293220000,"cmd":{"type":"prices","market":4,"quotes":[{"source":"venue0","mid":"1.1","ts":1793293220000},{"source":"venue1","mid":"1.1","ts":1793293220000}]},"events":[]}
-{"entry":"command","seq":362,"ts":1793293220000,"cmd":{"type":"prices","market":6,"quotes":[{"source":"venue0","mid":"20000","ts":1793293220000},{"source":"venue1","mid":"20000","ts":1793293220000}]},"events":[]}
-{"entry":"command","seq":363,"ts":1793293220000,"cmd":{"type":"prices","market":6,"quotes":[{"source":"venue0","mid":"19400","ts":1793293220000},{"source":"venue1","mid":"19400","ts":1793293220000}]},"events":[{"type":"stress_changed","market":6,"level":1}]}
-{"entry":"command","seq":364,"ts":1793293222000,"cmd":{"type":"prices","market":6,"quotes":[{"source":"venue0","mid":"19400","ts":1793293222000},{"source":"venue1","mid":"19400","ts":1793293222000}]},"events":[]}
-{"entry":"command","seq":365,"ts":1793293522000,"cmd":{"type":"tick"},"events":[]}
-{"entry":"command","seq":366,"ts":1793293522000,"cmd":{"type":"prices","market":6,"quotes":[{"source":"venue0","mid":"19400","ts":1793293522000},{"source":"venue1","mid":"19400","ts":1793293522000}]},"events":[]}
-{"entry":"command","seq":367,"ts":1793293522000,"cmd":{"type":"prices","market":4,"quotes":[{"source":"venue0","mid":"1.1","ts":1793293522000},{"source":"venue1","mid":"1.1","ts":1793293522000}]},"events":[{"type":"stress_changed","market":6,"level":0}]}
-{"entry":"checkpoint","seq":367,"root":"0x58922980d8cbc244cef859952ab5002167159f9351a8dfa6cc225f71daf3d011","signature":"0x","signer":"0x"}
+{"entry":"checkpoint","seq":360,"root":"0x52239e2ad1ec07cb3fc36b02be17dd3f32a5612d94377918482fa4dacd3e4bcb","signature":"0x","signer":"0x"}

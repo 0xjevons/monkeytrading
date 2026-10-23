@@ -99,9 +99,10 @@ pub enum ProtocolVersion {
     /// next markout after a lowered memory still weighs the history it had built under the old one;
     /// that markout caps the history at the memory then in force.
     V16,
-    /// Reopening a market keeps the trailing move window prices observed before the halt counted
-    /// for their window, so a move across a halt shorter than the window raises fast-move stress
-    /// as it would without the halt. Before `V17` an open cleared the window.
+    /// Reopening a market keeps its trailing move window: prices observed within the window before
+    /// a halt still count after the reopening, so a move across a halt shorter than the window
+    /// raises fast-move stress as it would without the halt. Before `V17` an open cleared the
+    /// window.
     V17,
 }
 

@@ -2,7 +2,7 @@
 //! custody, and operator commands, with values inside and outside the engine's input bounds, under
 //! `V2`, the rules every log starts under, and again under `V6`, under `V7` with markets quoted in
 //! other currencies, under `V11`, and under `V12` with those markets and the operator signing its
-//! commands, as `V13`, `V14`, `V15`, and `V16` then do. It checks after every command that it
+//! commands, as `V13`, `V14`, `V15`, `V16`, and `V17` then do. It checks after every command that it
 //! did not panic, that cash is conserved, and that each market's aggregates match its accounts'
 //! positions; under `V12`, also that every market has processed the index its quotes give at the
 //! sequenced time, holds no quote stamped after it, and was filled only at that index; under
@@ -195,6 +195,7 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
         ProtocolVersion::V14,
         ProtocolVersion::V15,
         ProtocolVersion::V16,
+        ProtocolVersion::V17,
     ]
     .into_iter()
     .flat_map(|version| expected.iter().map(move |path| (version, *path)))
@@ -204,8 +205,9 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
         (ProtocolVersion::V14, "close-out without a price"),
         (ProtocolVersion::V15, "close-out without a price"),
         (ProtocolVersion::V16, "close-out without a price"),
+        (ProtocolVersion::V17, "close-out without a price"),
     ])
-    // Only `V7`, `V12`, `V14`, `V15`, and `V16` list markets quoted in another currency.
+    // Only `V7`, `V12`, `V14`, `V15`, `V16`, and `V17` list markets quoted in another currency.
     .chain([(ProtocolVersion::V7, "fill converted to USD"), (ProtocolVersion::V7, "no FX price")])
     .chain([(ProtocolVersion::V12, "fill converted to USD"), (ProtocolVersion::V12, "no FX price")])
     .chain([(ProtocolVersion::V14, "fill converted to USD"), (ProtocolVersion::V14, "no FX price")])
@@ -215,9 +217,13 @@ fn generated_sessions_hold_the_invariants_and_reach_every_checked_path() {
     .chain([(ProtocolVersion::V14, QUIET_RESTING_FILL), (ProtocolVersion::V14, YEN_FILL)])
     .chain([(ProtocolVersion::V15, QUIET_RESTING_FILL), (ProtocolVersion::V15, YEN_FILL)])
     .chain([(ProtocolVersion::V16, QUIET_RESTING_FILL), (ProtocolVersion::V16, YEN_FILL)])
+    .chain([(ProtocolVersion::V17, "fill converted to USD"), (ProtocolVersion::V17, "no FX price")])
+    .chain([(ProtocolVersion::V17, QUIET_RESTING_FILL), (ProtocolVersion::V17, YEN_FILL)])
     .chain([(ProtocolVersion::V13, "stress changed")])
+    .chain([(ProtocolVersion::V17, "stress changed")])
     .chain([(ProtocolVersion::V15, "reducing order rests below the minimum")])
     .chain([(ProtocolVersion::V16, "toxicity history clamped")])
+    .chain([(ProtocolVersion::V17, "reducing order rests below the minimum")])
     .chain(v14_only.iter().map(|path| (ProtocolVersion::V14, *path)))
     .filter(|(version, path)| !paths(*version).contains(path))
     .collect();

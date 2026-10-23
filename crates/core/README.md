@@ -63,8 +63,9 @@ this crate and reproduce the signed state roots exactly.
 - From protocol `V13`, stress follows its inputs: each open, priced market's automatic level is
   re-evaluated before every fill and after every command, a fast move counts within a trailing
   window, and a divergence trigger is a share of each market's divergence bound, so every market
-  with a positive bound can reach every level; activating `V13` turns absolute divergence triggers
-  into shares of the widest listed bound
+  with a positive bound can reach every level; a market whose FX pair has no price keeps its
+  level, since nothing fills there; activating `V13` turns absolute divergence triggers into
+  shares of the widest listed bound
 - From protocol `V14`, a market whose benchmark has no rate accrues no financing, and each rollover
   records the benchmarks that have none; once any benchmark has a rate, a listing that names one
   without is refused; each account rests at most `max_resting_orders` orders, a resting order that
@@ -79,8 +80,7 @@ this crate and reproduce the signed state roots exactly.
   the memory, instead of that markout still weighing the history the account built
 - From protocol `V17`, reopening a market keeps its trailing move window: prices observed within
   the window before a halt still count after the reopening, so a move across a halt shorter than
-  the window raises fast-move stress as it would without the halt; a market whose FX pair has no
-  price keeps its stress level, since nothing fills there
+  the window raises fast-move stress as it would without the halt
 
 ## Repository Structure
 

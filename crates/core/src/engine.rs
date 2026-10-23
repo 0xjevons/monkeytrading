@@ -388,8 +388,6 @@ impl Engine {
         let market = self.markets.get_mut(&market_id).expect("found above");
         market.open = open;
         if open {
-            // Before V17 an open restarted the move window; from V17 a halt shorter than the
-            // window keeps the prices observed before it counted for their window.
             if self.protocol_version < ProtocolVersion::V17 {
                 market.stress.move_ref = None;
                 market.stress.move_window.clear();
