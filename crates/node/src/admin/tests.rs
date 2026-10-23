@@ -169,6 +169,20 @@ fn a_listing_or_parameters_come_from_toml_and_are_validated_before_signing() {
 }
 
 #[test]
+fn parameters_without_notional_weighting_are_refused_before_signing() {
+    // The latest version weighs markouts by notional, so parameters that name no weighting never
+    // run; the client refuses them before any call, as it does other invalid files.
+    let dir = scratch_dir("admin-no-notional");
+    fs::create_dir_all(&dir).unwrap();
+    let mut unweighted = dev_config().genesis.params;
+    unweighted.toxicity.notional = None;
+    let file = dir.join("unweighted.toml");
+    fs::write(&file, toml::to_string(&unweighted).unwrap()).unwrap();
+    let err = action(&["set-params", file.to_str().unwrap()]).command().unwrap_err();
+    assert!(format!("{err:#}").contains("toxicity needs notional weighting"), "{err:#}");
+}
+
+#[test]
 fn a_listing_or_parameters_carry_cap_floors_and_a_quote_currency_from_toml() {
     let dir = scratch_dir("admin-floors");
     fs::create_dir_all(&dir).unwrap();

@@ -9,7 +9,7 @@ use common::events::fills;
 use common::stress::with_divergence_shares;
 use common::{AAPL, BTC, DE40, ETH, EURUSD, Harness, USDJPY, acct, f, ny, operator, params};
 use engine_core::auth::ClientAuth;
-use engine_core::command::{AdminCommand, Command};
+use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::event::{Event, Fill};
 use engine_core::fixed::Rounding;
 use engine_core::params::{NotionalWeighting, ProtocolParams, ToxicityParams, ToxicityTier};
@@ -356,6 +356,17 @@ fn a_whole_bps_score_carries_over_when_v11_activates() {
     h.price(BTC, "100000");
     marked_out(&mut h, a, BTC, Side::Buy, "0.1", "1");
     assert_eq!(score(&h, a), f("24.976016791"));
+}
+
+#[test]
+fn set_toxicity_notional_before_parameters_are_set_is_refused() {
+    // The node sequences `SetToxicityNotional` only over parameters set before V11 that lack
+    // notional weighting, and `carry_toxicity_notional` returns early when parameters are absent,
+    // so a bare engine reaches this refusal only on a log the node did not write.
+    let weighting = NotionalWeighting { prior: f("10000"), memory: f("10000000") };
+    let cmd = Sequenced { seq: 0, ts: 0, cmd: Command::Admin(AdminCommand::SetToxicityNotional(weighting)) };
+    let events = Engine::new().apply(&cmd).expect("a sequenced command applies");
+    assert_eq!(events, [Event::AdminRejected { reason: "protocol params not set".into() }]);
 }
 
 #[test]
