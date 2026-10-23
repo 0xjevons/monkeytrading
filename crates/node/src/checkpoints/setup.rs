@@ -6,7 +6,7 @@ use anyhow::Context;
 use engine_core::types::AccountId;
 use tokio::sync::mpsc;
 
-use crate::checkpoints::{CheckpointChain, CheckpointRpc, Poster, Work};
+use crate::checkpoints::{CheckpointChain, CheckpointRpc, Poster, View, Work};
 use crate::config::NodeConfig;
 use crate::log::CheckpointDomain;
 use crate::tee::EnclaveKey;
@@ -26,8 +26,26 @@ pub(crate) async fn connect(cfg: &NodeConfig, key: &Arc<EnclaveKey>) -> anyhow::
     let Some(checkpoints) = &cfg.checkpoints else { return Ok(None) };
     let domain = CheckpointDomain { chain_id: cfg.custody.chain_id, vault: cfg.custody.vault.parse()? };
     let token = cfg.custody.evm.as_ref().context("checkpoint custody is not EVM")?.usdc;
-    let chain = CheckpointRpc::new(checkpoints, domain, token)?;
-    let state = chain.state().await?;
+    let evm = cfg.custody.evm.as_ref().context("checkpoint custody is not EVM")?;
+    let chain = CheckpointRpc::new(checkpoints, domain, token, evm.finality_tag, evm.confirmations)?;
+    // A restart must not sign from a finalized parent while its own latest inclusion is pending.
+    // Await that boundary without opening persisted state; an orphaned inclusion may disappear.
+    let state = tokio::time::timeout(evm.stall_critical_after, async {
+        loop {
+            let latest = chain.state(View::Latest).await?;
+            let finalized = chain.state(View::Finalized).await?;
+            anyhow::ensure!(
+                latest.signer == AccountId(key.address()) && finalized.signer == AccountId(key.address()),
+                "vault signer differs from this enclave; signer recovery is required"
+            );
+            if latest.checkpoint == finalized.checkpoint {
+                break anyhow::Ok(finalized);
+            }
+            tokio::time::sleep(checkpoints.retry_interval).await;
+        }
+    })
+    .await
+    .context("checkpoint startup awaits custody finality beyond its stall deadline")??;
     let parent = match state.checkpoint {
         Some((seq, root)) => crate::log::CheckpointParent { has_checkpoint: true, seq, root: root.parse()? },
         None => Default::default(),

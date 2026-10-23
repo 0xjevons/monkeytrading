@@ -99,6 +99,12 @@ impl EnclaveKey {
         Self { key: SigningKey::random(&mut OsRng) }
     }
 
+    /// Reproducible authority for isolated tests; never available to a running node.
+    #[cfg(test)]
+    pub(crate) fn test_key() -> Self {
+        Self { key: SigningKey::from_bytes((&[0x43; 32]).into()).expect("valid fixture key") }
+    }
+
     /// The key's EVM address: the last 20 bytes of keccak-256 over the uncompressed public key.
     pub fn address(&self) -> [u8; 20] {
         eip712::address(self.key.verifying_key()).0
@@ -137,14 +143,7 @@ impl EnclaveKey {
         amount: Fixed,
         nonce: u64,
     ) -> String {
-        let mut h = Keccak256::new();
-        h.update(b"engine.withdrawal.v1");
-        h.update(chain_id.to_be_bytes());
-        h.update(vault);
-        h.update(account.0);
-        h.update(amount.to_be_bytes());
-        h.update(nonce.to_be_bytes());
-        self.sign_digest(h.finalize().into())
+        self.sign_digest(withdrawal_digest(chain_id, vault, account, amount, nonce))
     }
 
     /// 65-byte `r || s || v` with `v` in {27, 28}, as `ecrecover` expects.
@@ -173,6 +172,24 @@ pub fn attest_key(
         report_data: format!("0x{}", hex::encode(report_data)),
         quote: format!("0x{}", hex::encode(quote)),
     })
+}
+
+/// Historical withdrawal authorization bytes, unchanged across checkpoint versions.
+pub(crate) fn withdrawal_digest(
+    chain_id: u64,
+    vault: &[u8; 20],
+    account: AccountId,
+    amount: Fixed,
+    nonce: u64,
+) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    h.update(b"engine.withdrawal.v1");
+    h.update(chain_id.to_be_bytes());
+    h.update(vault);
+    h.update(account.0);
+    h.update(amount.to_be_bytes());
+    h.update(nonce.to_be_bytes());
+    h.finalize().into()
 }
 
 /// V2 binds the exact parent so two authorized publishers cannot extend divergent forks.

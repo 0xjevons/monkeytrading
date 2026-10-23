@@ -1,10 +1,12 @@
 //! Withdrawal signature release only after a custody checkpoint commits its approval.
 
+use std::time::Instant;
+
 use anyhow::Context;
 use engine_core::Fixed;
 use engine_core::types::AccountId;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::checkpoints::{Work, liabilities};
 use crate::log::{Checkpoint, LogEntry};
@@ -25,6 +27,44 @@ impl Gate {
 }
 
 impl Sequencer {
+    /// Logs and publishes a signed state root for the last applied seq. From protocol `V9` the root
+    /// rehashes only what changed since the previous checkpoint, and API proofs are taken against it.
+    /// Error cases:
+    /// - no command has applied, or the log cannot be written
+    pub(super) fn checkpoint(&mut self) -> anyhow::Result<()> {
+        let seq = self.engine.last_seq().context("checkpoint before any command")?;
+        if self.gate.as_ref().is_some_and(|gate| gate.parent.has_checkpoint && gate.parent.seq == seq) {
+            return Ok(());
+        }
+        let (started, root) = (Instant::now(), self.engine.state_root());
+        let (elapsed_us, work) = (started.elapsed().as_micros(), self.engine.last_root_work());
+        debug!(seq, elapsed_us, leaves = work.map(|w| w.leaves), nodes = work.map(|w| w.nodes), "state root computed");
+        let cp = Checkpoint {
+            parent: self.gate.as_ref().map(|gate| gate.parent),
+            seq,
+            root: format!("0x{}", hex::encode(root)),
+            signature: if let Some(gate) = &self.gate {
+                self.key.sign_checkpoint_v2(self.chain_id, &self.vault.0, seq, &root, gate.parent)
+            } else {
+                self.key.sign_checkpoint(self.chain_id, &self.vault.0, seq, &root)
+            },
+            signer: self.key.address_hex(),
+            domain: Some(crate::log::CheckpointDomain { chain_id: self.chain_id, vault: self.vault }),
+            deferred_withdrawals: self.gate.is_some(),
+        };
+        self.record(LogEntry::Checkpoint(cp.clone()))?;
+        if self.gate.is_some() {
+            self.log.sync()?;
+            self.queue_checkpoint(cp)?;
+            if let Some(gate) = &mut self.gate {
+                gate.parent = crate::log::CheckpointParent { has_checkpoint: true, seq, root: root.into() };
+            }
+        }
+        self.last_checkpoint = Some(seq);
+        self.metrics.last_checkpoint_seconds.set(self.last_ts as f64 / 1000.0);
+        Ok(())
+    }
+
     /// Queues a durable checkpoint; bounded backpressure stops the node instead of losing work.
     /// Error cases:
     /// - the checkpoint worker is unavailable or its bounded queue is full

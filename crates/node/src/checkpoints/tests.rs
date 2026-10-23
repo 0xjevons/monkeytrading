@@ -8,7 +8,7 @@ use engine_core::types::AccountId;
 use engine_core::{Engine, Fixed};
 use tokio::sync::mpsc;
 
-use crate::checkpoints::{CheckpointChain, Poster, VaultState, Work, signature};
+use crate::checkpoints::{CheckpointChain, Poster, VaultState, View, Work, signature};
 use crate::log::{Checkpoint, CheckpointDomain, CommandEntry, LogEntry};
 use crate::sequencer::{Request, replay};
 use crate::tee::EnclaveKey;
@@ -16,13 +16,15 @@ use crate::tee::EnclaveKey;
 #[derive(Clone)]
 struct Chain {
     state: Arc<Mutex<VaultState>>,
+    finalized: Option<Arc<Mutex<VaultState>>>,
     fails: Arc<Mutex<usize>>,
     posts: Arc<Mutex<usize>>,
 }
 
 impl CheckpointChain for Chain {
-    async fn state(&self) -> anyhow::Result<VaultState> {
-        Ok(self.state.lock().unwrap().clone())
+    async fn state(&self, view: View) -> anyhow::Result<VaultState> {
+        let state = if view == View::Finalized { self.finalized.as_ref().unwrap_or(&self.state) } else { &self.state };
+        Ok(state.lock().unwrap().clone())
     }
     async fn post(&self, cp: &Checkpoint) -> anyhow::Result<()> {
         let mut fails = self.fails.lock().unwrap();
@@ -151,6 +153,106 @@ async fn uncredited_deposit_mismatch_escalates_after_catch_up_deadline() {
     task.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn latest_inclusion_never_authorizes_release_and_waiting_finality_does_not_repost() {
+    let (mut poster, work) = poster();
+    let finalized = Arc::new(Mutex::new(poster.chain.state.lock().unwrap().clone()));
+    poster.chain.finalized = Some(finalized.clone());
+    for _ in 0..3 {
+        assert_eq!(poster.reconcile(&work).await.unwrap(), (None, false));
+    }
+    assert_eq!(*poster.chain.posts.lock().unwrap(), 1, "latest inclusion waits without a duplicate relay");
+    poster.startup(None).await.unwrap(); // An unfinalized inclusion cannot become a rollback guarantee.
+    poster.chain.state.lock().unwrap().checkpoint = None; // Honest shallow reorg orphans inclusion.
+    assert_eq!(poster.reconcile(&work).await.unwrap(), (None, false));
+    assert_eq!(*poster.chain.posts.lock().unwrap(), 2, "orphaned inclusion may be relayed again");
+    *finalized.lock().unwrap() = poster.chain.state.lock().unwrap().clone();
+    assert_eq!(poster.reconcile(&work).await.unwrap(), (Some(work.checkpoint.seq), true));
+    assert!(poster.startup(None).await.is_err(), "finalized commitment is now the rollback boundary");
+}
+
+#[tokio::test]
+async fn a_provisional_then_orphaned_approval_never_releases_a_signature() {
+    let key = Arc::new(EnclaveKey::test_key());
+    let dir = crate::test_support::scratch_dir("checkpoint-finality-release");
+    let (work_tx, mut work_rx) = mpsc::channel(64);
+    let (signed_tx, mut signed_rx) = mpsc::unbounded_channel();
+    let cfg = crate::sequencer::SequencerConfig {
+        checkpoints: Some(work_tx),
+        ..crate::test_support::sequencer_config(&dir, tokio::sync::watch::channel(crate::log::Manifest::default()).0)
+    };
+    let mut seq =
+        crate::sequencer::Sequencer::recover(cfg, key.clone(), tokio::sync::broadcast::channel(1024).0, signed_tx)
+            .unwrap();
+    seq.activate_protocol().unwrap();
+    seq.genesis(&crate::test_support::dev_config().genesis).unwrap();
+    seq.trust(crate::test_support::trusted_now()).unwrap();
+    while work_rx.try_recv().is_ok() {}
+    let posted = seq.last_seq();
+    let (tx, rx) = mpsc::channel(64);
+    let task = tokio::spawn(seq.run(rx));
+    tx.send(Request::CheckpointStatus { posted, healthy: true }).await.unwrap();
+    submit(&tx, crate::test_support::deposit(100, "finality-deposit")).await;
+    submit(&tx, crate::test_support::withdraw(40)).await;
+    let mut work = None;
+    while let Ok(queued) = work_rx.try_recv() {
+        work = Some(queued);
+    }
+    let work = work.unwrap();
+    let parent = work.checkpoint.parent.unwrap();
+    let state = VaultState {
+        signer: AccountId(key.address()),
+        checkpoint: Some((parent.seq, parent.root.to_string())),
+        balance: work.liabilities,
+        deposits: work.deposits,
+    };
+    let finalized = Arc::new(Mutex::new(state.clone()));
+    let chain = Chain {
+        state: Arc::new(Mutex::new(state.clone())),
+        finalized: Some(finalized.clone()),
+        fails: Arc::new(Mutex::new(0)),
+        posts: Arc::new(Mutex::new(0)),
+    };
+    let poster = Poster {
+        chain,
+        domain: work.checkpoint.domain.unwrap(),
+        signer: AccountId(key.address()),
+        retry: Duration::from_millis(1),
+        pending_deposits_critical_after: Duration::from_secs(1),
+    };
+    for orphan in [false, true] {
+        if orphan {
+            *poster.chain.state.lock().unwrap() = state.clone();
+        }
+        let (posted, healthy) = poster.reconcile(&work).await.unwrap();
+        assert_eq!((posted, healthy), (None, false));
+        tx.send(Request::CheckpointStatus { posted, healthy }).await.unwrap();
+        sync(&tx).await;
+        assert!(signed_rx.try_recv().is_err(), "unfinalized or orphaned inclusion cannot release an approval");
+    }
+    *finalized.lock().unwrap() = poster.chain.state.lock().unwrap().clone();
+    let (posted, healthy) = poster.reconcile(&work).await.unwrap();
+    tx.send(Request::CheckpointStatus { posted, healthy }).await.unwrap();
+    sync(&tx).await;
+    let released = signed_rx.try_recv().expect("finalized healthy approval releases");
+    assert_eq!(released.approved_seq, Some(work.checkpoint.seq));
+    assert_eq!(released.amount, Fixed::from_int(40));
+    drop(tx);
+    task.await.unwrap().unwrap();
+}
+
+async fn submit(tx: &mpsc::Sender<Request>, cmd: Command) {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    tx.send(Request::Submit { cmd, reply: Some(reply) }).await.unwrap();
+    rx.await.unwrap();
+}
+
+async fn sync(tx: &mpsc::Sender<Request>) {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    tx.send(Request::Sync(reply)).await.unwrap();
+    rx.await.unwrap();
+}
+
 fn checkpoint(key: &EnclaveKey, seq: u64, root: [u8; 32]) -> Checkpoint {
     let domain = CheckpointDomain { chain_id: 31337, vault: AccountId([7; 20]) };
     Checkpoint {
@@ -175,6 +277,7 @@ fn poster() -> (Poster<Chain>, Work) {
             balance: work.liabilities,
             deposits: work.deposits,
         })),
+        finalized: None,
         fails: Arc::new(Mutex::new(0)),
         posts: Arc::new(Mutex::new(0)),
     };

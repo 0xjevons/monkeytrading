@@ -1,4 +1,5 @@
 use super::*;
+use crate::sequencer::fixture_tests::replay_trusted as replay;
 use std::fs;
 use std::path::PathBuf;
 
@@ -48,7 +49,7 @@ fn custody_gets_a_withdrawal_when_its_batch_is_flushed_not_when_it_is_signed() {
     let dir = scratch_dir("seq-custody");
     let (stream, _) = broadcast::channel(16);
     let (withdrawals_tx, mut withdrawals) = mpsc::unbounded_channel();
-    let key = Arc::new(EnclaveKey::generate());
+    let key = Arc::new(EnclaveKey::test_key());
     let manifest = watch::channel(Manifest::default()).0;
     let mut seq = Sequencer::recover(sequencer_config(&dir, manifest), key, stream, withdrawals_tx).unwrap();
     seq.trust(trusted_now()).unwrap();
@@ -91,7 +92,7 @@ async fn replay_refuses_logged_events_or_withdrawals_that_replay_does_not_produc
         w.amount = Fixed::from_int(41);
     }
     let err = replay(&forged).err().unwrap();
-    assert!(format!("{err:#}").contains("was not approved"), "{err:#}");
+    assert!(format!("{err:#}").contains("unauthorized withdrawal completion signer"), "{err:#}");
 }
 
 #[tokio::test]
@@ -270,7 +271,7 @@ fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
         clock: stamps.clone(),
         ..sequencer_config(&dir, manifest)
     };
-    let key = Arc::new(EnclaveKey::generate());
+    let key = Arc::new(EnclaveKey::test_key());
     let mut seq = Sequencer::recover(cfg, key, stream, mpsc::unbounded_channel().0).unwrap();
     seq.trust(sample_around(stamps.as_ref())).unwrap();
     seq.carry_toxicity_notional(dev_config().genesis.params.toxicity.notional.unwrap()).unwrap();
@@ -427,7 +428,7 @@ fn try_recover(
     let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
     let (manifest, _) = watch::channel(Manifest::default());
     let cfg = SequencerConfig { client_auth: client_auth.clone(), ..sequencer_config(dir, manifest) };
-    (Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, withdrawals_tx), withdrawals)
+    (Sequencer::recover(cfg, Arc::new(EnclaveKey::test_key()), stream, withdrawals_tx), withdrawals)
 }
 
 /// The commands among `entries`, in order.

@@ -82,7 +82,8 @@ account can fetch a proof of its balance and positions against the last checkpoi
 it without the node. `engine replay` re-applies a log from the beginning and checks the root at
 every checkpoint against the state the published code computes, and fails a log it cannot find or
 that holds no checkpoint, has a missing or invalid signature, or names an inconsistent deployment.
-Early logs that predate domain recording require explicit `--chain-id` and `--vault`. Replay reads
+Early logs that predate domain recording require explicit `--chain-id` and `--vault`; logs with
+withdrawal releases require an independently trusted `--signer`. Replay reads
 a node's log directory or the archive the node serves: its completed log segments, with a manifest of their seq ranges and
 SHA-256 hashes. A stream subscriber can start or resume at any message offset, and gets the log from
 disk and then live, each message once.

@@ -8,7 +8,7 @@ use engine_core::auth::{ClientAuth, Operator};
 use engine_core::types::AccountId;
 use engine_node::admin::{self, AdminArgs, HexKey, KeyEnv};
 use engine_node::log::CheckpointDomain;
-use engine_node::{NodeConfig, init_logging, init_telemetry, replay_path_in_domain, run_dedicated};
+use engine_node::{NodeConfig, init_logging, init_telemetry, replay_path_with_trust, run_dedicated};
 
 #[derive(Subcommand)]
 enum Cmd {
@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Replay { log: path, chain_id, vault, signer } => {
             init_logging("info")?;
             let domain = chain_id.zip(vault).map(|(chain_id, vault)| CheckpointDomain { chain_id, vault });
-            let mut replayed = replay_path_in_domain(&path, domain)?;
+            let mut replayed = replay_path_with_trust(&path, domain, signer)?;
             if let Some(signer) = signer {
                 anyhow::ensure!(
                     replayed.checkpoint_signers.iter().all(|named| *named == signer),

@@ -1,6 +1,7 @@
 //! Replay roots, ordering, and historical logs without logged events.
 
 use super::*;
+use crate::log::Checkpoint;
 
 fn tick(seq: u64) -> LogEntry {
     LogEntry::Command(CommandEntry { sequenced: Sequenced { seq, ts: 0, cmd: Command::Tick }, events: None })

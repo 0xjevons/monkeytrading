@@ -1,4 +1,5 @@
 use super::*;
+use crate::log::Checkpoint;
 
 use engine_core::command::{OrderKind, OrderRequest};
 use engine_core::price::SourceQuote;

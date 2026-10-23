@@ -339,7 +339,7 @@ fn open_reader(path: &Path) -> anyhow::Result<Connection> {
 /// pages are read.
 /// Error cases:
 /// - SQLite refuses a setting
-fn harden(conn: &Connection) -> anyhow::Result<()> {
+pub(super) fn harden(conn: &Connection) -> anyhow::Result<()> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true).context("enabling defensive mode")?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false).context("disabling triggers")?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false).context("disabling views")?;
@@ -348,7 +348,7 @@ fn harden(conn: &Connection) -> anyhow::Result<()> {
 }
 
 /// What `SCHEMA` creates, as `sqlite_schema` lists it.
-fn expected_schema() -> Vec<SchemaRow> {
+pub(super) fn expected_schema() -> Vec<SchemaRow> {
     let conn = Connection::open_in_memory().expect("SQLite opens an in-memory database");
     conn.execute_batch(SCHEMA).expect("the history schema builds");
     schema_of(&conn).expect("an in-memory schema reads")
@@ -369,7 +369,7 @@ fn schema_of(conn: &Connection) -> anyhow::Result<Vec<SchemaRow>> {
 /// the host added runs.
 /// Error cases:
 /// - the schema cannot be read, or differs from `expected`
-fn check_schema(conn: &Connection, expected: &[SchemaRow], path: &Path) -> anyhow::Result<()> {
+pub(super) fn check_schema(conn: &Connection, expected: &[SchemaRow], path: &Path) -> anyhow::Result<()> {
     ensure!(schema_of(conn)? == expected, "{} holds a schema this code did not create", path.display());
     Ok(())
 }

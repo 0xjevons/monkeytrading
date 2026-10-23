@@ -19,6 +19,7 @@ pub struct Replayed {
     pub engine: Engine,
     pub commands: u64,
     pub checkpoints: u64,
+    pub(crate) last_signed_checkpoint: Option<crate::log::Checkpoint>,
     /// Withdrawals the last command approved that the log ends before signing, as a crash between
     /// a command's entry and its withdrawal entry leaves: `(account, amount, nonce)`.
     pub unsigned: Vec<(AccountId, Fixed, u64)>,
@@ -44,6 +45,7 @@ pub(super) struct Replay {
     engine: Engine,
     commands: u64,
     checkpoints: u64,
+    last_signed_checkpoint: Option<crate::log::Checkpoint>,
     activations: Vec<(ProtocolVersion, u64)>,
     /// Withdrawals the last command approved that no withdrawal entry has matched yet. Entries
     /// written before events were logged have no withdrawal entries. Once a command carries its
@@ -55,13 +57,14 @@ pub(super) struct Replay {
     deferred: Vec<(u64, AccountId, Fixed, u64)>,
     unpaid: Fixed,
     domain: Option<CheckpointDomain>,
+    trusted_signer: Option<AccountId>,
     checkpoint_signers: BTreeSet<AccountId>,
 }
 
 impl Replay {
-    /// Creates a strict verifier with an explicit domain for early historical signatures.
-    pub(super) fn in_domain(domain: Option<CheckpointDomain>) -> Self {
-        Self { domain, ..Self::default() }
+    /// Pins the authority supplied independently by custody, retained key, or audit caller.
+    pub(super) fn with_trust(domain: Option<CheckpointDomain>, trusted_signer: Option<AccountId>) -> Self {
+        Self { domain, trusted_signer, ..Self::default() }
     }
     /// Applies the log's next entry.
     /// Error cases:
@@ -104,6 +107,19 @@ impl Replay {
                 self.commands += 1;
             }
             LogEntry::Withdrawal(w) => {
+                let recorded = engine
+                    .operator()
+                    .map(|operator| CheckpointDomain { chain_id: operator.chain_id, vault: operator.vault })
+                    .or_else(|| match engine.client_auth() {
+                        Some(engine_core::auth::ClientAuth::Eip712 { chain_id, vault }) => {
+                            Some(CheckpointDomain { chain_id: *chain_id, vault: *vault })
+                        }
+                        _ => None,
+                    });
+                if let (Some(explicit), Some(recorded)) = (self.domain, recorded) {
+                    ensure!(explicit == recorded, "withdrawal trusted deployment differs from recorded deployment");
+                }
+                crate::checkpoints::signature::verify_withdrawal(w, self.domain.or(recorded), self.trusted_signer)?;
                 if let Some(seq) = w.approved_seq {
                     let at = self
                         .deferred
@@ -113,9 +129,10 @@ impl Replay {
                     self.deferred.remove(at);
                     return Ok(());
                 }
-                if self.approved.pop_front() != Some((w.account, w.amount, w.nonce)) {
+                if self.approved.front() != Some(&(w.account, w.amount, w.nonce)) {
                     bail!("withdrawal {} nonce {} was not approved at seq {:?}", w.account, w.nonce, engine.last_seq());
                 }
+                self.approved.pop_front();
             }
             LogEntry::Checkpoint(cp) => {
                 if cp.deferred_withdrawals {
@@ -135,6 +152,7 @@ impl Replay {
                 crate::checkpoints::signature::verify_with_domain(cp, engine, self.domain)?;
                 self.checkpoint_signers.insert(cp.signer.parse()?);
                 self.checkpoints += 1;
+                self.last_signed_checkpoint = Some(cp.clone());
                 self.genesis.checkpoint();
                 // The checkpoint covers the last command applied, whose stamp is the engine's time.
                 self.last_checkpoint_ts = Some(engine.now());
@@ -159,6 +177,7 @@ impl Replay {
             deferred: self.deferred,
             unpaid: self.unpaid,
             checkpoint_signers: self.checkpoint_signers,
+            last_signed_checkpoint: self.last_signed_checkpoint,
         }
     }
 }
@@ -170,6 +189,24 @@ pub fn replay(entries: &[LogEntry]) -> anyhow::Result<Replayed> {
     let mut replay = Replay::default();
     entries.iter().try_for_each(|entry| replay.apply(entry))?;
     Ok(replay.finish())
+}
+
+/// Replays with an independently trusted signer for withdrawal completion evidence.
+/// Error cases:
+/// - any entry, signature, or authorization fails replay
+pub fn replay_with_signer(
+    entries: &[LogEntry],
+    domain: CheckpointDomain,
+    signer: AccountId,
+) -> anyhow::Result<Replayed> {
+    let mut replay = Replay::with_trust(Some(domain), Some(signer));
+    entries.iter().try_for_each(|entry| replay.apply(entry))?;
+    let replayed = replay.finish();
+    ensure!(
+        replayed.checkpoint_signers.iter().all(|named| *named == signer),
+        "checkpoint signer differs from trusted signer"
+    );
+    Ok(replayed)
 }
 
 /// Replays the log at `path`, a single log file or a directory of segments with their manifest, as
@@ -186,14 +223,31 @@ pub fn replay_path(path: &Path) -> anyhow::Result<Replayed> {
 /// Error cases:
 /// - the log fails replay or conflicts with `domain` (see `replay_path`)
 pub fn replay_path_in_domain(path: &Path, domain: Option<CheckpointDomain>) -> anyhow::Result<Replayed> {
+    replay_path_with_trust(path, domain, None)
+}
+
+/// Replays a published log with explicit authority for authenticating withdrawal releases.
+/// Error cases:
+/// - log, root, signature, domain or trusted signer validation fails
+pub fn replay_path_with_trust(
+    path: &Path,
+    domain: Option<CheckpointDomain>,
+    signer: Option<AccountId>,
+) -> anyhow::Result<Replayed> {
     let found = fs::metadata(path).with_context(|| format!("no readable log at {}", path.display()))?;
-    let mut replay = Replay::in_domain(domain);
+    let mut replay = Replay::with_trust(domain, signer);
     if found.is_dir() {
         SegmentedLog::open(path, |entry| replay.apply(&entry))?;
     } else {
         log::read_file(path, |entry| replay.apply(&entry))?;
     }
     let replayed = replay.finish();
+    if let Some(signer) = signer {
+        ensure!(
+            replayed.checkpoint_signers.iter().all(|named| *named == signer),
+            "checkpoint signer differs from trusted signer"
+        );
+    }
     ensure!(replayed.commands > 0, "{} holds no command", path.display());
     ensure!(replayed.checkpoints > 0, "{} holds no checkpoint, so nothing in it is verified", path.display());
     Ok(replayed)
@@ -214,3 +268,6 @@ fn ensure_signed(
         _ => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod auth_tests;

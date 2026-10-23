@@ -25,7 +25,8 @@ use crate::clock::test_clock::TestClock;
 use crate::config::RateLimit;
 use crate::history::INDEX_FILE;
 use crate::log::LogEntry;
-use crate::sequencer::{Sequencer, SequencerConfig, replay};
+use crate::sequencer::fixture_tests::replay_trusted as replay;
+use crate::sequencer::{Sequencer, SequencerConfig};
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
 use crate::test_support::{dev_config, log_entries, sample_around, scratch_dir, sequencer_config};
 

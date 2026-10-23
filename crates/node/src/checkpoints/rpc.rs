@@ -16,8 +16,8 @@ use alloy::transports::http::reqwest::{Certificate, Client, Url};
 use anyhow::{Context, anyhow, ensure};
 use tokio::time::timeout;
 
-use crate::checkpoints::{CheckpointChain, VaultState};
-use crate::config::CheckpointSection;
+use crate::checkpoints::{CheckpointChain, VaultState, View};
+use crate::config::{CheckpointSection, FinalityTag};
 use crate::custody::usdc_to_fixed;
 use crate::log::{Checkpoint, CheckpointDomain};
 
@@ -39,13 +39,21 @@ pub(crate) struct CheckpointRpc {
     token: Address,
     relayer: Address,
     timeout: Duration,
+    finality_tag: BlockNumberOrTag,
+    confirmations: u64,
 }
 
 impl CheckpointRpc {
     /// Builds a client using binary-owned certificate roots; sends no requests.
     /// Error cases:
     /// - the URL or certificate roots cannot be parsed, or the client cannot be built
-    pub fn new(cfg: &CheckpointSection, domain: CheckpointDomain, token: Address) -> anyhow::Result<Self> {
+    pub fn new(
+        cfg: &CheckpointSection,
+        domain: CheckpointDomain,
+        token: Address,
+        finality: FinalityTag,
+        confirmations: u64,
+    ) -> anyhow::Result<Self> {
         let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
             .iter()
             .map(|cert| Certificate::from_der(cert))
@@ -60,6 +68,12 @@ impl CheckpointRpc {
             token,
             relayer: cfg.relayer,
             timeout: cfg.rpc_timeout,
+            finality_tag: match finality {
+                FinalityTag::Latest => BlockNumberOrTag::Latest,
+                FinalityTag::Safe => BlockNumberOrTag::Safe,
+                FinalityTag::Finalized => BlockNumberOrTag::Finalized,
+            },
+            confirmations,
         })
     }
 
@@ -102,13 +116,26 @@ impl CheckpointChain for CheckpointRpc {
     /// Reads checkpoint state and collateral from one pinned canonical block.
     /// Error cases:
     /// - the endpoint is on the wrong chain or token, or an RPC/decoding error occurs
-    async fn state(&self) -> anyhow::Result<VaultState> {
+    async fn state(&self, view: View) -> anyhow::Result<VaultState> {
         let chain_id = self.deadline(self.provider.get_chain_id()).await?;
         ensure!(chain_id == self.domain.chain_id, "checkpoint endpoint is on another chain");
-        let block = self
-            .deadline(self.provider.get_block_by_number(BlockNumberOrTag::Latest))
+        let tag = if view == View::Latest { BlockNumberOrTag::Latest } else { self.finality_tag };
+        let tagged = self
+            .deadline(self.provider.get_block_by_number(tag))
             .await?
-            .context("checkpoint RPC has no head")?;
+            .context("checkpoint RPC has no finality block")?;
+        let block = if view == View::Finalized && self.confirmations > 0 {
+            let number = tagged
+                .header
+                .number
+                .checked_sub(self.confirmations)
+                .context("checkpoint chain has insufficient confirmation depth")?;
+            self.deadline(self.provider.get_block_by_number(BlockNumberOrTag::Number(number)))
+                .await?
+                .context("checkpoint confirmation block is missing")?
+        } else {
+            tagged
+        };
         let at = BlockId::hash_canonical(block.header.hash);
         let vault = Address::from(self.domain.vault.0);
         let token = usdcCall::abi_decode_returns(&self.call(vault, usdcCall {}.abi_encode(), at).await?)?;

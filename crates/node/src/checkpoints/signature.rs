@@ -81,3 +81,24 @@ pub(crate) fn verify_domain(cp: &Checkpoint, domain: CheckpointDomain) -> anyhow
     );
     Ok(())
 }
+
+/// Authenticates completion evidence against independently supplied authority and deployment.
+/// Error cases:
+/// - no trusted authority/domain is supplied, domain differs, or the signature is invalid
+pub(crate) fn verify_withdrawal(
+    w: &crate::sequencer::SignedWithdrawal,
+    domain: Option<CheckpointDomain>,
+    trusted: Option<AccountId>,
+) -> anyhow::Result<()> {
+    let trusted = trusted.context("withdrawal completion requires a trusted signer; supply --signer")?;
+    let domain = domain.context("withdrawal completion requires a trusted deployment")?;
+    ensure!(w.chain_id == domain.chain_id && w.vault == domain.vault, "withdrawal completion domain mismatch");
+    let signature: Signature =
+        w.signature.parse().context("withdrawal completion signature is missing or malformed")?;
+    let digest = crate::tee::withdrawal_digest(w.chain_id, &w.vault.0, w.account, w.amount, w.nonce);
+    ensure!(
+        trusted.0 != [0; 20] && eip712::recover(&B256::from(digest), &signature) == Some(trusted),
+        "unauthorized withdrawal completion signer"
+    );
+    Ok(())
+}

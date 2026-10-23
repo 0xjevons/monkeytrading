@@ -1,4 +1,5 @@
 use super::*;
+use crate::sequencer::fixture_tests::replay_trusted as replay;
 use std::io::Write;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -131,7 +132,7 @@ fn recover_at(dir: &Path, clock: Arc<TestClock>) -> (Sequencer, mpsc::UnboundedR
     let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
     let (manifest, _) = watch::channel(Manifest::default());
     let cfg = SequencerConfig { clock, ..sequencer_config(dir, manifest) };
-    (Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, withdrawals_tx).unwrap(), withdrawals)
+    (Sequencer::recover(cfg, Arc::new(EnclaveKey::test_key()), stream, withdrawals_tx).unwrap(), withdrawals)
 }
 
 /// The events `cmd` produced; panics if trusted time refused its stamp.

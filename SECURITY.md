@@ -100,11 +100,15 @@ sign a state its rules do not produce, act for an account without its owner's si
 account with funds that no deposit brought in, or pay out funds the engine did not approve. A
 finding that breaks one of these guarantees, or gets past one of those checks, is in scope even when
 it starts from an operator's key. With `[checkpoints]` configured, startup verifies the replayed log
-against the latest posted vault commitment and refuses a shorter or conflicting log before serving; checkpoint signatures verify
+against the latest posted vault commitment at custody finality and refuses a shorter or conflicting log before serving or opening
+history for writes; checkpoint signatures verify
 against their chain, vault, and named signer. New posts also sign the exact predecessor sequence
 and root, which the vault compares atomically to fence divergent same-key publishers. The checkpoint RPC still supplies the canonical chain
 view, and a signature's named signer must be checked against a trusted attestation or the vault's
-authorized signer. Hardware EVM custody requires this protection. Some checks are still being built:
+authorized signer. Withdrawal completion evidence also requires that independently trusted signer
+and its deployment before replay can clear an approval. Latest transaction inclusion alone never
+authorizes withdrawal release; the configured custody finality tag and confirmation depth apply.
+Hardware EVM custody requires this protection. Some checks are still being built:
 the alert outbox persists pages on host disk, whose schema and rows it checks but whose deletion or
 rollback it cannot detect, and its cross-restart age budget uses an unsealed host clock; the
 account history index is read from host disk with only its schema checked, and is matched to the log

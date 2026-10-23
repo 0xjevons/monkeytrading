@@ -34,12 +34,19 @@ pub(crate) struct VaultState {
     pub deposits: u64,
 }
 
+/// Latest inclusion is progress; only final custody-policy state authorizes signature release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum View {
+    Latest,
+    Finalized,
+}
+
 /// Chain access, kept separate from the authorized enclave signer lifecycle.
 pub(crate) trait CheckpointChain: Send + Sync {
     /// Reads the authorized signer, latest checkpoint, and collateral from one block.
     /// Error cases:
     /// - an RPC call fails, decodes incorrectly, or serves another chain
-    async fn state(&self) -> anyhow::Result<VaultState>;
+    async fn state(&self, view: View) -> anyhow::Result<VaultState>;
     /// Relays a signed checkpoint. Receipt loss is safe: the next state read detects the post.
     /// Error cases:
     /// - submission fails, times out, or reverts
@@ -72,7 +79,7 @@ impl<R: CheckpointChain> Poster<R> {
     /// Error cases:
     /// - reading fails, the authorized signer differs, or the log does not contain the posted root
     pub async fn startup(&self, anchor: Option<&Checkpoint>) -> anyhow::Result<()> {
-        let state = self.chain.state().await?;
+        let state = self.chain.state(View::Finalized).await?;
         ensure!(state.signer == self.signer, "vault signer differs from this enclave; signer recovery is required");
         if let Some((seq, root)) = state.checkpoint {
             let cp = anchor.context("log is shorter than the latest posted checkpoint")?;
@@ -139,7 +146,7 @@ impl<R: CheckpointChain> Poster<R> {
     async fn reconcile(&self, work: &Work) -> anyhow::Result<(Option<u64>, bool)> {
         let cp = &work.checkpoint;
         signature::verify_domain(cp, self.domain)?;
-        let mut state = self.chain.state().await?;
+        let mut state = self.chain.state(View::Latest).await?;
         if state.signer != self.signer || cp.signer.parse::<engine_core::types::AccountId>()? != self.signer {
             return Err(Conflict("checkpoint signer differs from the authorized vault signer").into());
         }
@@ -171,12 +178,24 @@ impl<R: CheckpointChain> Poster<R> {
                 }
                 self.chain.post(cp).await?;
                 // A submitted transaction is not a commitment. Verify inclusion before release.
-                state = self.chain.state().await?;
+                state = self.chain.state(View::Latest).await?;
                 ensure!(
                     state.checkpoint == Some((cp.seq, cp.root.clone())) && state.signer == self.signer,
                     "checkpoint transaction is not included in the authorized vault"
                 );
             }
+        }
+        // Latest inclusion prevents duplicate submission, but is revocable by a shallow reorg.
+        let state = self.chain.state(View::Finalized).await?;
+        if state.signer != self.signer {
+            return Err(Conflict("finalized vault signer differs from this enclave").into());
+        }
+        match &state.checkpoint {
+            Some((seq, root)) if *seq == cp.seq && *root == cp.root => {}
+            Some((seq, _)) if *seq >= cp.seq => {
+                return Err(Conflict("finalized checkpoint conflicts with local log").into());
+            }
+            _ => return Ok((None, false)),
         }
         let healthy = state.balance == work.liabilities && state.deposits == work.deposits;
         if healthy {

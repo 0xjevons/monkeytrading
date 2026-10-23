@@ -6,7 +6,8 @@ use engine_core::Fixed;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::log::{LogEntry, Manifest};
-use crate::sequencer::{Sequencer, replay};
+use crate::sequencer::Sequencer;
+use crate::sequencer::fixture_tests::replay_trusted as replay;
 use crate::tee::EnclaveKey;
 use crate::test_support::{deposit, dev_config, log_entries, scratch_dir, sequencer_config, trusted_now, withdraw};
 
@@ -16,7 +17,7 @@ fn only_a_reconciled_posted_prefix_releases_signatures_and_recovery_keeps_the_ga
     let (work, mut queued) = mpsc::channel(64);
     let (withdrawals, mut signed) = mpsc::unbounded_channel();
     let (stream, _) = broadcast::channel(128);
-    let key = Arc::new(EnclaveKey::generate());
+    let key = Arc::new(EnclaveKey::test_key());
     let cfg = crate::sequencer::SequencerConfig {
         checkpoint_parent: Default::default(),
         checkpoints: Some(work.clone()),
@@ -78,7 +79,7 @@ fn recovering_a_completed_archive_waits_for_a_command_before_appending_a_checkpo
     use engine_core::types::AccountId;
 
     let dir = scratch_dir("checkpoint-archive-recovery");
-    let key = Arc::new(EnclaveKey::generate());
+    let key = Arc::new(EnclaveKey::test_key());
     let mut engine = Engine::new();
     let command = Sequenced { seq: 0, ts: 0, cmd: Command::Tick };
     let events = engine.apply(&command).unwrap();
@@ -128,7 +129,7 @@ fn gated_checkpoints_sign_the_previous_queued_root_and_coalesce_duplicate_reques
     };
     let mut seq = Sequencer::recover(
         cfg,
-        Arc::new(EnclaveKey::generate()),
+        Arc::new(EnclaveKey::test_key()),
         broadcast::channel(128).0,
         mpsc::unbounded_channel().0,
     )

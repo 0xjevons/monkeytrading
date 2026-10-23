@@ -74,7 +74,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   registry, set up before the node runs
 - `src/sequencer/mod.rs` — the sequencer, checkpoints, and metrics
 - `src/sequencer/messages.rs` — sequencer requests, stream messages, and signed withdrawals
-- `src/sequencer/checkpoints.rs` — custody reconciliation and withdrawal signature release
+- `src/sequencer/checkpoints.rs` — checkpoint creation, custody reconciliation, and signature release
 - `src/sequencer/checkpoint_tests.rs` — confirmed-prefix signature gating and restart tests
 - `src/sequencer/fixture_tests.rs` — test-only signing of copies of placeholder protocol fixtures
 - `src/sequencer/replay.rs` — log replay, which recovery and `engine replay` share
@@ -167,9 +167,13 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/checkpoints/mod.rs` — posting, retry, signed-parent commitment checks, and collateral reconciliation
 - `src/checkpoints/signature.rs` — shared strict checkpoint signature and domain verification
 - `src/checkpoints/rpc.rs` — pinned-block vault reads and transaction relay through a signing RPC
-- `src/checkpoints/setup.rs` — chain anchor lookup before log recovery writes
+- `src/checkpoints/setup.rs` — finalized chain anchor lookup and pending-inclusion startup wait
 - `src/checkpoints/tests.rs` — signature mutations, rollback, retry, and reconciliation tests
-- `src/checkpoints/scenario.rs` — the isolated Anvil checkpoint dev scenario
+- `src/checkpoints/scenario.rs` — isolated Anvil posting, tampering, truncation, shortfall, and reorg checks
+- `src/history/preflight.rs` — immutable history planning before authorized SQLite mutation
+- `src/node/preflight.rs` — chain validation before writable history recovery
+- `src/node/preflight/tests.rs` — refused startup preserves history, WAL, and log bytes
+- `src/sequencer/replay/auth_tests.rs` — trusted immediate/deferred completion evidence regressions
 - `src/custody/mod.rs` — the custody providers (mock and EVM) and the USDC-to-`Fixed` conversion
 - `src/custody/evm.rs` — the deposit watcher: the chain and token check, range reads from blocks
   proven to lead to the tagged final block, the completeness check, and stall alerts
@@ -316,7 +320,10 @@ On-chain checkpoint posting uses an optional `[checkpoints]` section, required w
 custody. `node.checkpoint_every` sets the periodic frequency; every approved withdrawal also forces
 a checkpoint. Each root is durable locally before the relayer sends it, and the node releases no
 withdrawal signature until its approval is covered by a confirmed on-chain prefix and collateral
-reconciles. The queue is bounded; exhaustion stops the node with the durable log available for
+reconciles at custody's configured `finality_tag` minus `confirmations`. Latest inclusion is
+tracked separately so delayed finality never causes duplicate submission. Startup waits for a
+pending inclusion to reach that boundary (or disappear in a reorg), bounded by
+`custody.evm.stall_critical_after`, before selecting its rollback anchor and parent. The queue is bounded; exhaustion stops the node with the durable log available for
 recovery. Failed posts retry after `retry_interval` and emit `checkpoint_post_failed`. A conflicting
 posted root or signer stops the node with a Critical alert. A collateral mismatch emits Critical
 `collateral_mismatch` and pauses withdrawals; ordinary trading commands continue. Deposits not yet
@@ -336,7 +343,9 @@ pays gas for relays; only the attested enclave's signature authorizes a vault co
 pin signer, root, deposit count, and USDC balance to one canonical block hash. This RPC's chain view
 is trusted pending independent verification. The immutable `Vault` constructor signer must match
 the enclave key. Key persistence and rotation remain separate work: startup fails closed when a
-restart generates a different key. The Anvil test provisions its generated signer before deploying
+restart generates a different key. Before any history SQLite open-for-write, schema creation,
+WAL recovery, or repair, the node authenticates the replay and finalized anchor. History preflight
+uses immutable read-only access; a crash WAL is conservatively rebuilt only after authorization. The Anvil test provisions its generated signer before deploying
 the vault; this is a local harness, not a production key-provisioning workflow. Withdrawals still
 have no on-chain payout path, so reconciliation counts every approval as unpaid. Payout settlement
 must subtract confirmed payouts when that feature is added.
@@ -349,7 +358,10 @@ extensions of one parent. An absent parent is encoded as false/zero/zero. Histor
 keep the original `engine.checkpoint.v1` digest and remain replayable, but cannot authorize v2
 vault posts. Domains come from the checkpoint or the log's recorded operator/client authentication. For earlier genuine logs, supply
 `replay --chain-id <id> --vault <address>`; recovery uses the configured deployment and refuses a
-conflicting recorded domain. `replay --signer <address>` pins the enclave signer to an address
+conflicting recorded domain. Logs containing withdrawal release records require `replay --signer <address>` from an independent
+trust source. Both immediate and deferred completions must match the pending approval and carry a
+valid withdrawal signature for the trusted deployment before replay consumes it. The signer flag
+also pins checkpoint signers to an address
 obtained from an independently verified attestation or the vault. Protocol reference fixtures
 contain placeholder enclave signatures; fixture tests check their roots/events separately, while `engine replay` rejects their placeholders.
 

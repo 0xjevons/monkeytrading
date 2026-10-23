@@ -17,7 +17,7 @@ use engine_core::types::AccountId;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
 
-use crate::checkpoints::{CheckpointChain, CheckpointRpc, Poster};
+use crate::checkpoints::{CheckpointChain, CheckpointRpc, Poster, View};
 use crate::config::{CheckpointSection, CustodyProvider, FinalityTag};
 use crate::custody::Custody;
 use crate::log::{Checkpoint, CheckpointDomain, LogEntry, Manifest};
@@ -72,7 +72,7 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     ))
     .unwrap();
     let make_poster = || Poster {
-        chain: CheckpointRpc::new(&section, domain, token).unwrap(),
+        chain: CheckpointRpc::new(&section, domain, token, FinalityTag::Latest, 0).unwrap(),
         domain,
         signer: AccountId(key.address()),
         retry: section.retry_interval,
@@ -148,7 +148,7 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
                     _ => None,
                 })
                 .unwrap();
-            if make_poster().chain.state().await.unwrap().checkpoint.is_some_and(|(seq, _)| seq >= latest) {
+            if make_poster().chain.state(View::Latest).await.unwrap().checkpoint.is_some_and(|(seq, _)| seq >= latest) {
                 break;
             }
             sleep(Duration::from_millis(40)).await;
@@ -200,7 +200,7 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     sequencer.await.unwrap().unwrap();
 
     let entries = log_entries(&dir);
-    let state = make_poster().chain.state().await.unwrap();
+    let state = make_poster().chain.state(View::Latest).await.unwrap();
     let (posted_seq, _) = state.checkpoint.unwrap();
     let anchor = entries
         .iter()
@@ -234,6 +234,44 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     })
     .unwrap();
     assert!(make_poster().startup(found.as_ref()).await.is_err(), "truncation refuses startup");
+    // A canonical latest inclusion is revocable. Confirmation policy alone gates release.
+    let delayed =
+        Poster { chain: CheckpointRpc::new(&section, domain, token, FinalityTag::Latest, 2).unwrap(), ..make_poster() };
+    local_rpc(&url, "anvil_mine", serde_json::json!(["0x3"])).await;
+    let saved = local_rpc(&url, "evm_snapshot", serde_json::json!([])).await;
+    let current = delayed.chain.state(View::Latest).await.unwrap();
+    let (parent_seq, parent_root) = current.checkpoint.clone().unwrap();
+    let parent =
+        crate::log::CheckpointParent { has_checkpoint: true, seq: parent_seq, root: parent_root.parse().unwrap() };
+    let seq = parent_seq + 100;
+    let checkpoint = Checkpoint {
+        parent: Some(parent),
+        seq,
+        root: format!("0x{}", "99".repeat(32)),
+        signature: key.sign_checkpoint_v2(domain.chain_id, &domain.vault.0, seq, &[0x99; 32], parent),
+        signer: key.address_hex(),
+        domain: Some(domain),
+        deferred_withdrawals: true,
+    };
+    let work = crate::checkpoints::Work { checkpoint, liabilities: current.balance, deposits: current.deposits };
+    assert_eq!(delayed.reconcile(&work).await.unwrap(), (None, false));
+    let nonce = provider.get_transaction_count(relayer).await.unwrap();
+    assert_eq!(delayed.reconcile(&work).await.unwrap(), (None, false));
+    assert_eq!(provider.get_transaction_count(relayer).await.unwrap(), nonce, "pending finality must not resubmit");
+    assert_ne!(
+        delayed.chain.state(View::Finalized).await.unwrap().checkpoint,
+        Some((seq, work.checkpoint.root.clone()))
+    );
+    assert_eq!(local_rpc(&url, "evm_revert", serde_json::json!([saved])).await, serde_json::json!(true));
+    assert_eq!(
+        delayed.chain.state(View::Latest).await.unwrap().checkpoint,
+        current.checkpoint,
+        "reorg removes provisional inclusion"
+    );
+    assert_eq!(delayed.reconcile(&work).await.unwrap(), (None, false), "orphaned inclusion never released");
+    local_rpc(&url, "anvil_mine", serde_json::json!(["0x2"])).await;
+    assert_eq!(delayed.reconcile(&work).await.unwrap(), (Some(seq), true), "release follows confirmation depth");
+
     let mut forged = entries;
     let cp = forged
         .iter_mut()
@@ -286,4 +324,21 @@ async fn house(tx: &mpsc::Sender<Request>) -> Fixed {
 fn write_entries(path: &Path, entries: &[LogEntry]) {
     let text: String = entries.iter().map(|entry| format!("{}\n", serde_json::to_string(entry).unwrap())).collect();
     std::fs::write(path, text).unwrap();
+}
+
+/// Executes only local Anvil scenario controls and rejects JSON-RPC errors.
+async fn local_rpc(url: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let response: serde_json::Value = reqwest::Client::new()
+        .post(url)
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    response.get("result").unwrap().clone()
 }

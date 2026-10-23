@@ -47,7 +47,7 @@ fn a_funded_log_under_the_operator_takes_the_weighting_unsigned_and_activates_th
         ..sequencer_config(&dir, manifest)
     };
     let mut seq =
-        Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, mpsc::unbounded_channel().0).unwrap();
+        Sequencer::recover(cfg, Arc::new(EnclaveKey::test_key()), stream, mpsc::unbounded_channel().0).unwrap();
     seq.trust(sample_around(stamps.as_ref())).unwrap();
     let weighting = dev_config().genesis.params.toxicity.notional.unwrap();
     seq.carry_toxicity_notional(weighting).unwrap();

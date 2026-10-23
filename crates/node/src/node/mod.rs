@@ -26,7 +26,8 @@ use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProv
 use crate::custody::Custody;
 use crate::feeds;
 use crate::feeds::venue::{self, Timing};
-use crate::history::{History, HistoryCheck};
+use crate::history::HistoryPlan;
+mod preflight;
 use crate::limits::{ApiLimits, run_retain};
 use crate::log::Manifest;
 use crate::metrics::Metrics;
@@ -35,6 +36,7 @@ use crate::tee::{Attestor, ConfigfsTsm, EnclaveKey, MockAttestor, attest_key};
 use crate::telemetry::Telemetry;
 use crate::tls::{TlsIdentity, serve};
 use crate::{metrics, monitor, trusted_time};
+use preflight::finish_preflight;
 
 /// How long the sequencer gets to drain and checkpoint after a shutdown signal.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -110,20 +112,15 @@ async fn serve_node(
         .await
         .inspect_err(|e| error!(alert = "checkpoint_startup_failed", "refusing to serve: {e:#}"))?;
     let mut anchor = None;
-    let (log, mut history) = read_log_and_history_observe(&cfg, |entry| {
+    let (log, history_plan) = read_log_and_history_observe(&cfg, Some(AccountId(key.address())), |entry| {
         if let crate::log::LogEntry::Checkpoint(cp) = entry
             && checkpoint_setup.as_ref().and_then(|setup| setup.posted_seq) == Some(cp.seq)
         {
             anchor = Some(cp.clone());
         }
     })?;
-    if let Some(setup) = &checkpoint_setup {
-        setup
-            .poster
-            .startup(anchor.as_ref())
-            .await
-            .inspect_err(|e| error!(alert = "checkpoint_startup_failed", "refusing to serve: {e:#}"))?;
-    }
+    let mut history =
+        finish_preflight(history_plan, checkpoint_setup.as_ref().map(|setup| (&setup.poster, anchor.as_ref()))).await?;
 
     let vault: AccountId = cfg.custody.vault.parse().context("custody.vault")?;
     let client_auth = cfg.client_auth()?;
@@ -277,8 +274,9 @@ async fn serve_node(
 /// - the history index cannot be opened, nor a fresh one in its place (see `HistoryCheck`)
 /// - the log cannot be read or replayed (see `Sequencer::read_log`)
 #[cfg(test)]
-fn read_log_and_history(cfg: &NodeConfig) -> anyhow::Result<(ReplayedLog, History)> {
-    read_log_and_history_observe(cfg, |_| {})
+fn read_log_and_history(cfg: &NodeConfig) -> anyhow::Result<(ReplayedLog, crate::history::History)> {
+    let (log, plan) = read_log_and_history_observe(cfg, Some(AccountId(EnclaveKey::test_key().address())), |_| {})?;
+    Ok((log, plan.finish()?))
 }
 
 /// Replays and checks history while exposing the same entries for the on-chain anchor check.
@@ -286,21 +284,22 @@ fn read_log_and_history(cfg: &NodeConfig) -> anyhow::Result<(ReplayedLog, Histor
 /// - the log or history index cannot be read or verified
 fn read_log_and_history_observe(
     cfg: &NodeConfig,
+    signer: Option<AccountId>,
     mut observe: impl FnMut(&crate::log::LogEntry),
-) -> anyhow::Result<(ReplayedLog, History)> {
+) -> anyhow::Result<(ReplayedLog, HistoryPlan)> {
     let history_failed = |e: &anyhow::Error| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}");
-    let mut check = HistoryCheck::open(&cfg.history).inspect_err(history_failed)?;
-    let log = Sequencer::read_log_in_domain(
+    let mut check = HistoryPlan::open(&cfg.history).inspect_err(history_failed)?;
+    let log = Sequencer::read_log_with_trust(
         &cfg.node.log_dir,
         Some(crate::log::CheckpointDomain { chain_id: cfg.custody.chain_id, vault: cfg.custody.vault.parse()? }),
+        signer,
         |entry| {
             check.observe(entry);
             observe(entry);
         },
     )
     .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
-    let history = check.finish().inspect_err(history_failed)?;
-    Ok((log, history))
+    Ok((log, check))
 }
 
 /// Sequences a `Tick` every `every`, so sessions and rollovers fire without other traffic.

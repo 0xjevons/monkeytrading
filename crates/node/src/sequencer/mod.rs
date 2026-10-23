@@ -4,7 +4,7 @@
 //! beyond the channel: a fill costs about one engine step plus a buffered write.
 
 mod replay;
-pub use replay::{Replayed, replay, replay_path, replay_path_in_domain};
+pub use replay::{Replayed, replay, replay_path, replay_path_in_domain, replay_path_with_trust, replay_with_signer};
 mod checkpoints;
 use checkpoints::Gate;
 mod messages;
@@ -12,7 +12,7 @@ pub use messages::{Query, Request, SignedWithdrawal, StreamBody, StreamMsg};
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use engine_core::auth::{ClientAuth, Operator};
@@ -21,10 +21,10 @@ use engine_core::event::Event;
 use engine_core::types::{AccountId, Millis};
 use engine_core::{Engine, Fixed};
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{debug, error, info, info_span, warn};
+use tracing::{error, info, info_span, warn};
 
 use crate::clock::Clock;
-use crate::log::{Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, SegmentedLog};
+use crate::log::{CommandEntry, LogEntry, LogWriter, Manifest, SegmentedLog};
 use crate::metrics::Metrics;
 use crate::sequencer::alerts::{DeficitAlert, alert_on};
 use crate::sequencer::replay::Replay;
@@ -105,9 +105,10 @@ impl Sequencer {
         stream: broadcast::Sender<Arc<StreamMsg>>,
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
-        let log = Self::read_log_in_domain(
+        let log = Self::read_log_with_trust(
             cfg.log_dir,
             Some(crate::log::CheckpointDomain { chain_id: cfg.chain_id, vault: cfg.vault }),
+            Some(AccountId(key.address())),
             |_| {},
         )?;
         Self::recover_from(log, cfg, key, stream, withdrawals)
@@ -130,7 +131,19 @@ impl Sequencer {
         domain: Option<crate::log::CheckpointDomain>,
         mut observe: impl FnMut(&LogEntry),
     ) -> anyhow::Result<ReplayedLog> {
-        let mut replay = Replay::in_domain(domain);
+        Self::read_log_with_trust(dir, domain, None, &mut observe)
+    }
+
+    /// Reads one authenticated stream with an independently trusted withdrawal authority.
+    /// Error cases:
+    /// - reading, replay, or release authorization fails
+    pub fn read_log_with_trust(
+        dir: &Path,
+        domain: Option<crate::log::CheckpointDomain>,
+        signer: Option<AccountId>,
+        mut observe: impl FnMut(&LogEntry),
+    ) -> anyhow::Result<ReplayedLog> {
+        let mut replay = Replay::with_trust(domain, signer);
         let log = SegmentedLog::open(dir, |entry| {
             observe(&entry);
             replay.apply(&entry)
@@ -138,7 +151,7 @@ impl Sequencer {
         Ok(ReplayedLog { log, replayed: replay.finish() })
     }
 
-    /// As `recover`, from `log`, which `read_log` read and replayed.
+    /// Recovers the log `read_log` already authenticated.
     /// Error cases:
     /// - the log records a client auth or an operator other than the config's, or a genesis it did
     ///   not apply in full (see `GenesisProgress::ensure_closed`)
@@ -151,8 +164,18 @@ impl Sequencer {
         withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
     ) -> anyhow::Result<Self> {
         let ReplayedLog { log, replayed } = log;
-        let Replayed { engine, commands, checkpoints, unsigned, deferred, unpaid, genesis, last_checkpoint_ts, .. } =
-            replayed;
+        let Replayed {
+            engine,
+            commands,
+            checkpoints,
+            unsigned,
+            deferred,
+            unpaid,
+            genesis,
+            last_checkpoint_ts,
+            last_signed_checkpoint,
+            ..
+        } = replayed;
         // A config naming another client auth or operator, and so another chain, vault, or admin key,
         // is the wrong one for this log: refuse before anything is written or signed under it.
         if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
@@ -165,7 +188,7 @@ impl Sequencer {
         if !deferred.is_empty() && cfg.checkpoints.is_none() {
             bail!("checkpoint-gated withdrawals require the checkpoint service");
         }
-        let checkpoint_unsigned = cfg.checkpoints.is_some() && !unsigned.is_empty();
+        let checkpoint_unsigned = cfg.checkpoints.is_some() && (!unsigned.is_empty() || !deferred.is_empty());
         info!(commands, checkpoints, "recovered from log");
         if let Some(ts) = last_checkpoint_ts {
             cfg.metrics.last_checkpoint_seconds.set(ts as f64 / 1000.0);
@@ -210,7 +233,16 @@ impl Sequencer {
             gate.pending.extend(deferred);
         }
         if checkpoint_unsigned {
-            sequencer.checkpoint()?;
+            if sequencer
+                .gate
+                .as_ref()
+                .is_some_and(|gate| gate.parent.has_checkpoint && Some(gate.parent.seq) == sequencer.engine.last_seq())
+            {
+                let cp = last_signed_checkpoint.context("finalized recovery parent lacks its signed checkpoint")?;
+                sequencer.queue_checkpoint(cp)?;
+            } else {
+                sequencer.checkpoint()?;
+            }
         }
         sequencer.flush()?;
         Ok(sequencer)
@@ -389,45 +421,6 @@ impl Sequencer {
             signature,
             approved_seq: None,
         }))
-    }
-
-    /// Logs and publishes a signed state root for the last applied seq. From protocol `V9` the root
-    /// rehashes only what changed since the previous checkpoint, and API proofs are taken against it.
-    /// Error cases:
-    /// - nothing has been applied yet
-    /// - the log cannot be written
-    fn checkpoint(&mut self) -> anyhow::Result<()> {
-        let seq = self.engine.last_seq().context("checkpoint before any command")?;
-        if self.gate.as_ref().is_some_and(|gate| gate.parent.has_checkpoint && gate.parent.seq == seq) {
-            return Ok(());
-        }
-        let (started, root) = (Instant::now(), self.engine.state_root());
-        let (elapsed_us, work) = (started.elapsed().as_micros(), self.engine.last_root_work());
-        debug!(seq, elapsed_us, leaves = work.map(|w| w.leaves), nodes = work.map(|w| w.nodes), "state root computed");
-        let cp = Checkpoint {
-            parent: self.gate.as_ref().map(|gate| gate.parent),
-            seq,
-            root: format!("0x{}", hex::encode(root)),
-            signature: if let Some(gate) = &self.gate {
-                self.key.sign_checkpoint_v2(self.chain_id, &self.vault.0, seq, &root, gate.parent)
-            } else {
-                self.key.sign_checkpoint(self.chain_id, &self.vault.0, seq, &root)
-            },
-            signer: self.key.address_hex(),
-            domain: Some(crate::log::CheckpointDomain { chain_id: self.chain_id, vault: self.vault }),
-            deferred_withdrawals: self.gate.is_some(),
-        };
-        self.record(LogEntry::Checkpoint(cp.clone()))?;
-        if self.gate.is_some() {
-            self.log.sync()?;
-            self.queue_checkpoint(cp)?;
-            if let Some(gate) = &mut self.gate {
-                gate.parent = crate::log::CheckpointParent { has_checkpoint: true, seq, root: root.into() };
-            }
-        }
-        self.last_checkpoint = Some(seq);
-        self.metrics.last_checkpoint_seconds.set(self.last_ts as f64 / 1000.0);
-        Ok(())
     }
 
     /// Makes buffered log entries durable, then publishes what they produced and hands signed
