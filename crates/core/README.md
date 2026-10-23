@@ -125,6 +125,8 @@ this crate and reproduce the signed state roots exactly.
   `tests/quote_timing.rs` indices that change without a price update and venue quotes stamped ahead,
   `tests/stress.rs` stress levels from `V13`, and `tests/stress_activation.rs` the activation of
   `V13` over earlier divergence triggers and move references
+- `tests/close_spread_calibration.rs` — V17 fill/rounding/liquidation agreement vectors for
+  the research-only close-spread model; shares input fixtures with the Python study
 - `tests/reference/` — one reference log per protocol version: each line is a sequenced command and
   the state root after it
 - `tests/reference_logs.rs` — replays every reference log and fails at the first seq whose root

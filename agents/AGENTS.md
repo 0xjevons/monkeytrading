@@ -55,12 +55,15 @@ an index: load only the rule whose hint matches the current action.
   their venue calendars, each calendar's sources and unpublished gaps, their quote currencies, and
   the launch margins and fees; a deployment's node sections complete it into a config. Every
   section rejects unknown keys.
-- **research/** — studies that set protocol parameters from data, outside the build and CI.
+- **research/** — studies that set protocol parameters from data, outside the production runtime.
   `cap-calibration/` calibrates the house exposure-cap floors by Monte Carlo (#111): scripts that
   fetch and derive its public data (raw pulls in gitignored `data/raw/`, the derived dataset in
   `data/derived/`), the Python model behind `run.py`, its tests, and `results/`. Its `README.md`
   gives the method, sources, results, and how to re-run. Research may name the platforms whose
-  public data it studies, inside `research/` and its PR only.
+  public data it studies, inside `research/` and its PR only. `close-spread-calibration/` studies
+  per-market close-spread ceilings (#147), with pinned inventories, data-access limitations,
+  deterministic pricing vectors checked through `Engine::apply`, conditional gap sensitivities,
+  and explicitly incomplete parameter recommendations. Its README documents the pipeline/tests.
 - **scripts/** — `check-file-loc.sh`, the 500-line cap per Rust file, opted in per crate;
   `check-reference-logs.sh`, which fails a branch that changes a committed reference log;
   `dev-vault-deposits.sh`, the vault deposit dev scenario on Anvil; and `dev-metrics-alerts.sh`,
@@ -132,6 +135,11 @@ Run from the repo root:
   `research/cap-calibration/requirements.txt`: `python -I research/cap-calibration/run.py <command>`
   (`all` re-runs the simulations and report from the committed data), and its tests with
   `python -I -m pytest research/cap-calibration/tests`
+- Close-spread research, from a virtualenv with `research/close-spread-calibration/requirements.txt`:
+  `python -I research/close-spread-calibration/run.py`, then
+  `python -I research/close-spread-calibration/report.py`; tests:
+  `python -I -m unittest discover -s research/close-spread-calibration/tests` and
+  `cargo test -p engine-core --test close_spread_calibration --locked`
 
 ## Repo facts
 
