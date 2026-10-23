@@ -1,5 +1,9 @@
 """The data derivation on small synthetic inputs: gap cleaning, holidays, hedges, and the check."""
 
+import csv
+import gzip
+import json
+from collections import defaultdict
 from datetime import date, timedelta
 
 import numpy as np
@@ -108,3 +112,101 @@ def test_margin_buys_notional_band_by_band():
     margin, leverage = np.array([1e4, 1e6]), np.array([10.0, 1000.0])
     assert papertrade.mapped_notional(margin, leverage, btc, "capped").tolist() == pytest.approx([1e5, 5.5e6])
     assert papertrade.mapped_notional(margin, leverage, share, "capped").tolist() == pytest.approx([1e5, 3.3e6])
+
+
+D0 = 1_699_920_000  # a UTC midnight (day 19675); the block clock below runs 100 s per block
+# (user, side, margin, leverage, open block, close block, exit, adjusted pnl, fee). Blocks 0 and
+# 3456 anchor to D0 and D0 + 4 days, so days 0 and 3 are partial — the first open lands after day
+# 0's start and the last close before day 3's end — and their flow is nothing like the full days'.
+POSITIONS = [
+    ("0xa1", -1, 1e6, 1000, 72, 108, 49900, 1.6e6, 3.2e4),  # day 0: two huge 1000x shorts
+    ("0xa2", -1, 1e6, 1000, 72, 108, 49900, 1.6e6, 3.2e4),
+    ("0xa3", 1, 1e3, 10, 1692, 1728, 50100, 16, 0.32),  # day 1, full
+    ("0xa4", 1, 1e3, 10, 1692, 1728, 50100, 16, 0.32),
+    ("0xa5", 1, 1e3, 10, 1728, 1764, 50100, 16, 0.32),  # day 2, full
+    ("0xa6", 1, 1e3, 10, 1728, 1764, 50100, 16, 0.32),
+    ("0xa7", -1, 1e5, 500, 2628, 2664, 50050, -4e4, 800),  # day 3: one huge 500x short
+]
+
+
+def calibrate_logs(tmp_path):
+    """Writes the synthetic papertrade logs and Binance klines, runs derive(), returns the out dir."""
+
+    def words(*values):
+        return "0x" + "".join(f"{int(round(v)) % (1 << 256):064x}" for v in values)
+
+    def open_row(pid, user, side, margin, leverage, block, index):
+        row = [block, 0, index, [papertrade.OPEN, hex(pid), user]]
+        return row + [words(0, int(side > 0), 0, 50000 * 10, margin * 1e18, leverage)]
+
+    def close_row(pid, user, exit_, adjusted, fee, block, index):
+        row = [block, 0, index, [papertrade.CLOSE, hex(pid), user]]
+        return row + [words(exit_ * 10, adjusted * 1e18, adjusted * 1e18, 0, fee * 1e18)]
+
+    raw = tmp_path / "raw"
+    by_block = defaultdict(list)
+    for pid, (user, side, margin, lev, open_b, close_b, exit_, adjusted, fee) in enumerate(POSITIONS, start=1):
+        by_block[open_b].append(open_row(pid, user, side, margin, lev, open_b, len(by_block[open_b])))
+        by_block[close_b].append(close_row(pid, user, exit_, adjusted, fee, close_b, len(by_block[close_b])))
+    (raw / "logs").mkdir(parents=True)
+    for block, rows in sorted(by_block.items()):
+        with gzip.open(raw / "logs" / f"{block}.jsonl.gz", "wt") as fh:
+            for row in sorted(rows, key=lambda r: r[2]):
+                fh.write(json.dumps(row) + "\n")
+    (raw / "manifest.json").write_text(json.dumps({"from_block": 0, "last_block_pulled": 3456}))
+    (raw / "block_times.csv").write_text(f"block,timestamp\n0,{D0}\n3456,{D0 + 4 * 86400}\n")
+    klines = [[h * 3_600_000, 50000.0, 50000.0, 50000.0, 50000.0, 1.0] for h in range(D0 // 3600, D0 // 3600 + 97)]
+    binance = tmp_path / "raw_markets" / "binance"
+    binance.mkdir(parents=True)
+    with gzip.open(binance / "BTCUSDT_1h_papertrade.json.gz", "wt") as fh:
+        json.dump(klines, fh)
+    out = tmp_path / "derived"
+    papertrade.derive(raw, tmp_path / "raw_markets", out)
+    return out
+
+
+def read_csv(path):
+    with path.open() as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_flow_sizes_leverage_and_long_share_come_from_full_days_only(tmp_path):
+    out = calibrate_logs(tmp_path)
+    summary = json.loads((out / "papertrade_summary.json").read_text())
+
+    # Only the four positions opened on days 1 and 2 reach the full-day sample the profiles use.
+    assert summary["days"] == 3.0
+    assert summary["full_days_positions"] == 4
+    assert summary["full_days_hedged_share_of_notional"] == 0.0
+
+    # The flow profile is just those four longs: one directional class, the 1-50 leverage bin,
+    # $4k of margin; the partial days' 1000x and 500x shorts appear in no bin.
+    (flow,) = read_csv(out / "papertrade_flow.csv")
+    assert flow["kind"] == "directional" and int(flow["hold_class_h"]) == 1
+    assert flow["leverage_bin"] == "1-50"
+    assert float(flow["positions"]) == 4.0
+    assert float(flow["notional_usd"]) == 40000.0
+    assert float(flow["margin_usd"]) == 4000.0
+    assert float(flow["long_share"]) == 1.0
+
+    # All four full-day positions map to a single notional per schedule, so each margin share
+    # jumps straight from 0 to 1; any partial-day leak (at 1e6 or 5e5 of mapped notional) lands
+    # in between.
+    shares = [float(r["margin_share"]) for r in read_csv(out / "papertrade_sizes.csv") if r["kind"] == "directional"]
+    assert set(shares) == {0.0, 1.0}
+
+    # The leverage profile holds only the 1-50 bin, with all $4k of the full-day margin.
+    lev = [r for r in read_csv(out / "papertrade_leverage.csv") if r["kind"] == "directional"]
+    assert {r["leverage_bin"] for r in lev} == {"1-50"}
+    assert {float(r["margin_usd"]) for r in lev} == {4000.0}
+
+    # The long-share fit sees the same days: every sampled open is long, over the two consecutive
+    # hours of days 1 and 2; the partial days' shorts would pull the mean below 1.
+    assert summary["long_share_mean"] == 1.0
+    assert summary["long_share_resid_sd"] == 0.0
+    assert summary["hours"] == 1
+
+    # The daily CSV's full_day flag: the partial edge days are False, the covered middle days True.
+    daily = read_csv(out / "papertrade_daily.csv")
+    assert [r["full_day"] for r in daily] == ["False", "True", "True", "False"]
+    assert [int(r["positions"]) for r in daily] == [2, 2, 2, 1]
