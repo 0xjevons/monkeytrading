@@ -15,7 +15,7 @@ giving the measured share of paths with the one-sided 95% upper bound beside it:
 The 1% row for NAV is the uniform family: $1M on every market. The risk-level method below sets
 each market's floor from the market run alone, where a small market's own fees cannot absorb its
 gap losses; alone, no market stays at or below 0.3% at any floor, so at those levels the family
-puts $0 on every market and nothing opens. Its 1% choice is $49.4k on two markets, refusing 92% of
+puts $0 on every market and nothing opens. Its 1% choice is $49.4k on two markets, refusing 97% of
 launch-week notional; with every market at $1M, pooled crypto fees carry the small markets, the
 same target measures 1.00%, and it refuses 47%. For 0.1% and 0.01%, every candidate with any floor
 measures above the target, so the recommendation is $0. The house-cash 1% row is the binding
@@ -28,10 +28,10 @@ point: each market at the floor where its refusals end.
   queue, and NAV ends the 90 days at a median of $26.2M.
 - **Order size, not exposure, is what small floors refuse.** An order larger than the cap is
   refused whatever flows around it. At 200:1, orders up to $1M carry only 45% of papertrade's
-  margin, so a floor under a few million refuses most launch flow — 80% of launch-week notional at
+  margin, so a floor under a few million refuses most launch flow — 82% of launch-week notional at
   $100k a market, 47% at $1M — while $10M a market, papertrade's position cap, refuses 2%.
 - **Along the risk-level allocations, the dip rises quickly with the floors.** From 0.55% at $49.4k
-  in total (two markets with floors), it passes 1.70% at $7.78M and 7.10% at $98.1M, reaching
+  in total (two markets with floors), it passes 1.80% at $7.78M and 7.35% at $98.1M, reaching
   19.7% at $240M, where every market sits at its refusal-ending floor. At 0.3% and below the
   family sets $0 on every market, since alone no market stays at or below the level.
 - **Pooling carries the small markets.** Each market alone, at the floor where its refusals end,
@@ -39,8 +39,9 @@ point: each market at the floor where its refusals end.
   to its gap losses. Together at $10M a market the house earns a mean of $25.3M of fees over the 90
   days, and the crypto markets fund the others' risk.
 - **The total floor does not bind.** At the chosen per-market floors, a total floor at 25% to 100%
-  of their sum changes neither risk nor refusals — at $1M a market ($37M sum) from $9.25M to $37M,
-  and at the house-cash choice ($240M sum) from $60M to $240M.
+  of their sum leaves the measured risk unchanged and moves the refused share by less than a
+  hundredth of a point — at $1M a market ($37M sum) from $9.25M to $37M, and at the house-cash
+  choice ($240M sum) from $60M to $240M.
 
 The assumptions that move these numbers most, each at the house-cash 1% choice ($240M of floors),
 on 1,000 paths (the baseline gives NAV below zero 18.0% and house cash below zero 1.2%):
@@ -333,12 +334,12 @@ floors that stays at or below the level when the market runs alone):
 |---|---|---|---|---|---|---|---|---|---|---|
 | 0 | $0 | 0 | 0 | 0 | 0 | 100% | 100% | $0 | $0 | $0 |
 | 0.01% to 0.3% | $0 | 0 | 0 | 0 | 0 | 100% | 100% | $0 | $0 | $0 |
-| 1% | $49.4k | 2 | 0.55% | 0.55% | 0 | 92.4% | 34.0% | $19.4M | $18.3M | $400k |
-| 3% | $740k | 2 | 0.80% | 0.80% | 0 | 80.2% | 28.8% | $20.8M | $19.7M | $434k |
-| 10% | $3.6M | 12 | 0.65% | 0.70% | 0 | 61.3% | 23.9% | $21.9M | $20.8M | $462k |
-| 20% | $7.78M | 15 | 1.70% | 0.55% | 0 | 47.5% | 20.5% | $22.6M | $21.4M | $480k |
-| 30% | $13.5M | 17 | 2.55% | 0.50% | 0 | 35.9% | 17.3% | $23.2M | $22.0M | $501k |
-| 50% | $98.1M | 29 | 7.10% | 0.55% | 0.05% | 7.6% | 3.8% | $25.8M | $24.8M | $626k |
+| 1% | $49.4k | 2 | 0.55% | 3.55% | 0 | 97.2% | 42.3% | $16.8M | $15.8M | $338k |
+| 3% | $740k | 2 | 0.80% | 0.95% | 0 | 82.3% | 31.3% | $19.8M | $18.7M | $409k |
+| 10% | $3.35M | 12 | 0.75% | 0.80% | 0 | 62.6% | 25.1% | $21.4M | $20.2M | $450k |
+| 20% | $7.78M | 15 | 1.80% | 0.55% | 0 | 47.6% | 20.8% | $22.4M | $21.2M | $477k |
+| 30% | $13.5M | 17 | 2.55% | 0.50% | 0 | 35.9% | 17.4% | $23.0M | $21.9M | $500k |
+| 50% | $98.1M | 29 | 7.35% | 0.55% | 0.05% | 7.6% | 3.8% | $25.7M | $24.8M | $626k |
 | binding | $240M | 37 | 19.7% | 0.80% | 3.60% | 0.3% | 0.1% | $26.2M | $25.3M | $632k |
 
 Floors set for house cash below zero at some hour:
@@ -346,11 +347,9 @@ Floors set for house cash below zero at some hour:
 | Level | Total floor | Markets with a floor | NAV<0 ever | Cash<0 | NAV<-$100k | Refused, week 1 | Refused, 90 days | NAV day 90 p50 |
 |---|---|---|---|---|---|---|---|---|
 | 0 | $0 | 0 | 0 | 0 | 0 | 100% | 100% | $0 |
-| 0.01% to 0.3% | $0 | 0 | 0 | 0 | 0 | 100% | 100% | $0 |
-| 1% | $49.4k | 2 | 0.55% | 0.55% | 0 | 92.4% | 34.0% | $19.4M |
-| 3% | $662k | 2 | 1.15% | 1.15% | 0 | 81.2% | 29.1% | $20.7M |
-| 10% | $6.31M | 12 | 11.75% | 1.45% | 0 | 57.1% | 22.0% | $22.4M |
-| 20% | $63.2M | 20 | 14.1% | 0.65% | 0.90% | 6.5% | 2.9% | $25.9M |
+| 0.01% to 3% | $0 | 0 | 0 | 0 | 0 | 100% | 100% | $0 |
+| 10% | $6.31M | 12 | 11.75% | 1.45% | 0 | 57.2% | 22.2% | $22.2M |
+| 20% | $63.2M | 20 | 14.1% | 0.65% | 0.95% | 6.5% | 2.9% | $25.9M |
 | 30% | $176M | 26 | 19.75% | 0.80% | 3.70% | 0.9% | 0.3% | $26.2M |
 | 50%, binding | $240M | 37 | 19.7% | 0.80% | 3.60% | 0.3% | 0.1% | $26.2M |
 
@@ -358,10 +357,10 @@ The same floor on every market:
 
 | Floor | Total floor | Markets with a floor | NAV<0 ever | Cash<0 | NAV<-$100k | Refused, week 1 | Refused, 90 days | NAV day 90 p50 | Fees mean | Bad debt mean |
 |---|---|---|---|---|---|---|---|---|---|---|
-| $100k | $3.7M | 37 | 0.20% | 0.20% | 0 | 79.7% | 28.9% | $20.7M | $19.6M | $438k |
-| $300k | $11.1M | 37 | 0.25% | 0.25% | 0 | 68.2% | 25.4% | $21.6M | $20.5M | $460k |
-| $1M | $37M | 37 | 1.00% | 0.40% | 0 | 47.0% | 19.8% | $23.1M | $21.9M | $498k |
-| $3M | $111M | 37 | 8.90% | 0.75% | 0.05% | 23.8% | 12.1% | $24.7M | $23.6M | $572k |
+| $100k | $3.7M | 37 | 0.20% | 0.20% | 0 | 82.0% | 31.5% | $19.7M | $18.6M | $416k |
+| $300k | $11.1M | 37 | 0.25% | 0.25% | 0 | 69.0% | 26.8% | $21M | $19.9M | $448k |
+| $1M | $37M | 37 | 1.00% | 0.40% | 0 | 47.0% | 20.1% | $22.8M | $21.7M | $495k |
+| $3M | $111M | 37 | 9.00% | 0.75% | 0.05% | 23.8% | 12.1% | $24.7M | $23.6M | $572k |
 | $10M | $370M | 37 | 18.75% | 0.85% | 3.40% | 1.9% | 1.0% | $26.2M | $25.3M | $631k |
 
 Each probability is the share of the 2,000 paths. The recommendation for a target is the
