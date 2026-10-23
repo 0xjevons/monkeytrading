@@ -323,7 +323,10 @@ withdrawal signature until its approval is covered by a confirmed on-chain prefi
 reconciles at custody's configured `finality_tag` minus `confirmations`. Latest inclusion is
 tracked separately so delayed finality never causes duplicate submission. Startup waits for a
 pending inclusion to reach that boundary (or disappear in a reorg), bounded by
-`custody.evm.stall_critical_after`, before selecting its rollback anchor and parent. The queue is bounded; exhaustion stops the node with the durable log available for
+`custody.evm.stall_critical_after`, before selecting its rollback anchor. Recovery then restores every outstanding durable signed
+checkpoint and its original accounting before signing descendants; an unmined signature remains
+live even when both chain views still show its parent. Permissionless relays matching that local
+chain reconcile the covered prefix, including work beyond the receive queue. The queue is bounded; exhaustion stops the node with the durable log available for
 recovery. Failed posts retry after `retry_interval` and emit `checkpoint_post_failed`. A conflicting
 posted root or signer stops the node with a Critical alert. A collateral mismatch emits Critical
 `collateral_mismatch` and pauses withdrawals; ordinary trading commands continue. Deposits not yet
@@ -338,7 +341,16 @@ retry_interval = "2s"
 rpc_timeout = "10s"
 ```
 
-The endpoint must support `eth_sendTransaction` for the configured funded relayer. It signs and
+The endpoint must support `eth_sendTransaction`, `eth_getTransactionByHash` and latest/pending
+`eth_getTransactionCount` for a funded relayer dedicated to this log. The node durably reserves an
+explicit nonce in `node.log_dir/checkpoint-submission.json` before sending, reuses it after response
+loss or restart, and polls known transactions. Keep this sidecar with the log; startup refuses a
+live reservation absent from authenticated recovered work before touching history. The companion
+`.lock` and `.json.tmp` files serialize posting and atomic replacement. These files provide crash
+durability, not cryptographic protection against host deletion or rollback, and never authorize
+withdrawal release. Unidentified external pending work, an unrelated nonce consumer, or a stuck
+fee policy pauses posting for operator intervention; no automatic fee bump or cancel is sent.
+It signs and
 pays gas for relays; only the attested enclave's signature authorizes a vault commitment. Reads
 pin signer, root, deposit count, and USDC balance to one canonical block hash. This RPC's chain view
 is trusted pending independent verification. The immutable `Vault` constructor signer must match

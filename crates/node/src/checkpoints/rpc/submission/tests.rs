@@ -39,6 +39,7 @@ async fn long_pending_survives_restart_without_another_send_or_finality_release(
     assert_eq!(fs::read(dir.join("checkpoint-submission.json")).unwrap(), record);
     assert_eq!(server.state.lock().unwrap().sent.len(), 1, "a known pending transaction is only polled");
     let poster = Poster {
+        registry: None,
         chain,
         domain: domain(),
         signer: AccountId(EnclaveKey::test_key().address()),

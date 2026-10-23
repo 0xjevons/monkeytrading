@@ -52,6 +52,8 @@ async fn confirmation_depth_cannot_cross_a_reorg_between_tag_and_target_reads() 
         Address::ZERO,
         FinalityTag::Latest,
         2,
+        &crate::test_support::scratch_dir("checkpoint-ancestry-rpc"),
+        engine_core::types::AccountId(crate::tee::EnclaveKey::test_key().address()),
     )
     .unwrap();
     assert!(rpc.state(View::Finalized).await.is_err(), "a replacement tip must not inherit the orphan tag's depth");

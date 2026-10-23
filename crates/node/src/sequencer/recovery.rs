@@ -4,6 +4,35 @@ use super::*;
 use crate::sequencer::replay::Replay;
 
 impl ReplayedLog {
+    /// Requires a live reserved signature to occur in the same authenticated durable tail.
+    /// Error cases:
+    /// - a reserved checkpoint conflicts with the anchor or is absent from outstanding work
+    pub(crate) fn validate_submission(
+        &self,
+        parent: crate::log::CheckpointParent,
+        reserved: Option<&crate::log::Checkpoint>,
+    ) -> anyhow::Result<()> {
+        let Some(reserved) = reserved else { return Ok(()) };
+        if parent.has_checkpoint && reserved.seq <= parent.seq {
+            anyhow::ensure!(
+                reserved.seq < parent.seq || reserved.root == parent.root.to_string(),
+                "reserved checkpoint conflicts with finalized recovery anchor"
+            );
+            return Ok(());
+        }
+        let found = self
+            .replayed
+            .recovery_work
+            .iter()
+            .find(|work| work.checkpoint.seq == reserved.seq)
+            .context("reserved outstanding checkpoint is absent from the authenticated recovery log")?;
+        anyhow::ensure!(
+            serde_json::to_value(&found.checkpoint)? == serde_json::to_value(reserved)?,
+            "reserved outstanding checkpoint differs from authenticated recovery work"
+        );
+        Ok(())
+    }
+
     /// Checks every pure recovery refusal before history repair or opening the log for append.
     /// Error cases:
     /// - the deployment, genesis, or required checkpoint service differs from the replayed log

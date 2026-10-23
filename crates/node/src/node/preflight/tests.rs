@@ -262,3 +262,74 @@ async fn incomplete_genesis_and_missing_checkpoint_service_preserve_history_byte
         drop(db);
     }
 }
+
+struct ReservedChain {
+    state: VaultState,
+    checkpoint: crate::log::Checkpoint,
+}
+impl CheckpointChain for ReservedChain {
+    fn reserved_checkpoint(&self) -> anyhow::Result<Option<crate::log::Checkpoint>> {
+        Ok(Some(self.checkpoint.clone()))
+    }
+    async fn state(&self, _: View) -> anyhow::Result<VaultState> {
+        Ok(self.state.clone())
+    }
+    async fn post(&self, _: &crate::log::Checkpoint) -> anyhow::Result<()> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn reserved_signature_missing_from_recovered_log_refuses_before_history_mutation() {
+    let root = scratch_dir("preflight-reserved-signature");
+    let mut cfg = dev_config();
+    cfg.node.log_dir = root.join("log");
+    cfg.history.dir = root.join("history");
+    std::fs::create_dir_all(&cfg.node.log_dir).unwrap();
+    std::fs::create_dir_all(&cfg.history.dir).unwrap();
+    let db = rusqlite::Connection::open(cfg.history.dir.join(crate::history::INDEX_FILE)).unwrap();
+    db.execute_batch("PRAGMA journal_mode=wal; CREATE TABLE diagnostic(value TEXT); INSERT INTO diagnostic VALUES('keep reserved evidence');").unwrap();
+    let key = EnclaveKey::test_key();
+    let domain = CheckpointDomain { chain_id: 31337, vault: AccountId([0; 20]) };
+    let parent = crate::log::CheckpointParent::default();
+    let checkpoint = crate::log::Checkpoint {
+        seq: 10,
+        root: format!("0x{}", "12".repeat(32)),
+        signature: key.sign_checkpoint_v2(domain.chain_id, &domain.vault.0, 10, &[0x12; 32], parent),
+        signer: key.address_hex(),
+        parent: Some(parent),
+        domain: Some(domain),
+        deferred_withdrawals: true,
+    };
+    let poster = Poster {
+        registry: None,
+        chain: ReservedChain {
+            state: VaultState {
+                height: 0,
+                signer: AccountId(key.address()),
+                checkpoint: None,
+                balance: Fixed::ZERO,
+                deposits: 0,
+            },
+            checkpoint,
+        },
+        domain,
+        signer: AccountId(key.address()),
+        retry: Duration::from_millis(1),
+        pending_deposits_critical_after: Duration::from_secs(1),
+    };
+    let before = files(&root);
+    let (log, plan) =
+        crate::node::read_log_and_history_observe(&cfg, Some(AccountId(key.address())), Some(parent), |_| {}).unwrap();
+    let seq_cfg = crate::sequencer::SequencerConfig {
+        checkpoints: Some(tokio::sync::mpsc::channel(64).0),
+        ..crate::test_support::sequencer_config(
+            &cfg.node.log_dir,
+            tokio::sync::watch::channel(crate::log::Manifest::default()).0,
+        )
+    };
+    let error = finish_preflight(plan, Some((&poster, None)), Some((&log, &seq_cfg))).await.err().unwrap();
+    assert!(error.to_string().contains("absent"), "{error:#}");
+    assert_eq!(files(&root), before);
+    drop(db);
+}

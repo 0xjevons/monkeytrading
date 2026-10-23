@@ -121,6 +121,10 @@ impl CheckpointRpc {
 }
 
 impl CheckpointChain for CheckpointRpc {
+    fn reserved_checkpoint(&self) -> anyhow::Result<Option<Checkpoint>> {
+        Ok(self.submissions.read()?.map(|reservation| reservation.checkpoint))
+    }
+
     /// Reads checkpoint state and collateral from one pinned canonical block.
     /// Error cases:
     /// - the endpoint is on the wrong chain or token, or an RPC/decoding error occurs

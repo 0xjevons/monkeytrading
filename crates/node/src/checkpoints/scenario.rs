@@ -74,7 +74,8 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     let dir = scratch_dir("checkpoint-anvil");
     let make_poster = || Poster {
         registry: None,
-        chain: CheckpointRpc::new(&section, domain, token, FinalityTag::Latest, 0, &dir, AccountId(key.address())).unwrap(),
+        chain: CheckpointRpc::new(&section, domain, token, FinalityTag::Latest, 0, &dir, AccountId(key.address()))
+            .unwrap(),
         domain,
         signer: AccountId(key.address()),
         retry: section.retry_interval,

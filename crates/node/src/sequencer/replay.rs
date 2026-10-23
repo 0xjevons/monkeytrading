@@ -170,20 +170,19 @@ impl Replay {
                 self.checkpoints += 1;
                 if let Some(parent) = self.recovery_parent
                     && cp.parent.is_some()
+                    && (!parent.has_checkpoint || cp.seq > parent.seq)
                 {
-                    if !parent.has_checkpoint || cp.seq > parent.seq {
-                        ensure!(cp.parent == Some(parent), "outstanding checkpoint has a divergent signed parent");
-                        self.recovery_work.push(crate::checkpoints::Work {
-                            checkpoint: cp.clone(),
-                            liabilities: crate::checkpoints::liabilities(engine, self.unpaid),
-                            deposits: engine.credited_refs_with_prefix("0x").count() as u64,
-                        });
-                        self.recovery_parent = Some(crate::log::CheckpointParent {
-                            has_checkpoint: true,
-                            seq: cp.seq,
-                            root: cp.root.parse()?,
-                        });
-                    }
+                    ensure!(cp.parent == Some(parent), "outstanding checkpoint has a divergent signed parent");
+                    self.recovery_work.push(crate::checkpoints::Work {
+                        checkpoint: cp.clone(),
+                        liabilities: crate::checkpoints::liabilities(engine, self.unpaid),
+                        deposits: engine.credited_refs_with_prefix("0x").count() as u64,
+                    });
+                    self.recovery_parent = Some(crate::log::CheckpointParent {
+                        has_checkpoint: true,
+                        seq: cp.seq,
+                        root: cp.root.parse()?,
+                    });
                 }
                 self.last_signed_checkpoint = Some(cp.clone());
                 self.genesis.checkpoint();

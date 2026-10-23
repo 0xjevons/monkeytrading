@@ -16,6 +16,9 @@ pub(super) async fn finish_preflight<R: CheckpointChain>(
 ) -> anyhow::Result<History> {
     if let Some((log, cfg)) = recovery {
         log.validate_recovery(cfg)?;
+        if let Some((poster, _)) = checkpoint {
+            log.validate_submission(cfg.checkpoint_parent, poster.chain.reserved_checkpoint()?.as_ref())?;
+        }
     }
     if let Some((poster, anchor)) = checkpoint {
         poster

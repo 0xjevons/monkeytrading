@@ -48,6 +48,13 @@ pub(crate) enum View {
 
 /// Chain access, kept separate from the authorized enclave signer lifecycle.
 pub(crate) trait CheckpointChain: Send + Sync {
+    /// Reads the authenticated crash-recovery reservation without persisted mutation.
+    /// Error cases:
+    /// - the existing submission record is malformed or unauthorized
+    fn reserved_checkpoint(&self) -> anyhow::Result<Option<Checkpoint>> {
+        Ok(None)
+    }
+
     /// Reads the authorized signer, latest checkpoint, and collateral from one block.
     /// Error cases:
     /// - an RPC call fails, decodes incorrectly, or serves another chain
@@ -185,16 +192,16 @@ impl<R: CheckpointChain> Poster<R> {
     async fn reconcile_known(&self, work: &Work, known: &[&Work]) -> anyhow::Result<(Option<u64>, bool)> {
         let mut work = work;
         let mut state = self.chain.state(View::Latest).await?;
-        if let Some((seq, root)) = &state.checkpoint {
-            if *seq > work.checkpoint.seq {
-                work = known
-                    .iter()
-                    .copied()
-                    .find(|work| work.checkpoint.seq == *seq)
-                    .context("vault advanced to a checkpoint not yet received by this worker")?;
-                if work.checkpoint.root != *root {
-                    return Err(Conflict("conflicting publicly relayed checkpoint root").into());
-                }
+        if let Some((seq, root)) = &state.checkpoint
+            && *seq > work.checkpoint.seq
+        {
+            work = known
+                .iter()
+                .copied()
+                .find(|work| work.checkpoint.seq == *seq)
+                .context("vault advanced to a checkpoint not yet received by this worker")?;
+            if work.checkpoint.root != *root {
+                return Err(Conflict("conflicting publicly relayed checkpoint root").into());
             }
         }
         let cp = &work.checkpoint;
