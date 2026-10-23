@@ -124,6 +124,7 @@ mod benchmark_tests {
         let (logs, _guard) = Logs::capture();
         let effective_date = "2026-10-20".parse().unwrap();
         let rollover_date = "2026-10-28".parse().unwrap();
+        alert_on(&Event::BenchmarkRateMissing { benchmark: "SOFR".into(), markets: vec![1] });
         alert_on(&Event::BenchmarkRateUndated { benchmark: "SOFR".into() });
         alert_on(&Event::BenchmarkRateObserved {
             benchmark: "SOFR".into(),
@@ -131,8 +132,11 @@ mod benchmark_tests {
             rollover_date,
             stale: true,
         });
+        assert_eq!(logs.critical("benchmark_rate_missing"), 1);
         assert_eq!(logs.critical("benchmark_rate_undated"), 1);
         assert_eq!(logs.critical("benchmark_rate_stale"), 1);
+        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_undated\""), 1);
+        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_missing\""), 1);
         alert_on(&Event::BenchmarkRateObserved {
             benchmark: "SOFR".into(),
             effective_date: rollover_date,
@@ -141,5 +145,7 @@ mod benchmark_tests {
         });
         assert_eq!(logs.critical("benchmark_rate_stale"), 1);
         assert_eq!(logs.count("alert_resolved=\"benchmark_rate_stale\""), 1);
+        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_undated\""), 2);
+        assert_eq!(logs.count("alert_resolved=\"benchmark_rate_missing\""), 2);
     }
 }

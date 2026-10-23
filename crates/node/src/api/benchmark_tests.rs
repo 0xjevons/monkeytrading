@@ -3,15 +3,18 @@
 use super::*;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use clap::Parser;
-use engine_core::command::{Command, OrderKind, OrderRequest};
+use engine_core::command::{AdminCommand, Command, OrderKind, OrderRequest};
 use engine_core::event::Event;
 use engine_core::fixed::Rounding;
 use engine_core::price::SourceQuote;
 use engine_core::types::Side;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::admin::{self, AdminArgs, HexKey, KeyEnv};
@@ -126,6 +129,131 @@ endpoint = "{publisher}/estr"
     assert!(entries.iter().any(|entry| matches!(entry, LogEntry::Command(c) if c.sequenced.cmd == Command::SignedAdmin(Box::new(request.clone())))));
 }
 
+#[tokio::test]
+async fn benchmark_watch_retries_and_prefetches_before_rollover_then_cancels_in_flight() {
+    type WatchCase = (&'static str, &'static str, fn() -> Millis, usize);
+    let cases: [WatchCase; 2] = [("periodic", "10ms", || START, 3), ("preflight", "24h", || FIRST - 34_000 - 50, 2)];
+    for (name, interval, clock, pending_request) in cases {
+        let dir = scratch_dir(&format!("benchmark-watch-{name}"));
+        fs::create_dir_all(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let publisher = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (requests_tx, mut requests) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let pending = release.clone();
+        let sofr = move || {
+            let calls = calls.clone();
+            let requests_tx = requests_tx.clone();
+            let pending = pending.clone();
+            async move {
+                let request = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                requests_tx.send(request).unwrap();
+                if request == 1 && pending_request == 3 {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "publisher unavailable");
+                }
+                if request >= pending_request {
+                    pending.notified().await;
+                }
+                (StatusCode::OK, "Effective Date,Rate Type,Rate (%)\n10/20/2026,SOFR,1.00\n")
+            }
+        };
+        let app = Router::new()
+            .route("/sofr", get(sofr))
+            .route("/estr", get(|| async { "KEY,TIME_PERIOD,OBS_VALUE\nEST.B.EU000A2X2A25.WT,2026-10-20,2.442\n" }));
+        let (shutdown, stopped) = oneshot::channel();
+        let mut publishers = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        let cfg_path = dir.join("node.toml");
+        let mut text = fs::read_to_string(crate::test_support::DEV_CONFIG).unwrap();
+        text.push_str(&format!(
+            r#"
+    [benchmarks]
+    interval = "{interval}"
+    timeout = "2s"
+    [[benchmarks.sources]]
+    publisher = "sofr"
+    endpoint = "{publisher}/sofr"
+    [[benchmarks.sources]]
+    publisher = "estr"
+    endpoint = "{publisher}/estr"
+    "#
+        ));
+        fs::write(&cfg_path, text).unwrap();
+        let node = Node::start(&dir, clock(), clock).await;
+        let args = Cli::try_parse_from([
+            "engine",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--node",
+            &node.url,
+            "--pin",
+            &node.pin,
+            "sync-benchmarks",
+            "--watch",
+        ])
+        .unwrap()
+        .args;
+        let env = KeyEnv { key_file: None, key: Some(HexKey("42".repeat(32))) };
+        let worker = tokio::spawn(admin::run_with_clock(args, env, clock));
+        let observed = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut seen = Vec::new();
+            for _ in 0..pending_request {
+                seen.push(requests.recv().await);
+            }
+            seen
+        })
+        .await;
+        worker.abort();
+        let worker_result = worker.await;
+        release.notify_one();
+        let _ = shutdown.send(());
+        let publisher_result = tokio::time::timeout(Duration::from_secs(5), &mut publishers).await;
+        if publisher_result.is_err() {
+            publishers.abort();
+            let _ = publishers.await;
+        }
+        node.stop().await;
+
+        let expected: Vec<_> = (1..=pending_request).map(Some).collect();
+        assert_eq!(observed.expect("watch reaches its pending fetch"), expected, "{name}");
+        assert!(matches!(worker_result, Err(err) if err.is_cancelled()), "worker must remain in its pending fetch");
+        publisher_result.expect("publisher shutdown completes").unwrap().unwrap();
+        let entries = log_entries(&dir);
+        let snapshots: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| {
+                let LogEntry::Command(c) = entry else { return None };
+                let Command::SignedAdmin(request) = &c.sequenced.cmd else { return None };
+                let AdminCommand::SetBenchmarkRates(batch) = &request.command else { return None };
+                assert!(c.events.as_ref().unwrap().contains(&Event::AdminApplied));
+                Some(batch)
+            })
+            .collect();
+        assert_eq!(snapshots.len(), pending_request - 1, "only completed snapshots may be sequenced: {name}");
+        for batch in &snapshots {
+            assert_eq!(batch.checked.len(), 2);
+            assert!(batch.checked.contains("SOFR") && batch.checked.contains("ESTR"));
+        }
+        if pending_request == 3 {
+            assert!(snapshots[0].rates.iter().all(|rate| rate.benchmark != "SOFR"));
+        }
+        assert!(snapshots[0].rates.iter().any(|rate| rate.benchmark == "ESTR"));
+        let sofr: Vec<_> = snapshots.last().unwrap().rates.iter().filter(|rate| rate.benchmark == "SOFR").collect();
+        assert_eq!(sofr.len(), 1);
+        let day = "2026-10-20".parse().unwrap();
+        assert_eq!(sofr[0].effective_date, day);
+        assert_eq!(sofr[0].annual_rate, fixed("0.01"));
+        let replayed = replay(&entries).unwrap();
+        assert_eq!(replayed.engine.benchmark_history()["SOFR"][&day], fixed("0.01"));
+    }
+}
+
 impl Node {
     async fn start(dir: &Path, at: Millis, api_clock: fn() -> Millis) -> Self {
         let clock = Arc::new(TestClock::at(at));
@@ -136,7 +264,7 @@ impl Node {
         let cfg = SequencerConfig { clock: clock.clone(), ..sequencer_config(dir, manifest_tx) };
         let operator = cfg.operator;
         let mut seq = Sequencer::recover(cfg, key.clone(), stream.clone(), withdrawals).unwrap();
-        seq.wait_for_benchmarks();
+        seq.wait_for_benchmarks().unwrap();
         seq.activate_protocol().unwrap();
         if seq.needs_genesis() {
             seq.genesis(&dev_config().genesis).unwrap();

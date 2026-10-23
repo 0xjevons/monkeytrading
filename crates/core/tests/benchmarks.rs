@@ -140,7 +140,7 @@ fn invalid_or_unsigned_snapshots_cannot_install_rates_or_charge_pending_rollover
     let unsigned = h.cmd(Command::Admin(valid.clone()));
     assert!(unsigned.iter().any(|e| matches!(e, Event::AdminRejected { .. })));
     assert!(amounts(&unsigned).is_empty());
-    for change in 0..6 {
+    for change in 0..11 {
         let AdminCommand::SetBenchmarkRates(mut b) = valid.clone() else { unreachable!() };
         match change {
             0 => b.rates[0].annual_rate = f("1.000000001"),
@@ -149,10 +149,26 @@ fn invalid_or_unsigned_snapshots_cannot_install_rates_or_charge_pending_rollover
             3 => b.checked.clear(),
             4 => b.as_of = date("2026-10-19"),
             5 => b.rates[0].benchmark = "unknown".into(),
+            6 => b.rates[0].annual_rate = f("-1.000000001"),
+            7 => b.rates[0].effective_date = date("1969-12-31"),
+            8 => {
+                b.rates[0].benchmark.clear();
+                b.checked.insert(String::new());
+            }
+            9 => {
+                b.rates[0].benchmark = "x".repeat(65);
+                b.checked.insert(b.rates[0].benchmark.clone());
+            }
+            10 => b.checked.extend((0..256).map(|i| format!("extra-{i}"))),
             _ => unreachable!(),
         }
+        // A later invalid observation must not install earlier valid data.
+        b.rates.insert(
+            0,
+            BenchmarkRate { benchmark: "SOFR".into(), effective_date: date("2026-10-19"), annual_rate: f("0.04") },
+        );
         let events = h.operate(AdminCommand::SetBenchmarkRates(b));
-        assert!(events.iter().any(|e| matches!(e, Event::AdminRejected { .. })), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, Event::AdminRejected { .. })), "case {change}: {events:?}");
         assert!(amounts(&events).is_empty());
         assert_eq!(h.engine.benchmark_history(), &history);
         assert_eq!(h.engine.next_rollover(), next);

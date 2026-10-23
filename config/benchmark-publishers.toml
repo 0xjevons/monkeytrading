@@ -1,4 +1,6 @@
 # Append this section to a complete node config to enable the signed benchmark worker.
+# For a fresh node, omit genesis.benchmarks: manual startup-dated rates can take
+# precedence over the publishers' delayed observations. Production genesis leaves them unset.
 # Run `engine admin --config <config> --pin <attested TLS hash> sync-benchmarks --watch`
 # as a separate operator service. Only that process receives OPERATOR_KEY_FILE.
 [benchmarks]

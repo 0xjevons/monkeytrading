@@ -92,6 +92,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   look at, benchmarks with no rate, and house NAV below zero
 - `src/sequencer/tests/mod.rs` — sequencer, activation, recovery, and replay tests
 - `src/sequencer/tests/replay.rs` — root, sequence, and pre-event log replay tests
+- `src/sequencer/tests/benchmarks.rs` — publisher startup prerequisites and legacy-log refusal
 - `src/sequencer/tests/genesis.rs` — genesis tests: a rejected genesis writes nothing, and a log
   whose genesis did not apply in full is refused at recovery
 - `src/sequencer/tests/operator.rs` — recovery, activation, and replay with the operator the log
@@ -654,6 +655,9 @@ unset. A node whose TEE or custody provider is not `mock` refuses to start witho
 ### Dated benchmark worker
 
 Append `config/benchmark-publishers.toml` to a complete node config to enable publisher ingestion.
+On a fresh node, omit fixed `genesis.benchmarks` entries. They are manual rates effective on the
+startup date and can take precedence over delayed publisher observations; production genesis
+leaves them unset.
 The sources cover SOFR (NY Fed), ESTR (ECB), SONIA (Bank of England), AONIA (RBA), and TONA (BOJ).
 Endpoints use the official publishers' certificate chains against compiled-in roots; redirects and
 proxies are disabled. Loopback HTTP endpoints are accepted only with a mock TEE.
@@ -667,10 +671,15 @@ engine admin --config /path/to/node.toml --pin <attested-tls-hash> sync-benchmar
 Give `OPERATOR_KEY_FILE` to that worker alone. The node retains only the operator public key.
 Without `--watch`, the command fetches and signs one snapshot. The config's interval must be at
 most 24 hours; the example polls hourly to retry failures and pick up publications before rollover.
+Watch mode also schedules a fetch before the next rollover, reserving every publisher timeout
+and the three bounded calls to the node. Scheduling refuses unrepresentable time budgets.
 The worker shares the operator nonce with other admin clients and re-reads it for each snapshot.
 
 With `[benchmarks]` present, each startup refuses ordinary sequencing until an authorized snapshot
 has attempted every listed benchmark. Trusted time still gates genesis, activation, and the snapshot.
+A recovered log with a rollover schedule must already record client auth, the operator, and toxicity
+notional weighting. Publisher synchronization refuses older logs missing those activation prerequisites
+before writing any command; migrate such logs separately before configuring the publisher worker.
 The public `GET /v1/benchmarks` returns the next rollover and retained rate history, so the worker
 fetches histories covering downtime before a missed rollover is charged. A restart regenerates the
 TLS key: verify its attestation and restart the worker with the new pin before sequencing resumes.

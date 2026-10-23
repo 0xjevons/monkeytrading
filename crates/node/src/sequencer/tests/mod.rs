@@ -442,6 +442,7 @@ fn commands(entries: &[LogEntry]) -> Vec<Command> {
         .collect()
 }
 
+mod benchmarks;
 mod genesis;
 mod operator;
 mod toxicity;

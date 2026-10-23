@@ -15,10 +15,29 @@ use crate::sequencer::Sequencer;
 use crate::sequencer::genesis::{GENESIS_REF, check_genesis, genesis_commands, rejection};
 
 impl Sequencer {
-    /// Requires the external operator worker's first signed snapshot before ordinary sequencing.
-    pub fn wait_for_benchmarks(&mut self) {
+    /// Requires a signed publisher snapshot before catch-up or ordinary sequencing.
+    /// Error cases:
+    /// - a scheduled legacy log needs activation prerequisites that would charge rollovers first
+    pub fn wait_for_benchmarks(&mut self) -> anyhow::Result<()> {
+        let missing = if self.engine.client_auth().is_none() {
+            Some("client auth")
+        } else if self.engine.operator().is_none() {
+            Some("operator")
+        } else if self.engine.params().is_some_and(|params| params.toxicity.notional.is_none()) {
+            Some("toxicity notional weighting")
+        } else {
+            None
+        };
+        if self.engine.next_rollover().is_some()
+            && let Some(prerequisite) = missing
+        {
+            bail!(
+                "benchmark synchronization requires recorded {prerequisite}; legacy logs need prerequisite migration before configuring publishers"
+            );
+        }
         self.benchmark_sync = true;
         warn!(alert = "benchmark_sync_pending", "waiting for signed publisher history before catch-up");
+        Ok(())
     }
 
     /// The seq of the last command in the log, if any.

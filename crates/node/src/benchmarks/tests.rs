@@ -67,12 +67,26 @@ fn request_bounds_use_each_publishers_effective_date_api() {
 #[tokio::test]
 async fn publisher_errors_and_timeouts_retain_the_previous_snapshot_policy() {
     use crate::config::BenchmarkSource;
-    use axum::{Router, routing::get};
+    use axum::{Router, http::StatusCode, routing::get};
     use tokio::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = Router::new()
         .route("/bad", get(|| async { "<html>unavailable</html>" }))
+        .route(
+            "/http-error",
+            get(|| async {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Effective Date,Rate Type,Rate (%)\n10/22/2026,SOFR,3.90\n")
+            }),
+        )
+        .route(
+            "/oversized",
+            get(|| async {
+                let mut body = b"Effective Date,Rate Type,Rate (%)\n10/22/2026,SOFR,3.90\n".to_vec();
+                body.resize(8 * 1024 * 1024 + 1, b'\n');
+                body
+            }),
+        )
         .route("/timeout", get(|| async { std::future::pending::<&str>().await }));
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let state = BenchmarkState {
@@ -82,7 +96,12 @@ async fn publisher_errors_and_timeouts_retain_the_previous_snapshot_policy() {
         history: Default::default(),
     };
     let client = client().unwrap();
-    for path in ["bad", "timeout"] {
+    for (path, expected_error) in [
+        ("bad", "no matching observations"),
+        ("timeout", "timed out"),
+        ("http-error", "500 Internal Server Error"),
+        ("oversized", "publisher response exceeds byte bound"),
+    ] {
         let cfg = BenchmarkSection {
             interval: std::time::Duration::from_secs(3600),
             timeout: if path == "timeout" {
@@ -94,11 +113,7 @@ async fn publisher_errors_and_timeouts_retain_the_previous_snapshot_policy() {
         };
         let err =
             fetch(&cfg.sources[0], &client, cfg.timeout, date("2026-10-20"), date("2026-10-23")).await.unwrap_err();
-        if path == "timeout" {
-            assert!(err.to_string().contains("timed out"), "{err:#}");
-        } else {
-            assert!(err.to_string().contains("no matching observations"), "{err:#}");
-        }
+        assert!(err.to_string().contains(expected_error), "{path}: {err:#}");
         let batch = snapshot(&cfg, &client, &state, date("2026-10-23")).await.unwrap();
         assert_eq!(batch.checked, state.required);
         assert!(batch.rates.is_empty(), "invalid or unavailable data cannot supply a rate");
