@@ -63,8 +63,9 @@ this crate and reproduce the signed state roots exactly.
 - From protocol `V13`, stress follows its inputs: each open, priced market's automatic level is
   re-evaluated before every fill and after every command, a fast move counts within a trailing
   window, and a divergence trigger is a share of each market's divergence bound, so every market
-  with a positive bound can reach every level; activating `V13` turns absolute divergence triggers
-  into shares of the widest listed bound
+  with a positive bound can reach every level; a market whose FX pair has no price keeps its
+  level, since nothing fills there; activating `V13` turns absolute divergence triggers into
+  shares of the widest listed bound
 - From protocol `V14`, a market whose benchmark has no rate accrues no financing, and each rollover
   records the benchmarks that have none; once any benchmark has a rate, a listing that names one
   without is refused; each account rests at most `max_resting_orders` orders, a resting order that
@@ -77,6 +78,9 @@ this crate and reproduce the signed state roots exactly.
 - From protocol `V16`, parameters that set a smaller toxicity memory clamp every account's toxicity
   history to it, so a lowered memory already weighs the next markout against no more history than
   the memory, instead of that markout still weighing the history the account built
+- From protocol `V17`, reopening a market keeps its trailing move window: prices observed within
+  the window before a halt still count after the reopening, so a move across a halt shorter than
+  the window raises fast-move stress as it would without the halt
 
 ## Repository Structure
 
@@ -115,7 +119,8 @@ this crate and reproduce the signed state roots exactly.
 - `src/command.rs` / `src/event.rs` — engine inputs and outputs
 - `src/types.rs` — ids, sides, and asset classes
 - `tests/` — protocol tests through `Engine::apply`, with a shared harness, its signing client
-  (`client.rs`), and the reference-log format in `tests/common/`; `tests/operator.rs` covers signed
+  (`client.rs`), protocol-version constructors (`versions.rs`), and the reference-log format in
+  `tests/common/`; `tests/operator.rs` covers signed
   admin commands and every-market reduce-only, `tests/toxicity.rs` toxicity scoring, and
   `tests/quote_timing.rs` indices that change without a price update and venue quotes stamped ahead,
   `tests/stress.rs` stress levels from `V13`, and `tests/stress_activation.rs` the activation of
@@ -139,7 +144,7 @@ this crate and reproduce the signed state roots exactly.
 - `examples/reference_log/` — writes the reference log for a new protocol version: the session
   (`main.rs`), the requests and event names it uses (`helpers.rs`), its `V10` to `V12` parts
   (`v10.rs`, `v11.rs`, `v12.rs`), its `V13` part (`stress.rs`), its `V14` part (`v14.rs`), and its
-  `V15` and `V16` parts (`v15.rs`, `v16.rs`)
+  `V15`, `V16`, and `V17` parts (`v15.rs`, `v16.rs`, `v17.rs`)
 - `examples/sign_request.rs` — a client signing a request body for the API
 - `examples/verify_proof.rs` — checks an account proof from the API against a root
 
@@ -196,8 +201,8 @@ Two suites guard replay and accounting:
   deletes a committed log.
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
   under `V2`, `V6`, `V7` with markets quoted in other currencies, `V11`, and `V12` and `V13` with
-  those markets and signed operator commands, where `V13` must reach a stress change, and `V14`,
-  `V15`, and `V16`.
+  those markets and signed operator commands, where `V13` and `V17` must reach a stress change, and `V14`,
+  `V15`, `V16`, and `V17`.
   Each mixes client, feed, custody, and operator commands,
   with values inside and outside the input bounds, and checks after every command that nothing
   panicked, cash is conserved, and every market's aggregates match its accounts' positions. From
@@ -212,7 +217,7 @@ Two suites guard replay and accounting:
   version, the same sessions check that roots computed from what changed, at random points, equal a
   root hashed from scratch, and that every account's proof verifies against them. Under `V14` it
   also checks that resting orders keep to the cap, that placing an order fills or cancels no other,
-  and that no market is financed at a rollover that records its benchmark as having no rate; under
+  and that no market is financed at a rollover that records its benchmark as having no rate; from
   `V15` it also checks that a resting order accepted below its market's minimum notional, or with no
   dollar value, can only reduce its account's position in that market; under `V16`, that no
   account's toxicity history exceeds the memory in force.
@@ -247,7 +252,8 @@ follow its inputs; its log is `v13.jsonl`. `V14` finances only markets whose ben
 and caps each account's resting orders; its log is `v14.jsonl`. `V15` lets an order that can only
 reduce the account's position in its market skip the minimum-notional check at placement; its log is
 `v15.jsonl`. `V16` clamps every account's toxicity history when parameters set a lower memory; its
-log is `v16.jsonl`. For each later version:
+log is `v16.jsonl`. `V17` keeps a market's move window across a halt; its log is `v17.jsonl`.
+For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log/main.rs` so it activates the new version and exercises the new rules.

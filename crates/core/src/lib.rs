@@ -44,6 +44,9 @@
 //! - From `V16`, parameters that set a smaller toxicity memory clamp every account's toxicity
 //!   history to it, so a lowered memory already weighs the next markout against no more history
 //!   than the memory, instead of that markout still weighing the history the account built.
+//! - From `V17`, reopening a market keeps its trailing move window: prices observed within the
+//!   window before a halt still count after the reopening, so a move across a halt shorter than
+//!   the window raises fast-move stress as it would without the halt.
 
 pub mod account;
 mod admin;

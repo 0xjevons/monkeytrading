@@ -8,7 +8,8 @@ use std::cell::RefCell;
 
 use common::events::fills;
 use common::stress::{
-    BOUNDED, at_a_million_nav, bounded, diverge, divergence_only, divergence_params, with_divergence_shares,
+    BOUNDED, at_a_million_nav, bounded, diverge, divergence_only, divergence_params, halted_us_equities,
+    with_divergence_shares,
 };
 use common::{AAPL, BTC, DE40, ETH, EURUSD, Harness, UNLISTED, acct, de40, f, market, ny, params};
 use engine_core::Fixed;
@@ -297,6 +298,88 @@ fn a_divergence_share_above_zero_and_a_zero_bound_market_are_refused_together() 
     // A zero share fires at any divergence, so it may sit alongside a zero bound.
     diverge(&mut h, 0);
     assert_eq!(h.engine.markets()[&BOUNDED].stress.level, 1);
+}
+
+#[test]
+fn a_move_across_a_halt_shorter_than_the_window_raises_the_level_from_v17() {
+    // AAPL, halted 20s by a dated closure 10s after its last price. The 3% move across the halt
+    // raises the level from V17, which keeps the move window across the reopening; before it the
+    // open cleared the window, so the same move counts from nothing.
+    for (version, mut h) in [(ProtocolVersion::V15, Harness::v15()), (ProtocolVersion::V17, Harness::v17())] {
+        let schedule = halted_us_equities("2026-10-20T12:00:00", "2026-10-20T12:00:20");
+        h.operator_admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, schedule, 2_000)));
+        h.advance_to(ny(2026, 10, 20, 11, 59) + 50_000);
+        h.price(AAPL, "230");
+        h.advance_to(ny(2026, 10, 20, 12, 0));
+        let ev = h.cmd(Command::Tick);
+        assert!(ev.contains(&Event::MarketClosed { market: AAPL }), "{version:?}: {ev:?}");
+        h.advance(20_000);
+        // 30s after the last pre-halt price, inside the 60s window.
+        let ev = h.price(AAPL, "223.1");
+        let kept = version >= ProtocolVersion::V17;
+        assert!(ev.contains(&Event::MarketOpened { market: AAPL }), "{version:?}: {ev:?}");
+        assert_eq!(ev.contains(&Event::StressChanged { market: AAPL, level: 1 }), kept, "{version:?}: {ev:?}");
+        // The pre-halt price survives the halt only under V17.
+        let window = &h.engine.markets()[&AAPL].stress.move_window;
+        assert_eq!(window.iter().any(|bucket| bucket.high == f("230")), kept, "{version:?}: {window:?}");
+    }
+}
+
+#[test]
+fn a_move_across_a_halt_longer_than_the_window_does_not_count() {
+    // AAPL, halted 70s, its last price 80s before the reopening: the halt has outlasted the
+    // window, so neither version counts the move, and V17's kept window holds no bucket older
+    // than the window.
+    for (version, mut h) in [(ProtocolVersion::V15, Harness::v15()), (ProtocolVersion::V17, Harness::v17())] {
+        let schedule = halted_us_equities("2026-10-20T12:00:00", "2026-10-20T12:01:10");
+        h.operator_admin(AdminCommand::UpsertMarket(market(AAPL, "AAPL", AssetClass::Equity, schedule, 2_000)));
+        h.advance_to(ny(2026, 10, 20, 11, 59) + 50_000);
+        h.price(AAPL, "230");
+        h.advance_to(ny(2026, 10, 20, 12, 0));
+        let ev = h.cmd(Command::Tick);
+        assert!(ev.contains(&Event::MarketClosed { market: AAPL }), "{version:?}: {ev:?}");
+        h.advance(70_000);
+        let ev = h.price(AAPL, "223.1");
+        assert!(ev.contains(&Event::MarketOpened { market: AAPL }), "{version:?}: {ev:?}");
+        assert!(!ev.contains(&Event::StressChanged { market: AAPL, level: 1 }), "{version:?}: {ev:?}");
+        let window = &h.engine.markets()[&AAPL].stress.move_window;
+        assert!(window.iter().all(|bucket| h.ts - bucket.to <= WINDOW_MS), "{version:?}: {window:?}");
+    }
+}
+
+#[test]
+fn a_market_keeps_its_level_while_its_fx_pair_has_no_price() {
+    // Germany 40, raised by a 3% move, keeps its level while EUR-USD has no price, in every
+    // version that reads stress this way: with no FX index there is no reading, so nothing steps
+    // the level down even past the cooldown, and the move window freezes with it. A fresh EUR-USD
+    // index restores the reading; the window has aged past the pre-quiet move, so the level steps
+    // down at once.
+    for (version, mut h) in [(ProtocolVersion::V15, Harness::v15()), (ProtocolVersion::V17, Harness::v17())] {
+        h.list_fx();
+        h.price(EURUSD, "1.1");
+        h.price(DE40, "20000");
+        let ev = h.price(DE40, "19400");
+        assert!(ev.contains(&Event::StressChanged { market: DE40, level: 1 }), "{version:?}: {ev:?}");
+        // EUR-USD goes quiet: its 1s quote age passes. Germany 40, its own quotes fresh, still
+        // gets no reading, and calm prices change nothing.
+        h.advance(2_000);
+        let ev = h.price(DE40, "19400");
+        assert!(!ev.iter().any(|e| matches!(e, Event::StressChanged { .. })), "{version:?}: {ev:?}");
+        assert_eq!(h.engine.markets()[&DE40].stress.level, 1);
+        // Past the 300s cooldown the level still holds: with Germany 40's own quotes also stale,
+        // the tick reads nothing, and there is no step down.
+        h.advance(300_000);
+        let ev = h.cmd(Command::Tick);
+        assert!(!ev.iter().any(|e| matches!(e, Event::StressChanged { market: DE40, .. })), "{version:?}: {ev:?}");
+        assert_eq!(h.engine.markets()[&DE40].stress.level, 1);
+        // Germany 40's quotes are fresh again and EUR-USD's are still quiet: still no reading.
+        let ev = h.price(DE40, "19400");
+        assert!(!ev.iter().any(|e| matches!(e, Event::StressChanged { .. })), "{version:?}: {ev:?}");
+        assert_eq!(h.engine.markets()[&DE40].stress.level, 1);
+        // A fresh EUR-USD index restores the reading: the aged-out window leaves the move behind.
+        let ev = h.price(EURUSD, "1.1");
+        assert!(ev.contains(&Event::StressChanged { market: DE40, level: 0 }), "{version:?}: {ev:?}");
+    }
 }
 
 #[test]

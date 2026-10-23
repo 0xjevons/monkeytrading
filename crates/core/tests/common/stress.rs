@@ -7,10 +7,10 @@ use engine_core::event::Event;
 use engine_core::market::MarketSpec;
 use engine_core::params::{ProtocolParams, StressTrigger};
 use engine_core::price::SourceQuote;
-use engine_core::session::Schedule;
+use engine_core::session::{Period, Schedule};
 use engine_core::types::{AssetClass, MarketId, Millis};
 
-use crate::common::{Harness, f, market, params};
+use crate::common::{Harness, f, market, params, us_equities};
 
 /// A market the divergence tests list with a bound of their own.
 pub const BOUNDED: MarketId = 20;
@@ -66,4 +66,18 @@ pub fn diverge(h: &mut Harness, bps: i64) {
 pub fn with_divergence_shares(mut p: ProtocolParams) -> ProtocolParams {
     p.share_divergence_triggers(MAX_DIVERGENCE_BPS);
     p
+}
+
+/// US equities hours with one dated closure, for the across-halt tests and the `V17` reference
+/// part.
+pub fn halted_us_equities(from: &str, to: &str) -> Schedule {
+    let Schedule::Weekly { tz, windows, .. } = us_equities() else { unreachable!("US equities keep weekly hours") };
+    let at = |local: &str| local.parse().expect("a local date and time");
+    Schedule::Weekly {
+        tz,
+        windows,
+        closed_dates: vec![],
+        closures: vec![Period { from: at(from), to: at(to) }],
+        special_sessions: vec![],
+    }
 }
