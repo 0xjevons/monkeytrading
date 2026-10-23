@@ -101,7 +101,11 @@ account with funds that no deposit brought in, or pay out funds the engine did n
 finding that breaks one of these guarantees, or gets past one of those checks, is in scope even when
 it starts from an operator's key. Some of the checks behind them are still being built: `engine
 replay` does not yet verify checkpoint signatures; the node does not yet check the log it recovers
-from against anything its host cannot rewrite, so it accepts a truncated or rewritten one; the
+from against a freshness anchor its host cannot rewrite, so full replay accepts truncated or
+rewritten logs, and snapshot recovery accepts rollback to an older authenticated prefix.
+Optional recovery snapshots require independently provisioned attested signer pins and
+authenticate the complete snapshot, its deployment, and its checkpoint; these signatures establish
+integrity, not freshness. Full `engine replay` checks skipped historical log segments. The
 account history index is read from host disk with only its schema checked, and is matched to the log
 by one command, the newest it has taken, though SQLite reads it in defensive mode and each event it
 serves names its place in the log, where anyone can check it; the sequencer, which bounds its host's

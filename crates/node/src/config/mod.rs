@@ -89,6 +89,7 @@ pub struct NodeConfig {
     pub feeds: FeedsSection,
     pub time: TimeSection,
     pub history: HistorySection,
+    pub snapshots: Option<SnapshotSection>,
     pub metrics: MetricsSection,
     pub alerts: AlertsSection,
     /// Sequenced as admin commands after protocol activation on a log's first boot, all or nothing,
@@ -297,6 +298,16 @@ pub struct HistorySection {
     /// index and rebuilds it from the log.
     #[serde(with = "humantime_serde")]
     pub retention: Duration,
+}
+
+/// Optional signed recovery caches; signer pins must come from verified attestation.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotSection {
+    pub dir: PathBuf,
+    pub retain: NonZeroUsize,
+    pub max_bytes: NonZeroUsize,
+    pub trusted_signers: Vec<AccountId>,
 }
 
 #[derive(Debug, Deserialize)]

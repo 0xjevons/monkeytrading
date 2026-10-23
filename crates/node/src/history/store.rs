@@ -90,16 +90,25 @@ pub struct Reader {
 }
 
 impl Writer {
-    /// Opens the index at `path`, creating its directory, the file, and the schema if missing, and
-    /// returns it with what it has taken. One transaction checks the schema and the integrity of
-    /// the whole file, and reads that. Events leave the index `retention_ms` before the newest
-    /// command it holds.
+    /// Opens or creates the index, checks its schema and full integrity, and returns its cursor.
+    /// Retention is counted back from the newest indexed command's time.
     /// Error cases:
     /// - the directory or the file cannot be created or opened, or the file is not a SQLite database
     /// - the file holds another version of the schema, or a schema this code did not create
     /// - SQLite's integrity check finds the file damaged
     /// - the command the index holds does not parse
     pub(super) fn open(path: &Path, retention_ms: Millis) -> anyhow::Result<(Self, Option<Progress>)> {
+        Self::open_checked(path, retention_ms, false)
+    }
+
+    /// Opens the store with either a full integrity scan or the snapshot path's cursor check.
+    /// Error cases:
+    /// - as `open`
+    pub(super) fn open_checked(
+        path: &Path,
+        retention_ms: Millis,
+        cursor_only: bool,
+    ) -> anyhow::Result<(Self, Option<Progress>)> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
@@ -122,10 +131,8 @@ impl Writer {
             other => bail!("{} holds history schema {other}, not {SCHEMA_VERSION}", path.display()),
         }
         check_schema(&tx, &schema, path)?;
-        // A torn page, or an index that no longer matches its table, would fail a later write or
-        // serve another row; one bad entry is enough to refuse the file.
-        let integrity: String =
-            tx.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0)).context("checking the history index")?;
+        let check = if cursor_only { "PRAGMA integrity_check(progress)" } else { "PRAGMA integrity_check(1)" };
+        let integrity: String = tx.query_row(check, [], |row| row.get(0)).context("checking the history index")?;
         ensure!(integrity == "ok", "{} is damaged: {integrity}", path.display());
         let row: Option<(String, Millis)> = tx
             .query_row("SELECT command, retention_ms FROM progress WHERE id = 0", [], |row| {

@@ -138,6 +138,18 @@ impl SegmentedLog {
     ///   not named for the next seq
     /// - `visit` fails
     pub fn open(dir: &Path, mut visit: impl FnMut(LogEntry) -> anyhow::Result<()>) -> anyhow::Result<Self> {
+        Self::open_after(dir, None, &mut visit)
+    }
+
+    /// Reads the checkpoint's segment and suffix, skipping completed segments strictly before it.
+    /// The caller must authenticate `after` independently and find its checkpoint in the read.
+    /// Error cases:
+    /// - as `open`, for the segment suffix; skipped listings must still match the file sequence
+    pub(crate) fn open_after(
+        dir: &Path,
+        after: Option<Offset>,
+        mut visit: impl FnMut(LogEntry) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Self> {
         let (manifest, manifest_len) = Manifest::read(dir)?;
         let files = list_segments(dir)?;
         ensure!(
@@ -150,6 +162,19 @@ impl SegmentedLog {
         let (mut last, mut open) = (None, None);
         for (i, (first_seq, path)) in files.iter().enumerate() {
             let listed = manifest.segments.get(i);
+            if let Some(listed) = listed.filter(|listed| after.is_some_and(|at| listed.last_seq < at.seq)) {
+                ensure!(
+                    listed.first_seq == *first_seq && listed.file == segment_name(*first_seq),
+                    "snapshot prefix listing mismatch"
+                );
+                ensure!(
+                    listed.last_seq >= *first_seq
+                        && last.map_or(*first_seq == 0, |at: Offset| at.seq.checked_add(1) == Some(*first_seq)),
+                    "snapshot prefix sequence gap"
+                );
+                last = Some(Offset::start_of(listed.last_seq));
+                continue;
+            }
             if listed.is_none() && i + 1 < files.len() {
                 bail!("{} is followed by another segment but is not in {MANIFEST}", path.display());
             }
