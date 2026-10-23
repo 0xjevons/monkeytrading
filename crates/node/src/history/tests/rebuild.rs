@@ -8,6 +8,7 @@ use std::{iter, slice};
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::api::Feed;
 use crate::log::offset_of;
 use crate::test_support::{Alert, capture_alerts};
 
@@ -41,14 +42,19 @@ async fn an_index_a_power_loss_left_ahead_of_the_log_is_rebuilt_before_it_serves
         }
         let tip = node.next_seq().await.checked_sub(1);
         let (_guard, mut alerts) = capture_alerts();
-        let history = TestHistory::start_with_tip(&node, &dir, &index, tip).unwrap();
-        assert_eq!(history.resume_at, Offset::start_of(0), "{case}");
+        let (history, reader, resume_at, feed) = open_unstarted(&node, &dir, &index, tip);
+        assert_eq!(resume_at, Offset::start_of(0), "{case}");
         assert_discarded(&mut alerts, cause, case);
+        // Pages wait for the rebuild: following has not started, so nothing is served yet.
         let query = || PageQuery { account: TRADER, kind: None, before: None, after: None, limit: 200 };
-        assert_eq!(history.reader.page(query()).await.unwrap(), None, "{case}: pages wait for the rebuild");
-        let reader = history.reader.clone();
+        assert_eq!(reader.page(query()).await.unwrap(), None, "{case}: pages wait for the rebuild");
+        let task = tokio::spawn(history.run(feed));
         node.stop().await;
-        history.finish().await.unwrap();
+        timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the history task ends in time")
+            .expect("history task")
+            .unwrap();
         let served = reader.page(query()).await.unwrap().expect("rebuilt").events;
         assert_eq!(served, logged_history(&dir, TRADER), "{case}");
     }
@@ -223,6 +229,19 @@ async fn assert_rebuilt(log: &Path, index: &Path, retention: Duration, cause: &s
     let served = every_page(&Reader::new(file(index), ready()), A, None, 10).await;
     assert!(!served.is_empty(), "{case}");
     assert_eq!(served, every_page(&Reader::new(file(&fresh), ready()), A, None, 10).await, "{case}");
+}
+
+/// Opens the index in `index` against the log `node` writes in `dir`, letting readers in once it
+/// has taken `tip`, but does not follow the log: the caller spawns `history.run(feed)` to catch
+/// up, so the test can assert what readers see before the index has taken anything.
+fn open_unstarted(node: &TestSequencer, dir: &Path, index: &Path, tip: Option<u64>) -> (History, Reader, Offset, Feed) {
+    let cfg = HistorySection { dir: index.to_owned(), retention: RETENTION };
+    let mut history = open_history(&cfg, dir).unwrap();
+    history.catch_up_to(tip);
+    let backfills = Arc::new(Semaphore::new(MAX_BACKFILLS));
+    let (reader, resume_at) = (history.reader(), history.resume_at());
+    let feed = Feed::new(node.stream.subscribe(), dir.to_owned(), node.manifest.clone(), backfills, Some(resume_at));
+    (history, reader, resume_at, feed)
 }
 
 /// Checks that the alerts so far hold exactly one discard of the index, a Warning naming `cause`.

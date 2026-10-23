@@ -224,6 +224,7 @@ fn a_connection_that_quoted_retries_at_once_and_one_that_did_not_backs_off() {
 /// the lead, count, or reason, and each recovery resolves it under the same key.
 #[tokio::test(start_paused = true)]
 async fn venue_alerts_keep_one_key_per_subject_and_resolve_under_it() {
+    crate::test_support::keep_callsites_interested();
     let (layer, router) = alerts::channel(Routes::default(), Arc::new(Metrics::new()));
     let _logging = set_default(registry().with(layer.with_filter(filter_fn(is_alert_callsite))));
     let window = Duration::from_millis(300);

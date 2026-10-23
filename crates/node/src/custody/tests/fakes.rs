@@ -246,6 +246,7 @@ impl Node {
 impl Logs {
     /// Captures every log line emitted on this thread until the guard drops.
     pub(super) fn capture() -> (Self, DefaultGuard) {
+        crate::test_support::keep_callsites_interested();
         let logs = Logs::default();
         let writer = logs.clone();
         let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();

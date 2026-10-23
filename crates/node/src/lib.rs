@@ -25,6 +25,8 @@ pub use telemetry::{Telemetry, init_logging, init_telemetry};
 mod tee;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod test_tracing;
 mod throttle;
 mod tls;
 mod trusted_time;

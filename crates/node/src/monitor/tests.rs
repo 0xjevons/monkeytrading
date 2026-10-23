@@ -288,6 +288,7 @@ fn a_closed_or_briefly_unpriced_market_raises_nothing() {
 
 #[tokio::test(start_paused = true)]
 async fn the_monitor_pages_a_stalled_sequencer_resolves_it_and_stops_when_the_sequencer_goes() {
+    crate::test_support::keep_callsites_interested();
     let metrics = Arc::new(Metrics::new());
     let (layer, router) = channel(Routes::default(), metrics.clone());
     let _logging = set_default(registry().with(layer.with_filter(filter_fn(is_alert_callsite))));
