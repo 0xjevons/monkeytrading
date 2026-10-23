@@ -53,6 +53,7 @@ pub(crate) async fn connect(cfg: &NodeConfig, key: &Arc<EnclaveKey>) -> anyhow::
     let posted_seq = parent.has_checkpoint.then_some(parent.seq);
     let poster = Poster {
         chain,
+        registry: Some(Default::default()),
         domain,
         signer: AccountId(key.address()),
         retry: checkpoints.retry_interval,

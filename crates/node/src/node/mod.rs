@@ -96,7 +96,10 @@ async fn serve_node(
         }
         TeeProvider::ConfigfsTsm => Box::new(ConfigfsTsm::default()),
     };
+    #[cfg(not(test))]
     let key = Arc::new(EnclaveKey::generate());
+    #[cfg(test)]
+    let key = Arc::new(EnclaveKey::test_key());
     let tls = TlsIdentity::generate()?;
     let attestation = Arc::new(
         attest_key(attestor.as_ref(), &key, &tls.public_key_sha256).context("attesting the enclave and TLS keys")?,
@@ -112,15 +115,18 @@ async fn serve_node(
         .await
         .inspect_err(|e| error!(alert = "checkpoint_startup_failed", "refusing to serve: {e:#}"))?;
     let mut anchor = None;
-    let (log, history_plan) = read_log_and_history_observe(&cfg, Some(AccountId(key.address())), |entry| {
-        if let crate::log::LogEntry::Checkpoint(cp) = entry
-            && checkpoint_setup.as_ref().and_then(|setup| setup.posted_seq) == Some(cp.seq)
-        {
-            anchor = Some(cp.clone());
-        }
-    })?;
-    let mut history =
-        finish_preflight(history_plan, checkpoint_setup.as_ref().map(|setup| (&setup.poster, anchor.as_ref()))).await?;
+    let (log, history_plan) = read_log_and_history_observe(
+        &cfg,
+        Some(AccountId(key.address())),
+        checkpoint_setup.as_ref().map(|setup| setup.parent),
+        |entry| {
+            if let crate::log::LogEntry::Checkpoint(cp) = entry
+                && checkpoint_setup.as_ref().and_then(|setup| setup.posted_seq) == Some(cp.seq)
+            {
+                anchor = Some(cp.clone());
+            }
+        },
+    )?;
 
     let vault: AccountId = cfg.custody.vault.parse().context("custody.vault")?;
     let client_auth = cfg.client_auth()?;
@@ -134,6 +140,7 @@ async fn serve_node(
         segment_commands: cfg.node.segment_commands,
         manifest: manifest_tx,
         checkpoint_every: cfg.node.checkpoint_every,
+        checkpoint_registry: checkpoint_setup.as_ref().and_then(|setup| setup.poster.registry.clone()),
         checkpoint_parent: checkpoint_setup.as_ref().map(|setup| setup.parent).unwrap_or_default(),
         checkpoints: checkpoint_setup.as_ref().map(|setup| setup.tx.clone()),
         chain_id: cfg.custody.chain_id,
@@ -144,6 +151,12 @@ async fn serve_node(
         operator,
         metrics: metrics.clone(),
     };
+    let mut history = finish_preflight(
+        history_plan,
+        checkpoint_setup.as_ref().map(|setup| (&setup.poster, anchor.as_ref())),
+        Some((&log, &seq_cfg)),
+    )
+    .await?;
     let mut seq = Sequencer::recover_from(log, seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
     let custody = Custody::connect(&cfg.custody, seq.last_seq())
@@ -162,11 +175,14 @@ async fn serve_node(
     history.catch_up_to(seq.last_seq());
 
     let (tx, rx) = mpsc::channel::<Request>(CHANNEL_CAPACITY);
+    let recovery = seq.take_recovery_checkpoints();
     let mut sequencer = crate::sequencer_thread::Worker::start(seq.run(rx), cpu)?;
     let mut tasks: JoinSet<TaskResult> = JoinSet::new();
     if let Some(setup) = checkpoint_setup {
         let checkpoint_tx = tx.clone();
-        tasks.spawn(async move { ("checkpoints", setup.poster.run(setup.rx, checkpoint_tx).await) });
+        tasks.spawn(
+            async move { ("checkpoints", setup.poster.run_with_recovery(setup.rx, checkpoint_tx, recovery).await) },
+        );
     }
 
     let tick = cfg.node.tick;
@@ -275,7 +291,8 @@ async fn serve_node(
 /// - the log cannot be read or replayed (see `Sequencer::read_log`)
 #[cfg(test)]
 fn read_log_and_history(cfg: &NodeConfig) -> anyhow::Result<(ReplayedLog, crate::history::History)> {
-    let (log, plan) = read_log_and_history_observe(cfg, Some(AccountId(EnclaveKey::test_key().address())), |_| {})?;
+    let (log, plan) =
+        read_log_and_history_observe(cfg, Some(AccountId(EnclaveKey::test_key().address())), None, |_| {})?;
     Ok((log, plan.finish()?))
 }
 
@@ -285,14 +302,16 @@ fn read_log_and_history(cfg: &NodeConfig) -> anyhow::Result<(ReplayedLog, crate:
 fn read_log_and_history_observe(
     cfg: &NodeConfig,
     signer: Option<AccountId>,
+    parent: Option<crate::log::CheckpointParent>,
     mut observe: impl FnMut(&crate::log::LogEntry),
 ) -> anyhow::Result<(ReplayedLog, HistoryPlan)> {
     let history_failed = |e: &anyhow::Error| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}");
     let mut check = HistoryPlan::open(&cfg.history).inspect_err(history_failed)?;
-    let log = Sequencer::read_log_with_trust(
+    let log = Sequencer::read_log_for_recovery(
         &cfg.node.log_dir,
         Some(crate::log::CheckpointDomain { chain_id: cfg.custody.chain_id, vault: cfg.custody.vault.parse()? }),
         signer,
+        parent,
         |entry| {
             check.observe(entry);
             observe(entry);

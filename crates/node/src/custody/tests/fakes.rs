@@ -234,7 +234,7 @@ impl Node {
         };
         let (stream, _) = broadcast::channel(1_024);
         let (withdrawals, _) = mpsc::unbounded_channel();
-        let mut seq = Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, withdrawals).unwrap();
+        let mut seq = Sequencer::recover(cfg, Arc::new(EnclaveKey::test_key()), stream, withdrawals).unwrap();
         seq.trust(trusted_now()).unwrap();
         let (tx, rx) = mpsc::channel(64);
         Node { tx, sequencer: tokio::spawn(seq.run(rx)) }

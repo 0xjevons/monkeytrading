@@ -39,7 +39,7 @@ fn a_log_recording_another_operator_refuses_to_start_and_writes_nothing() {
         let (stream, _) = broadcast::channel(16);
         let (manifest, _) = watch::channel(Manifest::default());
         let cfg = SequencerConfig { client_auth: signed(31_337), operator: other, ..sequencer_config(&dir, manifest) };
-        let recovered = Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, mpsc::unbounded_channel().0);
+        let recovered = Sequencer::recover(cfg, Arc::new(EnclaveKey::test_key()), stream, mpsc::unbounded_channel().0);
         let err = recovered.err().unwrap();
         assert!(format!("{err:#}").contains("the log records operator"), "{err:#}");
     }

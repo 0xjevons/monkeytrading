@@ -19,6 +19,7 @@ pub struct Replayed {
     pub engine: Engine,
     pub commands: u64,
     pub checkpoints: u64,
+    pub(crate) recovery_work: Vec<crate::checkpoints::Work>,
     pub(crate) last_signed_checkpoint: Option<crate::log::Checkpoint>,
     /// Withdrawals the last command approved that the log ends before signing, as a crash between
     /// a command's entry and its withdrawal entry leaves: `(account, amount, nonce)`.
@@ -46,6 +47,8 @@ pub(super) struct Replay {
     commands: u64,
     checkpoints: u64,
     last_signed_checkpoint: Option<crate::log::Checkpoint>,
+    recovery_parent: Option<crate::log::CheckpointParent>,
+    recovery_work: Vec<crate::checkpoints::Work>,
     activations: Vec<(ProtocolVersion, u64)>,
     /// Withdrawals the last command approved that no withdrawal entry has matched yet. Entries
     /// written before events were logged have no withdrawal entries. Once a command carries its
@@ -65,6 +68,14 @@ impl Replay {
     /// Pins the authority supplied independently by custody, retained key, or audit caller.
     pub(super) fn with_trust(domain: Option<CheckpointDomain>, trusted_signer: Option<AccountId>) -> Self {
         Self { domain, trusted_signer, ..Self::default() }
+    }
+    /// Retains only the authenticated outstanding tail after the independently finalized anchor.
+    pub(super) fn with_recovery(
+        domain: Option<CheckpointDomain>,
+        trusted_signer: Option<AccountId>,
+        parent: crate::log::CheckpointParent,
+    ) -> Self {
+        Self { recovery_parent: Some(parent), ..Self::with_trust(domain, trusted_signer) }
     }
     /// Applies the log's next entry.
     /// Error cases:
@@ -150,8 +161,30 @@ impl Replay {
                     bail!("state root mismatch at seq {}: log says {}, replay gives {root}", cp.seq, cp.root);
                 }
                 crate::checkpoints::signature::verify_with_domain(cp, engine, self.domain)?;
-                self.checkpoint_signers.insert(cp.signer.parse()?);
+                let signer = cp.signer.parse()?;
+                ensure!(
+                    self.trusted_signer.is_none_or(|trusted| trusted == signer),
+                    "checkpoint signer differs from trusted recovery authority"
+                );
+                self.checkpoint_signers.insert(signer);
                 self.checkpoints += 1;
+                if let Some(parent) = self.recovery_parent
+                    && cp.parent.is_some()
+                {
+                    if !parent.has_checkpoint || cp.seq > parent.seq {
+                        ensure!(cp.parent == Some(parent), "outstanding checkpoint has a divergent signed parent");
+                        self.recovery_work.push(crate::checkpoints::Work {
+                            checkpoint: cp.clone(),
+                            liabilities: crate::checkpoints::liabilities(engine, self.unpaid),
+                            deposits: engine.credited_refs_with_prefix("0x").count() as u64,
+                        });
+                        self.recovery_parent = Some(crate::log::CheckpointParent {
+                            has_checkpoint: true,
+                            seq: cp.seq,
+                            root: cp.root.parse()?,
+                        });
+                    }
+                }
                 self.last_signed_checkpoint = Some(cp.clone());
                 self.genesis.checkpoint();
                 // The checkpoint covers the last command applied, whose stamp is the engine's time.
@@ -178,6 +211,7 @@ impl Replay {
             unpaid: self.unpaid,
             checkpoint_signers: self.checkpoint_signers,
             last_signed_checkpoint: self.last_signed_checkpoint,
+            recovery_work: self.recovery_work,
         }
     }
 }

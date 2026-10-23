@@ -72,6 +72,7 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     ))
     .unwrap();
     let make_poster = || Poster {
+        registry: None,
         chain: CheckpointRpc::new(&section, domain, token, FinalityTag::Latest, 0).unwrap(),
         domain,
         signer: AccountId(key.address()),
@@ -254,6 +255,7 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
         deferred_withdrawals: true,
     };
     let work = crate::checkpoints::Work { checkpoint, liabilities: current.balance, deposits: current.deposits };
+    include_checkpoint(&delayed, &work.checkpoint).await;
     assert_eq!(delayed.reconcile(&work).await.unwrap(), (None, false));
     let nonce = provider.get_transaction_count(relayer).await.unwrap();
     assert_eq!(delayed.reconcile(&work).await.unwrap(), (None, false));
@@ -268,7 +270,12 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
         current.checkpoint,
         "reorg removes provisional inclusion"
     );
-    assert_eq!(delayed.reconcile(&work).await.unwrap(), (None, false), "orphaned inclusion never released");
+    include_checkpoint(&delayed, &work.checkpoint).await;
+    assert_eq!(
+        delayed.reconcile(&work).await.unwrap(),
+        (None, false),
+        "re-inclusion still cannot release before finality"
+    );
     local_rpc(&url, "anvil_mine", serde_json::json!(["0x2"])).await;
     assert_eq!(delayed.reconcile(&work).await.unwrap(), (Some(seq), true), "release follows confirmation depth");
 
@@ -341,4 +348,21 @@ async fn local_rpc(url: &str, method: &str, params: serde_json::Value) -> serde_
         .unwrap();
     assert!(response.get("error").is_none(), "{response}");
     response.get("result").unwrap().clone()
+}
+
+/// Awaits canonical inclusion explicitly; transaction RPC acknowledgment is not a mined receipt.
+async fn include_checkpoint(poster: &Poster<CheckpointRpc>, checkpoint: &Checkpoint) {
+    poster.chain.post(checkpoint).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if poster.chain.state(View::Latest).await.unwrap().checkpoint
+                == Some((checkpoint.seq, checkpoint.root.clone()))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("checkpoint is included on local Anvil");
 }

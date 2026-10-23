@@ -14,19 +14,26 @@ use crate::sequencer::{Sequencer, SignedWithdrawal};
 
 pub(super) struct Gate {
     sink: mpsc::Sender<Work>,
+    pub registry: Option<crate::checkpoints::Registry>,
     pub parent: crate::log::CheckpointParent,
     pub healthy: bool,
+    pub recovery: Vec<Work>,
     pub pending: Vec<(u64, AccountId, Fixed, u64)>,
 }
 
 impl Gate {
     /// Starts paused until the first reconciliation succeeds.
     pub fn new(sink: mpsc::Sender<Work>, parent: crate::log::CheckpointParent) -> Self {
-        Self { sink, parent, healthy: false, pending: Vec::new() }
+        Self { sink, registry: None, parent, healthy: false, recovery: Vec::new(), pending: Vec::new() }
     }
 }
 
 impl Sequencer {
+    /// Transfers replayed durable work to the worker before admitting live commands.
+    pub(crate) fn take_recovery_checkpoints(&mut self) -> Vec<Work> {
+        self.gate.as_mut().map_or_else(Vec::new, |gate| std::mem::take(&mut gate.recovery))
+    }
+
     /// Logs and publishes a signed state root for the last applied seq. From protocol `V9` the root
     /// rehashes only what changed since the previous checkpoint, and API proofs are taken against it.
     /// Error cases:
@@ -74,13 +81,18 @@ impl Sequencer {
             warn!(alert = "checkpoint_post_failed", "checkpoint worker stopped; durable checkpoint awaits restart");
             return Ok(());
         }
-        gate.sink
-            .try_send(Work {
-                checkpoint,
-                liabilities: liabilities(&self.engine, self.unpaid),
-                deposits: self.engine.credited_refs_with_prefix("0x").count() as u64,
-            })
-            .map_err(|_| anyhow::anyhow!("checkpoint worker unavailable or queue full"))
+        let work = Work {
+            checkpoint,
+            liabilities: liabilities(&self.engine, self.unpaid),
+            deposits: self.engine.credited_refs_with_prefix("0x").count() as u64,
+        };
+        if let Some(registry) = &gate.registry {
+            registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("checkpoint work registry is poisoned"))?
+                .insert(work.checkpoint.seq, work.clone());
+        }
+        gate.sink.try_send(work).map_err(|_| anyhow::anyhow!("checkpoint worker unavailable or queue full"))
     }
 
     /// Releases only approvals covered by the confirmed prefix, and only after reconciliation.

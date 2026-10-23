@@ -161,3 +161,64 @@ fn gated_checkpoints_sign_the_previous_queued_root_and_coalesce_duplicate_reques
     seq.checkpoint().unwrap();
     assert!(queued.try_recv().is_err());
 }
+
+#[test]
+fn restart_resumes_exact_unmined_chain_and_original_checkpoint_accounting() {
+    let dir = scratch_dir("checkpoint-unmined-recovery");
+    let key = Arc::new(EnclaveKey::test_key());
+    let (sink, mut queued) = mpsc::channel(64);
+    let config = || crate::sequencer::SequencerConfig {
+        checkpoints: Some(sink.clone()),
+        checkpoint_every: 1,
+        ..sequencer_config(&dir, watch::channel(Manifest::default()).0)
+    };
+    let mut seq =
+        Sequencer::recover(config(), key.clone(), broadcast::channel(128).0, mpsc::unbounded_channel().0).unwrap();
+    seq.activate_protocol().unwrap();
+    seq.genesis(&dev_config().genesis).unwrap();
+    seq.trust(trusted_now()).unwrap();
+    let mut prior = Vec::new();
+    while let Ok(work) = queued.try_recv() {
+        prior.push(work);
+    }
+    let finalized = prior.last().unwrap().checkpoint.clone();
+    seq.checkpoint_status(Some(finalized.seq), true).unwrap();
+    seq.sequence(deposit(100, "pending-checkpoint-deposit")).unwrap();
+    seq.sequence(withdraw(40)).unwrap();
+    seq.sequence(deposit(20, "later-deposit")).unwrap();
+    seq.flush().unwrap();
+    let mut outstanding = Vec::new();
+    while let Ok(work) = queued.try_recv() {
+        outstanding.push(work);
+    }
+    assert!(outstanding.len() >= 3);
+    assert_ne!(outstanding.first().unwrap().liabilities, outstanding.last().unwrap().liabilities);
+    let last = outstanding.last().unwrap().checkpoint.clone();
+    let bytes = log_entries(&dir).len();
+    drop(seq);
+    let cfg = crate::sequencer::SequencerConfig {
+        checkpoint_parent: crate::log::CheckpointParent {
+            has_checkpoint: true,
+            seq: finalized.seq,
+            root: finalized.root.parse().unwrap(),
+        },
+        ..config()
+    };
+    let mut recovered = Sequencer::recover(cfg, key, broadcast::channel(128).0, mpsc::unbounded_channel().0).unwrap();
+    let restored = recovered.take_recovery_checkpoints();
+    assert_eq!(restored.len(), outstanding.len());
+    for (actual, expected) in restored.iter().zip(&outstanding) {
+        assert_eq!(
+            serde_json::to_value(&actual.checkpoint).unwrap(),
+            serde_json::to_value(&expected.checkpoint).unwrap()
+        );
+        assert_eq!(actual.liabilities, expected.liabilities);
+        assert_eq!(actual.deposits, expected.deposits);
+    }
+    assert_eq!(log_entries(&dir).len(), bytes, "restart must not sign a sibling");
+    recovered.trust(trusted_now()).unwrap();
+    recovered.sequence(engine_core::command::Command::Tick).unwrap();
+    let child = queued.try_recv().unwrap().checkpoint;
+    assert_eq!(child.parent.unwrap().seq, last.seq);
+    assert_eq!(child.parent.unwrap().root.to_string(), last.root);
+}

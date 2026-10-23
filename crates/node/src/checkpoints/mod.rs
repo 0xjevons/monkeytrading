@@ -5,7 +5,8 @@ pub(crate) mod setup;
 pub(crate) mod signature;
 pub(crate) use rpc::CheckpointRpc;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
@@ -25,9 +26,13 @@ pub(crate) struct Work {
     pub deposits: u64,
 }
 
+/// Durable work registered by its sequencer before bounded queue admission.
+pub(crate) type Registry = Arc<Mutex<BTreeMap<u64, Work>>>;
+
 /// The latest commitment and collateral, read at one canonical block hash.
 #[derive(Clone, Debug)]
 pub(crate) struct VaultState {
+    pub height: u64,
     pub signer: engine_core::types::AccountId,
     pub checkpoint: Option<(u64, String)>,
     pub balance: Fixed,
@@ -68,6 +73,7 @@ impl std::error::Error for Conflict {}
 /// Supervised checkpoint worker; work is durable in the log before it reaches this queue.
 pub(crate) struct Poster<R> {
     pub chain: R,
+    pub registry: Option<Registry>,
     pub domain: CheckpointDomain,
     pub signer: engine_core::types::AccountId,
     pub retry: Duration,
@@ -96,8 +102,21 @@ impl<R: CheckpointChain> Poster<R> {
     /// Posts checkpoints in log order, retries transport failures, and reports withdrawal health.
     /// Error cases:
     /// - the sequencer disappears, or the chain exposes an incompatible checkpoint/signer
-    pub async fn run(self, mut rx: mpsc::Receiver<Work>, tx: mpsc::Sender<Request>) -> anyhow::Result<()> {
-        let mut queued = VecDeque::new();
+    #[cfg(test)]
+    pub async fn run(self, rx: mpsc::Receiver<Work>, tx: mpsc::Sender<Request>) -> anyhow::Result<()> {
+        self.run_with_recovery(rx, tx, Vec::new()).await
+    }
+
+    /// Restores the durable signed tail before accepting newly sequenced checkpoints.
+    /// Error cases:
+    /// - the sequencer disappears or authenticated chain state conflicts
+    pub async fn run_with_recovery(
+        self,
+        mut rx: mpsc::Receiver<Work>,
+        tx: mpsc::Sender<Request>,
+        recovery: Vec<Work>,
+    ) -> anyhow::Result<()> {
+        let mut queued = VecDeque::from(recovery);
         let mut latest = None;
         let mut pending_since = None;
         let mut timer = interval(self.retry);
@@ -111,7 +130,13 @@ impl<R: CheckpointChain> Poster<R> {
                 _ = timer.tick() => {
                     let work = queued.front().or(latest.as_ref());
                     let Some(work) = work else { continue };
-                    let result = self.reconcile(work).await;
+                    let registered = self.registry.as_ref().map(|registry| registry.lock()
+                        .map(|work| work.values().cloned().collect::<Vec<_>>())
+                        .map_err(|_| anyhow::anyhow!("checkpoint work registry is poisoned")))
+                        .transpose()?.unwrap_or_default();
+                    let mut known: Vec<&Work> = queued.iter().chain(registered.iter()).collect();
+                    if let Some(latest) = latest.as_ref() { known.push(latest); }
+                    let result = self.reconcile_known(work, &known).await;
                     if matches!(result, Ok((Some(_), false))) {
                         let since = pending_since.get_or_insert_with(tokio::time::Instant::now);
                         if since.elapsed() >= self.pending_deposits_critical_after {
@@ -132,8 +157,14 @@ impl<R: CheckpointChain> Poster<R> {
                         }
                     };
                     tx.send(Request::CheckpointStatus { posted, healthy }).await.map_err(|_| anyhow::anyhow!("sequencer stopped"))?;
-                    if posted.is_some() && !queued.is_empty() {
-                        latest = queued.pop_front();
+                    if let Some(posted) = posted {
+                        let confirmed = known.iter().find(|work| work.checkpoint.seq == posted).map(|work| (*work).clone());
+                        while queued.front().is_some_and(|work| work.checkpoint.seq <= posted) { queued.pop_front(); }
+                        if let Some(confirmed) = confirmed { latest = Some(confirmed); }
+                        if let Some(registry) = &self.registry {
+                            registry.lock().map_err(|_| anyhow::anyhow!("checkpoint work registry is poisoned"))?
+                                .retain(|seq, _| *seq >= posted);
+                        }
                     }
                 }
             }
@@ -143,10 +174,31 @@ impl<R: CheckpointChain> Poster<R> {
     /// Verifies/extends the commitment and compares collateral to the checkpoint's ledger.
     /// Error cases:
     /// - the chain read or post fails, or a signer/root conflicts with the local log
+    #[cfg(test)]
     async fn reconcile(&self, work: &Work) -> anyhow::Result<(Option<u64>, bool)> {
+        self.reconcile_known(work, &[work]).await
+    }
+
+    /// Matches public relays to the authenticated local chain before accepting a covered prefix.
+    /// Error cases:
+    /// - unavailable/lagging views, unknown progress, or a proved conflicting local commitment
+    async fn reconcile_known(&self, work: &Work, known: &[&Work]) -> anyhow::Result<(Option<u64>, bool)> {
+        let mut work = work;
+        let mut state = self.chain.state(View::Latest).await?;
+        if let Some((seq, root)) = &state.checkpoint {
+            if *seq > work.checkpoint.seq {
+                work = known
+                    .iter()
+                    .copied()
+                    .find(|work| work.checkpoint.seq == *seq)
+                    .context("vault advanced to a checkpoint not yet received by this worker")?;
+                if work.checkpoint.root != *root {
+                    return Err(Conflict("conflicting publicly relayed checkpoint root").into());
+                }
+            }
+        }
         let cp = &work.checkpoint;
         signature::verify_domain(cp, self.domain)?;
-        let mut state = self.chain.state(View::Latest).await?;
         if state.signer != self.signer || cp.signer.parse::<engine_core::types::AccountId>()? != self.signer {
             return Err(Conflict("checkpoint signer differs from the authorized vault signer").into());
         }
@@ -174,6 +226,10 @@ impl<R: CheckpointChain> Poster<R> {
                     .transpose()?
                     .unwrap_or_default();
                 if parent != expected {
+                    ensure!(
+                        !(parent.has_checkpoint && (!expected.has_checkpoint || expected.seq < parent.seq)),
+                        "checkpoint view is behind the signed predecessor; awaiting backend catch-up"
+                    );
                     return Err(Conflict("signed parent differs from the latest vault checkpoint").into());
                 }
                 self.chain.post(cp).await?;
@@ -186,17 +242,27 @@ impl<R: CheckpointChain> Poster<R> {
             }
         }
         // Latest inclusion prevents duplicate submission, but is revocable by a shallow reorg.
+        let included_height = state.height;
         let state = self.chain.state(View::Finalized).await?;
+        ensure!(included_height >= state.height, "latest checkpoint view is behind the finalized view");
         if state.signer != self.signer {
             return Err(Conflict("finalized vault signer differs from this enclave").into());
         }
-        match &state.checkpoint {
-            Some((seq, root)) if *seq == cp.seq && *root == cp.root => {}
-            Some((seq, _)) if *seq >= cp.seq => {
-                return Err(Conflict("finalized checkpoint conflicts with local log").into());
-            }
-            _ => return Ok((None, false)),
+        let Some((seq, root)) = &state.checkpoint else { return Ok((None, false)) };
+        if *seq < known.iter().map(|work| work.checkpoint.seq).min().unwrap_or(cp.seq) {
+            return Ok((None, false));
         }
+        let finalized = known
+            .iter()
+            .copied()
+            .find(|work| work.checkpoint.seq == *seq)
+            .context("finalized checkpoint has not yet reached this worker")?;
+        signature::verify_domain(&finalized.checkpoint, self.domain)?;
+        if finalized.checkpoint.root != *root {
+            return Err(Conflict("finalized checkpoint conflicts with local log").into());
+        }
+        let work = finalized;
+        let cp = &work.checkpoint;
         let healthy = state.balance == work.liabilities && state.deposits == work.deposits;
         if healthy {
             info!(alert_resolved = "collateral_mismatch", "vault collateral reconciles");

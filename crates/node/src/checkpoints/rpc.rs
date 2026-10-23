@@ -124,18 +124,24 @@ impl CheckpointChain for CheckpointRpc {
             .deadline(self.provider.get_block_by_number(tag))
             .await?
             .context("checkpoint RPC has no finality block")?;
-        let block = if view == View::Finalized && self.confirmations > 0 {
-            let number = tagged
-                .header
-                .number
-                .checked_sub(self.confirmations)
-                .context("checkpoint chain has insufficient confirmation depth")?;
-            self.deadline(self.provider.get_block_by_number(BlockNumberOrTag::Number(number)))
-                .await?
-                .context("checkpoint confirmation block is missing")?
-        } else {
-            tagged
-        };
+        // Follow immutable parent hashes from the exact sampled tag. A by-number read could
+        // switch forks between requests and give an unconfirmed replacement the old tag's depth.
+        let mut block = tagged;
+        if view == View::Finalized {
+            ensure!(block.header.number >= self.confirmations, "checkpoint chain has insufficient confirmation depth");
+            for _ in 0..self.confirmations {
+                let parent = self
+                    .deadline(self.provider.get_block_by_hash(block.header.parent_hash))
+                    .await?
+                    .context("checkpoint confirmation ancestor is missing")?;
+                ensure!(
+                    parent.header.hash == block.header.parent_hash
+                        && parent.header.number.checked_add(1) == Some(block.header.number),
+                    "checkpoint confirmation ancestry is inconsistent"
+                );
+                block = parent;
+            }
+        }
         let at = BlockId::hash_canonical(block.header.hash);
         let vault = Address::from(self.domain.vault.0);
         let token = usdcCall::abi_decode_returns(&self.call(vault, usdcCall {}.abi_encode(), at).await?)?;
@@ -159,6 +165,7 @@ impl CheckpointChain for CheckpointRpc {
         let deposits =
             depositCountCall::abi_decode_returns(&self.call(vault, depositCountCall {}.abi_encode(), at).await?)?;
         Ok(VaultState {
+            height: block.header.number,
             signer: engine_core::types::AccountId(signer.into()),
             checkpoint,
             balance: usdc_to_fixed(balance).context("vault balance exceeds Fixed")?,
@@ -188,3 +195,6 @@ impl CheckpointChain for CheckpointRpc {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

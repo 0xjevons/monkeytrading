@@ -3,6 +3,7 @@
 //! acknowledged or published until its log entry is flushed. One task, no locks, and no queue
 //! beyond the channel: a fill costs about one engine step plus a buffered write.
 
+mod recovery;
 mod replay;
 pub use replay::{Replayed, replay, replay_path, replay_path_in_domain, replay_path_with_trust, replay_with_signer};
 mod checkpoints;
@@ -27,7 +28,6 @@ use crate::clock::Clock;
 use crate::log::{CommandEntry, LogEntry, LogWriter, Manifest, SegmentedLog};
 use crate::metrics::Metrics;
 use crate::sequencer::alerts::{DeficitAlert, alert_on};
-use crate::sequencer::replay::Replay;
 use crate::tee::EnclaveKey;
 use crate::trusted_time::{Sample, TimeGate};
 
@@ -79,6 +79,7 @@ pub struct SequencerConfig<'a> {
     pub operator: Operator,
     /// Where the sequencer records its metrics.
     pub metrics: Arc<Metrics>,
+    pub(crate) checkpoint_registry: Option<crate::checkpoints::Registry>,
     pub(crate) checkpoint_parent: crate::log::CheckpointParent,
     pub(crate) checkpoints: Option<mpsc::Sender<crate::checkpoints::Work>>,
 }
@@ -90,164 +91,6 @@ pub struct ReplayedLog {
 }
 
 impl Sequencer {
-    /// Rebuilds state by replaying the existing log, if there is one, and opens it for appending.
-    /// Signs, logs, and hands to custody any withdrawal the log ends before signing.
-    ///
-    /// The node checks the posted chain anchor before invoking recovery.
-    /// Error cases:
-    /// - the log cannot be read or replayed (see `read_log`)
-    /// - the log records a client auth or an operator other than the config's, or a genesis it did
-    ///   not apply in full
-    /// - the log cannot be opened for appending, or written
-    pub fn recover(
-        cfg: SequencerConfig<'_>,
-        key: Arc<EnclaveKey>,
-        stream: broadcast::Sender<Arc<StreamMsg>>,
-        withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
-    ) -> anyhow::Result<Self> {
-        let log = Self::read_log_with_trust(
-            cfg.log_dir,
-            Some(crate::log::CheckpointDomain { chain_id: cfg.chain_id, vault: cfg.vault }),
-            Some(AccountId(key.address())),
-            |_| {},
-        )?;
-        Self::recover_from(log, cfg, key, stream, withdrawals)
-    }
-
-    /// Reads the log in `dir` a segment at a time and replays it as it goes, handing each entry to
-    /// `observe` as well, so that a check of the log before recovery sees exactly what it replays.
-    /// Error cases:
-    /// - the log cannot be read, or fails its manifest check (see `SegmentedLog::open`) or replay
-    ///   (see `Replay`)
-    pub fn read_log(dir: &Path, mut observe: impl FnMut(&LogEntry)) -> anyhow::Result<ReplayedLog> {
-        Self::read_log_in_domain(dir, None, &mut observe)
-    }
-
-    /// Reads one log in a known custody deployment; signatures and the observer see that read.
-    /// Error cases:
-    /// - log reading or strict signature/root replay fails
-    pub fn read_log_in_domain(
-        dir: &Path,
-        domain: Option<crate::log::CheckpointDomain>,
-        mut observe: impl FnMut(&LogEntry),
-    ) -> anyhow::Result<ReplayedLog> {
-        Self::read_log_with_trust(dir, domain, None, &mut observe)
-    }
-
-    /// Reads one authenticated stream with an independently trusted withdrawal authority.
-    /// Error cases:
-    /// - reading, replay, or release authorization fails
-    pub fn read_log_with_trust(
-        dir: &Path,
-        domain: Option<crate::log::CheckpointDomain>,
-        signer: Option<AccountId>,
-        mut observe: impl FnMut(&LogEntry),
-    ) -> anyhow::Result<ReplayedLog> {
-        let mut replay = Replay::with_trust(domain, signer);
-        let log = SegmentedLog::open(dir, |entry| {
-            observe(&entry);
-            replay.apply(&entry)
-        })?;
-        Ok(ReplayedLog { log, replayed: replay.finish() })
-    }
-
-    /// Recovers the log `read_log` already authenticated.
-    /// Error cases:
-    /// - the log records a client auth or an operator other than the config's, or a genesis it did
-    ///   not apply in full (see `GenesisProgress::ensure_closed`)
-    /// - the log cannot be opened for appending, or written
-    pub fn recover_from(
-        log: ReplayedLog,
-        cfg: SequencerConfig<'_>,
-        key: Arc<EnclaveKey>,
-        stream: broadcast::Sender<Arc<StreamMsg>>,
-        withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
-    ) -> anyhow::Result<Self> {
-        let ReplayedLog { log, replayed } = log;
-        let Replayed {
-            engine,
-            commands,
-            checkpoints,
-            unsigned,
-            deferred,
-            unpaid,
-            genesis,
-            last_checkpoint_ts,
-            last_signed_checkpoint,
-            ..
-        } = replayed;
-        // A config naming another client auth or operator, and so another chain, vault, or admin key,
-        // is the wrong one for this log: refuse before anything is written or signed under it.
-        if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
-            bail!("the log records client auth {recorded:?}, but the config gives {:?}", cfg.client_auth);
-        }
-        if let Some(recorded) = engine.operator().filter(|recorded| **recorded != cfg.operator) {
-            bail!("the log records operator {recorded:?}, but the config gives {:?}", cfg.operator);
-        }
-        genesis.ensure_closed()?;
-        if !deferred.is_empty() && cfg.checkpoints.is_none() {
-            bail!("checkpoint-gated withdrawals require the checkpoint service");
-        }
-        let checkpoint_unsigned = cfg.checkpoints.is_some() && (!unsigned.is_empty() || !deferred.is_empty());
-        info!(commands, checkpoints, "recovered from log");
-        if let Some(ts) = last_checkpoint_ts {
-            cfg.metrics.last_checkpoint_seconds.set(ts as f64 / 1000.0);
-        }
-        let mut sequencer = Self {
-            next_seq: engine.last_seq().map_or(0, |s| s + 1),
-            last_ts: engine.now(),
-            last_checkpoint: engine.last_seq(),
-            engine,
-            log: log.into_writer(cfg.segment_commands.max(1), cfg.manifest)?,
-            key,
-            checkpoint_every: cfg.checkpoint_every.max(1),
-            chain_id: cfg.chain_id,
-            vault: cfg.vault,
-            stream,
-            withdrawals,
-            outbox: Vec::new(),
-            time: TimeGate::new(cfg.max_drift, cfg.clock.instant()),
-            clock: cfg.clock,
-            required: Vec::new(),
-            client_auth: cfg.client_auth,
-            deficit: DeficitAlert::default(),
-            operator: cfg.operator,
-            metrics: cfg.metrics,
-            gate: cfg.checkpoints.map(|sink| Gate::new(sink, cfg.checkpoint_parent)),
-            unpaid,
-        };
-        {
-            let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
-            sequencer.deficit.note(sequencer.engine.house_nav());
-        }
-        for (account, amount, nonce) in unsigned {
-            let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
-            warn!(%account, nonce, "the log ends before this approved withdrawal was signed");
-            if let Some(gate) = &mut sequencer.gate {
-                gate.pending.push((sequencer.engine.last_seq().expect("approval has a seq"), account, amount, nonce));
-            } else {
-                sequencer.sign_withdrawal(account, amount, nonce)?;
-            }
-        }
-        if let Some(gate) = &mut sequencer.gate {
-            gate.pending.extend(deferred);
-        }
-        if checkpoint_unsigned {
-            if sequencer
-                .gate
-                .as_ref()
-                .is_some_and(|gate| gate.parent.has_checkpoint && Some(gate.parent.seq) == sequencer.engine.last_seq())
-            {
-                let cp = last_signed_checkpoint.context("finalized recovery parent lacks its signed checkpoint")?;
-                sequencer.queue_checkpoint(cp)?;
-            } else {
-                sequencer.checkpoint()?;
-            }
-        }
-        sequencer.flush()?;
-        Ok(sequencer)
-    }
-
     /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch,
     /// of at most `MAX_BATCH` requests, is flushed before its replies, stream messages, and queries
     /// go out, and synced to storage first when it carries a sync request. A command trusted time

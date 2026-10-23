@@ -52,8 +52,10 @@ async fn rejected_anchor_and_signer_preserve_missing_corrupt_and_wal_history_byt
             let before = files(&root);
             let key = EnclaveKey::generate();
             let poster = Poster {
+                registry: None,
                 chain: Chain {
                     state: VaultState {
+                        height: 0,
                         signer: if signer_mismatch { AccountId([9; 20]) } else { AccountId(key.address()) },
                         checkpoint: Some((9, format!("0x{}", "ab".repeat(32)))),
                         balance: Fixed::ZERO,
@@ -66,7 +68,7 @@ async fn rejected_anchor_and_signer_preserve_missing_corrupt_and_wal_history_byt
                 pending_deposits_critical_after: Duration::from_secs(1),
             };
             let plan = HistoryPlan::open(&cfg.history).unwrap();
-            assert!(finish_preflight(plan, Some((&poster, None))).await.is_err());
+            assert!(finish_preflight(plan, Some((&poster, None)), None).await.is_err());
             assert_eq!(files(&root), before, "history kind {history_kind}, signer mismatch {signer_mismatch}");
             drop(conn);
         }
@@ -106,7 +108,7 @@ async fn replay_valid_truncated_log_cannot_discard_a_newer_valid_history_index()
     let before = files(&root);
     let key = EnclaveKey::test_key();
     let mut found = None;
-    let (_log, plan) = crate::node::read_log_and_history_observe(&cfg, Some(AccountId(key.address())), |entry| {
+    let (_log, plan) = crate::node::read_log_and_history_observe(&cfg, Some(AccountId(key.address())), None, |entry| {
         if let crate::log::LogEntry::Checkpoint(cp) = entry
             && cp.seq == anchor.seq
         {
@@ -115,8 +117,10 @@ async fn replay_valid_truncated_log_cannot_discard_a_newer_valid_history_index()
     })
     .unwrap();
     let poster = Poster {
+        registry: None,
         chain: Chain {
             state: VaultState {
+                height: 0,
                 signer: AccountId(key.address()),
                 checkpoint: Some((anchor.seq, anchor.root)),
                 balance: Fixed::from_int(100),
@@ -128,7 +132,7 @@ async fn replay_valid_truncated_log_cannot_discard_a_newer_valid_history_index()
         retry: Duration::from_millis(1),
         pending_deposits_critical_after: Duration::from_secs(1),
     };
-    assert!(finish_preflight(plan, Some((&poster, found.as_ref()))).await.is_err());
+    assert!(finish_preflight(plan, Some((&poster, found.as_ref())), None).await.is_err());
     assert_eq!(files(&root), before);
 }
 
@@ -143,4 +147,118 @@ fn files(root: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
         }
     }
     result
+}
+
+#[tokio::test]
+async fn wrong_recovery_deployment_preserves_history_wal_and_log_bytes() {
+    let root = scratch_dir("preflight-recovery-deployment");
+    let mut cfg = dev_config();
+    cfg.node.log_dir = root.join("log");
+    cfg.history.dir = root.join("history");
+    let node = crate::test_support::TestSequencer::start(&cfg.node.log_dir, 1);
+    node.stop().await;
+    std::fs::create_dir_all(&cfg.history.dir).unwrap();
+    let db = rusqlite::Connection::open(cfg.history.dir.join(crate::history::INDEX_FILE)).unwrap();
+    db.execute_batch(
+        "PRAGMA journal_mode=wal; CREATE TABLE diagnostic(value TEXT); INSERT INTO diagnostic VALUES('keep');",
+    )
+    .unwrap();
+    for wrong_operator in [false, true] {
+        let before = files(&root);
+        let (log, plan) = crate::node::read_log_and_history_observe(
+            &cfg,
+            Some(AccountId(EnclaveKey::test_key().address())),
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let mut seq_cfg = crate::test_support::sequencer_config(
+            &cfg.node.log_dir,
+            tokio::sync::watch::channel(crate::log::Manifest::default()).0,
+        );
+        if wrong_operator {
+            seq_cfg.operator.chain_id += 1;
+        } else {
+            seq_cfg.client_auth = engine_core::auth::ClientAuth::Eip712 { chain_id: 1, vault: AccountId([7; 20]) };
+        }
+        let error = finish_preflight::<Chain>(plan, None, Some((&log, &seq_cfg))).await.err().unwrap();
+        assert!(error.to_string().contains(if wrong_operator { "operator" } else { "client auth" }));
+        assert_eq!(files(&root), before);
+    }
+    drop(db);
+}
+
+#[tokio::test]
+async fn incomplete_genesis_and_missing_checkpoint_service_preserve_history_bytes() {
+    use crate::log::{LogEntry, Manifest};
+    use crate::sequencer::{Sequencer, SequencerConfig};
+    use crate::test_support::{sequencer_config, trusted_now};
+    use tokio::sync::{broadcast, mpsc, watch};
+
+    for incomplete_genesis in [false, true] {
+        let root = scratch_dir(&format!("preflight-pure-genesis-{incomplete_genesis}"));
+        let mut cfg = dev_config();
+        cfg.node.log_dir = root.join("log");
+        cfg.history.dir = root.join("history");
+        let (work, mut queued) = mpsc::channel(64);
+        let seq_cfg = SequencerConfig {
+            checkpoints: Some(work),
+            checkpoint_every: 1,
+            ..sequencer_config(&cfg.node.log_dir, watch::channel(Manifest::default()).0)
+        };
+        let mut seq = Sequencer::recover(
+            seq_cfg,
+            std::sync::Arc::new(EnclaveKey::test_key()),
+            broadcast::channel(128).0,
+            mpsc::unbounded_channel().0,
+        )
+        .unwrap();
+        seq.activate_protocol().unwrap();
+        seq.genesis(&cfg.genesis).unwrap();
+        seq.trust(trusted_now()).unwrap();
+        while queued.try_recv().is_ok() {}
+        // Drive approvals through the public sequencer request path.
+        let (tx, rx) = mpsc::channel(64);
+        let task = tokio::spawn(seq.run(rx));
+        tx.send(crate::sequencer::Request::CheckpointStatus { posted: None, healthy: true }).await.unwrap();
+        for cmd in [crate::test_support::deposit(100, "preflight-pure"), crate::test_support::withdraw(40)] {
+            let (reply, done) = tokio::sync::oneshot::channel();
+            tx.send(crate::sequencer::Request::Submit { cmd, reply: Some(reply) }).await.unwrap();
+            done.await.unwrap();
+        }
+        drop(tx);
+        task.await.unwrap().unwrap();
+        if incomplete_genesis {
+            let mut entries = crate::test_support::log_entries(&cfg.node.log_dir);
+            let first = entries.iter().position(|entry| matches!(entry, LogEntry::Command(command) if matches!(command.sequenced.cmd, engine_core::command::Command::Admin(engine_core::command::AdminCommand::SetParams(_))))).unwrap();
+            entries.truncate(first + 1);
+            std::fs::remove_dir_all(&cfg.node.log_dir).unwrap();
+            std::fs::create_dir_all(&cfg.node.log_dir).unwrap();
+            let bytes =
+                entries.iter().map(|entry| format!("{}\n", serde_json::to_string(entry).unwrap())).collect::<String>();
+            std::fs::write(cfg.node.log_dir.join("00000000000000000000.jsonl"), bytes).unwrap();
+        }
+        std::fs::create_dir_all(&cfg.history.dir).unwrap();
+        let db = rusqlite::Connection::open(cfg.history.dir.join(crate::history::INDEX_FILE)).unwrap();
+        db.execute_batch(
+            "PRAGMA journal_mode=wal; CREATE TABLE diagnostic(value TEXT); INSERT INTO diagnostic VALUES('preserve');",
+        )
+        .unwrap();
+        let before = files(&root);
+        let (log, plan) = crate::node::read_log_and_history_observe(
+            &cfg,
+            Some(AccountId(EnclaveKey::test_key().address())),
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let seq_cfg = sequencer_config(&cfg.node.log_dir, watch::channel(Manifest::default()).0);
+        let error = finish_preflight::<Chain>(plan, None, Some((&log, &seq_cfg))).await.err().unwrap();
+        assert!(
+            error.to_string().contains(if incomplete_genesis { "genesis" } else { "checkpoint service" }),
+            "{error:#}"
+        );
+        assert_eq!(files(&root), before);
+        drop(db);
+    }
 }

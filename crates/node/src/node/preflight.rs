@@ -12,7 +12,11 @@ use crate::log::Checkpoint;
 pub(super) async fn finish_preflight<R: CheckpointChain>(
     plan: HistoryPlan,
     checkpoint: Option<(&Poster<R>, Option<&Checkpoint>)>,
+    recovery: Option<(&crate::sequencer::ReplayedLog, &crate::sequencer::SequencerConfig<'_>)>,
 ) -> anyhow::Result<History> {
+    if let Some((log, cfg)) = recovery {
+        log.validate_recovery(cfg)?;
+    }
     if let Some((poster, anchor)) = checkpoint {
         poster
             .startup(anchor)

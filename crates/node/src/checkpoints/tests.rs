@@ -201,6 +201,7 @@ async fn a_provisional_then_orphaned_approval_never_releases_a_signature() {
     let work = work.unwrap();
     let parent = work.checkpoint.parent.unwrap();
     let state = VaultState {
+        height: 0,
         signer: AccountId(key.address()),
         checkpoint: Some((parent.seq, parent.root.to_string())),
         balance: work.liabilities,
@@ -214,6 +215,7 @@ async fn a_provisional_then_orphaned_approval_never_releases_a_signature() {
         posts: Arc::new(Mutex::new(0)),
     };
     let poster = Poster {
+        registry: None,
         chain,
         domain: work.checkpoint.domain.unwrap(),
         signer: AccountId(key.address()),
@@ -272,6 +274,7 @@ fn poster() -> (Poster<Chain>, Work) {
     let work = Work { checkpoint: checkpoint.clone(), liabilities: Fixed::from_int(100), deposits: 1 };
     let chain = Chain {
         state: Arc::new(Mutex::new(VaultState {
+            height: 0,
             signer: AccountId(key.address()),
             checkpoint: None,
             balance: work.liabilities,
@@ -283,6 +286,7 @@ fn poster() -> (Poster<Chain>, Work) {
     };
     (
         Poster {
+            registry: None,
             chain,
             domain: checkpoint.domain.unwrap(),
             signer: AccountId(key.address()),
@@ -291,4 +295,94 @@ fn poster() -> (Poster<Chain>, Work) {
         },
         work,
     )
+}
+
+#[tokio::test]
+async fn public_relayer_advanced_prefix_reconciles_against_its_own_accounting() {
+    let (poster, first) = poster();
+    let key = EnclaveKey::test_key();
+    // The fixture poster uses another key; make a self-consistent signed two-checkpoint chain.
+    let mut first = first;
+    first.checkpoint.signer = key.address_hex();
+    let domain = first.checkpoint.domain.unwrap();
+    let root = first.checkpoint.root.parse::<engine_core::eip712::B256>().unwrap();
+    first.checkpoint.signature = key.sign_checkpoint_v2(
+        domain.chain_id,
+        &domain.vault.0,
+        first.checkpoint.seq,
+        &root.0,
+        first.checkpoint.parent.unwrap(),
+    );
+    let mut second = first.clone();
+    second.checkpoint.seq += 1;
+    second.checkpoint.parent =
+        Some(crate::log::CheckpointParent { has_checkpoint: true, seq: first.checkpoint.seq, root });
+    second.liabilities += Fixed::from_int(10);
+    second.deposits += 1;
+    second.checkpoint.signature = key.sign_checkpoint_v2(
+        domain.chain_id,
+        &domain.vault.0,
+        second.checkpoint.seq,
+        &root.0,
+        second.checkpoint.parent.unwrap(),
+    );
+    let mut poster = poster;
+    poster.signer = AccountId(key.address());
+    {
+        let mut state = poster.chain.state.lock().unwrap();
+        state.signer = poster.signer;
+        state.checkpoint = Some((second.checkpoint.seq, second.checkpoint.root.clone()));
+        state.balance = second.liabilities;
+        state.deposits = second.deposits;
+    }
+    assert_eq!(poster.reconcile_known(&first, &[&first, &second]).await.unwrap(), (Some(second.checkpoint.seq), true));
+    assert_eq!(*poster.chain.posts.lock().unwrap(), 0);
+    // A backend which still sees the predecessor is retried, without treating it as a fork.
+    poster.chain.state.lock().unwrap().checkpoint = None;
+    let error = poster.reconcile(&second).await.unwrap_err();
+    assert!(!error.is::<super::Conflict>());
+    assert_eq!(*poster.chain.posts.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn publicly_relayed_work_beyond_the_full_worker_queue_is_recognized() {
+    let (mut poster, first) = poster();
+    let key = EnclaveKey::test_key();
+    let domain = first.checkpoint.domain.unwrap();
+    let root = first.checkpoint.root.parse::<engine_core::eip712::B256>().unwrap();
+    poster.signer = AccountId(key.address());
+    let registry: super::Registry = Default::default();
+    poster.registry = Some(registry.clone());
+    let mut chain = Vec::new();
+    let mut parent = first.checkpoint.parent.unwrap();
+    for offset in 0..65 {
+        let mut work = first.clone();
+        work.checkpoint.seq += offset;
+        work.checkpoint.signer = key.address_hex();
+        work.checkpoint.parent = Some(parent);
+        work.checkpoint.signature =
+            key.sign_checkpoint_v2(domain.chain_id, &domain.vault.0, work.checkpoint.seq, &root.0, parent);
+        work.liabilities += Fixed::from_int(offset as i64);
+        parent = crate::log::CheckpointParent { has_checkpoint: true, seq: work.checkpoint.seq, root };
+        registry.lock().unwrap().insert(work.checkpoint.seq, work.clone());
+        chain.push(work);
+    }
+    let advanced = chain.pop().unwrap();
+    {
+        let mut state = poster.chain.state.lock().unwrap();
+        state.signer = poster.signer;
+        state.checkpoint = Some((advanced.checkpoint.seq, advanced.checkpoint.root.clone()));
+        state.balance = advanced.liabilities;
+        state.deposits = advanced.deposits;
+    }
+    let (sink, input) = mpsc::channel(64);
+    sink.send(advanced.clone()).await.unwrap();
+    let (tx, mut status) = mpsc::channel(8);
+    let task = tokio::spawn(poster.run_with_recovery(input, tx, chain));
+    assert!(
+        matches!(status.recv().await, Some(Request::CheckpointStatus {posted: Some(seq), healthy: true}) if seq == advanced.checkpoint.seq)
+    );
+    assert_eq!(registry.lock().unwrap().len(), 1, "finalized covered prefix retires from the registry");
+    drop(sink);
+    task.await.unwrap().unwrap();
 }

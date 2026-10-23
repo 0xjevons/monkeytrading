@@ -148,7 +148,7 @@ impl Node {
     /// the dev genesis, and serves the API over it, checkpointing every `CHECKPOINT_EVERY` commands.
     async fn start(name: &str) -> Self {
         let dir = scratch_dir(name);
-        let key = Arc::new(EnclaveKey::generate());
+        let key = Arc::new(EnclaveKey::test_key());
         let (stream, _) = broadcast::channel(16);
         let (withdrawals_tx, _) = mpsc::unbounded_channel();
         let (manifest_tx, manifest) = watch::channel(Manifest::default());

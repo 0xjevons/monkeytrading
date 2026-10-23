@@ -8,7 +8,7 @@ fn tick(seq: u64) -> LogEntry {
 }
 
 fn checkpoint(seq: u64, root: String) -> LogEntry {
-    let key = EnclaveKey::generate();
+    let key = EnclaveKey::test_key();
     let domain = crate::log::CheckpointDomain { chain_id: 31337, vault: AccountId([0; 20]) };
     let signature = key.sign_checkpoint(
         domain.chain_id,
