@@ -139,23 +139,29 @@ fn close_out_passes_over_a_market_whose_fx_market_has_no_price() {
 
 #[test]
 fn an_fx_price_sets_every_mark_it_moves_before_any_market_acts_on_one() {
-    // Two euro markets, one losing and one gaining during an EUR-USD outage: valued together on
-    // the recovery, the account is margined, though valuing the loser first would close it out.
+    // Two euro markets, one losing and one gaining during an EUR-USD outage, with a resting buy in
+    // the loser. Germany 40 is dealt before France 40 (market id order); its fill's margin check
+    // reads France 40's stored mark, so the order is filled only if France 40 is re-marked first:
+    // at the stale mark the account shows 1,000 USD against a 1,300 requirement and the order is
+    // cancelled instead.
     let (mut h, a) = (Harness::fx(), acct(1));
     let fr40 = MarketSpec { id: FR40, symbol: "FR40".into(), ..de40(500) };
     h.admin(AdminCommand::UpsertMarket(fr40));
-    h.deposit(a, "1500");
+    h.deposit(a, "1000");
     h.price(EURUSD, "1");
     h.price(DE40, "20000");
     h.price(FR40, "8000");
-    h.market_order(a, DE40, Side::Buy, "1", "20000");
     h.market_order(a, FR40, Side::Buy, "1", "8000");
+    // A buy limit below Germany 40's last mark rests until the outage drops the market through it.
+    h.order(a, DE40, Side::Buy, "1", OrderKind::Limit { price: f("19000") });
     h.advance(1_500);
-    h.price(DE40, "19000");
+    h.price(DE40, "18000");
     h.price(FR40, "9000");
     let ev = h.price(EURUSD, "1");
-    assert!(!ev.iter().any(|e| matches!(e, Event::CloseOut { .. })), "{ev:?}");
-    assert_eq!((h.engine.markets()[&DE40].mark, h.engine.markets()[&FR40].mark), (Some(f("19000")), Some(f("9000"))));
+    let fill = only_fill(&ev);
+    assert!(fill.market == DE40 && fill.side == Side::Buy && fill.qty == f("1") && !fill.liquidation, "{fill:?}");
+    assert!(!ev.iter().any(|e| matches!(e, Event::CloseOut { .. } | Event::OrderCancelled { .. })), "{ev:?}");
+    assert_eq!((h.engine.markets()[&DE40].mark, h.engine.markets()[&FR40].mark), (Some(f("18000")), Some(f("9000"))));
 
     // EUR-USD itself and Germany 40: EUR-USD returns 2% lower after Germany 40 rallied 5% in the
     // outage. With Germany 40 at its fresh price the account is margined; at its old one it is not.
