@@ -45,7 +45,7 @@ fn authenticates_payload_and_deployment_before_loading_state() {
 }
 
 #[test]
-fn retains_newest_caches_and_ignores_staging_files() {
+fn retains_newest_caches_and_reclaims_staging_files() {
     let (cfg, key, mut snapshot) = fixture("snapshot-retain");
     for index in 1..5 {
         snapshot.offset.index = index;
@@ -53,6 +53,7 @@ fn retains_newest_caches_and_ignores_staging_files() {
     }
     fs::write(cfg.dir.join("99999999999999999999-0000000000.json.tmp"), b"torn").unwrap();
     let paths = candidates(&cfg).unwrap();
+    assert!(!cfg.dir.join("99999999999999999999-0000000000.json.tmp").exists());
     assert_eq!(paths.len(), 2);
     assert!(paths[0].ends_with("00000000000000000000-0000000004.json"));
     fs::write(&paths[0], b"{").unwrap();
@@ -60,6 +61,44 @@ fn retains_newest_caches_and_ignores_staging_files() {
     let small = SnapshotSection { max_bytes: NonZeroUsize::new(1).unwrap(), ..cfg };
     assert!(write(&small, &snapshot, &key).is_err());
     assert!(read(&small, &paths[1], 31337, snapshot.vault).err().unwrap().to_string().contains("max_bytes"));
+}
+
+#[test]
+fn failed_publication_removes_staging_and_restart_reclaims_partial_files() {
+    let (cfg, key, snapshot) = fixture("snapshot-failed-publication");
+    fs::create_dir_all(&cfg.dir).unwrap();
+    let target = cfg.dir.join(name(snapshot.offset));
+    fs::create_dir(&target).unwrap();
+    assert!(write(&cfg, &snapshot, &key).err().unwrap().to_string().contains("publishing snapshot"));
+    assert!(!cfg.dir.join(format!("{}.tmp", name(snapshot.offset))).exists());
+    fs::remove_dir(target).unwrap();
+    for seq in 0..8 {
+        fs::write(cfg.dir.join(format!("{seq:020}-0000000001.json.tmp")), b"partial allocation").unwrap();
+    }
+    let unrelated = cfg.dir.join("operator-notes.json.tmp");
+    fs::write(&unrelated, b"preserve").unwrap();
+    assert!(candidates(&cfg).unwrap().is_empty());
+    assert_eq!(fs::read_dir(&cfg.dir).unwrap().count(), 1);
+    assert_eq!(fs::read(unrelated).unwrap(), b"preserve");
+    write(&cfg, &snapshot, &key).unwrap();
+    assert_eq!(candidates(&cfg).unwrap().len(), 1);
+}
+
+#[test]
+fn partial_write_and_sync_failures_release_staging_allocation() {
+    let (cfg, _, snapshot) = fixture("snapshot-failed-io");
+    fs::create_dir_all(&cfg.dir).unwrap();
+    let staged = cfg.dir.join(format!("{}.tmp", name(snapshot.offset)));
+    let target = cfg.dir.join(name(snapshot.offset));
+    for written in [0, 16, 4096] {
+        let result = publish(&staged, &target, |file| {
+            file.write_all(&vec![1; written])?;
+            Err(std::io::Error::other("injected write/sync failure").into())
+        });
+        assert!(result.unwrap_err().to_string().contains("injected write/sync failure"));
+        assert!(!staged.exists(), "partial allocation of {written} bytes must be released");
+        assert!(!target.exists(), "failed staging must never publish");
+    }
 }
 
 fn fixture(label: &str) -> (SnapshotSection, EnclaveKey, Snapshot) {

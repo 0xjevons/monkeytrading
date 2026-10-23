@@ -1,5 +1,6 @@
 use super::*;
 use std::fs;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -122,6 +123,45 @@ fn missing_or_changed_checkpoint_cannot_authorize_skipping_replay() {
         .err()
         .expect("a cache cannot hide a changed authoritative checkpoint");
     assert!(format!("{error:#}").contains("state root mismatch"), "{error:#}");
+}
+
+#[test]
+fn every_physical_suffix_command_is_validated_after_the_checkpoint() {
+    for reversed in [false, true] {
+        let (dir, cfg, mut seq) = node("snapshot-physical-suffix", 1000);
+        seq.stamp(seq.last_ts, Command::Tick).unwrap();
+        seq.checkpoint().unwrap();
+        seq.flush().unwrap();
+        drop(seq);
+        let paths = snapshot::candidates(&cfg).unwrap();
+        let (snapshot, _) = snapshot::read(&cfg, &paths[0], 31337, AccountId([0; 20])).unwrap();
+        let path = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "jsonl") && path.file_name().unwrap() != "manifest.jsonl"
+            })
+            .max()
+            .unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        let command = contents
+            .lines()
+            .filter_map(|line| match serde_json::from_str::<LogEntry>(line).unwrap() {
+                LogEntry::Command(command) => Some(command),
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        let mut forged = command;
+        forged.sequenced.seq = snapshot.offset.seq - u64::from(reversed);
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&LogEntry::Command(forged)).unwrap()).unwrap();
+        drop(file);
+        assert!(
+            Sequencer::read_log_with_snapshots(&dir, Some(&cfg), 31337, AccountId([0; 20])).is_err(),
+            "a duplicate or reversed command after the authenticated boundary must fail recovery"
+        );
+    }
 }
 
 /// Isolated dev scenario: command count grows, the state stays fixed, history grows, and startup

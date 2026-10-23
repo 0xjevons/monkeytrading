@@ -49,6 +49,7 @@ struct Envelope {
 /// Error cases:
 /// - encoding, writing, syncing, renaming, or pruning fails, or the size limit is exceeded
 pub(crate) fn write(cfg: &SnapshotSection, snapshot: &Snapshot, key: &EnclaveKey) -> anyhow::Result<()> {
+    candidates(cfg)?;
     let payload = serde_json::to_string(snapshot).context("encoding snapshot")?;
     let signature = key.sign_digest(digest(snapshot.chain_id, snapshot.vault, payload.as_bytes()));
     let bytes = serde_json::to_vec(&Envelope { payload, signature }).context("encoding snapshot envelope")?;
@@ -56,10 +57,10 @@ pub(crate) fn write(cfg: &SnapshotSection, snapshot: &Snapshot, key: &EnclaveKey
     fs::create_dir_all(&cfg.dir).context("creating snapshot directory")?;
     let name = name(snapshot.offset);
     let staged = cfg.dir.join(format!("{name}.tmp"));
-    let mut file = File::create(&staged).context("creating staged snapshot")?;
-    file.write_all(&bytes).context("writing snapshot")?;
-    file.sync_all().context("syncing snapshot")?;
-    fs::rename(&staged, cfg.dir.join(name)).context("publishing snapshot")?;
+    publish(&staged, &cfg.dir.join(name), |file| {
+        file.write_all(&bytes).context("writing snapshot")?;
+        file.sync_all().context("syncing snapshot")
+    })?;
     let dir = File::open(&cfg.dir).context("opening snapshot directory")?;
     dir.sync_all().context("syncing snapshot directory")?;
     for path in candidates(cfg)?.into_iter().skip(cfg.retain.get()) {
@@ -70,7 +71,30 @@ pub(crate) fn write(cfg: &SnapshotSection, snapshot: &Snapshot, key: &EnclaveKey
     Ok(())
 }
 
-/// Newest cache files first; staging files are deliberately absent.
+/// Publishes one staging file, releasing its allocation on every failed write, sync, or rename.
+/// Error cases:
+/// - staging creation, the supplied write/sync operation, publication, or cleanup fails
+fn publish(
+    staged: &Path,
+    target: &Path,
+    write_synced: impl FnOnce(&mut File) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let published = (|| {
+        let mut file = File::create(staged).context("creating staged snapshot")?;
+        write_synced(&mut file)?;
+        fs::rename(staged, target).context("publishing snapshot")
+    })();
+    if published.is_err() {
+        match fs::remove_file(staged) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("cleaning failed snapshot staging file"),
+        }
+    }
+    published
+}
+
+/// Reclaims recognized interrupted staging files and lists newest cache files first.
 /// Error cases:
 /// - an existing directory cannot be listed
 pub(crate) fn candidates(cfg: &SnapshotSection) -> anyhow::Result<Vec<PathBuf>> {
@@ -83,16 +107,24 @@ pub(crate) fn candidates(cfg: &SnapshotSection) -> anyhow::Result<Vec<PathBuf>> 
     for entry in listing {
         let entry = entry.context("listing snapshot")?;
         let file = entry.file_name();
-        if file.to_str().is_some_and(|s| {
-            s.strip_suffix(".json").and_then(|s| s.split_once('-')).is_some_and(|(seq, index)| {
-                seq.len() == 20 && index.len() == 10 && seq.bytes().chain(index.bytes()).all(|b| b.is_ascii_digit())
-            })
-        }) {
+        let Some(file) = file.to_str() else {
+            continue;
+        };
+        if file.strip_suffix(".tmp").is_some_and(is_snapshot_name) {
+            fs::remove_file(entry.path()).context("cleaning interrupted snapshot staging file")?;
+        } else if is_snapshot_name(file) {
             paths.push(entry.path());
         }
     }
     paths.sort_unstable_by(|a, b| b.cmp(a));
     Ok(paths)
+}
+
+/// Recognizes only the sequence/index filenames this module owns.
+fn is_snapshot_name(file: &str) -> bool {
+    file.strip_suffix(".json").and_then(|s| s.split_once('-')).is_some_and(|(seq, index)| {
+        seq.len() == 20 && index.len() == 10 && seq.bytes().chain(index.bytes()).all(|b| b.is_ascii_digit())
+    })
 }
 
 /// Authenticates the whole payload before decoding engine state, then recomputes its root.

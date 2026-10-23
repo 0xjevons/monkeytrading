@@ -98,17 +98,6 @@ impl Writer {
     /// - SQLite's integrity check finds the file damaged
     /// - the command the index holds does not parse
     pub(super) fn open(path: &Path, retention_ms: Millis) -> anyhow::Result<(Self, Option<Progress>)> {
-        Self::open_checked(path, retention_ms, false)
-    }
-
-    /// Opens the store with either a full integrity scan or the snapshot path's cursor check.
-    /// Error cases:
-    /// - as `open`
-    pub(super) fn open_checked(
-        path: &Path,
-        retention_ms: Millis,
-        cursor_only: bool,
-    ) -> anyhow::Result<(Self, Option<Progress>)> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
@@ -131,8 +120,8 @@ impl Writer {
             other => bail!("{} holds history schema {other}, not {SCHEMA_VERSION}", path.display()),
         }
         check_schema(&tx, &schema, path)?;
-        let check = if cursor_only { "PRAGMA integrity_check(progress)" } else { "PRAGMA integrity_check(1)" };
-        let integrity: String = tx.query_row(check, [], |row| row.get(0)).context("checking the history index")?;
+        let integrity: String =
+            tx.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0)).context("checking the history index")?;
         ensure!(integrity == "ok", "{} is damaged: {integrity}", path.display());
         let row: Option<(String, Millis)> = tx
             .query_row("SELECT command, retention_ms FROM progress WHERE id = 0", [], |row| {

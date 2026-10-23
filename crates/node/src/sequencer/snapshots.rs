@@ -32,6 +32,9 @@ impl Sequencer {
                             let mut replay = Replay::from_snapshot(engine, snapshot);
                             let (mut offset, mut found) = (None, false);
                             let log = SegmentedLog::open_after(dir, Some(at), |entry| {
+                                if found {
+                                    return replay.apply(&entry);
+                                }
                                 let next = offset_of(offset, &entry)?;
                                 offset = Some(next);
                                 if next == at {
@@ -42,7 +45,6 @@ impl Sequencer {
                                     found = true;
                                 } else if next > at {
                                     ensure!(found, "snapshot checkpoint missing from log");
-                                    replay.apply(&entry)?;
                                 }
                                 Ok(())
                             })?;

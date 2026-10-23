@@ -330,15 +330,17 @@ At each checkpoint the sequencer syncs the log, signs the complete snapshot with
 deployment-bound domain, syncs a staging file, renames it, syncs the directory, and prunes older
 caches. Recovery tries caches newest first, checks their signatures against the configured pins,
 recomputes the state root, checks the checkpoint signature, finds that exact checkpoint in its log
-segment, then replays the suffix. Interrupted staging files are ignored. Corrupt, truncated,
-oversized, untrusted, or mismatched caches emit `snapshot_rejected` Warning alerts and fall back
+segment, then replays every physical entry in the suffix. Recognized interrupted staging files are
+reclaimed during startup and before writes. Failed publication removes its staging file. Corrupt,
+truncated, oversized, untrusted, or mismatched caches emit `snapshot_rejected` Warning alerts and fall back
 to another cache or genesis. A failed cache write emits `snapshot_write_failed` and keeps the
 authoritative log usable. Failed log syncs remain fatal.
 
 The recovery work is snapshot state reconstruction plus the checkpoint segment and command suffix;
-manifest loading and file listing still grow with segment count. Snapshot size grows with engine
-state. Signatures establish integrity, not freshness: rollback prevention still needs the on-chain
-checkpoint check in #24. The skipped historical prefix is checked by full `engine replay` or when
+manifest loading and file listing still grow with segment count. History readiness also requires a
+full SQLite event/index integrity scan, which grows with retained history. Snapshot size grows with
+engine state. Signatures establish integrity, not freshness: rollback prevention still needs the
+on-chain checkpoint check in #24. The skipped historical prefix is checked by full `engine replay` or when
 history/backfill reads its segments. Snapshots do not permit deleting the public log.
 
 Run the isolated restart scenario with
@@ -399,13 +401,12 @@ an index that fails that check is discarded with a Warning (`history_index_disca
 from the log's segments, and the route answers 503 until the rebuild has taken the log's tip. The
 log ends before that command after a power loss, since neither the log nor the index syncs every
 write, or after the log was rolled back or truncated; it holds another command there after it was
-replaced. An index is rebuilt the same way when opening it or checking its cursor table detects damage,
-when the file holds another schema, or when `history.retention` has changed since its events were
-pruned. Snapshot mode checks the small cursor table's integrity and schema without scanning all
-retained events; ordinary recovery keeps the full SQLite integrity scan. Event pages and index
-writes keep their defensive schema and row checks. A damaged event page in snapshot mode can
-therefore fail when accessed. Missing or unusable history needs a full rebuild before it
-serves, even when engine recovery used a snapshot. The node refuses to start
+replaced. An index is rebuilt the same way when opening it detects damage to its tables or secondary
+indexes, when the file holds another schema, or when `history.retention` has changed since its events were
+pruned. Every recovery mode performs the full SQLite integrity scan before readiness, including
+checking event/secondary-index consistency. This scan grows with retained history. Event pages and
+index writes keep their defensive schema and row checks. Missing or unusable history needs a full
+rebuild before it serves, even when engine recovery used a snapshot. The node refuses to start
 (`history_recovery_failed`) when it cannot open a fresh index or verify its cursor's log segment.
 The check compares that one command, so a log forged to end with it passes; a host able to
 forge the log can rewrite the index as well. SQLite opens the file in defensive mode, with triggers

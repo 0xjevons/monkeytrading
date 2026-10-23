@@ -189,25 +189,10 @@ impl HistoryCheck {
     /// - the retention is invalid
     /// - no index was on disk and a new one cannot be opened (see `Writer::open`)
     pub fn open(cfg: &HistorySection) -> anyhow::Result<Self> {
-        Self::open_checked(cfg, false)
-    }
-
-    /// Opens for snapshot mode without scanning retained event pages. Reads retain their defensive
-    /// checks; damage outside the cursor table can surface on access.
-    /// Error cases:
-    /// - as `open`, for the schema and cursor table
-    pub(crate) fn open_cursor(cfg: &HistorySection) -> anyhow::Result<Self> {
-        Self::open_checked(cfg, true)
-    }
-
-    /// Opens with the integrity scope appropriate to full or snapshot recovery.
-    /// Error cases:
-    /// - as `open`
-    fn open_checked(cfg: &HistorySection, cursor_only: bool) -> anyhow::Result<Self> {
         let path = cfg.dir.join(INDEX_FILE);
         let retention_ms = cfg.retention_ms().context("history.retention")?;
         let found_file = path.exists();
-        let opened = Writer::open_checked(&path, retention_ms, cursor_only).and_then(|(writer, progress)| match progress {
+        let opened = Writer::open(&path, retention_ms).and_then(|(writer, progress)| match progress {
             Some(progress) if progress.retention_ms != retention_ms => Err(anyhow!(
                 "its events were pruned under a retention of {} ms, not the {retention_ms} ms history.retention gives",
                 progress.retention_ms
@@ -220,6 +205,13 @@ impl HistoryCheck {
             opened => opened,
         };
         Ok(Self { dir: cfg.dir.clone(), retention_ms, opened, found: None })
+    }
+
+    /// Checks the full event/index integrity before snapshot recovery checks the cursor segment.
+    /// Error cases:
+    /// - as `open`
+    pub(crate) fn open_cursor(cfg: &HistorySection) -> anyhow::Result<Self> {
+        Self::open(cfg)
     }
 
     /// Notes the next entry of the log recovery reads.
