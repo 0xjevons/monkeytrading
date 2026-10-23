@@ -8,6 +8,7 @@ mod client;
 pub use client::*;
 pub mod reference;
 pub mod stress;
+mod versions;
 
 use std::collections::BTreeMap;
 
@@ -60,135 +61,6 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// Genesis: parameters, BTC and ETH (24/7, 10% margin), AAPL (US hours, 20% margin), and house
-    /// capital, at Tue 20 Oct 2026 10:00 New York.
-    pub fn new() -> Self {
-        let mut h = Harness::empty();
-        h.genesis();
-        h
-    }
-
-    /// `new`'s genesis under `V3`, after recording `auth`.
-    pub fn v3(auth: ClientAuth) -> Self {
-        let mut h = Harness::empty();
-        h.admin(AdminCommand::SetClientAuth(auth));
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V3 });
-        h.genesis();
-        h
-    }
-
-    /// `v3`, then `V4`, which allows dated schedule exceptions and zero house capital moves.
-    pub fn v4(auth: ClientAuth) -> Self {
-        let mut h = Harness::v3(auth);
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V4 });
-        h
-    }
-
-    /// `v4` taking unsigned requests, then `V5`, which rounds position accounting in the house's
-    /// favour.
-    pub fn v5() -> Self {
-        let mut h = Harness::v4(ClientAuth::Unsigned);
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V5 });
-        h
-    }
-
-    /// `v5`, then `V6`, which floors the house exposure caps and checks close-outs after financing
-    /// and parameter or listing changes.
-    pub fn v6() -> Self {
-        let mut h = Harness::v5();
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V6 });
-        h
-    }
-
-    /// `version`, with unsigned requests, and a house that starts with no capital, so house NAV is
-    /// zero until traders win or lose.
-    pub fn zero_house(version: ProtocolVersion) -> Self {
-        let mut h = Harness::empty();
-        h.admin(AdminCommand::SetClientAuth(ClientAuth::Unsigned));
-        h.admin(AdminCommand::ActivateProtocol { version });
-        h.house_capital = Fixed::ZERO;
-        h.genesis();
-        h
-    }
-
-    /// `new`'s genesis under `V8`, after recording `auth` and the harness operator.
-    pub fn v8(auth: ClientAuth) -> Self {
-        let mut h = Harness::empty();
-        h.admin(AdminCommand::SetClientAuth(auth));
-        h.admin(AdminCommand::SetOperator(operator()));
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V8 });
-        h.genesis();
-        h
-    }
-
-    /// `v8` taking unsigned requests, then `V9`, whose state root is the state tree's.
-    pub fn v9() -> Self {
-        let mut h = Harness::v8(ClientAuth::Unsigned);
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V9 });
-        h
-    }
-
-    /// `v9`, then `V10`, which rounds spreads and margin in the house's favour.
-    pub fn v10() -> Self {
-        let mut h = Harness::v9();
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V10 });
-        h
-    }
-
-    /// `v10`, then `V11`, which averages markouts by notional, to nine decimals of a bp, against the
-    /// index when they are scored.
-    pub fn v11() -> Self {
-        let mut h = Harness::v10();
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V11 });
-        h
-    }
-
-    /// `v11`, then `V12`, which brings every market to the sequenced time before each command and
-    /// counts a venue quote stamped ahead at once.
-    pub fn v12() -> Self {
-        let mut h = Harness::v11();
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V12 });
-        h
-    }
-
-    /// `v12`, then `V13`, which re-evaluates stress before every fill and after every command, and on
-    /// activation turns the harness parameters' divergence trigger into a share of the market bound.
-    pub fn v13() -> Self {
-        let mut h = Harness::v12();
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V13 });
-        h
-    }
-
-    /// `v13`, then `V14`, which finances only markets whose benchmark has a rate and caps each
-    /// account's resting orders.
-    pub fn v14() -> Self {
-        let mut h = Harness::v13();
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V14 });
-        h
-    }
-
-    /// `v14`, then `V15`, which lets an order that can only reduce the account's position in its
-    /// market skip the minimum-notional check at placement.
-    pub fn v15() -> Self {
-        let mut h = Harness::v14();
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V15 });
-        h
-    }
-
-    /// `v15`, then `V16`, which clamps each account's toxicity history to a lowered memory.
-    pub fn v16() -> Self {
-        let mut h = Harness::v15();
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V16 });
-        h
-    }
-
-    /// `v16`, then `V17`, which keeps a market's move window across a halt.
-    pub fn v17() -> Self {
-        let mut h = Harness::v16();
-        h.admin(AdminCommand::ActivateProtocol { version: ProtocolVersion::V17 });
-        h
-    }
-
     /// No commands yet, at the harness start time.
     fn empty() -> Self {
         Harness {

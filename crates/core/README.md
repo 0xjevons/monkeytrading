@@ -119,7 +119,8 @@ this crate and reproduce the signed state roots exactly.
 - `src/command.rs` / `src/event.rs` — engine inputs and outputs
 - `src/types.rs` — ids, sides, and asset classes
 - `tests/` — protocol tests through `Engine::apply`, with a shared harness, its signing client
-  (`client.rs`), and the reference-log format in `tests/common/`; `tests/operator.rs` covers signed
+  (`client.rs`), protocol-version constructors (`versions.rs`), and the reference-log format in
+  `tests/common/`; `tests/operator.rs` covers signed
   admin commands and every-market reduce-only, `tests/toxicity.rs` toxicity scoring, and
   `tests/quote_timing.rs` indices that change without a price update and venue quotes stamped ahead,
   `tests/stress.rs` stress levels from `V13`, and `tests/stress_activation.rs` the activation of
