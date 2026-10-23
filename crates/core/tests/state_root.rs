@@ -3,7 +3,8 @@
 
 mod common;
 
-use common::{BTC, CHAIN_ID, Client, DE40, ETH, EURUSD, Harness, VAULT, acct, f, operator};
+use common::stress::with_divergence_shares;
+use common::{BTC, CHAIN_ID, Client, DE40, ETH, EURUSD, Harness, VAULT, acct, f, operator, params};
 use engine_core::Engine;
 use engine_core::auth::ClientAuth;
 use engine_core::command::{AdminCommand, Command, OrderKind, Sequenced};
@@ -86,6 +87,21 @@ fn a_root_rehashes_only_the_leaves_changed_since_the_last_one() {
     apply(&mut engine, Command::Tick);
     assert_ne!(engine.state_root(), root);
     assert_eq!(engine.last_root_work().map(|work| work.leaves), Some(1));
+}
+
+#[test]
+fn a_v16_params_change_without_a_clamp_rehashes_no_account_leaf() {
+    // The memory clamp touches only the accounts it changes: a `V16` `SetParams` that leaves
+    // every history within the memory re-encodes no account leaf at the next root.
+    let mut h = Harness::v16();
+    h.deposit(acct(1), "100000");
+    h.deposit(acct(2), "100000");
+    h.engine.state_root();
+    h.operator_admin(AdminCommand::SetParams(with_divergence_shares(params())));
+    h.engine.state_root();
+    // The remaining state, the three markets `restress_all` re-evaluates, and the operator's
+    // spent nonce; no account leaf, since no history exceeds the memory this sets.
+    assert_eq!(h.engine.last_root_work().map(|work| work.leaves), Some(5));
 }
 
 #[test]

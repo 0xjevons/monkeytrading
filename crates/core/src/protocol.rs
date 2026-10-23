@@ -94,11 +94,16 @@ pub enum ProtocolVersion {
     /// minimum notional, exactly as a reduce-only order need not, so any position can be closed
     /// with a plain order.
     V15,
+    /// `SetParams` clamps every account's toxicity history to the memory in force, so a lowered
+    /// memory weighs the next markout against no more history than that. Before this, an account's
+    /// next markout after a lowered memory still weighs the history it had built under the old one;
+    /// that markout caps the history at the memory then in force.
+    V16,
 }
 
 impl ProtocolVersion {
     /// The newest version this build implements.
-    pub const LATEST: ProtocolVersion = ProtocolVersion::V15;
+    pub const LATEST: ProtocolVersion = ProtocolVersion::V16;
 
     /// Whether this is `V2`, which engine state leaves out of its encoding.
     pub fn is_v2(&self) -> bool {

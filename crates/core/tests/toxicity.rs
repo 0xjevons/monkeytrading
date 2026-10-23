@@ -6,9 +6,10 @@
 mod common;
 
 use common::events::fills;
+use common::stress::with_divergence_shares;
 use common::{AAPL, BTC, DE40, ETH, EURUSD, Harness, USDJPY, acct, f, ny, operator, params};
 use engine_core::auth::ClientAuth;
-use engine_core::command::{AdminCommand, Command};
+use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::event::{Event, Fill};
 use engine_core::fixed::Rounding;
 use engine_core::params::{NotionalWeighting, ProtocolParams, ToxicityParams, ToxicityTier};
@@ -357,6 +358,47 @@ fn a_whole_bps_score_carries_over_when_v11_activates() {
     assert_eq!(score(&h, a), f("24.976016791"));
 }
 
+#[test]
+fn set_toxicity_notional_before_parameters_are_set_is_refused() {
+    // The node sequences `SetToxicityNotional` only over parameters set before V11 that lack
+    // notional weighting, and `carry_toxicity_notional` returns early when parameters are absent,
+    // so a bare engine reaches this refusal only on a log the node did not write.
+    let weighting = NotionalWeighting { prior: f("10000"), memory: f("10000000") };
+    let cmd = Sequenced { seq: 0, ts: 0, cmd: Command::Admin(AdminCommand::SetToxicityNotional(weighting)) };
+    let events = Engine::new().apply(&cmd).expect("a sequenced command applies");
+    assert_eq!(events, [Event::AdminRejected { reason: "protocol params not set".into() }]);
+}
+
+#[test]
+fn lowered_memory_clamps_toxicity_history_from_the_next_markout() {
+    // Memory 100,000, then 10,000. A 10,000 fill at 100,000 marked out 50 bps up scores 25 over
+    // 20,000 of history; a second 10,000 fill there, marked out flat, then weighs it. From `V16`
+    // the lowered memory has clamped the history to 10,000, so the score falls by half its
+    // distance to the markout (12.5); before, it keeps weighing 20,000 and falls only to
+    // 16.666666667.
+    for (genesis, clamped) in [(Harness::v14(), false), (Harness::v16(), true)] {
+        let mut h = genesis;
+        let version = h.engine.protocol_version();
+        let set = |memory: &str| {
+            let base = with_divergence_shares(params());
+            let notional = Some(NotionalWeighting { prior: f("10000"), memory: f(memory) });
+            let toxicity = ToxicityParams { notional, tiers: vec![], ..base.toxicity };
+            AdminCommand::SetParams(ProtocolParams { toxicity, ..base })
+        };
+        h.operator_admin(set("100000"));
+        let a = funded(&mut h, 1, "100000");
+        marked_out(&mut h, a, BTC, Side::Buy, "0.1", "50");
+        assert_eq!((score(&h, a), history(&h, a)), (f("25"), f("20000")), "{version:?}");
+        h.operator_admin(set("10000"));
+        let kept = if clamped { f("10000") } else { f("20000") };
+        assert_eq!((score(&h, a), history(&h, a)), (f("25"), kept), "{version:?}");
+        h.price(BTC, "100000");
+        marked_out(&mut h, a, BTC, Side::Buy, "0.1", "0");
+        let weighed = if clamped { f("12.5") } else { f("16.666666667") };
+        assert_eq!((score(&h, a), history(&h, a)), (weighed, f("10000")), "{version:?}");
+    }
+}
+
 // ── Helpers ──
 
 /// Account `n`, funded with `amount`.
@@ -381,6 +423,11 @@ fn marked_out(h: &mut Harness, account: AccountId, market: MarketId, side: Side,
 /// The account's toxicity score.
 fn score(h: &Harness, account: AccountId) -> Fixed {
     h.engine.accounts()[&account].toxicity_score()
+}
+
+/// The fill notional of history behind the account's score.
+fn history(h: &Harness, account: AccountId) -> Fixed {
+    h.engine.accounts()[&account].toxicity_history
 }
 
 /// The market's last mark.

@@ -22,7 +22,9 @@ impl Engine {
     /// margin table may rise. From `V7`, a listing of a market others convert at also marks it and
     /// them as a price update does. Activating `V13` turns the absolute divergence triggers in force
     /// into shares of the widest listed bound; a market already listed with a zero bound reaches a
-    /// share above zero only once relisted with a positive one.
+    /// share above zero only once relisted with a positive one. From `V16`, parameters that set a
+    /// smaller toxicity memory clamp every account's toxicity history to it, so the next markout
+    /// already weighs no more history than the memory.
     /// Error cases:
     /// - `SetParams` with parameters that fail `ProtocolParams::validate_for` the version in force,
     ///   from `V8` that fail `ProtocolParams::check_closing_spread`, from `V11` that fail
@@ -64,6 +66,26 @@ impl Engine {
                 }
                 self.next_rollover = Some(params.rollover.next_after(self.now));
                 self.params = Some(params.clone());
+                // From `V16`, a lowered memory reweighs old history at once: without the clamp,
+                // the account's next markout still weighs the history it built under the earlier
+                // memory, and caps it only then. Raising the memory clamps nothing, since history
+                // never exceeds the memory it built under. `SetToxicityNotional` lands only
+                // where no history exists to clamp: parameters without weighting predate every
+                // notional-weighted markout. Read to select first: a touched account re-encodes
+                // its leaf at the next root, so touch only what the clamp changes.
+                if self.protocol_version >= ProtocolVersion::V16
+                    && let Some(memory) = params.toxicity.notional.map(|weighting| weighting.memory)
+                {
+                    let over: Vec<_> = self
+                        .accounts
+                        .iter()
+                        .filter(|(_, acct)| acct.toxicity_history > memory)
+                        .map(|(account, _)| *account)
+                        .collect();
+                    for account in over {
+                        self.accounts.get_mut(&account).expect("selected above").toxicity_history = memory;
+                    }
+                }
                 self.restress_all(events);
                 if self.protocol_version >= ProtocolVersion::V12 {
                     self.advance_markets(None, events);

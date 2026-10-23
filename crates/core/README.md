@@ -74,6 +74,9 @@ this crate and reproduce the signed state roots exactly.
   market — its side opposing the position, its quantity at most the position's — skips the
   minimum-notional check, exactly as a reduce-only order does, so any position can be closed with a
   plain order; one that would flip the position, or that adds to it, still meets the minimum
+- From protocol `V16`, parameters that set a smaller toxicity memory clamp every account's toxicity
+  history to it, so a lowered memory already weighs the next markout against no more history than
+  the memory, instead of that markout still weighing the history the account built
 
 ## Repository Structure
 
@@ -122,7 +125,8 @@ this crate and reproduce the signed state roots exactly.
 - `tests/reference_logs.rs` — replays every reference log and fails at the first seq whose root
   differs
 - `tests/invariants/` — property tests over generated sessions (`main.rs`), the session generator
-  (`session.rs`), fills at one price (`rounding.rs`), spreads and margin against their exact
+  (`session.rs`), the per-version checks each command must pass (`checks.rs`), fills at one price
+  (`rounding.rs`), spreads and margin against their exact
   amounts (`charges.rs`), and toxicity scores against their markouts (`toxicity.rs`)
 - `tests/invariants/state_root.rs` — incremental roots against a rebuild, with every account's
   proof checked, under generated sessions
@@ -135,7 +139,7 @@ this crate and reproduce the signed state roots exactly.
 - `examples/reference_log/` — writes the reference log for a new protocol version: the session
   (`main.rs`), the requests and event names it uses (`helpers.rs`), its `V10` to `V12` parts
   (`v10.rs`, `v11.rs`, `v12.rs`), its `V13` part (`stress.rs`), its `V14` part (`v14.rs`), and its
-  `V15` part (`v15.rs`)
+  `V15` and `V16` parts (`v15.rs`, `v16.rs`)
 - `examples/sign_request.rs` — a client signing a request body for the API
 - `examples/verify_proof.rs` — checks an account proof from the API against a root
 
@@ -192,8 +196,8 @@ Two suites guard replay and accounting:
   deletes a committed log.
 - `cargo test -p engine-core --test invariants` runs 1,024 generated sessions from a fixed seed, each
   under `V2`, `V6`, `V7` with markets quoted in other currencies, `V11`, and `V12` and `V13` with
-  those markets and signed operator commands, where `V13` must reach a stress change, and `V14` and
-  `V15`.
+  those markets and signed operator commands, where `V13` must reach a stress change, and `V14`,
+  `V15`, and `V16`.
   Each mixes client, feed, custody, and operator commands,
   with values inside and outside the input bounds, and checks after every command that nothing
   panicked, cash is conserved, and every market's aggregates match its accounts' positions. From
@@ -210,7 +214,8 @@ Two suites guard replay and accounting:
   also checks that resting orders keep to the cap, that placing an order fills or cancels no other,
   and that no market is financed at a rollover that records its benchmark as having no rate; under
   `V15` it also checks that a resting order accepted below its market's minimum notional, or with no
-  dollar value, can only reduce its account's position in that market.
+  dollar value, can only reduce its account's position in that market; under `V16`, that no
+  account's toxicity history exceeds the memory in force.
 
 ### Adding a protocol version
 
@@ -241,7 +246,8 @@ each command and counts a quote stamped ahead at once; its log is `v12.jsonl`. `
 follow its inputs; its log is `v13.jsonl`. `V14` finances only markets whose benchmark has a rate
 and caps each account's resting orders; its log is `v14.jsonl`. `V15` lets an order that can only
 reduce the account's position in its market skip the minimum-notional check at placement; its log is
-`v15.jsonl`. For each later version:
+`v15.jsonl`. `V16` clamps every account's toxicity history when parameters set a lower memory; its
+log is `v16.jsonl`. For each later version:
 
 1. Add the version in code as `src/protocol.rs` lists, then extend the session in
    `examples/reference_log/main.rs` so it activates the new version and exercises the new rules.
