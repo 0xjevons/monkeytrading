@@ -2,6 +2,7 @@
 //! commitments. Reads currently trust this endpoint's canonical chain; RPC quorum is separate.
 
 use std::future::IntoFuture;
+use std::path::Path;
 use std::time::Duration;
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
@@ -20,6 +21,9 @@ use crate::checkpoints::{CheckpointChain, VaultState, View};
 use crate::config::{CheckpointSection, FinalityTag};
 use crate::custody::usdc_to_fixed;
 use crate::log::{Checkpoint, CheckpointDomain};
+
+mod submission;
+use crate::checkpoints::rpc::submission::SubmissionStore;
 
 sol! {
     function checkpointSigner() external view returns (address);
@@ -41,18 +45,21 @@ pub(crate) struct CheckpointRpc {
     timeout: Duration,
     finality_tag: BlockNumberOrTag,
     confirmations: u64,
+    submissions: SubmissionStore,
 }
 
 impl CheckpointRpc {
-    /// Builds a client using binary-owned certificate roots; sends no requests.
+    /// Builds a client and checks existing nonce storage without requests or filesystem writes.
     /// Error cases:
-    /// - the URL or certificate roots cannot be parsed, or the client cannot be built
+    /// - the URL/certificates/client or an existing submission reservation is invalid
     pub fn new(
         cfg: &CheckpointSection,
         domain: CheckpointDomain,
         token: Address,
         finality: FinalityTag,
         confirmations: u64,
+        log_dir: &Path,
+        signer: engine_core::types::AccountId,
     ) -> anyhow::Result<Self> {
         let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
             .iter()
@@ -74,6 +81,7 @@ impl CheckpointRpc {
                 FinalityTag::Finalized => BlockNumberOrTag::Finalized,
             },
             confirmations,
+            submissions: SubmissionStore::load(log_dir, domain, cfg.relayer, signer)?,
         })
     }
 
@@ -173,10 +181,36 @@ impl CheckpointChain for CheckpointRpc {
         })
     }
 
-    /// Submits through the configured signing RPC; a later state read confirms inclusion.
+    /// Relays at a durable explicit nonce; only later canonical state reads confirm inclusion.
     /// Error cases:
-    /// - a root/signature fails decoding, or RPC submission fails or times out
+    /// - authorization, reservation durability/ownership, or an RPC request fails
     async fn post(&self, cp: &Checkpoint) -> anyhow::Result<()> {
+        self.submissions.validate_checkpoint(cp)?;
+        // Serialize nonce selection and sending across posting instances for this log.
+        let _lock = self.submissions.lock()?;
+        let chain_id = self.deadline(self.provider.get_chain_id()).await?;
+        ensure!(chain_id == self.domain.chain_id, "checkpoint endpoint is on another chain");
+        let latest_nonce = self.deadline(self.provider.get_transaction_count(self.relayer)).await?;
+        let mut reservation = match self.submissions.read()? {
+            Some(reservation) if reservation.checkpoint == *cp => reservation,
+            previous => {
+                if let Some(previous) = previous {
+                    ensure!(cp.seq > previous.checkpoint.seq, "checkpoint differs from its nonce reservation");
+                    ensure!(latest_nonce > previous.nonce, "another checkpoint submission is still pending");
+                }
+                let pending_nonce = self.deadline(self.provider.get_transaction_count(self.relayer).pending()).await?;
+                ensure!(
+                    pending_nonce == latest_nonce,
+                    "relayer has unreserved pending transactions; use a dedicated relayer"
+                );
+                ensure!(latest_nonce < u64::MAX, "relayer nonce is exhausted");
+                self.submissions.reserve(cp.clone(), latest_nonce)?
+            }
+        };
+        ensure!(
+            latest_nonce <= reservation.nonce,
+            "reserved nonce is consumed; await canonical checkpoint reconciliation"
+        );
         let parent = cp.parent.context("legacy checkpoint cannot be posted to a v2 vault")?;
         let input = postCheckpointCall {
             seq: cp.seq,
@@ -190,8 +224,30 @@ impl CheckpointChain for CheckpointRpc {
         let tx = TransactionRequest::default()
             .with_to(Address::from(self.domain.vault.0))
             .with_from(self.relayer)
+            .with_chain_id(self.domain.chain_id)
+            .with_nonce(reservation.nonce)
             .with_input(input);
-        let _pending = self.deadline(self.provider.send_transaction(tx)).await?;
+        if let Some(hash) = reservation.transaction_hash {
+            let known: Option<TransactionRequest> =
+                self.deadline(self.provider.client().request("eth_getTransactionByHash", (hash,))).await?;
+            if let Some(known) = known {
+                ensure!(
+                    known.from == tx.from
+                        && known.to == tx.to
+                        && known.nonce == tx.nonce
+                        && known.chain_id == tx.chain_id
+                        && known.value.unwrap_or_default() == tx.value.unwrap_or_default()
+                        && known.input.unique_input()? == tx.input.unique_input()?,
+                    "reserved transaction hash identifies another transaction"
+                );
+                return Ok(());
+            }
+        }
+        // A preceding sync failure must not turn a merely visible reservation into a send.
+        self.submissions.sync()?;
+        let hash = self.deadline(self.provider.client().request("eth_sendTransaction", (tx,))).await?;
+        reservation.transaction_hash = Some(hash);
+        self.submissions.store(&reservation)?;
         Ok(())
     }
 }

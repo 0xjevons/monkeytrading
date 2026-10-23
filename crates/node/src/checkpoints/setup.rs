@@ -27,7 +27,15 @@ pub(crate) async fn connect(cfg: &NodeConfig, key: &Arc<EnclaveKey>) -> anyhow::
     let domain = CheckpointDomain { chain_id: cfg.custody.chain_id, vault: cfg.custody.vault.parse()? };
     let token = cfg.custody.evm.as_ref().context("checkpoint custody is not EVM")?.usdc;
     let evm = cfg.custody.evm.as_ref().context("checkpoint custody is not EVM")?;
-    let chain = CheckpointRpc::new(checkpoints, domain, token, evm.finality_tag, evm.confirmations)?;
+    let chain = CheckpointRpc::new(
+        checkpoints,
+        domain,
+        token,
+        evm.finality_tag,
+        evm.confirmations,
+        &cfg.node.log_dir,
+        AccountId(key.address()),
+    )?;
     // A restart must not sign from a finalized parent while its own latest inclusion is pending.
     // Await that boundary without opening persisted state; an orphaned inclusion may disappear.
     let state = tokio::time::timeout(evm.stall_critical_after, async {

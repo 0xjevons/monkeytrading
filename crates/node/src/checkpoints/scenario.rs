@@ -71,9 +71,10 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
         "rpc_url = {url:?}\nrelayer = '{relayer:#x}'\nretry_interval = '40ms'\nrpc_timeout = '2s'"
     ))
     .unwrap();
+    let dir = scratch_dir("checkpoint-anvil");
     let make_poster = || Poster {
         registry: None,
-        chain: CheckpointRpc::new(&section, domain, token, FinalityTag::Latest, 0).unwrap(),
+        chain: CheckpointRpc::new(&section, domain, token, FinalityTag::Latest, 0, &dir, AccountId(key.address())).unwrap(),
         domain,
         signer: AccountId(key.address()),
         retry: section.retry_interval,
@@ -81,7 +82,6 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     };
     make_poster().startup(None).await.unwrap();
 
-    let dir = scratch_dir("checkpoint-anvil");
     let mut cfg = dev_config();
     cfg.custody.provider = CustodyProvider::Evm;
     cfg.custody.vault = format!("{vault:#x}");
@@ -236,8 +236,11 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     .unwrap();
     assert!(make_poster().startup(found.as_ref()).await.is_err(), "truncation refuses startup");
     // A canonical latest inclusion is revocable. Confirmation policy alone gates release.
-    let delayed =
-        Poster { chain: CheckpointRpc::new(&section, domain, token, FinalityTag::Latest, 2).unwrap(), ..make_poster() };
+    let delayed = Poster {
+        chain: CheckpointRpc::new(&section, domain, token, FinalityTag::Latest, 2, &dir, AccountId(key.address()))
+            .unwrap(),
+        ..make_poster()
+    };
     local_rpc(&url, "anvil_mine", serde_json::json!(["0x3"])).await;
     let saved = local_rpc(&url, "evm_snapshot", serde_json::json!([])).await;
     let current = delayed.chain.state(View::Latest).await.unwrap();
