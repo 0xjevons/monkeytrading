@@ -11,12 +11,14 @@ use engine_core::protocol::ProtocolVersion;
 use engine_core::types::{AccountId, Millis};
 use engine_core::{Engine, Fixed};
 
+use crate::checkpoints::accounting::Accounting;
 use crate::log::{self, CheckpointDomain, LogEntry, SegmentedLog};
 use crate::sequencer::GenesisProgress;
 
 /// The result of replaying a log.
 pub struct Replayed {
     pub engine: Engine,
+    pub(crate) accounting: Accounting,
     pub commands: u64,
     pub checkpoints: u64,
     pub(crate) recovery_work: Vec<crate::checkpoints::Work>,
@@ -58,7 +60,7 @@ pub(super) struct Replay {
     genesis: GenesisProgress,
     last_checkpoint_ts: Option<Millis>,
     deferred: Vec<(u64, AccountId, Fixed, u64)>,
-    unpaid: Fixed,
+    accounting: Accounting,
     domain: Option<CheckpointDomain>,
     trusted_signer: Option<AccountId>,
     checkpoint_signers: BTreeSet<AccountId>,
@@ -106,6 +108,7 @@ impl Replay {
                 if c.events.as_ref().is_some_and(|logged| *logged != events) {
                     bail!("events logged at seq {seq} differ from the events replay gives");
                 }
+                self.accounting.apply(&c.sequenced.cmd, &events)?;
                 self.approved = events
                     .into_iter()
                     .filter_map(|e| match e {
@@ -113,7 +116,6 @@ impl Replay {
                         _ => None,
                     })
                     .collect();
-                self.unpaid += self.approved.iter().map(|(_, amount, _)| *amount).sum::<Fixed>();
                 self.logs_events = c.events.is_some();
                 self.commands += 1;
             }
@@ -173,11 +175,7 @@ impl Replay {
                     && (!parent.has_checkpoint || cp.seq > parent.seq)
                 {
                     ensure!(cp.parent == Some(parent), "outstanding checkpoint has a divergent signed parent");
-                    self.recovery_work.push(crate::checkpoints::Work {
-                        checkpoint: cp.clone(),
-                        liabilities: crate::checkpoints::liabilities(engine, self.unpaid),
-                        deposits: engine.credited_refs_with_prefix("0x").count() as u64,
-                    });
+                    self.recovery_work.push(crate::checkpoints::Work::capture(cp.clone(), self.accounting));
                     self.recovery_parent = Some(crate::log::CheckpointParent {
                         has_checkpoint: true,
                         seq: cp.seq,
@@ -200,6 +198,7 @@ impl Replay {
             (self.engine, self.commands, self.checkpoints, self.activations, self.genesis, self.last_checkpoint_ts);
         Replayed {
             engine,
+            accounting: self.accounting,
             commands,
             checkpoints,
             unsigned,
@@ -207,7 +206,7 @@ impl Replay {
             genesis,
             last_checkpoint_ts,
             deferred: self.deferred,
-            unpaid: self.unpaid,
+            unpaid: self.accounting.unpaid(),
             checkpoint_signers: self.checkpoint_signers,
             last_signed_checkpoint: self.last_signed_checkpoint,
             recovery_work: self.recovery_work,
@@ -302,5 +301,7 @@ fn ensure_signed(
     }
 }
 
+#[cfg(test)]
+pub(super) mod accounting_tests;
 #[cfg(test)]
 mod auth_tests;

@@ -8,7 +8,7 @@ use engine_core::types::AccountId;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::checkpoints::{Work, liabilities};
+use crate::checkpoints::Work;
 use crate::log::{Checkpoint, LogEntry};
 use crate::sequencer::{Sequencer, SignedWithdrawal};
 
@@ -81,11 +81,7 @@ impl Sequencer {
             warn!(alert = "checkpoint_post_failed", "checkpoint worker stopped; durable checkpoint awaits restart");
             return Ok(());
         }
-        let work = Work {
-            checkpoint,
-            liabilities: liabilities(&self.engine, self.unpaid),
-            deposits: self.engine.credited_refs_with_prefix("0x").count() as u64,
-        };
+        let work = Work::capture(checkpoint, self.accounting);
         if let Some(registry) = &gate.registry {
             registry
                 .lock()
@@ -128,3 +124,6 @@ impl Sequencer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod accounting_tests;

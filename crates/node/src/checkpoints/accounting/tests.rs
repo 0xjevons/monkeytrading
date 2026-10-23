@@ -1,0 +1,160 @@
+use super::*;
+
+use engine_core::Engine;
+use engine_core::auth::ClientAuth;
+use engine_core::command::{AdminCommand, Sequenced};
+use engine_core::protocol::ProtocolVersion;
+use engine_core::types::AccountId;
+
+use crate::test_support::{TRADER, dev_config};
+
+#[test]
+fn accounting_matches_cash_and_references_across_credit_acceptance_rules() {
+    for version in
+        [ProtocolVersion::V2, ProtocolVersion::V3, ProtocolVersion::V4, ProtocolVersion::V8, ProtocolVersion::LATEST]
+    {
+        let mut engine = Engine::new();
+        let mut accounting = Accounting::default();
+        let mut unpaid = Fixed::ZERO;
+        let mut apply = |cmd: Command| {
+            let sequenced = Sequenced { seq: engine.last_seq().map_or(0, |seq| seq + 1), ts: 0, cmd };
+            let events = engine.apply(&sequenced).unwrap();
+            accounting.apply(&sequenced.cmd, &events).unwrap();
+            unpaid += approved(&events);
+            assert_eq!((accounting.liabilities, accounting.deposits), recompute(&engine, unpaid), "{sequenced:?}");
+            assert_eq!(accounting.unpaid(), unpaid);
+            events
+        };
+        apply(Command::Admin(AdminCommand::SetClientAuth(ClientAuth::Unsigned)));
+        apply(Command::Admin(AdminCommand::SetOperator(dev_config().operator().unwrap())));
+        if version != ProtocolVersion::V2 {
+            let events = apply(Command::Admin(AdminCommand::ActivateProtocol { version }));
+            assert!(events.contains(&Event::AdminApplied), "{version:?}: {events:?}");
+        }
+        let zero = apply(capital(0, "0xzero"));
+        assert_eq!(
+            zero.iter().any(|event| matches!(event, Event::HouseCapitalMoved { amount, .. } if amount.is_zero())),
+            version >= ProtocolVersion::V4,
+            "{version:?}: {zero:?}"
+        );
+        for cmd in [
+            capital(0, "0xzero"),
+            capital(100, "0xhouse"),
+            capital(-10, "0xremove"),
+            capital(-1_000, "0xretry-house"),
+            capital(10, "0xretry-house"),
+            deposit(25, "0xdeposit"),
+            deposit(25, "0xdeposit"),
+            deposit(-1, "0xretry"),
+            deposit(5, "0xretry"),
+            deposit(0, "0xzero-deposit"),
+            deposit(1, "0xhouse"),
+            capital(1, "0xdeposit"),
+            deposit(1, "0Xuppercase"),
+            deposit(1, "mock-credit"),
+            Command::Deposit { account: TRADER, amount: Fixed::MAX_INPUT + Fixed::ONE, chain_ref: "0xlarge".into() },
+            Command::HouseCapital { amount: Fixed::MAX_INPUT + Fixed::ONE, chain_ref: "0xlarge-house".into() },
+            Command::Withdraw { account: TRADER, amount: Fixed::from_int(10), auth: None },
+            Command::Withdraw { account: TRADER, amount: Fixed::from_int(1_000), auth: None },
+        ] {
+            apply(cmd);
+        }
+        assert_eq!(engine.protocol_version(), version);
+        assert_eq!(accounting.liabilities, Fixed::from_int(132));
+        assert_eq!(accounting.deposits, if version >= ProtocolVersion::V4 { 6 } else { 5 });
+        assert_eq!(accounting.unpaid(), Fixed::from_int(10));
+    }
+}
+
+#[test]
+fn only_matching_success_events_count_evm_credit_references() {
+    let other = AccountId([1; 20]);
+    let amount = Fixed::ONE;
+    let credit = Event::Deposited { account: TRADER, amount };
+    for cmd in [
+        Command::Tick,
+        Command::Deposit { account: other, amount, chain_ref: "0xcredit".into() },
+        deposit(2, "0xcredit"),
+        deposit(1, "mock-credit"),
+        capital(1, "0xcredit"),
+    ] {
+        assert!(!evm_credit(&cmd, &credit), "{cmd:?}");
+    }
+    assert!(evm_credit(&deposit(1, "0xcredit"), &credit));
+    assert!(!evm_credit(&capital(2, "0xcredit"), &Event::HouseCapitalMoved { amount, nav: amount }));
+    assert!(evm_credit(&capital(0, "0xzero"), &Event::HouseCapitalMoved { amount: Fixed::ZERO, nav: amount }));
+}
+
+#[test]
+fn overflow_refuses_the_whole_accounting_batch_without_wrapping() {
+    let max = Fixed::from_raw(i128::MAX);
+    let cases = [
+        (
+            Accounting { liabilities: max, deposits: 2, unpaid: Fixed::ZERO },
+            deposit(1, "0xoverflow"),
+            vec![Event::Deposited { account: TRADER, amount: Fixed::ONE }],
+            "liabilities overflow",
+        ),
+        (
+            Accounting { liabilities: Fixed::from_raw(i128::MIN), deposits: 2, unpaid: Fixed::ZERO },
+            capital(-1, "0xunderflow"),
+            vec![Event::HouseCapitalMoved { amount: -Fixed::ONE, nav: Fixed::ONE }],
+            "liabilities overflow",
+        ),
+        (
+            Accounting { liabilities: Fixed::ONE, deposits: 2, unpaid: max },
+            deposit(1, "0xatomic"),
+            vec![
+                Event::Deposited { account: TRADER, amount: Fixed::ONE },
+                Event::WithdrawalApproved { account: TRADER, amount: Fixed::ONE, nonce: 1 },
+            ],
+            "unpaid approvals overflow",
+        ),
+        (
+            Accounting { liabilities: Fixed::ONE, deposits: u64::MAX, unpaid: Fixed::ZERO },
+            capital(0, "0xcount-overflow"),
+            vec![Event::HouseCapitalMoved { amount: Fixed::ZERO, nav: Fixed::ONE }],
+            "deposit count overflow",
+        ),
+    ];
+    for (initial, cmd, events, reason) in cases {
+        let mut accounting = initial;
+        let err = accounting.apply(&cmd, &events).unwrap_err();
+        assert!(err.to_string().contains(reason), "{err:#}");
+        assert_eq!(accounting, initial, "failed batch must not publish even its successful prefix");
+    }
+}
+
+/// The former production scans, retained only as an independent state-based test oracle.
+pub(crate) fn recompute(engine: &Engine, unpaid: Fixed) -> (Fixed, u64) {
+    let liabilities =
+        engine.accounts().values().fold(engine.house_cash() + unpaid, |sum, account| sum + account.balance);
+    (liabilities, u64::try_from(engine.credited_refs_with_prefix("0x").count()).unwrap())
+}
+
+/// Compares every cached quantity with an independently replayed approval total and state scan.
+pub(crate) fn assert_matches(accounting: Accounting, engine: &Engine, unpaid: Fixed) {
+    assert_eq!((accounting.liabilities, accounting.deposits), recompute(engine, unpaid));
+    assert_eq!(accounting.unpaid(), unpaid);
+}
+
+/// Approvals from computed output; signatures do not prove that custody paid them.
+pub(crate) fn approved(events: &[Event]) -> Fixed {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::WithdrawalApproved { amount, .. } => Some(*amount),
+            _ => None,
+        })
+        .sum()
+}
+
+/// A credit to the test trader.
+fn deposit(amount: i64, chain_ref: &str) -> Command {
+    Command::Deposit { account: TRADER, amount: Fixed::from_int(amount), chain_ref: chain_ref.into() }
+}
+
+/// A signed amount of house capital, using the engine's historical acceptance rules.
+fn capital(amount: i64, chain_ref: &str) -> Command {
+    Command::HouseCapital { amount: Fixed::from_int(amount), chain_ref: chain_ref.into() }
+}

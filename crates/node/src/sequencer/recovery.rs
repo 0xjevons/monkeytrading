@@ -151,7 +151,7 @@ impl Sequencer {
             checkpoints,
             unsigned,
             deferred,
-            unpaid,
+            accounting,
             last_checkpoint_ts,
             last_signed_checkpoint,
             recovery_work,
@@ -187,7 +187,7 @@ impl Sequencer {
                 gate.registry = cfg.checkpoint_registry;
                 gate
             }),
-            unpaid,
+            accounting,
         };
         {
             let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();

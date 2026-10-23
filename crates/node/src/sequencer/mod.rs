@@ -24,6 +24,7 @@ use engine_core::{Engine, Fixed};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{error, info, info_span, warn};
 
+use crate::checkpoints::accounting::Accounting;
 use crate::clock::Clock;
 use crate::log::{CommandEntry, LogEntry, LogWriter, Manifest, SegmentedLog};
 use crate::metrics::Metrics;
@@ -58,7 +59,7 @@ pub struct Sequencer {
     operator: Operator,
     metrics: Arc<Metrics>,
     gate: Option<Gate>,
-    unpaid: Fixed,
+    accounting: Accounting,
 }
 
 pub struct SequencerConfig<'a> {
@@ -207,6 +208,7 @@ impl Sequencer {
         let sequenced = Sequenced { seq: self.next_seq, ts, cmd };
         let _span = info_span!("command", id = sequenced.seq).entered();
         let events = self.engine.apply(&sequenced).context("sequencer produced an invalid sequence")?;
+        self.accounting.apply(&sequenced.cmd, &events)?;
         self.next_seq += 1;
         self.last_ts = ts;
         self.record(LogEntry::Command(CommandEntry { sequenced, events: Some(events.clone()) }))?;
@@ -216,7 +218,6 @@ impl Sequencer {
             alert_on(event);
             self.metrics.record(event);
             if let Event::WithdrawalApproved { account, amount, nonce } = event {
-                self.unpaid += *amount;
                 if let Some(gate) = &mut self.gate {
                     gate.pending.push((
                         self.engine.last_seq().expect("applied command has a seq"),

@@ -75,6 +75,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/sequencer/mod.rs` — the sequencer, checkpoints, and metrics
 - `src/sequencer/messages.rs` — sequencer requests, stream messages, and signed withdrawals
 - `src/sequencer/checkpoints.rs` — checkpoint creation, custody reconciliation, and signature release
+- `src/sequencer/checkpoints/accounting_tests.rs` — live/recovery accounting oracles and gated 100k-account capture scaling
 - `src/sequencer/checkpoint_tests.rs` — confirmed-prefix signature gating and restart tests
 - `src/sequencer/fixture_tests.rs` — test-only signing of copies of placeholder protocol fixtures
 - `src/sequencer/replay.rs` — log replay, which recovery and `engine replay` share
@@ -165,6 +166,8 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/config/test_keys.rs` — the published test keys from `config/test-keys.toml`, which a node
   with real attestation refuses, and their tests
 - `src/checkpoints/mod.rs` — posting, retry, signed-parent commitment checks, and collateral reconciliation
+- `src/checkpoints/accounting.rs` — bounded custody totals derived from computed engine events
+- `src/checkpoints/accounting/tests.rs` — cash/reference recomputation oracles and arithmetic boundaries
 - `src/checkpoints/signature.rs` — shared strict checkpoint signature and domain verification
 - `src/checkpoints/rpc.rs` — pinned-block vault reads and transaction relay through a signing RPC
 - `src/checkpoints/setup.rs` — finalized chain anchor lookup and pending-inclusion startup wait
@@ -174,6 +177,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/node/preflight.rs` — chain validation before writable history recovery
 - `src/node/preflight/tests.rs` — refused startup preserves history, WAL, and log bytes
 - `src/sequencer/replay/auth_tests.rs` — trusted immediate/deferred completion evidence regressions
+- `src/sequencer/replay/accounting_tests.rs` — historical fixture and outstanding-work accounting oracles
 - `src/custody/mod.rs` — the custody providers (mock and EVM) and the USDC-to-`Fixed` conversion
 - `src/custody/evm.rs` — the deposit watcher: the chain and token check, range reads from blocks
   proven to lead to the tagged final block, the completeness check, and stall alerts
@@ -366,6 +370,15 @@ uses immutable read-only access; a crash WAL is conservatively rebuilt only afte
 the vault; this is a local harness, not a production key-provisioning workflow. Withdrawals still
 have no on-chain payout path, so reconciliation counts every approval as unpaid. Payout settlement
 must subtract confirmed payouts when that feature is added.
+
+Checkpoint work captures fixed-size node accounting derived from computed engine events during
+live sequencing and authenticated replay. Liabilities equal cumulative successful deposits plus
+positive or negative house-capital moves; approvals transfer cash to unpaid liabilities. Only a
+matching successful credit counts its `0x` reference, including accepted zero-capital moves.
+Accounting overflow refuses further sequencing or replay. This cache adds no trusted metadata:
+future snapshot recovery must rebuild or verify it once against authenticated cash, unpaid
+approvals, and credited references before use, retaining exact outstanding checkpoint accounting
+or falling back to full replay.
 
 New on-chain checkpoints use `engine.checkpoint.v2`, signing the domain tag, chain id (u64 big
 endian), vault (20 bytes), sequence (u64 big endian), root (32 bytes), parent-present byte,

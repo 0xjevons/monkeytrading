@@ -1,5 +1,6 @@
 //! On-chain checkpoint commitments, replay protection, and collateral reconciliation.
 
+pub(crate) mod accounting;
 mod rpc;
 pub(crate) mod setup;
 pub(crate) mod signature;
@@ -10,11 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
-use engine_core::{Engine, Fixed};
+use engine_core::Fixed;
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
+use crate::checkpoints::accounting::Accounting;
 use crate::log::{Checkpoint, CheckpointDomain};
 use crate::sequencer::Request;
 
@@ -24,6 +26,13 @@ pub(crate) struct Work {
     pub checkpoint: Checkpoint,
     pub liabilities: Fixed,
     pub deposits: u64,
+}
+
+impl Work {
+    /// Captures custody accounting without traversing engine accounts or credited references.
+    pub(crate) fn capture(checkpoint: Checkpoint, accounting: Accounting) -> Self {
+        Self { checkpoint, liabilities: accounting.liabilities, deposits: accounting.deposits }
+    }
 }
 
 /// Durable work registered by its sequencer before bounded queue admission.
@@ -288,11 +297,6 @@ impl<R: CheckpointChain> Poster<R> {
         }
         Ok((Some(cp.seq), healthy))
     }
-}
-
-/// Ledger cash plus approvals not paid on chain. Payout settlement will reduce `unpaid`.
-pub(crate) fn liabilities(engine: &Engine, unpaid: Fixed) -> Fixed {
-    engine.accounts().values().fold(engine.house_cash() + unpaid, |total, account| total + account.balance)
 }
 
 #[cfg(test)]
