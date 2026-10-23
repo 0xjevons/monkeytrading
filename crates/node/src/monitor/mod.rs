@@ -1,11 +1,11 @@
 //! The node watching itself. Every second it reads the sequencer's queue depth and, through a query
 //! between batches, the house's NAV and exposure, each market's session and price, and the newest
 //! quote from each venue; it sets those as metrics and raises `market_no_price` for an open market
-//! a configured feed prices that has gone without a usable price for `alerts.no_price_after`. A
-//! market no configured feed prices is named once, in a `market_unfed` Warning, and never pages. A
-//! sequencer that answers no sample for that long raises `sequencer_stalled`, since no market can be
-//! priced meanwhile. It reads the engine's state, not the feeds, so any feed that sequences
-//! `Command::Prices` is covered.
+//! a configured feed prices that has gone without a usable price for `alerts.no_price_after`. Each
+//! market no configured feed prices is named once, in its own `market_unfed` Warning, and never
+//! pages. A sequencer that answers no sample for that long raises `sequencer_stalled`, since no
+//! market can be priced meanwhile. It reads the engine's state, not the feeds, so any feed that
+//! sequences `Command::Prices` is covered.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -141,20 +141,18 @@ impl NoPrice {
     }
 
     /// Fires `market_no_price` once an open market a configured feed prices has been unpriced for
-    /// `after`, and resolves it when the market is priced again or closes. Names the markets no
-    /// configured feed prices in one `market_unfed` Warning the first time a sample holds them.
+    /// `after`, and resolves it when the market is priced again or closes. Names each market no
+    /// configured feed prices in a `market_unfed` Warning of its own the first time a sample holds
+    /// it, so one unfed market's episode does not swallow another's.
     pub fn check(&mut self, sample: &Sample, now: Instant, after: Duration) {
-        let unfed: Vec<&str> = sample
-            .markets
-            .iter()
-            .filter(|market| !self.fed.contains(&market.id) && self.named.insert(market.id))
-            .map(|market| market.symbol.as_str())
-            .collect();
-        if !unfed.is_empty() {
+        for market in
+            sample.markets.iter().filter(|market| !self.fed.contains(&market.id) && self.named.insert(market.id))
+        {
             warn!(
                 alert = "market_unfed",
-                "no configured feed prices {}: they cannot trade, and do not page market_no_price",
-                unfed.join(", ")
+                market = market.id,
+                "no configured feed prices {}: it cannot trade, and does not page market_no_price",
+                market.symbol
             );
         }
         for market in sample.markets.iter().filter(|market| self.fed.contains(&market.id)) {
