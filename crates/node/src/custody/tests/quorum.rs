@@ -270,6 +270,7 @@ async fn every_query_requires_current_identity_eligibility_and_failed_identity_c
 async fn minority_head_and_timestamp_extremes_cannot_override_majority_diagnostics() {
     let chains = chains();
     let quorum = quorum(&chains).await;
+    chains[1].set_final(Some(0));
     for (minority_head, minority_time, expected_head, expected_time) in [(1, 1, 10, 100), (999, 999_999, 11, 101)] {
         for (i, chain) in chains.iter().take(2).enumerate() {
             let mut state = chain.0.lock().unwrap();
@@ -289,6 +290,7 @@ async fn one_pinned_head_cannot_hide_a_genuine_finality_stall_and_recovery_resol
     let dir = scratch("quorum-pinned-head");
     let node = Node::start(&dir);
     let chains = chains();
+    chains[1].set_final(Some(0));
     let mut watcher = watcher(&chains, &dir);
     let (logs, _guard) = Logs::capture();
     for chain in &chains[..2] {
@@ -307,6 +309,25 @@ async fn one_pinned_head_cannot_hide_a_genuine_finality_stall_and_recovery_resol
     }
     assert!(matches!(watcher.poll(&node.tx).await, Ok(Polled::Read { .. })));
     assert_eq!(logs.lines_with("alert_resolved=\"custody_finality_stalled\"").len(), 1);
+}
+
+#[tokio::test]
+async fn detected_tag_contradictions_cannot_supply_diagnostics_even_when_finality_has_a_majority() {
+    let chains = chains();
+    let quorum = quorum(&chains).await;
+    for (i, chain) in chains.iter().take(2).enumerate() {
+        chain.0.lock().unwrap().head = 10 + i as u64;
+        chain.0.lock().unwrap().head_time = Some(100 + i as u64);
+    }
+    chains[2].0.lock().unwrap().head = 999;
+    chains[2].0.lock().unwrap().head_time = Some(999_999);
+    for above_head in [false, true] {
+        chains[2].0.lock().unwrap().tag_hash = Some(B256::repeat_byte(0xff));
+        chains[2].set_final(Some(if above_head { 1000 } else { 1 }));
+        let f = quorum.finality().await.unwrap();
+        assert_eq!((f.head, f.head_time), (10, 100));
+        assert_eq!(f.tagged.unwrap().hash, canonical_hash(1));
+    }
 }
 
 // ── Helpers ──

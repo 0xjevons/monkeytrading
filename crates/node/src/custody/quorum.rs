@@ -154,6 +154,13 @@ impl<R: VaultReader + Sync> VaultReader for Quorum<R> {
             r.finality().await
         }))
         .await;
+        // Head diagnostics are independent of how far each provider's finality tag has reached.
+        let mut diagnostics: Vec<_> = answers
+            .iter()
+            .map(|a| {
+                a.as_ref().ok().filter(|f| f.tagged.is_none_or(|b| b.number <= f.head)).map(|f| (f.head, f.head_time))
+            })
+            .collect();
         let mut heights: Vec<_> = answers
             .iter()
             .filter_map(|a| a.as_ref().ok().filter(|f| f.tagged.is_none_or(|b| b.number <= f.head)))
@@ -168,24 +175,37 @@ impl<R: VaultReader + Sync> VaultReader for Quorum<R> {
         }
         let mut votes = Vec::new();
         for common in candidates {
-            votes = join_all(self.providers.iter().zip(&answers).map(|((_, reader), answer)| async move {
-                let f = answer.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
-                if f.tagged.is_some_and(|b| b.number > f.head) {
-                    bail!("finality tag is above the provider head");
-                }
-                match (common, f.tagged) {
-                    (Some(number), Some(tagged)) if tagged.number >= number => {
-                        let header = last_header(reader.headers(number, number).await?, number)?;
-                        if tagged.number == number && tagged.hash != header.hash {
-                            bail!("finality tag disagrees with the provider's header");
-                        }
-                        Ok(Some(BlockRef { number, hash: header.hash }))
+            let results = join_all(self.providers.iter().zip(&answers).map(|((_, reader), answer)| async move {
+                let mut contradicted = false;
+                let vote = async {
+                    let f = answer.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                    if f.tagged.is_some_and(|b| b.number > f.head) {
+                        contradicted = true;
+                        bail!("finality tag is above the provider head");
                     }
-                    (None, None) => Ok(None),
-                    _ => bail!("provider has not reached the common final block"),
+                    match (common, f.tagged) {
+                        (Some(number), Some(tagged)) if tagged.number >= number => {
+                            let header = last_header(reader.headers(number, number).await?, number)?;
+                            if tagged.number == number && tagged.hash != header.hash {
+                                contradicted = true;
+                                bail!("finality tag disagrees with the provider's header");
+                            }
+                            Ok(Some(BlockRef { number, hash: header.hash }))
+                        }
+                        (None, None) => Ok(None),
+                        _ => bail!("provider has not reached the common final block"),
+                    }
                 }
+                .await;
+                (vote, contradicted)
             }))
             .await;
+            for (diagnostic, (_, contradicted)) in diagnostics.iter_mut().zip(&results) {
+                if *contradicted {
+                    *diagnostic = None;
+                }
+            }
+            votes = results.into_iter().map(|(vote, _)| vote).collect();
             if majority(&votes, self.required).is_some() {
                 break;
             }
@@ -201,10 +221,9 @@ impl<R: VaultReader + Sync> VaultReader for Quorum<R> {
                 }
             }
         }
-        let (tagged, voters) = self.vote("finality", votes)?;
-        let heads = voters.iter().map(|&i| answers[i].as_ref().expect("a finality vote has an answer"));
-        let head = quorum_lower_bound(heads.clone().map(|f| f.head), self.required);
-        let head_time = quorum_lower_bound(heads.map(|f| f.head_time), self.required);
+        let (tagged, _) = self.vote("finality", votes)?;
+        let head = quorum_lower_bound(diagnostics.iter().flatten().map(|d| d.0), self.required);
+        let head_time = quorum_lower_bound(diagnostics.iter().flatten().map(|d| d.1), self.required);
         Ok(Finality { head, head_time, tagged })
     }
 
