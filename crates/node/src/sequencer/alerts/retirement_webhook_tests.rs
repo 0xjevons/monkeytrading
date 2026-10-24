@@ -31,7 +31,8 @@ use crate::clock::test_clock::TestClock;
 use crate::config::WebhookRoute;
 use crate::log::Manifest;
 use crate::metrics::{Metrics, SeverityLabel};
-use crate::sequencer::{Sequencer, SequencerConfig, replay};
+use crate::sequencer::fixture_tests::replay_trusted as replay;
+use crate::sequencer::{Sequencer, SequencerConfig};
 use crate::tee::EnclaveKey;
 use crate::test_support::{
     dev_config, keep_callsites_interested, log_entries, sample_around, scratch_dir, sequencer_config,
@@ -120,7 +121,7 @@ fn retire_with_rollover(log_dir: &Path, condition: &str, fired_earlier: bool) ->
     let (manifest, _) = watch::channel(Manifest::default());
     let (withdrawals, _) = mpsc::unbounded_channel();
     let mut seq =
-        Sequencer::recover(sequencer_config(log_dir, manifest), Arc::new(EnclaveKey::generate()), stream, withdrawals)?;
+        Sequencer::recover(sequencer_config(log_dir, manifest), Arc::new(EnclaveKey::test_key()), stream, withdrawals)?;
     let genesis = dev_config().genesis;
     let mut market = genesis.markets[0].clone();
     ensure!(market.financing.benchmark == "SOFR", "fixture's sole benchmark");
@@ -404,7 +405,7 @@ fn retirement_recover_at(log_dir: &Path, at: i64) -> anyhow::Result<Sequencer> {
     let (manifest, _) = watch::channel(Manifest::default());
     let (withdrawals, _) = mpsc::unbounded_channel();
     let cfg = SequencerConfig { clock: clock.clone(), ..sequencer_config(log_dir, manifest) };
-    let mut seq = Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, withdrawals)?;
+    let mut seq = Sequencer::recover(cfg, Arc::new(EnclaveKey::test_key()), stream, withdrawals)?;
     seq.trust(sample_around(clock.as_ref()))?;
     Ok(seq)
 }

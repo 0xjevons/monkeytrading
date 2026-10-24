@@ -23,7 +23,8 @@ use crate::clock::test_clock::TestClock;
 use crate::history::Reader;
 use crate::limits::ApiLimits;
 use crate::log::{LogEntry, Manifest};
-use crate::sequencer::{Request as SeqRequest, Sequencer, SequencerConfig, replay};
+use crate::sequencer::fixture_tests::replay_trusted as replay;
+use crate::sequencer::{Request as SeqRequest, Sequencer, SequencerConfig};
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
 use crate::test_support::{dev_config, log_entries, sample_around, scratch_dir, sequencer_config};
 use crate::tls::{TlsIdentity, serve};
@@ -321,7 +322,7 @@ async fn run_watch_cases(cases: &[WatchCase], interrupt: bool) {
 impl Node {
     async fn start(dir: &Path, at: Millis, api_clock: fn() -> Millis) -> Self {
         let clock = Arc::new(TestClock::at(at));
-        let key = Arc::new(EnclaveKey::generate());
+        let key = Arc::new(EnclaveKey::test_key());
         let (stream, _) = broadcast::channel(1024);
         let (manifest_tx, manifest) = watch::channel(Manifest::default());
         let (withdrawals, _) = mpsc::unbounded_channel();

@@ -93,5 +93,5 @@ fn recover_at(dir: &Path, at: Millis) -> Sequencer {
     let (stream, _) = broadcast::channel(16);
     let (manifest, _) = watch::channel(Manifest::default());
     let cfg = SequencerConfig { clock: Arc::new(TestClock::at(at)), ..sequencer_config(dir, manifest) };
-    Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, mpsc::unbounded_channel().0).unwrap()
+    Sequencer::recover(cfg, Arc::new(EnclaveKey::test_key()), stream, mpsc::unbounded_channel().0).unwrap()
 }
