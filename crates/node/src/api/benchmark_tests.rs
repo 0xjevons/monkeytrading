@@ -33,6 +33,8 @@ const FIRST: Millis = 1_792_530_000_000; // 20 Oct 2026 21:00 UTC = 22:00 London
 const RESTART: Millis = FIRST + 2 * 86_400_000 + 1;
 const TRADER: AccountId = AccountId([0xaa; 20]);
 
+mod recovery;
+
 type WatchCase = (&'static str, &'static str, fn() -> Millis, usize);
 
 #[derive(Parser)]
@@ -100,6 +102,8 @@ endpoint = "{publisher}/estr"
         }))
         .await;
     assert!(fills.iter().any(|e| matches!(e, Event::Fill(_))), "{fills:?}");
+    // Renew trusted time before the rollover, then cross it within the sample grace.
+    first.advance(FIRST - 30_000).await;
     first.advance(FIRST + 1).await;
     let events = first.submit(Command::Tick).await;
     assert_eq!(charges(&events), [charge("0.01")]);
@@ -384,6 +388,14 @@ impl Node {
     async fn advance(&self, to: Millis) {
         self.clock.advance(Duration::from_millis((to - self.clock.now_ms()) as u64));
         self.tx.send(SeqRequest::TimeSample(sample_around(self.clock.as_ref()))).await.unwrap();
+        let (reply, seen) = oneshot::channel();
+        self.tx
+            .send(SeqRequest::Query(Box::new(move |_| {
+                let _ = reply.send(());
+            })))
+            .await
+            .unwrap();
+        seen.await.unwrap();
     }
 
     async fn stop(self) {

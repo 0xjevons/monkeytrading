@@ -195,6 +195,8 @@ impl Sequencer {
             }),
             accounting,
             benchmark_sync: false,
+            benchmark_sync_enabled: false,
+            benchmark_time_refused: false,
         };
         {
             let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();

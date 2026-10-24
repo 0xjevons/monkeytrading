@@ -93,6 +93,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/sequencer/tests/mod.rs` — sequencer, activation, recovery, and replay tests
 - `src/sequencer/tests/replay.rs` — root, sequence, and pre-event log replay tests
 - `src/sequencer/tests/benchmarks.rs` — publisher startup prerequisites and legacy-log refusal
+- `src/sequencer/tests/benchmark_recovery.rs` — publisher synchronization after trusted-time halts
 - `src/sequencer/tests/genesis.rs` — genesis tests: a rejected genesis writes nothing, and a log
   whose genesis did not apply in full is refused at recovery
 - `src/sequencer/tests/operator.rs` — recovery, activation, and replay with the operator the log
@@ -114,6 +115,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/api/mod.rs` — REST routes, request signature checks, and the request span
 - `src/api/admin.rs` — the operator's admin route, checked before it is sequenced
 - `src/api/benchmark_tests.rs` — deterministic publisher/TLS/API restart and financing dev scenario
+- `src/api/benchmark_tests/recovery.rs` — publisher retries during an in-process trusted-time halt
 - `src/api/admin_tests.rs` — admin route tests, and the operator channel dev scenario through
   `engine admin`
 - `src/api/stream/mod.rs` — the WebSocket stream: backfill from disk, then live, under the
@@ -677,6 +679,9 @@ The worker shares the operator nonce with other admin clients and re-reads it fo
 
 With `[benchmarks]` present, each startup refuses ordinary sequencing until an authorized snapshot
 has attempted every listed benchmark. Trusted time still gates genesis, activation, and the snapshot.
+If trusted-time admission halts across an unpaid rollover, recovery waits for another complete signed
+snapshot before ordinary or queued commands can charge catch-up. Publisher failures still use the
+missing/stale policy below. A brief halt with no unpaid rollover resumes without an extra snapshot.
 A recovered log with a rollover schedule must already record client auth, the operator, and toxicity
 notional weighting. Publisher synchronization refuses older logs missing those activation prerequisites
 before writing any command; migrate such logs separately before configuring the publisher worker.

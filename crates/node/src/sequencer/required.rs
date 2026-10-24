@@ -35,9 +35,26 @@ impl Sequencer {
                 "benchmark synchronization requires recorded {prerequisite}; legacy logs need prerequisite migration before configuring publishers"
             );
         }
+        self.benchmark_sync_enabled = true;
         self.benchmark_sync = true;
         warn!(alert = "benchmark_sync_pending", "waiting for signed publisher history before catch-up");
         Ok(())
+    }
+
+    /// Requires another publisher attempt if refused time resumes over an unpaid rollover.
+    pub(super) fn note_benchmark_time_admission(&mut self, admitted: bool, ts: Millis) {
+        if !self.benchmark_sync_enabled {
+            return;
+        }
+        if !admitted {
+            self.benchmark_time_refused = true;
+        } else if std::mem::take(&mut self.benchmark_time_refused)
+            && self.engine.next_rollover().is_some_and(|next| next <= ts)
+            && !self.benchmark_sync
+        {
+            self.benchmark_sync = true;
+            warn!(alert = "benchmark_sync_pending", "waiting for signed publisher history after trusted time recovers");
+        }
     }
 
     /// The seq of the last command in the log, if any.
@@ -127,9 +144,18 @@ impl Sequencer {
     /// - the engine rejects any of them
     /// - the log cannot be written
     pub(super) fn sequence_queued(&mut self, ts: Millis) -> anyhow::Result<()> {
-        for (what, cmds) in std::mem::take(&mut self.required) {
+        let mut queued = std::mem::take(&mut self.required).into_iter();
+        while let Some((what, cmds)) = queued.next() {
             info!(what, commands = cmds.len(), "sequencing required commands");
-            for cmd in cmds {
+            let mut cmds = cmds.into_iter();
+            while let Some(cmd) = cmds.next() {
+                let activation = matches!(&cmd, Command::Admin(AdminCommand::ActivateProtocol { version })
+                    if *version >= ProtocolVersion::V18);
+                if self.benchmark_sync && self.engine.next_rollover().is_some_and(|next| next <= ts) && !activation {
+                    self.required.push((what, std::iter::once(cmd).chain(cmds).collect()));
+                    self.required.extend(queued);
+                    return Ok(());
+                }
                 let events = self.stamp(ts, cmd)?;
                 if let Some(reason) = rejection(&events) {
                     bail!("{what}: rejected: {reason}");

@@ -62,8 +62,10 @@ pub struct Sequencer {
     metrics: Arc<Metrics>,
     gate: Option<Gate>,
     accounting: Accounting,
-    /// Startup waits for a signed, complete publisher fetch attempt before catch-up.
+    /// Startup and recovery wait for a signed, complete publisher attempt before catch-up.
     benchmark_sync: bool,
+    benchmark_sync_enabled: bool,
+    benchmark_time_refused: bool,
 }
 
 pub struct SequencerConfig<'a> {
@@ -179,6 +181,7 @@ impl Sequencer {
         if self.benchmark_sync && snapshot && events.contains(&Event::AdminApplied) {
             self.benchmark_sync = false;
             info!(alert_resolved = "benchmark_sync_pending", "publisher snapshot installed; sequencing resumed");
+            self.sequence_queued(ts)?;
         }
         Ok(Some(events))
     }
@@ -189,8 +192,20 @@ impl Sequencer {
     /// - the engine rejects a queued required command
     /// - the log cannot be written
     fn take_sample(&mut self, sample: Sample) -> anyhow::Result<()> {
+        if self.benchmark_sync_enabled {
+            let host_ms = self.clock.now_ms();
+            self.benchmark_time_refused |=
+                !self.time.can_admit(host_ms, host_ms.max(self.last_ts), self.clock.instant());
+        }
         self.time.update(sample);
-        self.sequence_queued_if_admitted()
+        if self.benchmark_sync_enabled {
+            if let Some(ts) = self.admitted_ts() {
+                self.sequence_queued(ts)?;
+            }
+            Ok(())
+        } else {
+            self.sequence_queued_if_admitted()
+        }
     }
 
     /// `take_sample` outside `run`, flushing what it sequences: how a test gives a sequencer trusted
@@ -209,7 +224,9 @@ impl Sequencer {
     fn admitted_ts(&mut self) -> Option<Millis> {
         let host_ms = self.clock.now_ms();
         let ts = host_ms.max(self.last_ts);
-        self.time.admit(host_ms, ts, self.clock.instant()).then_some(ts)
+        let admitted = self.time.admit(host_ms, ts, self.clock.instant());
+        self.note_benchmark_time_admission(admitted, ts);
+        admitted.then_some(ts)
     }
 
     /// Applies one command at `ts`, logs it with its events, signs any approved withdrawal, and
