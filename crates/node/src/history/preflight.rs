@@ -29,6 +29,11 @@ impl HistoryPlan {
             if !path.exists() {
                 return Ok(None);
             }
+            let metadata = std::fs::metadata(&path).context("reading history database metadata")?;
+            ensure!(metadata.is_file(), "history database is not a regular file");
+            // SQLite may remove an existing WAL while opening a zero-page main database,
+            // even on a read-only connection. Such an image must wait for authorized repair.
+            ensure!(metadata.len() > 0, "history database is empty");
             // A read-only no-lock VFS plus EXCLUSIVE mode gives SQLite a private heap WAL
             // index. It reads committed WAL pages without creating/updating the original SHM,
             // unlike an ordinary read-only open. Actual writable progress is rechecked below.

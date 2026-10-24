@@ -84,3 +84,16 @@ fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
         })
         .collect()
 }
+
+#[test]
+fn empty_database_never_deletes_recovery_evidence_during_preflight() {
+    let dir = scratch_dir("history-empty-with-wal");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(INDEX_FILE), []).unwrap();
+    std::fs::write(dir.join(format!("{INDEX_FILE}-wal")), b"original recovery evidence").unwrap();
+    std::fs::write(dir.join(format!("{INDEX_FILE}-shm")), b"original shared-memory evidence").unwrap();
+    let before = files(&dir);
+    let plan = HistoryPlan::open(&HistorySection { dir: dir.clone(), retention: Duration::from_secs(60) }).unwrap();
+    assert!(plan.progress.unwrap_err().to_string().contains("empty"));
+    assert_eq!(files(&dir), before);
+}
