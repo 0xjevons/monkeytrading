@@ -90,6 +90,8 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   before any is written, and how far a replayed log got through genesis
 - `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must
   look at, benchmarks with no rate, and house NAV below zero
+- `src/sequencer/alerts/retirement_tests.rs` — benchmark retirement, catalogue changes, and resolution state
+- `src/sequencer/alerts/retirement_webhook_tests.rs` — retirement pages through the durable webhook router
 - `src/sequencer/tests/mod.rs` — sequencer, activation, recovery, and replay tests
 - `src/sequencer/tests/replay.rs` — root, sequence, and pre-event log replay tests
 - `src/sequencer/tests/benchmarks.rs` — publisher startup prerequisites and legacy-log refusal
@@ -696,6 +698,8 @@ and still applies. With no observation or inherited rate, `benchmark_rate_missin
 that benchmark accrues no financing. An inherited undated rate still applies and raises
 `benchmark_rate_undated` until a dated observation covers the rollover. Fetch errors retain previously
 sequenced history; the separate worker logs `benchmark_fetch_failed` and retries at its next interval.
+When an accepted market update removes the final use of a benchmark, its alerts resolve after that
+command's rollover events, including incidents raised before the node restarted.
 
 Monitor both processes. A configured node waiting for its worker logs `benchmark_sync_pending`;
 the worker must run after every restart. SONIA's free database has the publisher's publication delay.

@@ -114,13 +114,33 @@ impl BenchmarkAlerts {
         }
     }
 
-    /// Drops retired names after the entire accepted admin command's events were handled.
-    pub(super) fn retain_listed(&mut self, engine: &Engine) {
-        let listed: BTreeSet<_> =
-            engine.markets().values().map(|market| market.spec.financing.benchmark.as_str()).collect();
+    /// Benchmarks used by at least one current market.
+    pub(super) fn listed(engine: &Engine) -> BTreeSet<String> {
+        engine.markets().values().map(|market| market.spec.financing.benchmark.clone()).collect()
+    }
+
+    /// Resolves retired names after all accepted-command events, including unknown restart state.
+    pub(super) fn retain_listed(&mut self, engine: &Engine, previous: &BTreeSet<String>) {
+        let listed = Self::listed(engine);
+        for benchmark in previous.difference(&listed) {
+            let conditions = self.tracked.entry(benchmark.clone()).or_default();
+            for (condition, name) in [
+                (&mut conditions.missing, "benchmark_rate_missing"),
+                (&mut conditions.undated, "benchmark_rate_undated"),
+                (&mut conditions.stale, "benchmark_rate_stale"),
+            ] {
+                resolve(condition, name, benchmark, "benchmark is no longer used by a listed market");
+            }
+        }
         self.tracked.retain(|benchmark, _| listed.contains(benchmark.as_str()));
     }
 }
+
+#[cfg(test)]
+mod retirement_tests;
+
+#[cfg(test)]
+mod retirement_webhook_tests;
 
 /// Emits the first unknown clear and subsequent clears only after the condition fired again.
 fn resolve(condition: &mut Option<bool>, name: &str, benchmark: &str, message: &str) {

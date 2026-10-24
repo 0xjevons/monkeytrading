@@ -235,6 +235,8 @@ impl Sequencer {
     /// - the log cannot be written
     /// - the engine refuses the sequence, which means this sequencer is broken
     fn stamp(&mut self, ts: Millis, cmd: Command) -> anyhow::Result<Vec<Event>> {
+        let previous_benchmarks =
+            matches!(&cmd, Command::Admin(_) | Command::SignedAdmin(_)).then(|| BenchmarkAlerts::listed(&self.engine));
         let sequenced = Sequenced { seq: self.next_seq, ts, cmd };
         let _span = info_span!("command", id = sequenced.seq).entered();
         let events = self.engine.apply(&sequenced).context("sequencer produced an invalid sequence")?;
@@ -261,8 +263,8 @@ impl Sequencer {
                 }
             }
         }
-        if events.contains(&Event::AdminApplied) {
-            self.benchmark_alerts.retain_listed(&self.engine);
+        if let Some(previous) = previous_benchmarks.filter(|_| events.contains(&Event::AdminApplied)) {
+            self.benchmark_alerts.retain_listed(&self.engine, &previous);
         }
         self.deficit.note(self.engine.house_nav());
         if self.next_seq.is_multiple_of(self.checkpoint_every)

@@ -33,7 +33,8 @@ an index: load only the rule whose hint matches the current action.
   vault's finalized commitment before history writes, plus authenticated withdrawal completion replay,
   price feeds: live crypto
   venue WebSockets (`feeds/`, one adapter per venue) and a mock, Prometheus metrics on an operator
-  listener, and alert routing to webhooks with a bounded durable outbox outside the public log. `tests/reference/` holds the node-format reference log
+  listener, and alert routing to webhooks with a bounded durable outbox outside the public log.
+  `sequencer/alerts/` tests benchmark retirement and webhook recovery. `tests/reference/` holds the node-format reference log
   per protocol version, with events, written once by `examples/reference_log.rs`. Its `README.md`
   lists every file.
 - **contracts/** — Foundry project for the custody vault. `src/Vault.sol` takes USDC deposits of
