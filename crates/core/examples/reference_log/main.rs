@@ -15,6 +15,7 @@ mod v14;
 mod v15;
 mod v16;
 mod v17;
+mod v18;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -490,5 +491,6 @@ fn session() -> Vec<Sequenced> {
     v15::session(&mut h);
     v16::session(&mut h);
     v17::session(&mut h);
+    v18::session(&mut h);
     h.log
 }

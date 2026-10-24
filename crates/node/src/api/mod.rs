@@ -4,6 +4,7 @@
 
 mod admin;
 mod archive;
+mod benchmark_schedule;
 mod history;
 mod stream;
 pub(crate) use stream::{Feed, MAX_BACKFILLS};
@@ -274,6 +275,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/attestation", get(attestation))
         .route("/v1/markets", get(markets))
+        .route("/v1/benchmarks", get(benchmarks))
+        .route("/v1/benchmarks/schedule", get(benchmark_schedule::schedule))
         .route("/v1/house", get(house))
         .route("/v1/accounts/{address}", get(account))
         .route("/v1/accounts/{address}/nonce", get(nonce))
@@ -329,6 +332,13 @@ async fn markets(State(s): State<ApiState>) -> ApiResult<Vec<MarketView>> {
         })
         .await?;
     Ok(Json(views))
+}
+
+/// Benchmark history and the next rollover; available while startup synchronization waits.
+/// Error cases:
+/// - the sequencer has stopped
+async fn benchmarks(State(s): State<ApiState>) -> ApiResult<engine_core::benchmark::BenchmarkState> {
+    Ok(Json(s.query(Engine::benchmark_state).await?))
 }
 
 /// House cash, NAV, and gross exposure.
@@ -452,3 +462,6 @@ mod auth_tests;
 mod proof_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod benchmark_tests;

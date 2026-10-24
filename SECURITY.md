@@ -82,12 +82,13 @@ configuration uses hardware attestation, on-chain custody, live prices, and sign
 Requests are signed, and the node refuses unsigned ones unless both the enclave and custody are
 mocks. The other three are not finished: the node can request an attestation report through
 configfs-tsm, but attestation on SEV-SNP hardware and a verifier for it are still being built, as
-are live prices and on-chain custody, which credits vault deposits but does not yet pay withdrawals.
+are live prices, the separate signed benchmark publisher worker, and on-chain custody, which credits
+vault deposits but does not yet pay withdrawals.
 
 Out of scope are volumetric denial of service, meaning attacks that work only by flooding the API or
 the network with traffic; social engineering of anyone involved with the project; reorganisations of
 Arbitrum One that undo a block after its batch reached Ethereum, the finality the custody adapter
-waits for; and vulnerabilities in third-party services, such as the venues that supply prices, the
+waits for; and vulnerabilities in third-party services, such as the venues and benchmark publishers that supply data, the
 Arbitrum network, the USDC contract, and the enclave hardware, which should be reported to their
 owners. How the engine handles what those services send it, including a venue that quotes a false
 price, is in scope.

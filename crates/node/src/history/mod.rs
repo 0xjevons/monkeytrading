@@ -251,6 +251,8 @@ pub fn account_of(event: &Event) -> Option<AccountId> {
         Event::Fill(fill) => Some(fill.account),
         Event::HouseCapitalMoved { .. }
         | Event::BenchmarkRateMissing { .. }
+        | Event::BenchmarkRateObserved { .. }
+        | Event::BenchmarkRateUndated { .. }
         | Event::MarketOpened { .. }
         | Event::MarketClosed { .. }
         | Event::StressChanged { .. }

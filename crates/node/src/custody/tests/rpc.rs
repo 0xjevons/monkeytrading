@@ -204,7 +204,26 @@ async fn rpc_wire_keeps_tags_batches_filters_quantities_and_canonical_hash_calls
             json!([call(depositCountCall {}.abi_encode()), {"blockHash":B256::repeat_byte(7),"requireCanonical":true}]),
         ),
     ];
-    assert_eq!(observed, expected);
+    let canonicalize = |mut requests: Vec<Value>| {
+        // Only alternatives within one topic position are unordered.
+        let alternatives = requests[7]["params"][0]["topics"][0].as_array_mut().unwrap();
+        alternatives.sort_unstable_by(|left, right| left.as_str().unwrap().cmp(right.as_str().unwrap()));
+        requests
+    };
+    let expected = canonicalize(expected);
+    assert_eq!(canonicalize(observed.clone()), expected);
+    for (alternatives, matches) in [
+        (json!([Deposited::SIGNATURE_HASH, HouseDeposited::SIGNATURE_HASH]), true),
+        (json!([HouseDeposited::SIGNATURE_HASH, Deposited::SIGNATURE_HASH]), true),
+        (json!([Deposited::SIGNATURE_HASH]), false),
+        (json!([Deposited::SIGNATURE_HASH, Deposited::SIGNATURE_HASH]), false),
+        (json!([Deposited::SIGNATURE_HASH, HouseDeposited::SIGNATURE_HASH, Deposited::SIGNATURE_HASH]), false),
+        (json!([Deposited::SIGNATURE_HASH, B256::repeat_byte(9)]), false),
+    ] {
+        let mut variant = observed.clone();
+        variant[7]["params"][0]["topics"][0] = alternatives;
+        assert_eq!(canonicalize(variant) == expected, matches);
+    }
 
     async fn wire_answer(State(tx): State<mpsc::UnboundedSender<Value>>, Json(request): Json<Value>) -> Json<Value> {
         fn answer(request: &Value) -> Value {

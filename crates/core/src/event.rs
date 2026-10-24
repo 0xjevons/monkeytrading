@@ -74,6 +74,17 @@ pub enum Event {
         benchmark: String,
         markets: Vec<MarketId>,
     },
+    /// A legacy rate with unknown publisher date still applies and raises a Critical alert.
+    BenchmarkRateUndated {
+        benchmark: String,
+    },
+    /// The dated rate selected at a V18 rollover; stale observations still apply.
+    BenchmarkRateObserved {
+        benchmark: String,
+        effective_date: chrono::NaiveDate,
+        rollover_date: chrono::NaiveDate,
+        stale: bool,
+    },
     MarketOpened {
         market: MarketId,
     },

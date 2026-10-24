@@ -15,7 +15,7 @@ pub type Millis = i64;
 /// before it becomes engine time, so every time derived from a stamp — a session check, a
 /// rollover — stays well inside chrono's range in any market's time zone, and the rollover walk
 /// in `crate::params::Rollover::next_after` always has a representable day to step to.
-pub(crate) const MAX_STAMP_MS: Millis = 253_402_300_799_999;
+pub const MAX_STAMP_MS: Millis = 253_402_300_799_999;
 
 pub type MarketId = u32;
 pub type OrderId = u64;

@@ -26,9 +26,9 @@
 #   their venues (quote_currency). Their profit and loss accrues in that
 #   currency and converts to USD at the engine's own USD-JPY, EUR-USD and
 #   GBP-USD prices, which are listed before them.
-# - Benchmark rates are not set here. The daily benchmark rates feature (#33)
-#   sequences them; until then a market whose benchmark has no rate accrues no
-#   financing, and each rollover records the benchmark and raises an alert.
+# - Benchmark rates are supplied by the separate signed publisher worker (#33).
+#   Complete the node config with config/benchmark-publishers.toml and run the worker
+#   before serving. With no rate, a market accrues no financing and raises a Critical alert.
 # - house_capital is 0: the house starts with no capital and builds it from
 #   trader losses. Genesis records a zero house capital credit, which moves no
 #   cash and marks genesis done, so the vault holds only trader deposits.

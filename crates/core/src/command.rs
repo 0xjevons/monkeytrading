@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Fixed;
 use crate::auth::{ClientAuth, Operator, RequestAuth};
+use crate::benchmark::BenchmarkBatch;
 use crate::market::MarketSpec;
 use crate::params::{NotionalWeighting, ProtocolParams};
 use crate::price::SourceQuote;
@@ -89,6 +90,8 @@ pub enum AdminCommand {
         benchmark: String,
         annual_bps: i64,
     },
+    /// An atomic publisher-history snapshot, installed before missed rollovers are charged.
+    SetBenchmarkRates(BenchmarkBatch),
     /// The operator's stress floor for one market, or every market if
     /// `market` is `None`. The effective level is the higher of this and the
     /// automatic level, so the operator can raise stress but never suppress it.
@@ -172,6 +175,11 @@ pub struct WithdrawalRequest {
 }
 
 impl AdminCommand {
+    /// Whether this is a dated publisher snapshot.
+    pub fn is_benchmark_snapshot(&self) -> bool {
+        matches!(self, Self::SetBenchmarkRates(_))
+    }
+
     /// Whether the operator may sign this command: listings, parameters, benchmark rates, stress
     /// floors, and reduce-only. The node alone sequences the others, from its config and build.
     pub fn is_operator_command(&self) -> bool {
@@ -179,6 +187,7 @@ impl AdminCommand {
             AdminCommand::SetParams(_)
             | AdminCommand::UpsertMarket(_)
             | AdminCommand::SetBenchmarkRate { .. }
+            | AdminCommand::SetBenchmarkRates(_)
             | AdminCommand::SetStressFloor { .. }
             | AdminCommand::SetReduceOnly { .. } => true,
             AdminCommand::SetClientAuth(_)
@@ -186,5 +195,13 @@ impl AdminCommand {
             | AdminCommand::SetToxicityNotional(_)
             | AdminCommand::ActivateProtocol { .. } => false,
         }
+    }
+}
+
+impl Command {
+    /// Whether this carries an atomic dated benchmark snapshot, signed or during genesis.
+    pub fn is_benchmark_batch(&self) -> bool {
+        matches!(self, Self::Admin(AdminCommand::SetBenchmarkRates(_)))
+            || matches!(self, Self::SignedAdmin(req) if matches!(req.command, AdminCommand::SetBenchmarkRates(_)))
     }
 }

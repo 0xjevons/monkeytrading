@@ -3,6 +3,8 @@
 //! `OPERATOR_KEY` environment variable, never the command line, where other users of the machine
 //! could read it, and it never leaves this process: the node holds only the operator's public key.
 
+mod benchmark_feed;
+mod benchmark_watch;
 mod tls;
 
 use std::fmt;
@@ -34,7 +36,7 @@ use crate::clock::now_ms;
 use crate::config::NodeConfig;
 
 /// How long one call to the node may take, connection included.
-const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How far ahead a signed command expires: half the engine's bound, so it is accepted with this
 /// machine's clock up to two and a half minutes off the node's either way.
 const EXPIRES_IN_MS: Millis = MAX_EXPIRY_AHEAD_MS / 2;
@@ -72,6 +74,12 @@ pub enum AdminAction {
         benchmark: String,
         #[arg(allow_negative_numbers = true)]
         annual_bps: i64,
+    },
+    /// Fetch publisher histories and sequence their effective dates through the signed operator channel.
+    SyncBenchmarks {
+        /// Repeat at benchmarks.interval; run as a separate operator service.
+        #[arg(long)]
+        watch: bool,
     },
     /// Set the operator's stress floor for one market, or for every market without `--market`.
     /// A market's level never falls below what its automatic triggers set.
@@ -153,6 +161,7 @@ impl AdminAction {
             AdminAction::SetBenchmarkRate { benchmark, annual_bps } => {
                 AdminCommand::SetBenchmarkRate { benchmark, annual_bps }
             }
+            AdminAction::SyncBenchmarks { .. } => bail!("publisher sync is asynchronous"),
             AdminAction::SetStressFloor { level, market } => AdminCommand::SetStressFloor { market, level },
             AdminAction::SetReduceOnly { reduce_only, market } => AdminCommand::SetReduceOnly { market, reduce_only },
         })
@@ -168,25 +177,43 @@ impl AdminAction {
 /// - the node cannot be reached in time, or refuses the request (see `call`)
 /// - the engine rejects the command
 pub async fn run(args: AdminArgs, env: KeyEnv) -> anyhow::Result<AdminRequest> {
-    run_with_clock(args, env, now_ms).await
+    let cfg = NodeConfig::load(&args.config)?;
+    crate::init_logging(&cfg.logging.level)?;
+    run_configured(args, env, now_ms, cfg).await
 }
 
 /// `run`, with expiries counted from `clock`.
 /// Error cases:
 /// - see `run`
+#[cfg(test)]
 pub(crate) async fn run_with_clock(
     args: AdminArgs,
     env: KeyEnv,
-    clock: fn() -> Millis,
+    clock: impl Fn() -> Millis,
 ) -> anyhow::Result<AdminRequest> {
     let cfg = NodeConfig::load(&args.config)?;
+    run_configured(args, env, clock, cfg).await
+}
+
+/// Runs one configured operator client with its explicit clock.
+/// Error cases:
+/// - see `run`
+async fn run_configured(
+    args: AdminArgs,
+    env: KeyEnv,
+    clock: impl Fn() -> Millis,
+    cfg: NodeConfig,
+) -> anyhow::Result<AdminRequest> {
     let operator = cfg.operator()?;
     let key = resolve_key(args.key_file.as_deref(), env)?;
     if eip712::address(key.verifying_key()) != operator.address {
         bail!("the key is not the operator key {} in {}", operator.address, args.config.display());
     }
-    let command = args.action.command()?;
     let node = NodeApi { url: args.node, pin: args.pin };
+    if let AdminAction::SyncBenchmarks { watch } = args.action {
+        return benchmark_feed::run(&cfg, &node, &key, &operator, clock, watch).await;
+    }
+    let command = args.action.command()?;
     let path = format!("/v1/accounts/{}/nonce", operator.address);
     let NonceView { next_nonce } = call(&node, Method::GET, &path, None).await?;
     let req = sign(&key, &operator, command, next_nonce, clock() + EXPIRES_IN_MS);

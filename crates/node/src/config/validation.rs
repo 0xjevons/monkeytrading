@@ -37,6 +37,9 @@ impl NodeConfig {
     /// - genesis lists a market id, a market symbol, or a benchmark name twice
     /// - the engine would reject a genesis command (see `check_genesis`)
     pub(super) fn validate(&self) -> anyhow::Result<()> {
+        if let Some(benchmarks) = &self.benchmarks {
+            benchmarks.validate(self)?;
+        }
         let filter = EnvFilter::try_new(&self.logging.level).context("logging.level")?;
         // A word that is not a level, such as "warning", parses as a target and hides every alert.
         ensure!(

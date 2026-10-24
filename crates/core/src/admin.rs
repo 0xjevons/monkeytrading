@@ -110,8 +110,11 @@ impl Engine {
                     self.markets.get(&spec.id).is_none_or(|market| market.spec.financing.benchmark != *benchmark);
                 if self.protocol_version >= ProtocolVersion::V14
                     && named
-                    && !self.benchmarks.is_empty()
+                    && (!self.benchmarks.is_empty()
+                        || (self.protocol_version >= ProtocolVersion::V18 && !self.benchmark_history.is_empty()))
                     && !self.benchmarks.contains_key(benchmark)
+                    && !(self.protocol_version >= ProtocolVersion::V18
+                        && self.benchmark_history.contains_key(benchmark))
                 {
                     return Err(format!("benchmark {benchmark} has no rate"));
                 }
@@ -154,7 +157,15 @@ impl Engine {
                     return Err(format!("benchmark rate {annual_bps}bps out of range"));
                 }
                 self.benchmarks.insert(benchmark.clone(), *annual_bps);
+                if self.protocol_version >= ProtocolVersion::V18 {
+                    let date = self.benchmark_date(self.now);
+                    self.benchmark_history
+                        .entry(benchmark.clone())
+                        .or_default()
+                        .insert(date, crate::Fixed::from_bps(*annual_bps));
+                }
             }
+            AdminCommand::SetBenchmarkRates(batch) => self.set_benchmark_rates(batch)?,
             AdminCommand::SetStressFloor { market, level } => {
                 let levels = self.params.as_ref().ok_or("protocol params not set")?.stress_levels.len();
                 if *level >= levels {

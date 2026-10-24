@@ -8,13 +8,55 @@ use engine_core::command::{AdminCommand, Command};
 use engine_core::params::NotionalWeighting;
 use engine_core::protocol::ProtocolVersion;
 use engine_core::types::Millis;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Genesis;
 use crate::sequencer::Sequencer;
 use crate::sequencer::genesis::{GENESIS_REF, check_genesis, genesis_commands, rejection};
 
 impl Sequencer {
+    /// Requires a signed publisher snapshot before catch-up or ordinary sequencing.
+    /// Error cases:
+    /// - a scheduled legacy log needs activation prerequisites that would charge rollovers first
+    pub fn wait_for_benchmarks(&mut self) -> anyhow::Result<()> {
+        let missing = if self.engine.client_auth().is_none() {
+            Some("client auth")
+        } else if self.engine.operator().is_none() {
+            Some("operator")
+        } else if self.engine.params().is_some_and(|params| params.toxicity.notional.is_none()) {
+            Some("toxicity notional weighting")
+        } else {
+            None
+        };
+        if self.engine.next_rollover().is_some()
+            && let Some(prerequisite) = missing
+        {
+            bail!(
+                "benchmark synchronization requires recorded {prerequisite}; legacy logs need prerequisite migration before configuring publishers"
+            );
+        }
+        self.benchmark_sync_enabled = true;
+        self.benchmark_sync = true;
+        warn!(alert = "benchmark_sync_pending", "waiting for signed publisher history before catch-up");
+        Ok(())
+    }
+
+    /// Requires another publisher attempt if refused time resumes over an unpaid rollover.
+    pub(super) fn note_benchmark_time_admission(&mut self, admitted: bool, ts: Millis) {
+        if !self.benchmark_sync_enabled {
+            return;
+        }
+        if !admitted {
+            self.benchmark_time_refused = true;
+        } else if std::mem::take(&mut self.benchmark_time_refused)
+            && self.engine.next_rollover().is_some_and(|next| next <= ts)
+            && !self.benchmark_sync
+        {
+            self.benchmark_sync = true;
+            warn!(alert = "benchmark_sync_pending", "waiting for signed publisher history after trusted time recovers");
+        }
+    }
+
     /// The seq of the last command in the log, if any.
     pub fn last_seq(&self) -> Option<u64> {
         self.engine.last_seq()
@@ -102,9 +144,18 @@ impl Sequencer {
     /// - the engine rejects any of them
     /// - the log cannot be written
     pub(super) fn sequence_queued(&mut self, ts: Millis) -> anyhow::Result<()> {
-        for (what, cmds) in std::mem::take(&mut self.required) {
+        let mut queued = std::mem::take(&mut self.required).into_iter();
+        while let Some((what, cmds)) = queued.next() {
             info!(what, commands = cmds.len(), "sequencing required commands");
-            for cmd in cmds {
+            let mut cmds = cmds.into_iter();
+            while let Some(cmd) = cmds.next() {
+                let activation = matches!(&cmd, Command::Admin(AdminCommand::ActivateProtocol { version })
+                    if *version >= ProtocolVersion::V18);
+                if self.benchmark_sync && self.engine.next_rollover().is_some_and(|next| next <= ts) && !activation {
+                    self.required.push((what, std::iter::once(cmd).chain(cmds).collect()));
+                    self.required.extend(queued);
+                    return Ok(());
+                }
                 let events = self.stamp(ts, cmd)?;
                 if let Some(reason) = rejection(&events) {
                     bail!("{what}: rejected: {reason}");

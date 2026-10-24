@@ -78,6 +78,11 @@ impl TimeGate {
         self.sample = Some(sample);
     }
 
+    /// Checks admission without changing alerts, including just before a new sample replaces it.
+    pub(crate) fn can_admit(&self, host_ms: Millis, ts: Millis, now: Instant) -> bool {
+        self.check(host_ms, ts, now).is_none()
+    }
+
     /// Whether `ts`, stamped from the host clock reading `host_ms`, may be logged at monotonic time
     /// `now`. Raises a Critical alert when sequencing halts, or halts for another reason, and logs
     /// when it resumes.

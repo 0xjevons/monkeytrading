@@ -5,6 +5,7 @@
 pub mod admin;
 mod alerts;
 mod api;
+mod benchmarks;
 mod checkpoints;
 mod clock;
 pub mod config;

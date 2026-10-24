@@ -10,6 +10,8 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 
 ## Features
 
+- Dated publisher ingestion with a separate signing worker, startup synchronization, and per-date
+  rollover catch-up under V18
 - Single-owner sequencer on a dedicated OS thread: commands are logged and flushed before any client sees their effect
 - Genesis all or nothing: the engine checks every genesis command at config load and again before
   any is written, and recovery refuses a log whose genesis stopped short of its closing checkpoint
@@ -66,6 +68,10 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/main.rs` — the `engine` binary: `run`, `replay`, and `admin`
 - `src/lib.rs` — module index
 - `src/admin/mod.rs` — `engine admin`: the operator key, the commands it signs, and submission
+- `src/admin/benchmark_feed.rs` — the separate signed publisher worker and rollover scheduling
+- `src/admin/benchmark_watch.rs` — bounded schedule notifications and reconnection for the worker
+- `src/benchmarks/` — official CSV fetching (`mod.rs`), exact decimal parsing (`parse.rs`), compact
+  schedule notifications (`schedule.rs`), and tests
 - `src/admin/tls.rs` — the TLS connection to a node, pinned to its attested key
 - `src/admin/tests.rs` — `engine admin` tests: key sources, commands, signing, and pins
 - `src/node/mod.rs` — startup, task supervision, and shutdown
@@ -86,8 +92,15 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   before any is written, and how far a replayed log got through genesis
 - `src/sequencer/alerts.rs` — the alerts the sequencer raises: engine rejections an operator must
   look at, benchmarks with no rate, and house NAV below zero
+- `src/sequencer/alerts/retirement_tests.rs` — benchmark retirement, catalogue changes, and resolution state
+- `src/sequencer/alerts/retirement_webhook_tests.rs` — retirement pages through the durable webhook router
+- `src/sequencer/alerts/undated_tests.rs` — scalar fallback, independent incidents, and durable webhook recovery
+- `src/sequencer/benchmark_schedule.rs` — changed rollover notifications and publisher synchronization when due
+- `src/sequencer/tests/benchmark_schedule.rs` — schedule changes, durable watches, and due-time synchronization
 - `src/sequencer/tests/mod.rs` — sequencer, activation, recovery, and replay tests
 - `src/sequencer/tests/replay.rs` — root, sequence, and pre-event log replay tests
+- `src/sequencer/tests/benchmarks.rs` — publisher startup prerequisites and legacy-log refusal
+- `src/sequencer/tests/benchmark_recovery.rs` — publisher synchronization after trusted-time halts
 - `src/sequencer/tests/genesis.rs` — genesis tests: a rejected genesis writes nothing, and a log
   whose genesis did not apply in full is refused at recovery
 - `src/sequencer/tests/operator.rs` — recovery, activation, and replay with the operator the log
@@ -108,6 +121,12 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   and the checks on what it reads
 - `src/api/mod.rs` — REST routes, request signature checks, and the request span
 - `src/api/admin.rs` — the operator's admin route, checked before it is sequenced
+- `src/api/benchmark_schedule.rs` — capped, bounded watches of the durable rollover schedule
+- `src/api/benchmark_tests.rs` — deterministic publisher/TLS/API restart and financing dev scenario
+- `src/api/benchmark_tests/recovery.rs` — publisher retries during an in-process trusted-time halt
+- `src/api/benchmark_tests/retention.rs` — failed publisher refreshes and calendar changes after restart
+- `src/api/benchmark_tests/schedule.rs` — actual worker rescheduling, in-flight nonce fencing, and financing
+- `src/api/benchmark_tests/schedule/reconnect.rs` — watch-only transport failure during a publisher fetch
 - `src/api/admin_tests.rs` — admin route tests, and the operator channel dev scenario through
   `engine admin`
 - `src/api/stream/mod.rs` — the WebSocket stream: backfill from disk, then live, under the
@@ -154,6 +173,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/tls/tests/stream.rs` — the stream end to end over TLS: the subscriber and message caps
 - `src/limits.rs` — request rate limits, connection caps, and the stream subscriber cap
 - `src/config/mod.rs` — the node config schema and loading
+- `src/config/benchmarks.rs` — publisher endpoints, cadence, timeout, and catalogue coverage
 - `src/config/checkpoints.rs` — checkpoint relayer config and validation
 - `src/config/custody.rs` — the `[custody.evm]` section, independent RPC providers, redacted
   URLs, and custody checks
@@ -644,6 +664,75 @@ The alert webhook URLs are credentials, so config names the environment variable
 unless it is HTTP to a loopback address, and the node refuses to start when a named variable is
 unset. A node whose TEE or custody provider is not `mock` refuses to start without
 `[alerts.critical]`, since its Critical alerts would otherwise page no one.
+
+### Dated benchmark worker
+
+Append `config/benchmark-publishers.toml` to a complete node config to enable publisher ingestion.
+On a fresh node, omit fixed `genesis.benchmarks` entries. They are manual rates effective on the
+startup date and can take precedence over delayed publisher observations; production genesis
+leaves them unset.
+The sources cover SOFR (NY Fed), ESTR (ECB), SONIA (Bank of England), AONIA (RBA), and TONA (BOJ).
+Endpoints use the official publishers' certificate chains against compiled-in roots; redirects and
+proxies are disabled. Loopback HTTP endpoints are accepted only with a mock TEE.
+
+Start the node with this config, verify its attestation, then run a separate operator service:
+
+```sh
+engine admin --config /path/to/node.toml --pin <attested-tls-hash> sync-benchmarks --watch
+```
+
+Give `OPERATOR_KEY_FILE` to that worker alone. The node retains only the operator public key.
+Without `--watch`, the command fetches and signs one snapshot. The config's interval must be at
+most 24 hours; the example polls hourly to retry failures and pick up publications before rollover.
+Watch mode also schedules a fetch before the next rollover, reserving every publisher timeout
+and the three bounded calls to the node. Scheduling refuses unrepresentable time budgets.
+The worker shares the operator nonce with other admin clients and reads it before fetching each
+snapshot. A signed admin change during the fetch invalidates that nonce; the old attempt cannot
+install its observations under the new schedule. Watch mode retries a refused or failed submission
+within the shorter of the configured interval and the node-call timeout.
+
+With `[benchmarks]` present, each startup refuses ordinary sequencing until an authorized snapshot
+has attempted every listed benchmark. Trusted time still gates genesis, activation, and the snapshot.
+If trusted-time admission halts across an unpaid rollover, recovery waits for another complete signed
+snapshot before ordinary or queued commands can charge catch-up. Publisher failures still use the
+missing/stale policy below. A brief halt with no unpaid rollover resumes without an extra snapshot.
+An accepted change to the rollover timezone or time also requires a fresh complete attempt.
+Ordinary sequencing continues before the newly selected rollover; if it becomes due first,
+financing waits for the attempt. Rejected or unchanged schedules do not re-arm this requirement.
+The worker follows compact durable revisions through `GET /v1/benchmarks/schedule?after=<revision>`;
+changes trigger an immediate fetch and re-arm preflight, even inside the new fetch window.
+Watches share the API subscriber cap, wait within the node-call timeout, and refresh on reconnection.
+A recovered log with a rollover schedule must already record client auth, the operator, and toxicity
+notional weighting. Publisher synchronization refuses older logs missing those activation prerequisites
+before writing any command; migrate such logs separately before configuring the publisher worker.
+The public `GET /v1/benchmarks` returns the next rollover and retained rate history, so the worker
+fetches histories covering downtime before a missed rollover is charged. A restart regenerates the
+TLS key: verify its attestation and restart the worker with the new pin before sequencing resumes.
+
+Each signed snapshot logs effective dates and annual fractions, retaining sub-basis-point precision.
+Each rollover selects the latest observation on or before its local date. Weekdays mean Monday to
+Friday; an observation older than five weekdays raises `benchmark_rate_stale` at Critical severity
+and still applies. With no observation or inherited rate, `benchmark_rate_missing` is Critical and
+that benchmark accrues no financing. An inherited undated rate still applies and raises
+`benchmark_rate_undated` until a dated observation covers the rollover. Applying that fallback
+resolves the independent missing-rate incident immediately. Fetch errors retain previously
+sequenced history; the separate worker logs `benchmark_fetch_failed` and retries at its next interval.
+When an accepted market update removes the final use of a benchmark, its alerts resolve after that
+command's rollover events, including incidents raised before the node restarted.
+
+Monitor both processes. A configured node waiting for its worker logs `benchmark_sync_pending`;
+the worker must run after every restart. SONIA's free database has the publisher's publication delay.
+For long outages, size `api.max_body_bytes` for the signed history (the protocol allows 16,384
+observations per snapshot); a rejected or lost HTTP submission leaves startup synchronization pending.
+After catch-up, histories retain predecessors needed by unpaid rollovers and any legal calendar
+change. Older observations are removed only after a retained predecessor supersedes them for all
+those dates. Previously charged dates are not billed again when a publisher revises a rate.
+
+Protocol activation is one-way: a build predating V18 cannot replay a log that activated it.
+Run the deterministic dev scenario with
+`cargo test -p engine-node dev_scenario_benchmark_worker` and protocol coverage with
+`cargo test -p engine-core --test benchmarks --test benchmark_retention`; both run in the existing
+crate CI lanes.
 
 ## Testing
 

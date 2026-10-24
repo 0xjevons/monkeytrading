@@ -31,7 +31,9 @@ small additional spread on every trade.
 
 Losing trades pay nothing. Winning trades pay a fixed share of the profit they realise, and
 positions held over the daily rollover pay or receive financing at a benchmark interest rate plus
-or minus a markup.
+or minus a markup. Under V18, a separate operator worker fetches dated rates from the official
+publishers. After downtime, each missed rollover uses the rate effective on its local date. The
+worker setup and stale-rate policy are in [engine-node](crates/node/README.md#dated-benchmark-worker).
 
 Accounts are kept in US dollars. A market quoted in another currency, such as Germany 40 in euros
 or Japan 225 in yen, accrues profit and loss in that currency and converts it to dollars at the

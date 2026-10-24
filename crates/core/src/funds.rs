@@ -101,6 +101,9 @@ impl Engine {
         let rollover = params.rollover.clone();
         while let Some(at) = self.next_rollover.filter(|at| *at <= self.now) {
             self.charge_financing(events);
+            if self.protocol_version >= ProtocolVersion::V18 {
+                self.prune_benchmark_history(self.benchmark_date(at));
+            }
             self.next_rollover = Some(rollover.next_after(at));
             if self.protocol_version >= ProtocolVersion::V6 {
                 self.check_all_closeouts(events);
@@ -112,7 +115,12 @@ impl Engine {
     /// receive benchmark - markup. From `V14` each benchmark with no rate is recorded with the markets
     /// that use it, which accrue nothing.
     fn charge_financing(&mut self, events: &mut Vec<Event>) {
-        if self.protocol_version >= ProtocolVersion::V14 {
+        if self.protocol_version >= ProtocolVersion::V18 {
+            self.benchmark_status(
+                self.benchmark_date(self.next_rollover.expect("charging a scheduled rollover")),
+                events,
+            );
+        } else if self.protocol_version >= ProtocolVersion::V14 {
             let unrated = self
                 .markets
                 .iter()
@@ -153,6 +161,20 @@ impl Engine {
         let market = self.markets.get(&market_id)?;
         let mark = market.mark?;
         let financing = &market.spec.financing;
+        if self.protocol_version >= ProtocolVersion::V18 {
+            let date = self.benchmark_date(self.next_rollover.expect("charging a scheduled rollover"));
+            let rate = self
+                .dated_benchmark(&financing.benchmark, date)
+                .map(|(_, rate)| rate)
+                .or_else(|| self.benchmarks.get(&financing.benchmark).map(|bps| Fixed::from_bps(*bps)))?;
+            let markup = Fixed::from_bps(financing.markup_bps);
+            let annual_rate = if pos.qty.is_positive() { rate + markup } else { markup - rate };
+            let notional =
+                pos.qty.abs().mul_rounded(mark, if annual_rate >= Fixed::ZERO { Rounding::Up } else { Rounding::Down });
+            let amount =
+                notional.mul_rounded(annual_rate, Rounding::Up).div_int_rounded(financing.day_basis, Rounding::Up);
+            return Some(market.usd_at_mark(amount, Rounding::Up));
+        }
         let benchmark = match self.benchmarks.get(&financing.benchmark) {
             Some(rate) => *rate,
             None if self.protocol_version >= ProtocolVersion::V14 => return None,
