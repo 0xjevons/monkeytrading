@@ -124,7 +124,7 @@ fn validate_geometry(path: &std::path::Path, len: u64) -> anyhow::Result<()> {
     let page_size = if encoded == 1 { 65_536_u64 } else { u64::from(encoded) };
     ensure!((512..=65_536).contains(&page_size) && page_size.is_power_of_two(), "invalid history page size");
     ensure!(len >= page_size, "history database is smaller than one page");
-    ensure!(len.div_ceil(page_size) <= u64::from(u32::MAX) - 1, "history database page count exceeds SQLite limit");
+    ensure!(len.div_ceil(page_size) < u64::from(u32::MAX), "history database page count exceeds SQLite limit");
     Ok(())
 }
 
