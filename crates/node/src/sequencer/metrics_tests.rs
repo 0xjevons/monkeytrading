@@ -1,9 +1,11 @@
 use super::*;
+use crate::log::Checkpoint;
 
 use engine_core::command::{OrderKind, OrderRequest};
 use engine_core::price::SourceQuote;
 use engine_core::types::Side;
 
+use tokio::sync::oneshot;
 use tokio::time::advance;
 
 use crate::alerts::capture;
@@ -63,7 +65,7 @@ fn recovery_sets_the_checkpoint_time_from_the_command_it_covers() {
 
     let metrics = Arc::new(Metrics::new());
     let (stream, _) = broadcast::channel(16);
-    let key = Arc::new(EnclaveKey::generate());
+    let key = Arc::new(EnclaveKey::test_key());
     let manifest = watch::channel(Manifest::default()).0;
     let cfg = SequencerConfig { metrics: metrics.clone(), ..sequencer_config(&dir, manifest) };
     Sequencer::recover(cfg, key, stream, mpsc::unbounded_channel().0).unwrap();
@@ -78,7 +80,7 @@ async fn a_batch_is_timed_once_across_every_command_it_sequences() {
     let (stream, _) = broadcast::channel(16);
     let dir = scratch_dir("seq-batch");
     let manifest = watch::channel(Manifest::default()).0;
-    let key = Arc::new(EnclaveKey::generate());
+    let key = Arc::new(EnclaveKey::test_key());
     let clock = Arc::new(SlowStamps(TestClock::default()));
     let cfg = SequencerConfig { clock: clock.clone(), metrics: metrics.clone(), ..sequencer_config(&dir, manifest) };
     let mut seq = Sequencer::recover(cfg, key, stream, mpsc::unbounded_channel().0).unwrap();
@@ -107,7 +109,7 @@ async fn a_batch_of_reads_alone_is_not_timed() {
     let (stream, _) = broadcast::channel(16);
     let dir = scratch_dir("seq-batch-reads");
     let manifest = watch::channel(Manifest::default()).0;
-    let key = Arc::new(EnclaveKey::generate());
+    let key = Arc::new(EnclaveKey::test_key());
     let cfg = SequencerConfig { metrics: metrics.clone(), ..sequencer_config(&dir, manifest) };
     let seq = Sequencer::recover(cfg, key, stream, mpsc::unbounded_channel().0).unwrap();
     let (tx, rx) = mpsc::channel(8);
@@ -162,7 +164,23 @@ async fn a_house_deficit_resolves_once_nav_stays_at_or_above_zero() {
 // ── Helpers ──
 
 fn checkpoint(seq: u64, root: String) -> LogEntry {
-    LogEntry::Checkpoint(Checkpoint { seq, root, signature: String::new(), signer: String::new() })
+    let key = EnclaveKey::test_key();
+    let domain = crate::log::CheckpointDomain { chain_id: 31337, vault: AccountId([0; 20]) };
+    let signature = key.sign_checkpoint(
+        domain.chain_id,
+        &domain.vault.0,
+        seq,
+        &root.parse::<engine_core::eip712::B256>().unwrap_or_default().0,
+    );
+    LogEntry::Checkpoint(Checkpoint {
+        parent: None,
+        seq,
+        root,
+        signature,
+        signer: key.address_hex(),
+        domain: Some(domain),
+        deferred_withdrawals: false,
+    })
 }
 
 /// A market buy of `qty` BTC by `TRADER` at the test mid.

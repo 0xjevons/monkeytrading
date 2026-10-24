@@ -26,6 +26,8 @@ use serde::{Deserialize, Deserializer};
 
 mod custody;
 pub use custody::{EvmCustodySection, FinalityTag, RpcProviderSection, SecretUrl};
+mod checkpoints;
+pub use checkpoints::CheckpointSection;
 mod telemetry;
 pub use crate::config::telemetry::*;
 
@@ -86,6 +88,7 @@ pub struct NodeConfig {
     pub tee: TeeSection,
     pub operator: OperatorSection,
     pub custody: CustodySection,
+    pub checkpoints: Option<CheckpointSection>,
     pub feeds: FeedsSection,
     pub time: TimeSection,
     pub history: HistorySection,
@@ -166,6 +169,9 @@ pub struct LoggingSection {
 #[serde(deny_unknown_fields)]
 pub struct TeeSection {
     pub provider: TeeProvider,
+    /// Uses the public development signer only with simulated attestation.
+    #[serde(default)]
+    pub use_published_mock_key: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -450,3 +456,6 @@ mod custody_tests;
 mod telemetry_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod mock_key_tests;

@@ -54,6 +54,7 @@ level = "info"
 
 [tee]
 provider = "mock" # "configfs_tsm" on a TDX / SEV-SNP confidential VM
+use_published_mock_key = true # Public development identity; forbidden with real attestation.
 
 [operator]
 rotation_enabled = false

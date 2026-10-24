@@ -161,6 +161,8 @@ jobs:
           RPC_QUORUM_SCENARIO: "1"
           RPC_A_PORT: "8546" # Exercise a destination matching provider B's original config port.
         run: ./scripts/dev-vault-deposits.sh
+      - name: Run the checkpoint dev scenario
+        run: ./scripts/dev-checkpoints.sh
 
   dev-metrics-alerts:
     runs-on: ubuntu-24.04

@@ -1,6 +1,7 @@
 //! Batching: a batch ends after `MAX_BATCH` requests of any kind.
 
 use super::*;
+use tokio::sync::oneshot;
 
 use crate::test_support::{log_entries, scratch_dir, sequencer_config, trusted_now};
 

@@ -137,6 +137,8 @@ impl Node {
         let seq_cfg = SequencerConfig {
             segment_commands: 1_000_000,
             checkpoint_every: 1_000,
+            checkpoint_parent: Default::default(),
+            checkpoints: None,
             ..sequencer_config(&dir, manifest)
         };
         let mut seq = Sequencer::recover(seq_cfg, Arc::new(EnclaveKey::generate()), stream_tx, withdrawals_tx)

@@ -4,6 +4,7 @@ pragma solidity 0.8.36;
 import {IERC20} from "@openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin-contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin-contracts/utils/ReentrancyGuardTransient.sol";
+import {ECDSA} from "@openzeppelin-contracts/utils/cryptography/ECDSA.sol";
 
 /// @title Vault
 /// @notice Holds the engine's USDC collateral. The chain handles custody only: the engine credits
@@ -31,6 +32,15 @@ contract Vault is ReentrancyGuardTransient {
     /// @notice Deposits accepted so far, trader and house alike; the next deposit's id.
     uint256 public depositCount;
 
+    /// @notice Authorized enclave address, provisioned after verifying its attestation.
+    /// Rotation and recovery require a separate signer-lifecycle implementation.
+    address public immutable checkpointSigner;
+    bool public hasCheckpoint;
+    uint64 public latestSeq;
+    bytes32 public latestRoot;
+
+    event CheckpointPosted(uint64 indexed seq, bytes32 root, bytes signature);
+
     /// @notice `amount` USDC base units deposited to trader account `account`.
     event Deposited(uint256 indexed id, address indexed account, uint256 amount);
 
@@ -39,10 +49,49 @@ contract Vault is ReentrancyGuardTransient {
 
     error ZeroAddress();
     error InvalidAmount(uint256 amount);
+    error CheckpointNotExtended();
+    error InvalidCheckpointSigner();
+    error CheckpointParentMismatch();
+    error UnsupportedChain();
 
-    constructor(IERC20 usdc_) {
-        if (address(usdc_) == address(0)) revert ZeroAddress();
+    constructor(IERC20 usdc_, address checkpointSigner_) {
+        if (address(usdc_) == address(0) || checkpointSigner_ == address(0)) revert ZeroAddress();
+        if (block.chainid > type(uint64).max) revert UnsupportedChain();
         usdc = usdc_;
+        checkpointSigner = checkpointSigner_;
+    }
+
+    /// @notice Anyone may relay an enclave checkpoint. Only increasing seqs with the exact signed parent can
+    /// commit, fencing concurrent instances and log rollback. A successful receipt must precede withdrawal signing.
+    function postCheckpoint(
+        uint64 seq,
+        bytes32 root,
+        bool hasParent,
+        uint64 parentSeq,
+        bytes32 parentRoot,
+        bytes calldata signature
+    ) external {
+        if (hasCheckpoint && seq <= latestSeq) revert CheckpointNotExtended();
+        if (hasParent != hasCheckpoint || parentSeq != latestSeq || parentRoot != latestRoot) {
+            revert CheckpointParentMismatch();
+        }
+        bytes32 digest = keccak256(
+            abi.encodePacked(
+                "engine.checkpoint.v2",
+                uint64(block.chainid),
+                address(this),
+                seq,
+                root,
+                hasParent,
+                parentSeq,
+                parentRoot
+            )
+        );
+        if (ECDSA.recover(digest, signature) != checkpointSigner) revert InvalidCheckpointSigner();
+        hasCheckpoint = true;
+        latestSeq = seq;
+        latestRoot = root;
+        emit CheckpointPosted(seq, root, signature);
     }
 
     /// @notice Deposits `amount` USDC base units from the caller into the caller's trading account,

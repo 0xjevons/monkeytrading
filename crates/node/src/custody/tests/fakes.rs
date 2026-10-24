@@ -226,13 +226,15 @@ impl Node {
         let cfg = SequencerConfig {
             segment_commands: 1_000,
             checkpoint_every: 1_000,
+            checkpoint_parent: Default::default(),
+            checkpoints: None,
             chain_id: CHAIN_ID,
             vault: TRADER,
             ..sequencer_config(&log_dir, watch::channel(Manifest::default()).0)
         };
         let (stream, _) = broadcast::channel(1_024);
         let (withdrawals, _) = mpsc::unbounded_channel();
-        let mut seq = Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, withdrawals).unwrap();
+        let mut seq = Sequencer::recover(cfg, Arc::new(EnclaveKey::test_key()), stream, withdrawals).unwrap();
         seq.trust(trusted_now()).unwrap();
         let (tx, rx) = mpsc::channel(64);
         Node { tx, sequencer: tokio::spawn(seq.run(rx)) }
@@ -320,6 +322,7 @@ pub(super) fn refusing_sequencer(answer_syncs: bool, refusals: usize) -> mpsc::S
                     let _ = reply.send(engine.last_seq());
                 }
                 Request::Sync(_) => {}
+                Request::CheckpointStatus { .. } => unreachable!("no checkpoint worker in this test"),
                 Request::TimeSample(_) => unreachable!("custody sends no time samples"),
             }
         }

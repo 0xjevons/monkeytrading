@@ -15,6 +15,8 @@
 //! can check it; keeping the index in enclave memory or on an integrity-protected volume would bound
 //! both.
 
+mod preflight;
+pub(crate) use preflight::HistoryPlan;
 mod store;
 pub use store::Reader;
 

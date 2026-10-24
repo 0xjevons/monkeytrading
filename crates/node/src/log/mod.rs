@@ -47,12 +47,38 @@ pub struct CommandEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
+    /// Signed compare-and-swap predecessor; absent for historical v1 signatures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<CheckpointParent>,
     pub seq: u64,
     /// 0x-prefixed keccak-256 state root.
     pub root: String,
     /// Enclave signature over the root; see `tee::EnclaveKey::sign_checkpoint`.
     pub signature: String,
     pub signer: String,
+    /// Missing only in historical logs; recover the domain from their recorded operator or auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<CheckpointDomain>,
+    /// Withdrawal signatures follow only after custody confirms this commitment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred_withdrawals: bool,
+}
+
+/// The exact prior vault commitment covered by a v2 checkpoint signature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointParent {
+    pub has_checkpoint: bool,
+    pub seq: u64,
+    pub root: engine_core::eip712::B256,
+}
+
+/// The custody deployment a checkpoint commits to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointDomain {
+    pub chain_id: u64,
+    pub vault: engine_core::types::AccountId,
 }
 
 /// Where a message sits in the log: its seq, and its index among that seq's entries (the command

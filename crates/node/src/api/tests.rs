@@ -18,11 +18,11 @@ use crate::clock::test_clock::TestClock;
 use crate::config::RateLimit;
 use crate::history::{HistoryEvent, INDEX_FILE, account_of};
 use crate::log::{LogEntry, MANIFEST, Manifest, Offset, SegmentedLog, segment_seq};
-use crate::sequencer::replay_path;
+use crate::sequencer::replay_path_with_trust;
 use crate::tee::{EnclaveKey, MockAttestor, attest_key};
 use crate::test_support::{
-    SEGMENT_COMMANDS, TRADER, TestHistory, TestSequencer, deposit, dev_config, file_entries, log_messages,
-    logged_history, scratch_dir, withdraw,
+    SEGMENT_COMMANDS, TRADER, TestHistory, TestSequencer, deposit, dev_config, log_messages, logged_history,
+    scratch_dir, withdraw,
 };
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -76,7 +76,12 @@ async fn dev_scenario_resume_between_messages_of_one_seq_and_replay_the_archive(
         assert_eq!(status, 200);
         fs::write(archive.join(&listed.file), segment).unwrap();
     }
-    let replayed = replay_path(&archive).unwrap();
+    let replayed = replay_path_with_trust(
+        &archive,
+        None,
+        Some(engine_core::types::AccountId(crate::tee::EnclaveKey::test_key().address())),
+    )
+    .unwrap();
     assert_eq!(replayed.engine.last_seq(), manifest.segments.last().map(|s| s.last_seq));
     assert!(replayed.checkpoints > 0);
 }
@@ -137,7 +142,7 @@ async fn dev_scenario_page_account_history_one_event_at_a_time_across_a_restart(
         .unwrap()
         .into_writer(SEGMENT_COMMANDS, watch::channel(Manifest::default()).0)
         .unwrap();
-    let reference = file_entries(Path::new(REFERENCE_LOG));
+    let reference = crate::sequencer::fixture_tests::signed_fixture(Path::new(REFERENCE_LOG));
     for entry in &reference {
         log.append(entry).unwrap();
     }

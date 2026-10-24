@@ -1,0 +1,74 @@
+//! Sequencer requests and public log stream messages.
+
+use engine_core::command::Command;
+use engine_core::event::Event;
+use engine_core::types::AccountId;
+use engine_core::{Engine, Fixed};
+use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
+
+use crate::log::{Checkpoint, CommandEntry, LogEntry, Offset};
+use crate::trusted_time::Sample;
+
+pub type Query = Box<dyn FnOnce(&Engine) + Send>;
+
+// Unboxed on purpose: boxing every command would add an allocation to the hot path.
+#[allow(clippy::large_enum_variant)]
+pub enum Request {
+    Submit {
+        cmd: Command,
+        reply: Option<oneshot::Sender<Vec<Event>>>,
+    },
+    Query(Query),
+    /// A trusted time sample from the trusted time task.
+    TimeSample(Sample),
+    /// Answered with the last seq once every command before it is synced, so it survives power loss.
+    Sync(oneshot::Sender<Option<u64>>),
+    /// Custody confirmation; affects signature release, never deterministic protocol state.
+    CheckpointStatus {
+        posted: Option<u64>,
+        healthy: bool,
+    },
+}
+
+/// What `/v1/stream` publishes: each log entry at its offset, in offset order.
+#[derive(Clone, Debug, Serialize)]
+pub struct StreamMsg {
+    pub offset: Offset,
+    #[serde(flatten)]
+    pub body: StreamBody,
+}
+
+// Unboxed on purpose, like `Request`.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamBody {
+    Command(CommandEntry),
+    Checkpoint(Checkpoint),
+    Withdrawal(SignedWithdrawal),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SignedWithdrawal {
+    pub account: AccountId,
+    pub amount: Fixed,
+    pub nonce: u64,
+    pub chain_id: u64,
+    pub vault: AccountId,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_seq: Option<u64>,
+}
+
+impl StreamMsg {
+    /// The stream form of the log entry at `offset`.
+    pub fn new(offset: Offset, entry: LogEntry) -> Self {
+        let body = match entry {
+            LogEntry::Command(c) => StreamBody::Command(c),
+            LogEntry::Checkpoint(cp) => StreamBody::Checkpoint(cp),
+            LogEntry::Withdrawal(w) => StreamBody::Withdrawal(w),
+        };
+        Self { offset, body }
+    }
+}

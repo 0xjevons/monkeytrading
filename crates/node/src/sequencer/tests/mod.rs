@@ -1,4 +1,5 @@
 use super::*;
+use crate::sequencer::fixture_tests::replay_trusted as replay;
 use std::fs;
 use std::path::PathBuf;
 
@@ -7,65 +8,15 @@ use engine_core::params::{ProtocolParams, StressTrigger};
 use engine_core::protocol::ProtocolVersion;
 
 use crate::clock::test_clock::TestClock;
-use crate::log::{Manifest, segment_seq};
+use crate::log::{Manifest, Offset, segment_seq};
 use crate::test_support::{
     SEGMENT_COMMANDS, TRADER, TestSequencer, deposit, dev_config, log_entries, log_messages, sample_around,
     scratch_dir, sequencer_config, trusted_now, withdraw,
 };
+use tokio::sync::oneshot;
 
 const V1_DEV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/v1-dev.jsonl");
 const V3_REFERENCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference/v3.jsonl");
-
-fn tick(seq: u64) -> LogEntry {
-    LogEntry::Command(CommandEntry { sequenced: Sequenced { seq, ts: 0, cmd: Command::Tick }, events: None })
-}
-
-fn checkpoint(seq: u64, root: String) -> LogEntry {
-    LogEntry::Checkpoint(Checkpoint { seq, root, signature: String::new(), signer: String::new() })
-}
-
-#[test]
-fn replay_verifies_checkpoint_roots() {
-    let mut engine = Engine::new();
-    engine.apply(&Sequenced { seq: 0, ts: 0, cmd: Command::Tick }).unwrap();
-    let root = format!("0x{}", hex::encode(engine.state_root()));
-    let replayed = replay(&[tick(0), checkpoint(0, root)]).unwrap();
-    assert_eq!((replayed.commands, replayed.checkpoints), (1, 1));
-}
-
-#[test]
-fn replay_refuses_a_tampered_root_or_a_misplaced_checkpoint() {
-    let err = replay(&[tick(0), checkpoint(0, "0xbad".into())]).err().unwrap();
-    assert!(format!("{err:#}").contains("state root mismatch"), "{err:#}");
-    let err = replay(&[tick(0), checkpoint(5, "0x".into())]).err().unwrap();
-    assert!(format!("{err:#}").contains("checkpoint for seq 5"), "{err:#}");
-}
-
-#[test]
-fn replay_refuses_a_gap_in_the_log() {
-    let err = replay(&[tick(0), tick(2)]).err().unwrap();
-    assert!(format!("{err:#}").contains("applying seq 2"), "{err:#}");
-}
-
-#[test]
-fn replay_accepts_a_log_written_before_events_and_withdrawals_were_logged() {
-    let mut engine = Engine::new();
-    let commands = [deposit(100, "dep-1"), withdraw(40)];
-    let mut entries: Vec<_> = commands
-        .into_iter()
-        .enumerate()
-        .map(|(seq, cmd)| {
-            let sequenced = Sequenced { seq: seq as u64, ts: 0, cmd };
-            engine.apply(&sequenced).unwrap();
-            LogEntry::Command(CommandEntry { sequenced, events: None })
-        })
-        .collect();
-    entries.push(checkpoint(1, format!("0x{}", hex::encode(engine.state_root()))));
-    let replayed = replay(&entries).unwrap();
-    assert_eq!((replayed.commands, replayed.checkpoints), (2, 1));
-    // The old node signed that withdrawal itself; recovery must not sign it again.
-    assert!(replayed.unsigned.is_empty());
-}
 
 #[tokio::test]
 async fn one_withdrawal_puts_command_withdrawal_and_checkpoint_at_one_seq() {
@@ -98,7 +49,7 @@ fn custody_gets_a_withdrawal_when_its_batch_is_flushed_not_when_it_is_signed() {
     let dir = scratch_dir("seq-custody");
     let (stream, _) = broadcast::channel(16);
     let (withdrawals_tx, mut withdrawals) = mpsc::unbounded_channel();
-    let key = Arc::new(EnclaveKey::generate());
+    let key = Arc::new(EnclaveKey::test_key());
     let manifest = watch::channel(Manifest::default()).0;
     let mut seq = Sequencer::recover(sequencer_config(&dir, manifest), key, stream, withdrawals_tx).unwrap();
     seq.trust(trusted_now()).unwrap();
@@ -141,7 +92,7 @@ async fn replay_refuses_logged_events_or_withdrawals_that_replay_does_not_produc
         w.amount = Fixed::from_int(41);
     }
     let err = replay(&forged).err().unwrap();
-    assert!(format!("{err:#}").contains("was not approved"), "{err:#}");
+    assert!(format!("{err:#}").contains("unauthorized withdrawal completion signer"), "{err:#}");
 }
 
 #[tokio::test]
@@ -257,7 +208,7 @@ fn an_existing_v1_log_activates_at_its_next_seq_and_still_verifies() {
     let dir = scratch_dir("activation-v1");
     fs::create_dir_all(&dir).unwrap();
     // A log written as one file before segments existed continues as the first segment.
-    fs::copy(V1_DEV, dir.join("00000000000000000000.jsonl")).unwrap();
+    crate::sequencer::fixture_tests::copy_fixture(V1_DEV, dir.join("00000000000000000000.jsonl"));
     let before = replay(&log_entries(&dir)).unwrap().engine.params().cloned().expect("the log sets parameters");
     let mut seq = recover(&dir, &signed(31_337));
     let weighting = dev_config().genesis.params.toxicity.notional.unwrap();
@@ -301,7 +252,7 @@ fn protocol_activation_and_genesis_wait_for_trusted_time_then_go_in_order() {
 fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
     let dir = scratch_dir("activation-v3");
     fs::create_dir_all(&dir).unwrap();
-    fs::copy(V3_REFERENCE, dir.join("00000000000000000000.jsonl")).unwrap();
+    crate::sequencer::fixture_tests::copy_fixture(V3_REFERENCE, dir.join("00000000000000000000.jsonl"));
     let before = replay(&log_entries(&dir)).unwrap();
     // As the node does, the log's parameters take the config's notional weighting at its next seq;
     // the operator follows, and the latest version after it.
@@ -311,9 +262,16 @@ fn a_v3_log_takes_the_state_tree_at_its_next_seq_and_still_verifies() {
     let stamps = Arc::new(TestClock::at(before.engine.now() + 1_000));
     let (stream, _) = broadcast::channel(16);
     let (manifest, _) = watch::channel(Manifest::default());
-    let cfg =
-        SequencerConfig { client_auth: signed(31_337), clock: stamps.clone(), ..sequencer_config(&dir, manifest) };
-    let key = Arc::new(EnclaveKey::generate());
+    let mut operator = dev_config().operator().unwrap();
+    operator.vault = AccountId([0xaa; 20]);
+    let cfg = SequencerConfig {
+        client_auth: signed(31_337),
+        vault: operator.vault,
+        operator,
+        clock: stamps.clone(),
+        ..sequencer_config(&dir, manifest)
+    };
+    let key = Arc::new(EnclaveKey::test_key());
     let mut seq = Sequencer::recover(cfg, key, stream, mpsc::unbounded_channel().0).unwrap();
     seq.trust(sample_around(stamps.as_ref())).unwrap();
     seq.carry_toxicity_notional(dev_config().genesis.params.toxicity.notional.unwrap()).unwrap();
@@ -342,13 +300,14 @@ fn a_restart_with_the_recorded_client_auth_sequences_nothing() {
 #[test]
 fn a_log_holding_only_client_auth_activates_on_restart() {
     let dir = scratch_dir("activation-auth-only");
-    let auth = Command::Admin(AdminCommand::SetClientAuth(signed(31_337)));
-    recover(&dir, &signed(31_337)).sequence_required("client auth", vec![auth.clone()]).unwrap();
-    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
+    let client_auth = ClientAuth::Eip712 { chain_id: 31337, vault: AccountId([0; 20]) };
+    let auth = Command::Admin(AdminCommand::SetClientAuth(client_auth.clone()));
+    recover(&dir, &client_auth).sequence_required("client auth", vec![auth.clone()]).unwrap();
+    recover(&dir, &client_auth).activate_protocol().unwrap();
     let written = log_entries(&dir);
     assert_eq!(commands(&written).iter().filter(|cmd| **cmd == auth).count(), 1);
     assert_eq!(replay(&written).unwrap().engine.protocol_version(), ProtocolVersion::LATEST);
-    recover(&dir, &signed(31_337)).activate_protocol().unwrap();
+    recover(&dir, &client_auth).activate_protocol().unwrap();
     assert_eq!(log_entries(&dir).len(), written.len());
 }
 
@@ -469,7 +428,7 @@ fn try_recover(
     let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
     let (manifest, _) = watch::channel(Manifest::default());
     let cfg = SequencerConfig { client_auth: client_auth.clone(), ..sequencer_config(dir, manifest) };
-    (Sequencer::recover(cfg, Arc::new(EnclaveKey::generate()), stream, withdrawals_tx), withdrawals)
+    (Sequencer::recover(cfg, Arc::new(EnclaveKey::test_key()), stream, withdrawals_tx), withdrawals)
 }
 
 /// The commands among `entries`, in order.
@@ -486,3 +445,5 @@ fn commands(entries: &[LogEntry]) -> Vec<Command> {
 mod genesis;
 mod operator;
 mod toxicity;
+
+mod replay;

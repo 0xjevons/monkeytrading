@@ -130,7 +130,10 @@ mod tests {
             .replace("provider = \"mock\" # \"configfs_tsm\"", "provider = \"configfs_tsm\" #")
             .replace("auth = \"none\"", "auth = \"eip712\"");
         assert_ne!(attested, text, "the replacement must change the config");
-        toml::from_str(&format!("{attested}\n[alerts.critical]\nurl_env = \"PAGER\"\n")).unwrap()
+        let mut cfg: NodeConfig =
+            toml::from_str(&format!("{attested}\n[alerts.critical]\nurl_env = \"PAGER\"\n")).unwrap();
+        cfg.tee.use_published_mock_key = false;
+        cfg
     }
 
     /// `attested_dev` with `key` as the operator's public key.

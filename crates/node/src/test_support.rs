@@ -74,7 +74,7 @@ impl TestSequencer {
         let (stream, _) = broadcast::channel(stream_capacity);
         let (withdrawals_tx, withdrawals) = mpsc::unbounded_channel();
         let (manifest_tx, manifest) = watch::channel(Manifest::default());
-        let key = Arc::new(EnclaveKey::generate());
+        let key = Arc::new(EnclaveKey::test_key());
         let metrics = Arc::new(Metrics::new());
         let cfg =
             SequencerConfig { clock: clock.clone(), metrics: metrics.clone(), ..sequencer_config(dir, manifest_tx) };
@@ -247,6 +247,9 @@ pub fn sequencer_config(dir: &Path, manifest: watch::Sender<Manifest>) -> Sequen
         segment_commands: SEGMENT_COMMANDS,
         manifest,
         checkpoint_every: CHECKPOINT_EVERY,
+        checkpoint_registry: None,
+        checkpoint_parent: Default::default(),
+        checkpoints: None,
         chain_id: 31337,
         vault: AccountId([0; 20]),
         clock: Arc::new(SystemClock),

@@ -26,7 +26,8 @@ use crate::config::{AuthMode, CustodyProvider, FeedProvider, NodeConfig, TeeProv
 use crate::custody::Custody;
 use crate::feeds;
 use crate::feeds::venue::{self, Timing};
-use crate::history::{History, HistoryCheck};
+use crate::history::HistoryPlan;
+mod preflight;
 use crate::limits::{ApiLimits, run_retain};
 use crate::log::Manifest;
 use crate::metrics::Metrics;
@@ -35,6 +36,7 @@ use crate::tee::{Attestor, ConfigfsTsm, EnclaveKey, MockAttestor, attest_key};
 use crate::telemetry::Telemetry;
 use crate::tls::{TlsIdentity, serve};
 use crate::{metrics, monitor, trusted_time};
+use preflight::finish_preflight;
 
 /// How long the sequencer gets to drain and checkpoint after a shutdown signal.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -94,7 +96,13 @@ async fn serve_node(
         }
         TeeProvider::ConfigfsTsm => Box::new(ConfigfsTsm::default()),
     };
-    let key = Arc::new(EnclaveKey::generate());
+    let key = Arc::new(
+        EnclaveKey::for_config(&cfg.tee)
+            .inspect_err(|e| error!(alert = "enclave_key_failed", "refusing to serve: {e:#}"))?,
+    );
+    if cfg.tee.use_published_mock_key {
+        warn!("using the public development signing key: mock attestation only");
+    }
     let tls = TlsIdentity::generate()?;
     let attestation = Arc::new(
         attest_key(attestor.as_ref(), &key, &tls.public_key_sha256).context("attesting the enclave and TLS keys")?,
@@ -106,7 +114,22 @@ async fn serve_node(
         "enclave and TLS keys attested"
     );
 
-    let (log, mut history) = read_log_and_history(&cfg)?;
+    let checkpoint_setup = crate::checkpoints::setup::connect(&cfg, &key)
+        .await
+        .inspect_err(|e| error!(alert = "checkpoint_startup_failed", "refusing to serve: {e:#}"))?;
+    let mut anchor = None;
+    let (log, history_plan) = read_log_and_history_observe(
+        &cfg,
+        Some(AccountId(key.address())),
+        checkpoint_setup.as_ref().map(|setup| setup.parent),
+        |entry| {
+            if let crate::log::LogEntry::Checkpoint(cp) = entry
+                && checkpoint_setup.as_ref().and_then(|setup| setup.posted_seq) == Some(cp.seq)
+            {
+                anchor = Some(cp.clone());
+            }
+        },
+    )?;
 
     let vault: AccountId = cfg.custody.vault.parse().context("custody.vault")?;
     let client_auth = cfg.client_auth()?;
@@ -120,6 +143,9 @@ async fn serve_node(
         segment_commands: cfg.node.segment_commands,
         manifest: manifest_tx,
         checkpoint_every: cfg.node.checkpoint_every,
+        checkpoint_registry: checkpoint_setup.as_ref().and_then(|setup| setup.poster.registry.clone()),
+        checkpoint_parent: checkpoint_setup.as_ref().map(|setup| setup.parent).unwrap_or_default(),
+        checkpoints: checkpoint_setup.as_ref().map(|setup| setup.tx.clone()),
         chain_id: cfg.custody.chain_id,
         vault,
         clock: clock.clone(),
@@ -128,10 +154,16 @@ async fn serve_node(
         operator,
         metrics: metrics.clone(),
     };
+    let custody = Custody::connect(&cfg.custody, log.last_seq())
+        .inspect_err(|e| error!(alert = "custody_connect_failed", "refusing to serve: {e:#}"))?;
+    let mut history = finish_preflight(
+        history_plan,
+        checkpoint_setup.as_ref().map(|setup| (&setup.poster, anchor.as_ref())),
+        Some((&log, &seq_cfg)),
+    )
+    .await?;
     let mut seq = Sequencer::recover_from(log, seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
-    let custody = Custody::connect(&cfg.custody, seq.last_seq())
-        .inspect_err(|e| error!(alert = "custody_connect_failed", "refusing to serve: {e:#}"))?;
     // Protocol activation and genesis wait, like any command, for a stamp trusted time admits;
     // with no sample yet, they are queued. Parameters an older log set take the config's toxicity
     // notional weighting first, which the latest version needs.
@@ -146,8 +178,15 @@ async fn serve_node(
     history.catch_up_to(seq.last_seq());
 
     let (tx, rx) = mpsc::channel::<Request>(CHANNEL_CAPACITY);
+    let recovery = seq.take_recovery_checkpoints();
     let mut sequencer = crate::sequencer_thread::Worker::start(seq.run(rx), cpu)?;
     let mut tasks: JoinSet<TaskResult> = JoinSet::new();
+    if let Some(setup) = checkpoint_setup {
+        let checkpoint_tx = tx.clone();
+        tasks.spawn(
+            async move { ("checkpoints", setup.poster.run_with_recovery(setup.rx, checkpoint_tx, recovery).await) },
+        );
+    }
 
     let tick = cfg.node.tick;
     let ticks = tx.clone();
@@ -253,13 +292,36 @@ async fn serve_node(
 /// Error cases:
 /// - the history index cannot be opened, nor a fresh one in its place (see `HistoryCheck`)
 /// - the log cannot be read or replayed (see `Sequencer::read_log`)
-fn read_log_and_history(cfg: &NodeConfig) -> anyhow::Result<(ReplayedLog, History)> {
+#[cfg(test)]
+fn read_log_and_history(cfg: &NodeConfig) -> anyhow::Result<(ReplayedLog, crate::history::History)> {
+    let (log, plan) =
+        read_log_and_history_observe(cfg, Some(AccountId(EnclaveKey::test_key().address())), None, |_| {})?;
+    Ok((log, plan.finish()?))
+}
+
+/// Replays and checks history while exposing the same entries for the on-chain anchor check.
+/// Error cases:
+/// - the log or history index cannot be read or verified
+fn read_log_and_history_observe(
+    cfg: &NodeConfig,
+    signer: Option<AccountId>,
+    parent: Option<crate::log::CheckpointParent>,
+    mut observe: impl FnMut(&crate::log::LogEntry),
+) -> anyhow::Result<(ReplayedLog, HistoryPlan)> {
     let history_failed = |e: &anyhow::Error| error!(alert = "history_recovery_failed", "refusing to serve: {e:#}");
-    let mut check = HistoryCheck::open(&cfg.history).inspect_err(history_failed)?;
-    let log = Sequencer::read_log(&cfg.node.log_dir, |entry| check.observe(entry))
-        .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
-    let history = check.finish().inspect_err(history_failed)?;
-    Ok((log, history))
+    let mut check = HistoryPlan::open(&cfg.history).inspect_err(history_failed)?;
+    let log = Sequencer::read_log_for_recovery(
+        &cfg.node.log_dir,
+        Some(crate::log::CheckpointDomain { chain_id: cfg.custody.chain_id, vault: cfg.custody.vault.parse()? }),
+        signer,
+        parent,
+        |entry| {
+            check.observe(entry);
+            observe(entry);
+        },
+    )
+    .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
+    Ok((log, check))
 }
 
 /// Sequences a `Tick` every `every`, so sessions and rollovers fire without other traffic.
@@ -304,182 +366,4 @@ fn sequencer_outcome(joined: Result<anyhow::Result<()>, tokio::sync::oneshot::er
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-    use std::fs::{self, OpenOptions};
-    use std::io::Write;
-    use std::path::{Path, PathBuf};
-    use std::{iter, net};
-
-    use crate::alerts::{self, AlertLayer, Routes};
-    use crate::config::HistorySection;
-    use crate::history::INDEX_FILE;
-    use crate::log::{LogEntry, MANIFEST, Offset, segment_seq};
-    use crate::test_support::{
-        RETENTION, TestHistory, TestSequencer, capture_alerts, deposit, dev_config, log_entries, open_history,
-        scratch_dir,
-    };
-
-    /// Startup's one read of the log decides the history index's fate: an index that took the log's
-    /// last command resumes after it, with no alert and no rebuild.
-    #[tokio::test]
-    async fn startup_resumes_a_history_index_its_read_of_the_log_matches() {
-        let (dir, index) = (scratch_dir("node-history-resumes"), scratch_dir("node-history-resumes-index"));
-        let node = TestSequencer::start(&dir, 1024);
-        let history = TestHistory::start(&node, &dir, &index).await.unwrap();
-        node.submit(deposit(1, "dep-1")).await;
-        node.stop().await;
-        history.finish().await.unwrap();
-        let mut commands = log_entries(&dir).into_iter().filter_map(|entry| match entry {
-            LogEntry::Command(command) => Some(command.sequenced.seq),
-            _ => None,
-        });
-        let last = commands.next_back().expect("the log holds commands");
-
-        let mut cfg = dev_config();
-        cfg.alerts.outbox.dir = scratch_dir(&format!("node-outbox-{}", rand::random::<u64>()));
-        (cfg.node.log_dir, cfg.history.dir, cfg.history.retention) = (dir, index, RETENTION);
-        let (_guard, mut alerts) = capture_alerts();
-        let (_, history) = read_log_and_history(&cfg).unwrap();
-        assert_eq!(history.resume_at(), Offset::start_of(last + 1));
-        assert!(alerts.try_recv().is_err(), "no alert");
-    }
-
-    /// A power loss that keeps what the history index took but not the log's unsynced tail leaves
-    /// the index ahead of the log. The node discards the index with a Warning alert and goes on to
-    /// start: here as far as binding the API, whose port the test holds.
-    #[tokio::test]
-    async fn a_history_index_ahead_of_its_log_is_discarded_and_the_node_starts() {
-        let (kept, index) = index_ahead_of_log("node-history-ahead").await;
-        let held = net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut cfg = dev_config();
-        cfg.alerts.outbox.dir = scratch_dir(&format!("node-outbox-{}", rand::random::<u64>()));
-        (cfg.node.log_dir, cfg.history.dir) = (kept.clone(), index.clone());
-        cfg.node.listen = held.local_addr().unwrap();
-        cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
-        let (_guard, mut alerts) = capture_alerts();
-        let (telemetry, _layer) = telemetry();
-        let stopped = timeout(Duration::from_secs(10), run(cfg, telemetry)).await.expect("the node stops in time");
-        let err = stopped.expect_err("the API port is held");
-        assert!(format!("{err:#}").contains("binding"), "{err:#}");
-        let alert = alerts.try_recv().expect("an alert");
-        assert_eq!((alert["alert"].as_str(), alert["level"].as_str()), ("history_index_discarded", "WARN"));
-        // What the node left is a fresh index, which takes the log from its start with no alert.
-        let cfg = HistorySection { dir: index, retention: RETENTION };
-        let reopened = open_history(&cfg, &kept).unwrap();
-        assert_eq!(reopened.resume_at(), Offset::start_of(0));
-        assert!(alerts.try_recv().is_err(), "one alert");
-    }
-
-    /// An index the node must discard but cannot remove, beside a write-ahead log the host replaced
-    /// with a directory, stops the node with a Critical alert before recovery writes to the log.
-    #[tokio::test]
-    async fn a_history_index_the_node_cannot_discard_stops_it_before_it_writes_to_the_log() {
-        let (kept, index) = index_ahead_of_log("node-history-stuck").await;
-        fs::create_dir(index.join(format!("{INDEX_FILE}-wal"))).unwrap();
-        // A listing a crash cut short, which recovery trims.
-        let mut manifest = OpenOptions::new().append(true).open(kept.join(MANIFEST)).unwrap();
-        manifest.write_all(br#"{"file":"#).unwrap();
-        let before = files(&kept);
-
-        let mut cfg = dev_config();
-        cfg.alerts.outbox.dir = scratch_dir(&format!("node-outbox-{}", rand::random::<u64>()));
-        (cfg.node.log_dir, cfg.history.dir) = (kept.clone(), index);
-        cfg.node.listen = "127.0.0.1:0".parse().unwrap();
-        cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
-        let (_guard, mut alerts) = capture_alerts();
-        let (telemetry, _layer) = telemetry();
-        let refused = timeout(Duration::from_secs(10), run(cfg, telemetry)).await.expect("the node stops in time");
-        let err = refused.expect_err("the index cannot be discarded");
-        assert!(format!("{err:#}").contains("removing"), "{err:#}");
-        let levels: Vec<_> = iter::from_fn(|| alerts.try_recv().ok())
-            .map(|alert| (alert["alert"].clone(), alert["level"].clone()))
-            .collect();
-        let expected = [("history_index_discarded", "WARN"), ("history_recovery_failed", "ERROR")];
-        assert_eq!(levels, expected.map(|(alert, level)| (alert.to_owned(), level.to_owned())));
-        assert_eq!(files(&kept), before, "the log is as it was found");
-    }
-
-    #[tokio::test]
-    async fn a_genesis_cut_short_stops_the_node_before_it_writes_to_the_log() {
-        let (dir, index) = (scratch_dir("node-genesis-cut"), scratch_dir("node-genesis-cut-index"));
-        TestSequencer::start(&dir, 1024).stop().await;
-        // As if the boot that ran genesis died before its house capital credit reached disk.
-        let segment = files(&dir).into_keys().filter(|name| segment_seq(name).is_some()).max().expect("a segment");
-        let text = fs::read_to_string(dir.join(&segment)).unwrap();
-        let credit = text.find(r#""cmd":{"type":"house_capital""#).expect("the credit is in the last segment");
-        let line = text[..credit].rfind('\n').expect("a command before it");
-        fs::write(dir.join(&segment), &text[..line + 1]).unwrap();
-        let before = files(&dir);
-
-        let mut cfg = dev_config();
-        cfg.alerts.outbox.dir = scratch_dir(&format!("node-outbox-{}", rand::random::<u64>()));
-        (cfg.node.log_dir, cfg.history.dir) = (dir.clone(), index);
-        cfg.node.listen = "127.0.0.1:0".parse().unwrap();
-        cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
-        let (telemetry, _layer) = telemetry();
-        let refused = timeout(Duration::from_secs(10), run(cfg, telemetry)).await.expect("the node stops in time");
-        let err = refused.expect_err("genesis did not finish");
-        assert!(format!("{err:#}").contains("did not reach the checkpoint after its house capital credit"), "{err:#}");
-        assert_eq!(files(&dir), before, "the log is as it was found");
-    }
-
-    /// A genesis the engine would reject, in a config that skipped validation, stops the node with a
-    /// Critical alert before anything reaches the log.
-    #[tokio::test]
-    async fn a_genesis_the_engine_would_reject_stops_the_node_with_an_alert_and_writes_nothing() {
-        let (dir, index) = (scratch_dir("node-genesis-refused"), scratch_dir("node-genesis-refused-index"));
-        let mut cfg = dev_config();
-        cfg.alerts.outbox.dir = scratch_dir(&format!("node-outbox-{}", rand::random::<u64>()));
-        (cfg.node.log_dir, cfg.history.dir) = (dir.clone(), index);
-        cfg.node.listen = "127.0.0.1:0".parse().unwrap();
-        cfg.genesis.benchmarks[0].annual_bps = 40_000;
-        cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
-        let (_guard, mut alerts) = capture_alerts();
-        let (telemetry, _layer) = telemetry();
-        let refused = timeout(Duration::from_secs(10), run(cfg, telemetry)).await.expect("the node stops in time");
-        let err = refused.expect_err("the engine rejects the benchmark");
-        assert!(format!("{err:#}").contains("genesis benchmark SOFR: the engine rejects it"), "{err:#}");
-        let raised: Vec<_> = iter::from_fn(|| alerts.try_recv().ok())
-            .map(|alert| (alert["alert"].clone(), alert["level"].clone()))
-            .collect();
-        assert_eq!(raised, [("genesis_refused".to_owned(), "ERROR".to_owned())]);
-        assert!(log_entries(&dir).is_empty(), "nothing reached the log");
-    }
-
-    // ── Helpers ──
-
-    /// Telemetry with no webhooks, and the layer that feeds it, kept so the router stays open; the
-    /// test's own subscriber sees the alert lines.
-    fn telemetry() -> (Telemetry, AlertLayer) {
-        let metrics = Arc::new(Metrics::new());
-        let (layer, alerts) = alerts::channel(Routes::default(), metrics.clone());
-        (Telemetry { metrics, alerts, pages_critical: false }, layer)
-    }
-
-    /// A log in a new directory named after `name`, as the disk keeps it when the power fails after
-    /// its first deposit, and an index that took a second deposit the log then lost.
-    async fn index_ahead_of_log(name: &str) -> (PathBuf, PathBuf) {
-        let (dir, index) = (scratch_dir(name), scratch_dir(&format!("{name}-index")));
-        let node = TestSequencer::start(&dir, 1024);
-        let history = TestHistory::start(&node, &dir, &index).await.unwrap();
-        node.submit(deposit(1, "dep-1")).await;
-        let kept = scratch_dir(&format!("{name}-kept"));
-        fs::create_dir_all(&kept).unwrap();
-        for file in fs::read_dir(&dir).unwrap() {
-            let file = file.unwrap();
-            fs::copy(file.path(), kept.join(file.file_name())).unwrap();
-        }
-        node.submit(deposit(1, "dep-2")).await;
-        node.stop().await;
-        history.finish().await.unwrap();
-        (kept, index)
-    }
-
-    /// Every file in `dir` and its bytes.
-    fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
-        let names = fs::read_dir(dir).unwrap().map(|file| file.unwrap().file_name().into_string().unwrap());
-        names.map(|name| (name.clone(), fs::read(dir.join(name)).unwrap())).collect()
-    }
-}
+mod tests;

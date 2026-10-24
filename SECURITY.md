@@ -99,16 +99,24 @@ with a check, and whoever runs it cannot alter the published log without detecti
 sign a state its rules do not produce, act for an account without its owner's signature, credit an
 account with funds that no deposit brought in, or pay out funds the engine did not approve. A
 finding that breaks one of these guarantees, or gets past one of those checks, is in scope even when
-it starts from an operator's key. Some of the checks behind them are still being built: `engine
-replay` does not yet verify checkpoint signatures; the node does not yet check the log it recovers
-from against anything its host cannot rewrite, so it accepts a truncated or rewritten one; the
-alert outbox persists pages on host disk, whose schema and rows it checks but whose deletion or
+it starts from an operator's key. With `[checkpoints]` configured, startup verifies the replayed log
+against the latest posted vault commitment at custody finality and refuses a shorter or conflicting log before serving or opening
+history for writes; checkpoint signatures verify
+against their chain, vault, and named signer. New posts also sign the exact predecessor sequence
+and root, which the vault compares atomically to fence divergent same-key publishers. The checkpoint RPC still supplies the canonical chain
+view, and a signature's named signer must be checked against a trusted attestation or the vault's
+authorized signer. Withdrawal completion evidence also requires that independently trusted signer
+and its deployment before replay can clear an approval. Latest transaction inclusion alone never
+authorizes withdrawal release; the configured custody finality tag and confirmation depth apply.
+Hardware EVM custody requires this protection. Some checks are still being built:
+the alert outbox persists pages on host disk, whose schema and rows it checks but whose deletion or
 rollback it cannot detect, and its cross-restart age budget uses an unsealed host clock; the
 account history index is read from host disk with only its schema checked, and is matched to the log
 by one command, the newest it has taken, though SQLite reads it in defensive mode and each event it
 serves names its place in the log, where anyone can check it; the sequencer, which bounds its host's
 clock with signed time, trusts the guest's monotonic clock without yet checking that the host cannot
-scale it; the enclave's signing key does not yet survive a restart; the custody adapter requires a strict
+scale it; hardware enclave signing keys do not yet survive a restart; the dev configurations explicitly
+use a published mock-only signer, which real attestation refuses; the custody adapter requires a strict
 majority of at least three configured independent RPC providers to agree on deposits, block hashes
 and finality, with reads compared at the same block height and empty log responses requiring the
 answering provider to serve the range's final block. A dissenting or unavailable provider alerts;
@@ -120,7 +128,8 @@ serves the intended chain and token; endpoint independence alone cannot establis
 a compromised majority, operator independence is not machine-verifiable, and it takes the vault,
 its token, provider endpoints and finality tag from the
 host-supplied configuration, and keeps its deposit cursor on host storage, where a cursor moved
-forward skips deposits without an alert; and the node refuses unsigned requests unless both the
+forward skips deposits; checkpoint reconciliation detects the resulting deposit-count mismatch
+and escalates after its configured catch-up deadline; and the node refuses unsigned requests unless both the
 enclave and custody are mocks, but does not yet refuse mock custody or simulated prices when it runs
 with hardware attestation, whose report vouches for the signing key but not for the configuration. A
 gap that this policy, an open issue, or a `TODO` in the code already records is known, so a report

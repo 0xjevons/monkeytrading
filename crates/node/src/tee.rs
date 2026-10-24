@@ -1,6 +1,7 @@
 //! Enclave identity and remote attestation.
 //!
-//! At boot the enclave generates a secp256k1 key that never leaves it. It puts the key's EVM
+//! At boot a hardware enclave generates a secp256k1 key that never leaves it. Mock configurations
+//! can explicitly select a published development key; hardware configurations refuse that option. It puts the key's EVM
 //! address in the attestation report data, so a hardware quote proves "this address belongs to an
 //! enclave running this measurement". The vault contract and anyone reading the log trust
 //! signatures from that address and nothing else. The report data also carries the hash of the
@@ -10,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use engine_core::Fixed;
 use engine_core::eip712::{self, B256};
 use engine_core::types::AccountId;
@@ -99,6 +100,28 @@ impl EnclaveKey {
         Self { key: SigningKey::random(&mut OsRng) }
     }
 
+    /// Selects an explicitly configured public mock authority or generates a private fresh key.
+    /// Error cases:
+    /// - a published development key is requested beside real attestation
+    pub(crate) fn for_config(cfg: &crate::config::TeeSection) -> anyhow::Result<Self> {
+        ensure!(
+            !cfg.use_published_mock_key || cfg.provider == crate::config::TeeProvider::Mock,
+            "tee.use_published_mock_key requires tee.provider = \"mock\""
+        );
+        Ok(if cfg.use_published_mock_key { Self::published_mock_key() } else { Self::generate() })
+    }
+
+    /// Public 0x4343…43 development key, listed in config/test-keys.toml. Never a hardware identity.
+    fn published_mock_key() -> Self {
+        Self { key: SigningKey::from_bytes((&[0x43; 32]).into()).expect("valid public development key") }
+    }
+
+    /// The same explicit public authority used by the committed mock configurations.
+    #[cfg(test)]
+    pub(crate) fn test_key() -> Self {
+        Self::published_mock_key()
+    }
+
     /// The key's EVM address: the last 20 bytes of keccak-256 over the uncompressed public key.
     pub fn address(&self) -> [u8; 20] {
         eip712::address(self.key.verifying_key()).0
@@ -114,6 +137,18 @@ impl EnclaveKey {
         self.sign_digest(checkpoint_digest(chain_id, vault, seq, root))
     }
 
+    /// Signs an atomic extension of the exact prior vault commitment.
+    pub fn sign_checkpoint_v2(
+        &self,
+        chain_id: u64,
+        vault: &[u8; 20],
+        seq: u64,
+        root: &[u8; 32],
+        parent: crate::log::CheckpointParent,
+    ) -> String {
+        self.sign_digest(checkpoint_digest_v2(chain_id, vault, seq, root, parent))
+    }
+
     /// Signs an approved withdrawal for the vault on `chain_id` to pay out.
     ///
     /// TODO: move to EIP-712 typed data once the vault contract is written.
@@ -125,14 +160,7 @@ impl EnclaveKey {
         amount: Fixed,
         nonce: u64,
     ) -> String {
-        let mut h = Keccak256::new();
-        h.update(b"engine.withdrawal.v1");
-        h.update(chain_id.to_be_bytes());
-        h.update(vault);
-        h.update(account.0);
-        h.update(amount.to_be_bytes());
-        h.update(nonce.to_be_bytes());
-        self.sign_digest(h.finalize().into())
+        self.sign_digest(withdrawal_digest(chain_id, vault, account, amount, nonce))
     }
 
     /// 65-byte `r || s || v` with `v` in {27, 28}, as `ecrecover` expects.
@@ -163,8 +191,46 @@ pub fn attest_key(
     })
 }
 
+/// Historical withdrawal authorization bytes, unchanged across checkpoint versions.
+pub(crate) fn withdrawal_digest(
+    chain_id: u64,
+    vault: &[u8; 20],
+    account: AccountId,
+    amount: Fixed,
+    nonce: u64,
+) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    h.update(b"engine.withdrawal.v1");
+    h.update(chain_id.to_be_bytes());
+    h.update(vault);
+    h.update(account.0);
+    h.update(amount.to_be_bytes());
+    h.update(nonce.to_be_bytes());
+    h.finalize().into()
+}
+
+/// V2 binds the exact parent so two authorized publishers cannot extend divergent forks.
+pub(crate) fn checkpoint_digest_v2(
+    chain_id: u64,
+    vault: &[u8; 20],
+    seq: u64,
+    root: &[u8; 32],
+    parent: crate::log::CheckpointParent,
+) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    h.update(b"engine.checkpoint.v2");
+    h.update(chain_id.to_be_bytes());
+    h.update(vault);
+    h.update(seq.to_be_bytes());
+    h.update(root);
+    h.update([u8::from(parent.has_checkpoint)]);
+    h.update(parent.seq.to_be_bytes());
+    h.update(parent.root.0);
+    h.finalize().into()
+}
+
 /// The digest a checkpoint signature covers: domain tag, chain id, vault, seq, and root.
-fn checkpoint_digest(chain_id: u64, vault: &[u8; 20], seq: u64, root: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn checkpoint_digest(chain_id: u64, vault: &[u8; 20], seq: u64, root: &[u8; 32]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(b"engine.checkpoint.v1");
     h.update(chain_id.to_be_bytes());

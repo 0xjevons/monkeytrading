@@ -75,6 +75,10 @@ impl NodeConfig {
             anyhow::bail!("node.auth = \"none\" needs tee.provider and custody.provider both \"mock\"");
         }
         self.refuse_test_keys()?;
+        ensure!(
+            !self.tee.use_published_mock_key || self.tee.provider == TeeProvider::Mock,
+            "tee.use_published_mock_key requires tee.provider = \"mock\""
+        );
         if self.time.max_drift.is_zero() || self.time.interval.is_zero() {
             anyhow::bail!("time.max_drift and time.interval must be non-zero");
         }
@@ -100,6 +104,7 @@ impl NodeConfig {
         self.alerts.outbox.validate_location(&self.node.log_dir)?;
         self.history.retention_ms().context("history.retention")?;
         self.validate_custody()?;
+        self.validate_checkpoints()?;
         // Without a Critical webhook, Critical alerts reach only the node's own log, so a node
         // beside a real enclave or real funds must have one.
         if self.alerts.critical.is_none()

@@ -3,12 +3,17 @@
 //! acknowledged or published until its log entry is flushed. One task, no locks, and no queue
 //! beyond the channel: a fill costs about one engine step plus a buffered write.
 
+mod recovery;
 mod replay;
-pub use replay::{Replayed, replay, replay_path};
+pub use replay::{Replayed, replay, replay_path, replay_path_in_domain, replay_path_with_trust, replay_with_signer};
+mod checkpoints;
+use checkpoints::Gate;
+mod messages;
+pub use messages::{Query, Request, SignedWithdrawal, StreamBody, StreamMsg};
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use engine_core::auth::{ClientAuth, Operator};
@@ -16,64 +21,19 @@ use engine_core::command::{Command, Sequenced};
 use engine_core::event::Event;
 use engine_core::types::{AccountId, Millis};
 use engine_core::{Engine, Fixed};
-use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tracing::{debug, error, info, info_span, warn};
+use tokio::sync::{broadcast, mpsc, watch};
+use tracing::{error, info, info_span, warn};
 
+use crate::checkpoints::accounting::Accounting;
 use crate::clock::Clock;
-use crate::log::{Checkpoint, CommandEntry, LogEntry, LogWriter, Manifest, Offset, SegmentedLog};
+use crate::log::{CommandEntry, LogEntry, LogWriter, Manifest, SegmentedLog};
 use crate::metrics::Metrics;
 use crate::sequencer::alerts::{DeficitAlert, alert_on};
-use crate::sequencer::replay::Replay;
 use crate::tee::EnclaveKey;
 use crate::trusted_time::{Sample, TimeGate};
 
 /// Most requests of any kind taken into one batch before it is flushed and answered.
 const MAX_BATCH: usize = 1024;
-
-pub type Query = Box<dyn FnOnce(&Engine) + Send>;
-
-// Unboxed on purpose: boxing every command would add an allocation to the hot path.
-#[allow(clippy::large_enum_variant)]
-pub enum Request {
-    Submit {
-        cmd: Command,
-        reply: Option<oneshot::Sender<Vec<Event>>>,
-    },
-    Query(Query),
-    /// A trusted time sample from the trusted time task.
-    TimeSample(Sample),
-    /// Answered with the last seq once every command before it is synced, so it survives power loss.
-    Sync(oneshot::Sender<Option<u64>>),
-}
-
-/// What `/v1/stream` publishes: each log entry at its offset, in offset order.
-#[derive(Clone, Debug, Serialize)]
-pub struct StreamMsg {
-    pub offset: Offset,
-    #[serde(flatten)]
-    pub body: StreamBody,
-}
-
-// Unboxed on purpose, like `Request`.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum StreamBody {
-    Command(CommandEntry),
-    Checkpoint(Checkpoint),
-    Withdrawal(SignedWithdrawal),
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SignedWithdrawal {
-    pub account: AccountId,
-    pub amount: Fixed,
-    pub nonce: u64,
-    pub chain_id: u64,
-    pub vault: AccountId,
-    pub signature: String,
-}
 
 pub struct Sequencer {
     engine: Engine,
@@ -98,6 +58,8 @@ pub struct Sequencer {
     deficit: DeficitAlert,
     operator: Operator,
     metrics: Arc<Metrics>,
+    gate: Option<Gate>,
+    accounting: Accounting,
 }
 
 pub struct SequencerConfig<'a> {
@@ -118,6 +80,9 @@ pub struct SequencerConfig<'a> {
     pub operator: Operator,
     /// Where the sequencer records its metrics.
     pub metrics: Arc<Metrics>,
+    pub(crate) checkpoint_registry: Option<crate::checkpoints::Registry>,
+    pub(crate) checkpoint_parent: crate::log::CheckpointParent,
+    pub(crate) checkpoints: Option<mpsc::Sender<crate::checkpoints::Work>>,
 }
 
 /// A log read from disk and replayed, before anything is written to it.
@@ -126,114 +91,7 @@ pub struct ReplayedLog {
     replayed: Replayed,
 }
 
-impl StreamMsg {
-    /// The stream form of the log entry at `offset`.
-    pub fn new(offset: Offset, entry: LogEntry) -> Self {
-        let body = match entry {
-            LogEntry::Command(c) => StreamBody::Command(c),
-            LogEntry::Checkpoint(cp) => StreamBody::Checkpoint(cp),
-            LogEntry::Withdrawal(w) => StreamBody::Withdrawal(w),
-        };
-        Self { offset, body }
-    }
-}
-
 impl Sequencer {
-    /// Rebuilds state by replaying the existing log, if there is one, and opens it for appending.
-    /// Signs, logs, and hands to custody any withdrawal the log ends before signing.
-    ///
-    /// TODO: the log sits on host storage, so the host could truncate it. Before serving, check the
-    /// replayed root against the latest root posted on-chain.
-    /// Error cases:
-    /// - the log cannot be read or replayed (see `read_log`)
-    /// - the log records a client auth or an operator other than the config's, or a genesis it did
-    ///   not apply in full
-    /// - the log cannot be opened for appending, or written
-    pub fn recover(
-        cfg: SequencerConfig<'_>,
-        key: Arc<EnclaveKey>,
-        stream: broadcast::Sender<Arc<StreamMsg>>,
-        withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
-    ) -> anyhow::Result<Self> {
-        let log = Self::read_log(cfg.log_dir, |_| {})?;
-        Self::recover_from(log, cfg, key, stream, withdrawals)
-    }
-
-    /// Reads the log in `dir` a segment at a time and replays it as it goes, handing each entry to
-    /// `observe` as well, so that a check of the log before recovery sees exactly what it replays.
-    /// Error cases:
-    /// - the log cannot be read, or fails its manifest check (see `SegmentedLog::open`) or replay
-    ///   (see `Replay`)
-    pub fn read_log(dir: &Path, mut observe: impl FnMut(&LogEntry)) -> anyhow::Result<ReplayedLog> {
-        let mut replay = Replay::default();
-        let log = SegmentedLog::open(dir, |entry| {
-            observe(&entry);
-            replay.apply(&entry)
-        })?;
-        Ok(ReplayedLog { log, replayed: replay.finish() })
-    }
-
-    /// As `recover`, from `log`, which `read_log` read and replayed.
-    /// Error cases:
-    /// - the log records a client auth or an operator other than the config's, or a genesis it did
-    ///   not apply in full (see `GenesisProgress::ensure_closed`)
-    /// - the log cannot be opened for appending, or written
-    pub fn recover_from(
-        log: ReplayedLog,
-        cfg: SequencerConfig<'_>,
-        key: Arc<EnclaveKey>,
-        stream: broadcast::Sender<Arc<StreamMsg>>,
-        withdrawals: mpsc::UnboundedSender<SignedWithdrawal>,
-    ) -> anyhow::Result<Self> {
-        let ReplayedLog { log, replayed } = log;
-        let Replayed { engine, commands, checkpoints, unsigned, genesis, last_checkpoint_ts, .. } = replayed;
-        // A config naming another client auth or operator, and so another chain, vault, or admin key,
-        // is the wrong one for this log: refuse before anything is written or signed under it.
-        if let Some(recorded) = engine.client_auth().filter(|recorded| **recorded != cfg.client_auth) {
-            bail!("the log records client auth {recorded:?}, but the config gives {:?}", cfg.client_auth);
-        }
-        if let Some(recorded) = engine.operator().filter(|recorded| **recorded != cfg.operator) {
-            bail!("the log records operator {recorded:?}, but the config gives {:?}", cfg.operator);
-        }
-        genesis.ensure_closed()?;
-        info!(commands, checkpoints, "recovered from log");
-        if let Some(ts) = last_checkpoint_ts {
-            cfg.metrics.last_checkpoint_seconds.set(ts as f64 / 1000.0);
-        }
-        let mut sequencer = Self {
-            next_seq: engine.last_seq().map_or(0, |s| s + 1),
-            last_ts: engine.now(),
-            last_checkpoint: engine.last_seq(),
-            engine,
-            log: log.into_writer(cfg.segment_commands.max(1), cfg.manifest)?,
-            key,
-            checkpoint_every: cfg.checkpoint_every.max(1),
-            chain_id: cfg.chain_id,
-            vault: cfg.vault,
-            stream,
-            withdrawals,
-            outbox: Vec::new(),
-            time: TimeGate::new(cfg.max_drift, cfg.clock.instant()),
-            clock: cfg.clock,
-            required: Vec::new(),
-            client_auth: cfg.client_auth,
-            deficit: DeficitAlert::default(),
-            operator: cfg.operator,
-            metrics: cfg.metrics,
-        };
-        {
-            let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
-            sequencer.deficit.note(sequencer.engine.house_nav());
-        }
-        for (account, amount, nonce) in unsigned {
-            let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();
-            warn!(%account, nonce, "the log ends before this approved withdrawal was signed; signing it now");
-            sequencer.sign_withdrawal(account, amount, nonce)?;
-        }
-        sequencer.flush()?;
-        Ok(sequencer)
-    }
-
     /// Sequences requests until every sender is gone, then writes a final checkpoint. Each batch,
     /// of at most `MAX_BATCH` requests, is flushed before its replies, stream messages, and queries
     /// go out, and synced to storage first when it carries a sync request. A command trusted time
@@ -263,6 +121,7 @@ impl Sequencer {
                     Request::Query(q) => queries.push(q),
                     Request::TimeSample(sample) => self.take_sample(sample)?,
                     Request::Sync(reply) => syncs.push(reply),
+                    Request::CheckpointStatus { posted, healthy } => self.checkpoint_status(posted, healthy)?,
                 }
                 if taken < MAX_BATCH {
                     next = rx.try_recv().ok();
@@ -304,6 +163,10 @@ impl Sequencer {
             return Ok(None);
         };
         self.sequence_queued(ts)?;
+        if matches!(cmd, Command::Withdraw { .. }) && self.gate.as_ref().is_some_and(|gate| !gate.healthy) {
+            warn!(alert = "withdrawals_paused", "withdrawal refused until custody reconciles");
+            return Ok(None);
+        }
         self.stamp(ts, cmd).map(Some)
     }
 
@@ -345,6 +208,7 @@ impl Sequencer {
         let sequenced = Sequenced { seq: self.next_seq, ts, cmd };
         let _span = info_span!("command", id = sequenced.seq).entered();
         let events = self.engine.apply(&sequenced).context("sequencer produced an invalid sequence")?;
+        self.accounting.apply(&sequenced.cmd, &events)?;
         self.next_seq += 1;
         self.last_ts = ts;
         self.record(LogEntry::Command(CommandEntry { sequenced, events: Some(events.clone()) }))?;
@@ -354,11 +218,24 @@ impl Sequencer {
             alert_on(event);
             self.metrics.record(event);
             if let Event::WithdrawalApproved { account, amount, nonce } = event {
-                self.sign_withdrawal(*account, *amount, *nonce)?;
+                if let Some(gate) = &mut self.gate {
+                    gate.pending.push((
+                        self.engine.last_seq().expect("applied command has a seq"),
+                        *account,
+                        *amount,
+                        *nonce,
+                    ));
+                } else {
+                    self.sign_withdrawal(*account, *amount, *nonce)?;
+                }
             }
         }
         self.deficit.note(self.engine.house_nav());
-        if self.next_seq.is_multiple_of(self.checkpoint_every) {
+        if self.next_seq.is_multiple_of(self.checkpoint_every)
+            || self.gate.as_ref().is_some_and(|gate| {
+                gate.pending.last().is_some_and(|w| w.0 == self.engine.last_seq().expect("applied command has a seq"))
+            })
+        {
             self.checkpoint()?;
         }
         Ok(events)
@@ -386,29 +263,8 @@ impl Sequencer {
             chain_id: self.chain_id,
             vault: self.vault,
             signature,
+            approved_seq: None,
         }))
-    }
-
-    /// Logs and publishes a signed state root for the last applied seq. From protocol `V9` the root
-    /// rehashes only what changed since the previous checkpoint, and API proofs are taken against it.
-    /// Error cases:
-    /// - nothing has been applied yet
-    /// - the log cannot be written
-    fn checkpoint(&mut self) -> anyhow::Result<()> {
-        let seq = self.engine.last_seq().context("checkpoint before any command")?;
-        let (started, root) = (Instant::now(), self.engine.state_root());
-        let (elapsed_us, work) = (started.elapsed().as_micros(), self.engine.last_root_work());
-        debug!(seq, elapsed_us, leaves = work.map(|w| w.leaves), nodes = work.map(|w| w.nodes), "state root computed");
-        let cp = Checkpoint {
-            seq,
-            root: format!("0x{}", hex::encode(root)),
-            signature: self.key.sign_checkpoint(self.chain_id, &self.vault.0, seq, &root),
-            signer: self.key.address_hex(),
-        };
-        self.record(LogEntry::Checkpoint(cp))?;
-        self.last_checkpoint = Some(seq);
-        self.metrics.last_checkpoint_seconds.set(self.last_ts as f64 / 1000.0);
-        Ok(())
     }
 
     /// Makes buffered log entries durable, then publishes what they produced and hands signed
@@ -443,3 +299,8 @@ mod margin_tests;
 mod metrics_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod checkpoint_tests;
+#[cfg(test)]
+pub(crate) mod fixture_tests;

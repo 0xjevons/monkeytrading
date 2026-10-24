@@ -211,7 +211,7 @@ impl Node {
             max_drift: cfg.time.max_drift,
             ..sequencer_config(&dir, watch::channel(Manifest::default()).0)
         };
-        let mut seq = Sequencer::recover(seq_cfg, Arc::new(EnclaveKey::generate()), stream, withdrawals).unwrap();
+        let mut seq = Sequencer::recover(seq_cfg, Arc::new(EnclaveKey::test_key()), stream, withdrawals).unwrap();
         // As the node does: both wait for a stamp trusted time admits.
         seq.activate_protocol().unwrap();
         if seq.needs_genesis() {

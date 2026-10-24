@@ -144,6 +144,7 @@ pub fn spawn_feed(
                             return;
                         }
                     }
+                    Some(Request::CheckpointStatus { .. }) => unreachable!("no checkpoint worker in this test"),
                     Some(Request::TimeSample(_)) => unreachable!("a feed sends no time samples"),
                     Some(Request::Sync(_)) => unreachable!("only custody asks for a log sync"),
                     None => return,

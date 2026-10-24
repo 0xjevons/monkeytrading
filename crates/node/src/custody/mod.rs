@@ -8,7 +8,7 @@
 //! - checkpoints: post the signed state roots so anyone can check the enclave against the public
 //!   log.
 //!
-//! Deposits are built (`evm`); on-chain withdrawal payouts and checkpoint posting are not yet.
+//! Deposits (`evm`) and the optional checkpoint service are built; on-chain withdrawal payouts remain pending.
 
 use alloy::primitives::{Address, U256};
 use anyhow::Context;
@@ -94,7 +94,7 @@ async fn log_withdrawals(mut withdrawals: mpsc::UnboundedReceiver<SignedWithdraw
 
 /// USDC base units as `Fixed`, exactly: `Fixed` carries more decimals than USDC, so no precision
 /// is lost. `None` only when the value is beyond what `Fixed` can hold; the engine bounds the rest.
-fn usdc_to_fixed(units: U256) -> Option<Fixed> {
+pub(crate) fn usdc_to_fixed(units: U256) -> Option<Fixed> {
     let scale = 10i128.pow(DECIMALS - USDC_DECIMALS);
     i128::try_from(units).ok()?.checked_mul(scale).map(Fixed::from_raw)
 }

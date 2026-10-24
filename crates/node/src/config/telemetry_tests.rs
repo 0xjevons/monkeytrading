@@ -25,6 +25,12 @@ fn only_a_mock_node_may_run_without_a_critical_route() {
     let parse = |text: &str| {
         let mut cfg: NodeConfig = toml::from_str(text).unwrap();
         cfg.operator.public_key = own_operator_key();
+        cfg.tee.use_published_mock_key = false;
+        if cfg.custody.provider == crate::config::CustodyProvider::Evm
+            && cfg.tee.provider != crate::config::TeeProvider::Mock
+        {
+            cfg.checkpoints = Some(toml::from_str("rpc_url = 'http://127.0.0.1:8545'\nrelayer = '0x1111111111111111111111111111111111111111'\nretry_interval = '2s'\nrpc_timeout = '10s'").unwrap());
+        }
         cfg
     };
     for (text, needs_route) in rows {
