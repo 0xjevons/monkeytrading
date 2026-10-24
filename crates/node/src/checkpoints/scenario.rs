@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
 
 use crate::checkpoints::{CheckpointChain, CheckpointRpc, Poster, View};
-use crate::config::{CheckpointSection, CustodyProvider, FinalityTag};
+use crate::config::{CheckpointSection, CustodyProvider, FinalityTag, RpcProviderSection};
 use crate::custody::Custody;
 use crate::log::{Checkpoint, CheckpointDomain, LogEntry, Manifest};
 use crate::sequencer::{Request, Sequencer, replay_path};
@@ -93,11 +93,35 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
         toml::from_str(&std::fs::read_to_string(crate::test_support::ANVIL_CONFIG).unwrap()).unwrap();
     cfg.custody.evm = anvil_cfg.custody.evm;
     let evm = cfg.custody.evm.as_mut().unwrap();
-    evm.rpc_url = toml::from_str::<CheckpointSection>(&format!(
-        "rpc_url = {url:?}\nrelayer = '{checkpoint_relayer:#x}'\nretry_interval = '40ms'\nrpc_timeout = '2s'"
-    ))
-    .unwrap()
-    .rpc_url;
+    // Three local proxies exercise the production quorum adapter. They deliberately share
+    // this isolated Anvil; independent service operation is a production deployment concern.
+    let mut proxies = Vec::new();
+    evm.providers.clear();
+    for index in 0..3 {
+        let proxy_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        proxies.push(Anvil(
+            Process::new("python3")
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/dev-rpc-proxy.py"))
+                .args(["--port", &proxy_port.to_string(), "--target", &url])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("Python3 installed"),
+        ));
+        timeout(Duration::from_secs(10), async {
+            while tokio::net::TcpStream::connect(("127.0.0.1", proxy_port)).await.is_err() {
+                sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .unwrap();
+        evm.providers.push(
+            toml::from_str::<RpcProviderSection>(&format!(
+                "name = 'scenario-{index}'\nrpc_url = 'http://127.0.0.1:{proxy_port}'"
+            ))
+            .unwrap(),
+        );
+    }
     evm.usdc = token;
     evm.finality_tag = FinalityTag::Latest;
     evm.confirmations = 0;
