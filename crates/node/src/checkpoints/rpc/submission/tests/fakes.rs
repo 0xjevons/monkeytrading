@@ -100,6 +100,8 @@ async fn answer(State(state): State<Arc<Mutex<RpcState>>>, Json(request): Json<V
     let result = match method {
         "eth_chainId" => json!(format!("{:#x}", state.chain_id)),
         "eth_getTransactionCount" => {
+            assert_eq!(params.as_array().unwrap().len(), 2);
+            assert_eq!(params[0], serde_json::to_value(alloy::primitives::Address::repeat_byte(3)).unwrap());
             let nonce = if params[1].is_object() {
                 assert_eq!(params[1]["requireCanonical"], true);
                 let hash: B256 = serde_json::from_value(params[1]["blockHash"].clone()).unwrap();
@@ -110,6 +112,7 @@ async fn answer(State(state): State<Arc<Mutex<RpcState>>>, Json(request): Json<V
             } else if params[1] == "pending" {
                 state.pending_nonce
             } else {
+                assert_eq!(params[1], "latest");
                 state.latest_nonce
             };
             json!(format!("{nonce:#x}"))
@@ -148,6 +151,8 @@ async fn answer(State(state): State<Arc<Mutex<RpcState>>>, Json(request): Json<V
             }
         }
         "eth_getBlockByNumber" => {
+            assert_eq!(params[1], false);
+            assert_eq!(params.as_array().unwrap().len(), 2);
             let number = match params[0].as_str().unwrap() {
                 "finalized" => 8,
                 "latest" => 10,
@@ -156,6 +161,8 @@ async fn answer(State(state): State<Arc<Mutex<RpcState>>>, Json(request): Json<V
             block(number)
         }
         "eth_getBlockByHash" => {
+            assert!(params[1].is_boolean());
+            assert_eq!(params.as_array().unwrap().len(), 2);
             let hash: B256 = serde_json::from_value(params[0].clone()).unwrap();
             let number = hash.as_slice()[0] as u64;
             let mut result = block(number);
@@ -177,6 +184,9 @@ async fn answer(State(state): State<Arc<Mutex<RpcState>>>, Json(request): Json<V
             result
         }
         "eth_call" => {
+            assert_eq!(params.as_array().unwrap().len(), 2);
+            assert_eq!(params[1]["requireCanonical"], true);
+            assert!(params[1]["blockHash"].as_str().is_some());
             let finalized = params[1]["blockHash"] == json!(B256::repeat_byte(8));
             let checkpoint = if finalized { &state.finalized } else { &state.latest };
             let input = params[0].get("input").or_else(|| params[0].get("data")).unwrap().as_str().unwrap();

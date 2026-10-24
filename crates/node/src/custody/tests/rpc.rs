@@ -141,3 +141,110 @@ async fn malformed_successful_header_payloads_are_content_errors_but_timeouts_ar
     assert!(!err.is::<InvalidRpcResponse>(), "{err:#}");
     assert!(format!("{err:#}").contains("timed out"));
 }
+
+#[tokio::test]
+async fn rpc_wire_keeps_tags_batches_filters_quantities_and_canonical_hash_calls() {
+    use alloy::rpc::types::Block;
+    use axum::extract::State;
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+    use tokio::sync::mpsc;
+
+    use crate::custody::evm::BlockRef;
+    use crate::custody::rpc::{InvalidRpcResponse, usdcCall};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, mut requests) = mpsc::unbounded_channel();
+    let app = Router::new().route("/", post(wire_answer)).with_state(tx);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let rpc = rpc_at(&url);
+    let identity = rpc.identity().await.unwrap();
+    assert_eq!(identity.chain_id, 31337);
+    assert_eq!(identity.token, Some(Address::repeat_byte(2)));
+    let finality = rpc.finality().await.unwrap();
+    assert_eq!((finality.head, finality.head_time), (12, 1234));
+    assert_eq!(finality.tagged, Some(BlockRef { number: 7, hash: B256::repeat_byte(7) }));
+    let headers = rpc.headers(6, 7).await.unwrap();
+    assert_eq!(
+        headers.iter().map(|h| (h.number, h.hash)).collect::<Vec<_>>(),
+        vec![(6, B256::repeat_byte(6)), (7, B256::repeat_byte(7))]
+    );
+    for number in [8, 9] {
+        let error = rpc.headers(number, number).await.unwrap_err();
+        assert!(error.is::<InvalidRpcResponse>(), "{error:#}");
+    }
+    assert!(rpc.deposits(6, 7).await.unwrap().is_empty());
+    assert_eq!(rpc.deposit_count(BlockRef { number: 7, hash: B256::repeat_byte(7) }).await.unwrap(), 4);
+    server.abort();
+    let _ = server.await;
+    let mut observed = Vec::new();
+    while let Ok(request) = requests.try_recv() {
+        observed.push(request);
+    }
+    let call = |input: Vec<u8>| json!({"to": VAULT, "input": Bytes::from(input)});
+    let compact = |method: &str, params: Value| json!({"method":method,"params":params});
+    let expected = vec![
+        compact("eth_chainId", json!([])),
+        compact("eth_call", json!([call(usdcCall {}.abi_encode()), "latest"])),
+        compact("eth_getBlockByNumber", json!(["safe", false])),
+        compact("eth_getBlockByNumber", json!(["latest", false])),
+        json!([
+            compact("eth_getBlockByNumber", json!(["0x6", false])),
+            compact("eth_getBlockByNumber", json!(["0x7", false]))
+        ]),
+        json!([compact("eth_getBlockByNumber", json!(["0x8", false]))]),
+        json!([compact("eth_getBlockByNumber", json!(["0x9", false]))]),
+        compact(
+            "eth_getLogs",
+            json!([{"address":VAULT,"fromBlock":"0x6","toBlock":"0x7","topics":[[Deposited::SIGNATURE_HASH,HouseDeposited::SIGNATURE_HASH]]}]),
+        ),
+        compact(
+            "eth_call",
+            json!([call(depositCountCall {}.abi_encode()), {"blockHash":B256::repeat_byte(7),"requireCanonical":true}]),
+        ),
+    ];
+    assert_eq!(observed, expected);
+
+    async fn wire_answer(State(tx): State<mpsc::UnboundedSender<Value>>, Json(request): Json<Value>) -> Json<Value> {
+        fn answer(request: &Value) -> Value {
+            let result = match request["method"].as_str().unwrap() {
+                "eth_chainId" => json!("0x7a69"),
+                "eth_call" if request["params"][1] == "latest" => {
+                    json!(Bytes::from(usdcCall::abi_encode_returns(&Address::repeat_byte(2))))
+                }
+                "eth_call" => json!(Bytes::from(depositCountCall::abi_encode_returns(&U256::from(4)))),
+                "eth_getLogs" => json!([]),
+                "eth_getBlockByNumber" => {
+                    let number = match request["params"][0].as_str().unwrap() {
+                        "safe" => 7,
+                        "latest" => 12,
+                        value => u64::from_str_radix(value.trim_start_matches("0x"), 16).unwrap(),
+                    };
+                    if number == 8 {
+                        Value::Null
+                    } else {
+                        let mut block = Block::<alloy::rpc::types::Transaction>::default();
+                        block.header.number = if number == 9 { 10 } else { number };
+                        block.header.timestamp = 1234;
+                        block.header.hash = B256::repeat_byte(number as u8);
+                        serde_json::to_value(block).unwrap()
+                    }
+                }
+                method => panic!("unexpected method {method}"),
+            };
+            json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+        }
+        fn compact(request: &Value) -> Value {
+            json!({"method":request["method"],"params":request.get("params").cloned().unwrap_or(json!([]))})
+        }
+        let result = if let Some(batch) = request.as_array() {
+            tx.send(Value::Array(batch.iter().map(compact).collect())).unwrap();
+            Value::Array(batch.iter().map(answer).collect())
+        } else {
+            tx.send(compact(&request)).unwrap();
+            answer(&request)
+        };
+        Json(result)
+    }
+}

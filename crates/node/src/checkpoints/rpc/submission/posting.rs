@@ -1,8 +1,7 @@
 //! Reservation transitions require actual vault progress, never transaction hashes or nonces alone.
 
-use alloy::network::TransactionBuilder;
-use alloy::primitives::Address;
-use alloy::providers::Provider;
+use alloy::eips::BlockNumberOrTag;
+use alloy::primitives::{Address, U64};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::{Context, ensure};
@@ -24,7 +23,7 @@ impl CheckpointRpc {
             return Ok(());
         }
         self.check_parent(cp, &latest)?;
-        let latest_nonce = self.deadline(self.provider.get_transaction_count(self.relayer)).await?;
+        let latest_nonce = self.relayer_nonce(BlockNumberOrTag::Latest).await?;
         let mut reservation = match self.submissions.read()? {
             Some(previous) if previous.checkpoint == *cp => {
                 if latest_nonce > previous.nonce {
@@ -61,14 +60,14 @@ impl CheckpointRpc {
             }
         };
         let tx = TransactionRequest::default()
-            .with_to(Address::from(self.domain.vault.0))
-            .with_from(self.relayer)
-            .with_chain_id(self.domain.chain_id)
-            .with_nonce(reservation.nonce)
-            .with_input(checkpoint_input(cp)?);
+            .to(Address::from(self.domain.vault.0))
+            .from(self.relayer)
+            .nonce(reservation.nonce)
+            .input(checkpoint_input(cp)?.into());
+        let tx = TransactionRequest { chain_id: Some(self.domain.chain_id), ..tx };
         if let Some(hash) = reservation.transaction_hash {
             let known: Option<TransactionRequest> =
-                self.deadline(self.provider.client().request("eth_getTransactionByHash", (hash,))).await?;
+                self.deadline(self.client.request("eth_getTransactionByHash", (hash,))).await?;
             if let Some(known) = known {
                 ensure!(same_transaction(&known, &tx)?, "reserved transaction hash identifies another transaction");
                 return Ok(());
@@ -76,7 +75,7 @@ impl CheckpointRpc {
         }
         // A preceding sync failure must not turn a merely visible reservation into a send.
         self.submissions.sync()?;
-        let hash = self.deadline(self.provider.client().request("eth_sendTransaction", (tx,))).await?;
+        let hash = self.deadline(self.client.request("eth_sendTransaction", (tx,))).await?;
         reservation.transaction_hash = Some(hash);
         self.submissions.store(&reservation)?;
         Ok(())
@@ -132,12 +131,20 @@ impl CheckpointRpc {
     /// Error cases:
     /// - nonce reads changed, pending work exists, or the account is exhausted
     async fn check_free_nonce(&self, nonce: u64) -> anyhow::Result<()> {
-        let latest = self.deadline(self.provider.get_transaction_count(self.relayer)).await?;
-        let pending = self.deadline(self.provider.get_transaction_count(self.relayer).pending()).await?;
+        let latest = self.relayer_nonce(BlockNumberOrTag::Latest).await?;
+        let pending = self.relayer_nonce(BlockNumberOrTag::Pending).await?;
         ensure!(latest == nonce, "relayer nonce changed during reconciliation");
         ensure!(pending == nonce, "relayer has unreserved pending transactions; use a dedicated relayer");
         ensure!(nonce < u64::MAX, "relayer nonce is exhausted");
         Ok(())
+    }
+
+    /// Reads the relayer nonce at the requested progress tag.
+    /// Error cases:
+    /// - the RPC fails, times out, or returns a malformed quantity
+    async fn relayer_nonce(&self, tag: BlockNumberOrTag) -> anyhow::Result<u64> {
+        let nonce: U64 = self.deadline(self.client.request("eth_getTransactionCount", (self.relayer, tag))).await?;
+        Ok(nonce.to())
     }
 
     /// Rechecks canonical parent and account freedom before atomically moving nonce ownership.

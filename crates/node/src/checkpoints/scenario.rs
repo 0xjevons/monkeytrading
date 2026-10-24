@@ -5,10 +5,9 @@ use std::process::{Child, Command as Process, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::{Provider, ProviderBuilder, RootProvider};
-use alloy::rpc::types::TransactionRequest;
+use alloy::primitives::{Address, B256, U64, U256};
+use alloy::rpc::client::RpcClient;
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolValue};
 use engine_core::Fixed;
@@ -53,15 +52,15 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
             .expect("Anvil installed"),
     );
     let url = format!("http://127.0.0.1:{port}");
-    let provider = ProviderBuilder::default().connect_http(url.parse().unwrap());
+    let provider = RpcClient::new_http(url.parse().unwrap());
     timeout(Duration::from_secs(10), async {
-        while provider.get_chain_id().await.is_err() {
+        while provider.request::<_, U64>("eth_chainId", ()).await.is_err() {
             sleep(Duration::from_millis(30)).await;
         }
     })
     .await
     .unwrap();
-    let accounts = provider.get_accounts().await.unwrap();
+    let accounts: Vec<Address> = provider.request("eth_accounts", ()).await.unwrap();
     let relayer = accounts[0];
     // Checkpoint nonce ownership is independent of deployment, funding, and deposit transactions.
     let checkpoint_relayer = accounts[9];
@@ -288,10 +287,10 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     let work = crate::checkpoints::Work { checkpoint, liabilities: current.balance, deposits: current.deposits };
     include_checkpoint(&delayed, &work.checkpoint).await;
     assert_eq!(delayed.reconcile(&work).await.unwrap(), (None, false));
-    let nonce = provider.get_transaction_count(checkpoint_relayer).await.unwrap();
+    let nonce = provider.request::<_, U64>("eth_getTransactionCount", (checkpoint_relayer, "latest")).await.unwrap();
     assert_eq!(delayed.reconcile(&work).await.unwrap(), (None, false));
     assert_eq!(
-        provider.get_transaction_count(checkpoint_relayer).await.unwrap(),
+        provider.request::<_, U64>("eth_getTransactionCount", (checkpoint_relayer, "latest")).await.unwrap(),
         nonce,
         "pending finality must not resubmit"
     );
@@ -328,23 +327,37 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
     assert!(replay_path(&tampered).is_err(), "edited signature fails replay");
 }
 
-async fn deploy(provider: &RootProvider, from: Address, artifact: &str, args: &[u8]) -> Address {
+async fn deploy(provider: &RpcClient, from: Address, artifact: &str, args: &[u8]) -> Address {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/out");
     let artifact: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join(artifact)).expect("forge build first")).unwrap();
     let mut input = hex::decode(artifact["bytecode"]["object"].as_str().unwrap().trim_start_matches("0x")).unwrap();
     input.extend_from_slice(args);
-    let pending =
-        provider.send_transaction(TransactionRequest::default().with_from(from).with_input(input)).await.unwrap();
-    timeout(Duration::from_secs(5), pending.get_receipt()).await.unwrap().unwrap().contract_address.unwrap()
+    let receipt = transact(provider, TransactionRequest::default().from(from).input(input.into())).await;
+    assert!(receipt.status(), "deployment reverted");
+    receipt.contract_address.unwrap()
 }
 
-async fn send(provider: &RootProvider, from: Address, to: Address, input: Vec<u8>) {
-    let pending = provider
-        .send_transaction(TransactionRequest::default().with_from(from).with_to(to).with_input(Bytes::from(input)))
-        .await
-        .unwrap();
-    assert!(timeout(Duration::from_secs(5), pending.get_receipt()).await.unwrap().unwrap().status());
+async fn send(provider: &RpcClient, from: Address, to: Address, input: Vec<u8>) {
+    let receipt = transact(provider, TransactionRequest::default().from(from).to(to).input(input.into())).await;
+    assert!(receipt.status());
+}
+
+/// Sends through Anvil's unlocked account and polls its receipt under the scenario deadline.
+async fn transact(provider: &RpcClient, transaction: TransactionRequest) -> TransactionReceipt {
+    let hash: B256 = provider.request("eth_sendTransaction", (transaction,)).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(receipt) =
+                provider.request::<_, Option<TransactionReceipt>>("eth_getTransactionReceipt", (hash,)).await.unwrap()
+            {
+                return receipt;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap()
 }
 
 async fn submit(tx: &mpsc::Sender<Request>, cmd: Command) -> Option<Vec<engine_core::event::Event>> {

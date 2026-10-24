@@ -64,7 +64,7 @@ mod tests {
         assert!(!keys.is_empty());
         for key in keys {
             let point = VerifyingKey::from_sec1_bytes(&hex::decode(key.trim_start_matches("0x")).unwrap()).unwrap();
-            let compressed = format!("0x{}", hex::encode(point.to_encoded_point(true).as_bytes()));
+            let compressed = format!("0x{}", hex::encode(point.to_sec1_point(true).as_bytes()));
             assert_ne!(compressed, key);
             for form in [key.clone(), compressed] {
                 let err = attested(&form).validate().unwrap_err();
@@ -92,7 +92,7 @@ mod tests {
         ];
         for private_key in private_keys {
             let key = SigningKey::from_slice(&hex::decode(private_key).unwrap()).unwrap();
-            let public_key = format!("0x{}", hex::encode(key.verifying_key().to_encoded_point(false).as_bytes()));
+            let public_key = format!("0x{}", hex::encode(key.verifying_key().to_sec1_point(false).as_bytes()));
             let err = attested(&public_key).validate().unwrap_err();
             assert!(format!("{err:#}").contains("is a published test key"), "{private_key}: {err:#}");
         }

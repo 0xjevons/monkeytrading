@@ -14,7 +14,10 @@ engine-core = { path = "crates/core", version = "0.1.0" }
 alloy-dyn-abi = { version = "1.7.3", default-features = false, features = ["std", "eip712"] }
 alloy-primitives = { version = "1.7.3", default-features = false, features = ["std", "serde"] }
 alloy-sol-types = { version = "1.7.3", default-features = false, features = ["std"] }
-alloy = { version = "2.5", default-features = false, features = ["std", "provider-http", "reqwest-rustls-tls", "rpc-types", "sol-types"] }
+alloy = { version = "2.5", default-features = false, features = ["std", "rpc-client", "rpc-types", "sol-types", "eips"] }
+# Enable HTTP/TLS on the components without the aggregate provider feature forwarding.
+alloy-rpc-client = { version = "2.5", default-features = false, features = ["reqwest"] }
+alloy-transport-http = { version = "2.5", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 # Without `simd-unsafe`, its only source of `unsafe` code.
@@ -31,7 +34,7 @@ http-body-util = "0.1"
 humantime-serde = "1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+k256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
 nix = { version = "0.31.3", default-features = false, features = ["sched"] }
 prometheus-client = "0.25"
 proptest = { version = "1.12", default-features = false, features = ["std"] }
