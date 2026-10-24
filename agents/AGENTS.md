@@ -27,7 +27,8 @@ an index: load only the rule whose hint matches the current action.
   replay`, `engine admin` (the operator's signing client), the REST API with the operator's admin
   route and account proofs, and the resumable WebSocket stream (TLS from an attested in-enclave key,
   with rate limits and connection caps), the account history index (SQLite, derived from the log),
-  dated benchmark ingestion (`benchmarks/` and the separate `admin/benchmark_feed.rs` signing worker),
+  dated benchmark ingestion (`benchmarks/` and the separate `admin/benchmark_feed.rs` signing worker
+  with bounded durable schedule watches in `admin/benchmark_watch.rs` and `api/benchmark_schedule.rs`),
   TEE attestation (configfs-tsm for TDX and SEV-SNP), the trusted time check against Roughtime
   servers, the custody adapter (mock, or EVM vault deposits over alloy), checkpoint posting and collateral
   reconciliation (`checkpoints/`), with strict signature replay and startup checks against the
@@ -35,8 +36,9 @@ an index: load only the rule whose hint matches the current action.
   price feeds: live crypto
   venue WebSockets (`feeds/`, one adapter per venue) and a mock, Prometheus metrics on an operator
   listener, and alert routing to webhooks with a bounded durable outbox outside the public log.
-  `sequencer/alerts/` tests benchmark retirement and webhook recovery;
-  `api/benchmark_tests/retention.rs` checks failed publisher refreshes across restart/calendar changes. `tests/reference/` holds the node-format reference log
+  `sequencer/alerts/` tests benchmark retirement, scalar fallback, and webhook recovery;
+  `api/benchmark_tests/retention.rs` checks failed publisher refreshes across restart/calendar changes;
+  `api/benchmark_tests/schedule.rs` checks changed schedules and in-flight worker nonce fencing. `tests/reference/` holds the node-format reference log
   per protocol version, with events, written once by `examples/reference_log.rs`. Its `README.md`
   lists every file.
 - **contracts/** — Foundry project for the custody vault. `src/Vault.sol` takes USDC deposits of

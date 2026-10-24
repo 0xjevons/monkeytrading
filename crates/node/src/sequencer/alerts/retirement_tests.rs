@@ -51,10 +51,11 @@ fn benchmark_retirement_closes_multiple_firing_and_unknown_conditions_independen
     let mut alerts = BenchmarkAlerts::default();
     alerts.note(&firing("SOFR", 0));
     alerts.note(&firing("SOFR", 1));
-    assert_eq!(clears(&logs), [0, 0, 0]);
+    alerts.note(&firing("SOFR", 0));
+    assert_eq!(clears(&logs), [1, 0, 0], "the undated fallback already resolved missing");
     let before = BenchmarkAlerts::listed(&catalogue(&["SOFR"]));
     alerts.retain_listed(&Engine::new(), &before);
-    assert_eq!(clears(&logs), [1, 1, 1], "both firing conditions and the unknown stale condition close");
+    assert_eq!(clears(&logs), [2, 1, 1], "retirement closes both reopened/firing conditions and unknown stale");
     assert!(alerts.tracked.is_empty());
 }
 
@@ -80,16 +81,16 @@ fn benchmark_retirement_retains_active_names_until_their_last_market_changes() {
     let both = catalogue(&["SOFR", "SOFR", "SONIA"]);
     let partial = catalogue(&["SOFR", "SONIA"]);
     alerts.retain_listed(&partial, &BenchmarkAlerts::listed(&both));
-    assert_eq!(clears(&logs), [0, 0, 0], "a name with one remaining market stays active");
+    assert_eq!(clears(&logs), [1, 0, 0], "partial retirement adds no clear beyond SONIA's fallback");
     assert_eq!(alerts.tracked.len(), 2);
     assert_eq!(alerts.tracked["SOFR"].missing, Some(false));
     assert_eq!(alerts.tracked["SONIA"].undated, Some(false));
     alerts.retain_listed(&catalogue(&["SONIA"]), &BenchmarkAlerts::listed(&partial));
-    assert_eq!(clears(&logs), [1, 1, 1]);
+    assert_eq!(clears(&logs), [2, 1, 1]);
     assert_eq!(alerts.tracked.len(), 1);
     assert_eq!(alerts.tracked["SONIA"].undated, Some(false), "other active episodes retain their state");
     alerts.retain_listed(&catalogue(&["SONIA"]), &BenchmarkAlerts::listed(&catalogue(&["SONIA"])));
-    assert_eq!(clears(&logs), [1, 1, 1]);
+    assert_eq!(clears(&logs), [2, 1, 1]);
 }
 
 #[test]

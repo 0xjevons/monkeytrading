@@ -167,6 +167,7 @@ impl Sequencer {
         if let Some(ts) = last_checkpoint_ts {
             cfg.metrics.last_checkpoint_seconds.set(ts as f64 / 1000.0);
         }
+        let benchmark_schedule = watch::channel(BenchmarkSchedule::from_engine(&engine)).0;
         let mut sequencer = Self {
             next_seq: engine.last_seq().map_or(0, |s| s + 1),
             last_ts: engine.now(),
@@ -197,6 +198,9 @@ impl Sequencer {
             benchmark_sync: false,
             benchmark_sync_enabled: false,
             benchmark_time_refused: false,
+            benchmark_schedule,
+            benchmark_schedule_dirty: false,
+            benchmark_schedule_pending: false,
         };
         {
             let _span = info_span!("command", id = sequencer.engine.last_seq()).entered();

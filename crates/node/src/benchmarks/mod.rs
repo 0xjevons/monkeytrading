@@ -1,6 +1,8 @@
 //! Fetch dated observations over publisher-authenticated HTTPS for the external operator worker.
 
 mod parse;
+mod schedule;
+pub use schedule::BenchmarkSchedule;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

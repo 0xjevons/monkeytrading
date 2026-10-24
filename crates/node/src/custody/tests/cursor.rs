@@ -55,6 +55,7 @@ async fn the_cursor_moves_only_after_the_log_is_synced_past_the_credits() {
                     let _ = reply.send(engine.last_seq());
                 }
                 Request::CheckpointStatus { .. } => unreachable!("no checkpoint worker in this test"),
+                Request::WatchBenchmarkSchedule(_) => unreachable!("only the API watches benchmark schedules"),
                 Request::TimeSample(_) => unreachable!("custody sends no time samples"),
             }
         }

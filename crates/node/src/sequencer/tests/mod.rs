@@ -443,6 +443,7 @@ fn commands(entries: &[LogEntry]) -> Vec<Command> {
 }
 
 mod benchmark_recovery;
+mod benchmark_schedule;
 mod benchmarks;
 mod genesis;
 mod operator;

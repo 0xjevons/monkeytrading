@@ -157,6 +157,12 @@ endpoint = "{publisher}/estr"
         params.rollover = dev_config().genesis.params.rollover;
         fs::write(&params_path, toml::to_string(&params)?)?;
         run_admin(live, &config, &["set-params", params_path.to_str().context("params path")?], || RESUMED).await?;
+        let refresh = run_admin(live, &config, &["sync-benchmarks"], || RESUMED).await?;
+        let AdminCommand::SetBenchmarkRates(batch) = &refresh.command else { unreachable!() };
+        ensure!(batch.rates.is_empty(), "the restored calendar still attempts both failed publishers");
+        ensure!(batch.checked.contains("SOFR") && batch.checked.contains("ESTR"), "both fetches were attempted");
+        ensure!(batch.as_of == "2026-10-20".parse::<chrono::NaiveDate>()?, "refresh uses restored London's date");
+        ensure!(retention_state(live).await?.1 == after.1, "a predeadline refresh charges nothing");
         live.advance(FIRST - 30_000).await;
         live.advance(FIRST + 1).await;
         ensure!(
@@ -196,7 +202,7 @@ endpoint = "{publisher}/estr"
     let entries = log_entries(&dir);
     let mut financing = Vec::new();
     let mut observations = Vec::new();
-    let mut failed_snapshots = 0;
+    let mut failed_snapshots = Vec::new();
     let mut parameter_changes = 0;
     for entry in &entries {
         let LogEntry::Command(command) = entry else { continue };
@@ -212,7 +218,8 @@ endpoint = "{publisher}/estr"
         if let Command::SignedAdmin(request) = &command.sequenced.cmd {
             match &request.command {
                 AdminCommand::SetBenchmarkRates(batch) if batch.rates.is_empty() => {
-                    failed_snapshots += 1;
+                    failed_snapshots.push(batch.as_of);
+                    assert!(batch.checked.contains("SOFR") && batch.checked.contains("ESTR"));
                     assert!(events.contains(&Event::AdminApplied));
                 }
                 AdminCommand::SetParams(_) => {
@@ -223,7 +230,11 @@ endpoint = "{publisher}/estr"
             }
         }
     }
-    assert_eq!(failed_snapshots, 1, "refused attempts stay out of the public log");
+    assert_eq!(
+        failed_snapshots,
+        ["2026-10-19".parse().unwrap(), "2026-10-20".parse().unwrap()],
+        "each changed calendar gets a complete attempt; refused attempts stay out of the public log"
+    );
     assert_eq!(parameter_changes, 2, "both legal calendar changes use signed HTTPS admin commands");
     assert_eq!(financing, [charge("0.01"), charge("0.02")]);
     let older = "2026-10-19".parse().unwrap();

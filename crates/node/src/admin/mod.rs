@@ -4,6 +4,7 @@
 //! could read it, and it never leaves this process: the node holds only the operator's public key.
 
 mod benchmark_feed;
+mod benchmark_watch;
 mod tls;
 
 use std::fmt;
@@ -35,7 +36,7 @@ use crate::clock::now_ms;
 use crate::config::NodeConfig;
 
 /// How long one call to the node may take, connection included.
-const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How far ahead a signed command expires: half the engine's bound, so it is accepted with this
 /// machine's clock up to two and a half minutes off the node's either way.
 const EXPIRES_IN_MS: Millis = MAX_EXPIRY_AHEAD_MS / 2;
@@ -188,7 +189,7 @@ pub async fn run(args: AdminArgs, env: KeyEnv) -> anyhow::Result<AdminRequest> {
 pub(crate) async fn run_with_clock(
     args: AdminArgs,
     env: KeyEnv,
-    clock: fn() -> Millis,
+    clock: impl Fn() -> Millis,
 ) -> anyhow::Result<AdminRequest> {
     let cfg = NodeConfig::load(&args.config)?;
     run_configured(args, env, clock, cfg).await
@@ -200,7 +201,7 @@ pub(crate) async fn run_with_clock(
 async fn run_configured(
     args: AdminArgs,
     env: KeyEnv,
-    clock: fn() -> Millis,
+    clock: impl Fn() -> Millis,
     cfg: NodeConfig,
 ) -> anyhow::Result<AdminRequest> {
     let operator = cfg.operator()?;

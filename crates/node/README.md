@@ -68,8 +68,10 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/main.rs` — the `engine` binary: `run`, `replay`, and `admin`
 - `src/lib.rs` — module index
 - `src/admin/mod.rs` — `engine admin`: the operator key, the commands it signs, and submission
-- `src/admin/benchmark_feed.rs` — the separate signed publisher worker and its daily retry cadence
-- `src/benchmarks/` — official CSV fetching (`mod.rs`), exact decimal parsing (`parse.rs`), and tests
+- `src/admin/benchmark_feed.rs` — the separate signed publisher worker and rollover scheduling
+- `src/admin/benchmark_watch.rs` — bounded schedule notifications and reconnection for the worker
+- `src/benchmarks/` — official CSV fetching (`mod.rs`), exact decimal parsing (`parse.rs`), compact
+  schedule notifications (`schedule.rs`), and tests
 - `src/admin/tls.rs` — the TLS connection to a node, pinned to its attested key
 - `src/admin/tests.rs` — `engine admin` tests: key sources, commands, signing, and pins
 - `src/node/mod.rs` — startup, task supervision, and shutdown
@@ -92,6 +94,9 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   look at, benchmarks with no rate, and house NAV below zero
 - `src/sequencer/alerts/retirement_tests.rs` — benchmark retirement, catalogue changes, and resolution state
 - `src/sequencer/alerts/retirement_webhook_tests.rs` — retirement pages through the durable webhook router
+- `src/sequencer/alerts/undated_tests.rs` — scalar fallback, independent incidents, and durable webhook recovery
+- `src/sequencer/benchmark_schedule.rs` — changed rollover notifications and publisher synchronization when due
+- `src/sequencer/tests/benchmark_schedule.rs` — schedule changes, durable watches, and due-time synchronization
 - `src/sequencer/tests/mod.rs` — sequencer, activation, recovery, and replay tests
 - `src/sequencer/tests/replay.rs` — root, sequence, and pre-event log replay tests
 - `src/sequencer/tests/benchmarks.rs` — publisher startup prerequisites and legacy-log refusal
@@ -116,9 +121,12 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
   and the checks on what it reads
 - `src/api/mod.rs` — REST routes, request signature checks, and the request span
 - `src/api/admin.rs` — the operator's admin route, checked before it is sequenced
+- `src/api/benchmark_schedule.rs` — capped, bounded watches of the durable rollover schedule
 - `src/api/benchmark_tests.rs` — deterministic publisher/TLS/API restart and financing dev scenario
 - `src/api/benchmark_tests/recovery.rs` — publisher retries during an in-process trusted-time halt
 - `src/api/benchmark_tests/retention.rs` — failed publisher refreshes and calendar changes after restart
+- `src/api/benchmark_tests/schedule.rs` — actual worker rescheduling, in-flight nonce fencing, and financing
+- `src/api/benchmark_tests/schedule/reconnect.rs` — watch-only transport failure during a publisher fetch
 - `src/api/admin_tests.rs` — admin route tests, and the operator channel dev scenario through
   `engine admin`
 - `src/api/stream/mod.rs` — the WebSocket stream: backfill from disk, then live, under the
@@ -678,13 +686,22 @@ Without `--watch`, the command fetches and signs one snapshot. The config's inte
 most 24 hours; the example polls hourly to retry failures and pick up publications before rollover.
 Watch mode also schedules a fetch before the next rollover, reserving every publisher timeout
 and the three bounded calls to the node. Scheduling refuses unrepresentable time budgets.
-The worker shares the operator nonce with other admin clients and re-reads it for each snapshot.
+The worker shares the operator nonce with other admin clients and reads it before fetching each
+snapshot. A signed admin change during the fetch invalidates that nonce; the old attempt cannot
+install its observations under the new schedule. Watch mode retries a refused or failed submission
+within the shorter of the configured interval and the node-call timeout.
 
 With `[benchmarks]` present, each startup refuses ordinary sequencing until an authorized snapshot
 has attempted every listed benchmark. Trusted time still gates genesis, activation, and the snapshot.
 If trusted-time admission halts across an unpaid rollover, recovery waits for another complete signed
 snapshot before ordinary or queued commands can charge catch-up. Publisher failures still use the
 missing/stale policy below. A brief halt with no unpaid rollover resumes without an extra snapshot.
+An accepted change to the rollover timezone or time also requires a fresh complete attempt.
+Ordinary sequencing continues before the newly selected rollover; if it becomes due first,
+financing waits for the attempt. Rejected or unchanged schedules do not re-arm this requirement.
+The worker follows compact durable revisions through `GET /v1/benchmarks/schedule?after=<revision>`;
+changes trigger an immediate fetch and re-arm preflight, even inside the new fetch window.
+Watches share the API subscriber cap, wait within the node-call timeout, and refresh on reconnection.
 A recovered log with a rollover schedule must already record client auth, the operator, and toxicity
 notional weighting. Publisher synchronization refuses older logs missing those activation prerequisites
 before writing any command; migrate such logs separately before configuring the publisher worker.
@@ -697,7 +714,8 @@ Each rollover selects the latest observation on or before its local date. Weekda
 Friday; an observation older than five weekdays raises `benchmark_rate_stale` at Critical severity
 and still applies. With no observation or inherited rate, `benchmark_rate_missing` is Critical and
 that benchmark accrues no financing. An inherited undated rate still applies and raises
-`benchmark_rate_undated` until a dated observation covers the rollover. Fetch errors retain previously
+`benchmark_rate_undated` until a dated observation covers the rollover. Applying that fallback
+resolves the independent missing-rate incident immediately. Fetch errors retain previously
 sequenced history; the separate worker logs `benchmark_fetch_failed` and retries at its next interval.
 When an accepted market update removes the final use of a benchmark, its alerts resolve after that
 command's rollover events, including incidents raised before the node restarted.

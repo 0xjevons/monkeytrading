@@ -4,6 +4,7 @@
 
 mod admin;
 mod archive;
+mod benchmark_schedule;
 mod history;
 mod stream;
 pub(crate) use stream::{Feed, MAX_BACKFILLS};
@@ -275,6 +276,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/attestation", get(attestation))
         .route("/v1/markets", get(markets))
         .route("/v1/benchmarks", get(benchmarks))
+        .route("/v1/benchmarks/schedule", get(benchmark_schedule::schedule))
         .route("/v1/house", get(house))
         .route("/v1/accounts/{address}", get(account))
         .route("/v1/accounts/{address}/nonce", get(nonce))

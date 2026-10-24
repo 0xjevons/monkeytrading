@@ -5,8 +5,9 @@ use engine_core::event::Event;
 use engine_core::types::AccountId;
 use engine_core::{Engine, Fixed};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
+use crate::benchmarks::BenchmarkSchedule;
 use crate::log::{Checkpoint, CommandEntry, LogEntry, Offset};
 use crate::trusted_time::Sample;
 
@@ -24,6 +25,8 @@ pub enum Request {
     TimeSample(Sample),
     /// Answered with the last seq once every command before it is synced, so it survives power loss.
     Sync(oneshot::Sender<Option<u64>>),
+    /// Subscribes to durable rollover changes after every prior request has been flushed.
+    WatchBenchmarkSchedule(oneshot::Sender<watch::Receiver<BenchmarkSchedule>>),
     /// Custody confirmation; affects signature release, never deterministic protocol state.
     CheckpointStatus {
         posted: Option<u64>,

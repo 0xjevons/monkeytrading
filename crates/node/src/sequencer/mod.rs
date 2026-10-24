@@ -10,6 +10,7 @@ mod checkpoints;
 use checkpoints::Gate;
 mod messages;
 pub use messages::{Query, Request, SignedWithdrawal, StreamBody, StreamMsg};
+mod benchmark_schedule;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,13 +18,14 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use engine_core::auth::{ClientAuth, Operator};
-use engine_core::command::{Command, Sequenced};
+use engine_core::command::{AdminCommand, Command, Sequenced};
 use engine_core::event::Event;
 use engine_core::types::{AccountId, Millis};
 use engine_core::{Engine, Fixed};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{error, info, info_span, warn};
 
+use crate::benchmarks::BenchmarkSchedule;
 use crate::checkpoints::accounting::Accounting;
 use crate::clock::Clock;
 use crate::log::{CommandEntry, LogEntry, LogWriter, Manifest, SegmentedLog};
@@ -66,6 +68,9 @@ pub struct Sequencer {
     benchmark_sync: bool,
     benchmark_sync_enabled: bool,
     benchmark_time_refused: bool,
+    benchmark_schedule: watch::Sender<BenchmarkSchedule>,
+    benchmark_schedule_dirty: bool,
+    benchmark_schedule_pending: bool,
 }
 
 pub struct SequencerConfig<'a> {
@@ -110,6 +115,7 @@ impl Sequencer {
         let mut replies = Vec::new();
         let mut queries: Vec<Query> = Vec::new();
         let mut syncs = Vec::new();
+        let mut benchmark_watches = Vec::new();
         while let Some(first) = rx.recv().await {
             let started = self.clock.instant();
             let mut sequenced = false;
@@ -127,6 +133,7 @@ impl Sequencer {
                     Request::Query(q) => queries.push(q),
                     Request::TimeSample(sample) => self.take_sample(sample)?,
                     Request::Sync(reply) => syncs.push(reply),
+                    Request::WatchBenchmarkSchedule(reply) => benchmark_watches.push(reply),
                     Request::CheckpointStatus { posted, healthy } => self.checkpoint_status(posted, healthy)?,
                 }
                 if taken < MAX_BATCH {
@@ -143,6 +150,9 @@ impl Sequencer {
             }
             replies.drain(..).for_each(|(reply, events)| {
                 let _ = reply.send(events);
+            });
+            benchmark_watches.drain(..).for_each(|reply| {
+                let _ = reply.send(self.benchmark_schedule.subscribe());
             });
             // Only admitted commands are written: a batch of reads or refusals would dilute the latency.
             if sequenced {
@@ -176,8 +186,11 @@ impl Sequencer {
         if self.benchmark_sync && !matches!(&cmd, Command::SignedAdmin(req) if req.command.is_benchmark_snapshot()) {
             return Ok(None);
         }
-        let snapshot = cmd.is_benchmark_batch();
+        let snapshot = matches!(&cmd, Command::SignedAdmin(req) if req.command.is_benchmark_snapshot());
         let events = self.stamp(ts, cmd)?;
+        if snapshot && events.contains(&Event::AdminApplied) {
+            self.benchmark_schedule_pending = false;
+        }
         if self.benchmark_sync && snapshot && events.contains(&Event::AdminApplied) {
             self.benchmark_sync = false;
             info!(alert_resolved = "benchmark_sync_pending", "publisher snapshot installed; sequencing resumed");
@@ -226,6 +239,9 @@ impl Sequencer {
         let ts = host_ms.max(self.last_ts);
         let admitted = self.time.admit(host_ms, ts, self.clock.instant());
         self.note_benchmark_time_admission(admitted, ts);
+        if admitted {
+            self.admit_benchmark_schedule(ts);
+        }
         admitted.then_some(ts)
     }
 
@@ -235,6 +251,14 @@ impl Sequencer {
     /// - the log cannot be written
     /// - the engine refuses the sequence, which means this sequencer is broken
     fn stamp(&mut self, ts: Millis, cmd: Command) -> anyhow::Result<Vec<Event>> {
+        let parameters = match &cmd {
+            Command::Admin(command) => Some(command),
+            Command::SignedAdmin(request) => Some(&request.command),
+            _ => None,
+        };
+        let previous_schedule = parameters
+            .filter(|command| matches!(command, AdminCommand::SetParams(_)))
+            .map(|_| self.engine.params().map(|params| params.rollover.clone()));
         let previous_benchmarks =
             matches!(&cmd, Command::Admin(_) | Command::SignedAdmin(_)).then(|| BenchmarkAlerts::listed(&self.engine));
         let sequenced = Sequenced { seq: self.next_seq, ts, cmd };
@@ -244,6 +268,9 @@ impl Sequencer {
         self.next_seq += 1;
         self.last_ts = ts;
         self.record(LogEntry::Command(CommandEntry { sequenced, events: Some(events.clone()) }))?;
+        if let Some(previous) = previous_schedule.filter(|_| events.contains(&Event::AdminApplied)) {
+            self.note_benchmark_schedule(previous);
+        }
         self.metrics.commands.inc();
 
         for event in &events {
@@ -309,6 +336,9 @@ impl Sequencer {
     /// - the log cannot be written
     fn flush(&mut self) -> anyhow::Result<()> {
         self.log.flush()?;
+        if std::mem::take(&mut self.benchmark_schedule_dirty) {
+            self.benchmark_schedule.send_replace(BenchmarkSchedule::from_engine(&self.engine));
+        }
         for msg in self.outbox.drain(..) {
             if let StreamBody::Withdrawal(w) = &msg.body
                 && self.withdrawals.send(w.clone()).is_err()

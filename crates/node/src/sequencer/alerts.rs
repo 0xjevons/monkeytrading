@@ -84,7 +84,14 @@ impl BenchmarkAlerts {
                 );
             }
             Event::BenchmarkRateUndated { benchmark } => {
-                self.tracked.entry(benchmark.clone()).or_default().undated = Some(false);
+                let conditions = self.tracked.entry(benchmark.clone()).or_default();
+                resolve(
+                    &mut conditions.missing,
+                    "benchmark_rate_missing",
+                    benchmark,
+                    "benchmark has an effective rate",
+                );
+                conditions.undated = Some(false);
                 error!(
                     alert = "benchmark_rate_undated",
                     benchmark, "legacy benchmark has no publisher date; financing still applies"
@@ -141,6 +148,9 @@ mod retirement_tests;
 
 #[cfg(test)]
 mod retirement_webhook_tests;
+
+#[cfg(test)]
+mod undated_tests;
 
 /// Emits the first unknown clear and subsequent clears only after the condition fired again.
 fn resolve(condition: &mut Option<bool>, name: &str, benchmark: &str, message: &str) {

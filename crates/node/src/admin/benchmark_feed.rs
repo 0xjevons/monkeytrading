@@ -11,10 +11,11 @@ use engine_core::params::Rollover;
 use engine_core::types::{MAX_STAMP_MS, Millis};
 use hyper::Method;
 use k256::ecdsa::SigningKey;
+use tokio::sync::watch as channel;
 use tokio::time::{Instant, sleep_until};
 use tracing::{info, warn};
 
-use crate::admin::{CALL_TIMEOUT, EXPIRES_IN_MS, NodeApi, NonceView, call, sign, submit};
+use crate::admin::{CALL_TIMEOUT, EXPIRES_IN_MS, NodeApi, NonceView, benchmark_watch, call, sign, submit};
 use crate::benchmarks;
 use crate::config::NodeConfig;
 
@@ -26,7 +27,7 @@ pub(super) async fn run(
     node: &NodeApi,
     key: &SigningKey,
     operator: &Operator,
-    clock: fn() -> Millis,
+    clock: impl Fn() -> Millis,
     watch: bool,
 ) -> anyhow::Result<AdminRequest> {
     let settings = cfg.benchmarks.as_ref().context("sync-benchmarks needs [benchmarks] in the config")?;
@@ -34,69 +35,120 @@ pub(super) async fn run(
     checked_horizon(clock(), budget)?;
     let _ = Instant::now().checked_add(settings.timeout).context("publisher timeout cannot be represented")?;
     let client = benchmarks::client()?;
-    let mut ticks = tokio::time::interval(settings.interval);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut rollover = None;
-    let mut preflight = None;
-    let mut last = None;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            _ = ticks.tick() => {},
-            _ = async {
-                if let Some(at) = preflight {
-                    sleep_until(at).await;
-                }
-            }, if watch && preflight.is_some() => {},
-            stopped = &mut shutdown, if watch => {
-                stopped?;
-                return last.context("benchmark worker stopped before its first snapshot");
-            }
-        }
-        let attempt = async {
-            let state: BenchmarkState = call(node, Method::GET, "/v1/benchmarks", None).await?;
-            rollover = state.rollover.clone();
-            if rollover.is_none() {
-                bail!("node genesis is still pending trusted time");
-            }
-            let now = clock();
-            checked_horizon(now, budget)?;
-            let batch = benchmarks::snapshot(settings, &client, &state, state.date_at(now)).await?;
-            let path = format!("/v1/accounts/{}/nonce", operator.address);
-            let NonceView { next_nonce } = call(node, Method::GET, &path, None).await?;
-            let expires_at = checked_horizon(clock(), EXPIRES_IN_MS)?;
-            let req = sign(key, operator, AdminCommand::SetBenchmarkRates(batch), next_nonce, expires_at);
-            let events = submit(node, &req).await?;
-            if let Some(reason) = events.iter().find_map(|event| match event {
-                Event::AdminRejected { reason } => Some(reason),
-                _ => None,
-            }) {
-                bail!("benchmark snapshot rejected: {reason}");
-            }
-            info!(nonce = next_nonce, "signed benchmark snapshot sequenced");
-            anyhow::Ok(req)
-        };
-        let attempt = tokio::select! {
+    let initial = if watch {
+        let reply = tokio::select! {
             biased;
-            stopped = &mut shutdown, if watch => {
+            stopped = &mut shutdown => {
                 stopped?;
-                return last.context("benchmark worker stopped before its first snapshot");
+                bail!("benchmark worker stopped before its first snapshot");
             }
-            result = attempt => result,
+            reply = benchmark_watch::current(node, None) => reply,
         };
-        match attempt {
-            Ok(request) if !watch => return Ok(request),
-            Ok(request) => last = Some(request),
-            Err(err) if !watch => return Err(err),
+        match reply {
+            Ok(schedule) => {
+                info!(alert_resolved = "benchmark_schedule_watch_failed", "benchmark schedule watch connected");
+                Some(schedule.revision)
+            }
             Err(err) => {
-                warn!(alert = "benchmark_sync_failed", "benchmark worker will retry at its next interval: {err:#}")
+                warn!(alert = "benchmark_schedule_watch_failed", "benchmark schedule watch will reconnect: {err:#}");
+                None
             }
         }
-        if let Some(schedule) = &rollover {
-            let delay = preflight_delay(schedule, clock(), budget)?;
-            preflight =
-                Some(Instant::now().checked_add(delay).context("rollover preflight wait cannot be represented")?);
+    } else {
+        None
+    };
+    let (updates, mut schedules) = channel::channel(initial);
+    let retry = settings.interval.min(CALL_TIMEOUT);
+    let work = async {
+        let mut ticks = tokio::time::interval(settings.interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut rollover = None;
+        let mut preflight = None;
+        let mut last = None;
+        loop {
+            tokio::select! {
+                biased;
+                stopped = &mut shutdown, if watch => {
+                    stopped?;
+                    return last.context("benchmark worker stopped before its first snapshot");
+                }
+                changed = schedules.changed(), if watch => {
+                    changed.context("benchmark schedule watch stopped")?;
+                    schedules.borrow_and_update();
+                }
+                _ = ticks.tick() => {},
+                _ = async {
+                    if let Some(at) = preflight {
+                        sleep_until(at).await;
+                    }
+                }, if watch && preflight.is_some() => {},
+            }
+            let attempt = async {
+                // A signed schedule change consumes this nonce, fencing off an older fetch.
+                let path = format!("/v1/accounts/{}/nonce", operator.address);
+                let NonceView { next_nonce } = call(node, Method::GET, &path, None).await?;
+                let state: BenchmarkState = call(node, Method::GET, "/v1/benchmarks", None).await?;
+                rollover = state.rollover.clone();
+                if rollover.is_none() {
+                    bail!("node genesis is still pending trusted time");
+                }
+                let now = clock();
+                checked_horizon(now, budget)?;
+                let batch = benchmarks::snapshot(settings, &client, &state, state.date_at(now)).await?;
+                let expires_at = checked_horizon(clock(), EXPIRES_IN_MS)?;
+                let req = sign(key, operator, AdminCommand::SetBenchmarkRates(batch), next_nonce, expires_at);
+                let events = submit(node, &req).await?;
+                if let Some(reason) = events.iter().find_map(|event| match event {
+                    Event::AdminRejected { reason } => Some(reason),
+                    _ => None,
+                }) {
+                    bail!("benchmark snapshot rejected: {reason}");
+                }
+                info!(
+                    alert_resolved = "benchmark_sync_failed",
+                    "signed benchmark snapshot sequenced with nonce {next_nonce}"
+                );
+                anyhow::Ok(req)
+            };
+            // A POST may already be durable: finish its acknowledgement before the next attempt.
+            let attempt = tokio::select! {
+                biased;
+                stopped = &mut shutdown, if watch => {
+                    stopped?;
+                    return last.context("benchmark worker stopped before its first snapshot");
+                }
+                result = attempt => result,
+            };
+            let failed = attempt.is_err();
+            match attempt {
+                Ok(request) if !watch => return Ok(request),
+                Ok(request) => last = Some(request),
+                Err(err) if !watch => return Err(err),
+                Err(err) => {
+                    warn!(alert = "benchmark_sync_failed", "benchmark worker will retry: {err:#}")
+                }
+            }
+            preflight = rollover
+                .as_ref()
+                .map(|schedule| {
+                    let delay = preflight_delay(schedule, clock(), budget)?;
+                    Instant::now().checked_add(delay).context("rollover preflight wait cannot be represented")
+                })
+                .transpose()?;
+            if failed {
+                let retry_at =
+                    Instant::now().checked_add(retry).context("benchmark retry wait cannot be represented")?;
+                preflight = Some(preflight.map_or(retry_at, |at| at.min(retry_at)));
+            }
+        }
+    };
+    tokio::select! {
+        result = work => result,
+        result = benchmark_watch::run(node, initial, retry, updates), if watch => {
+            result?;
+            bail!("benchmark schedule watch stopped");
         }
     }
 }

@@ -36,6 +36,7 @@ const TRADER: AccountId = AccountId([0xaa; 20]);
 
 mod recovery;
 mod retention;
+mod schedule;
 
 type WatchCase = (&'static str, &'static str, fn() -> Millis, usize);
 
@@ -322,6 +323,15 @@ async fn run_watch_cases(cases: &[WatchCase], interrupt: bool) {
 
 impl Node {
     async fn start(dir: &Path, at: Millis, api_clock: fn() -> Millis) -> Self {
+        Self::start_with_router(dir, at, api_clock, std::convert::identity).await
+    }
+
+    async fn start_with_router(
+        dir: &Path,
+        at: Millis,
+        api_clock: fn() -> Millis,
+        wrap: impl FnOnce(Router) -> Router,
+    ) -> Self {
         let clock = Arc::new(TestClock::at(at));
         let key = Arc::new(EnclaveKey::test_key());
         let (stream, _) = broadcast::channel(1024);
@@ -355,7 +365,7 @@ impl Node {
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("https://{}", listener.local_addr().unwrap());
-        let app = router(state.clone());
+        let app = wrap(router(state.clone()));
         let api = tokio::spawn(serve(listener, tls.config, app, state.limits.clone(), dev_config().api));
         Self { tx, task, api, url, pin: hex::encode(tls.public_key_sha256), clock }
     }
