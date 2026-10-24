@@ -75,7 +75,9 @@ impl Sequencer {
     /// Queues a durable checkpoint; bounded backpressure stops the node instead of losing work.
     /// Error cases:
     /// - the checkpoint worker is unavailable or its bounded queue is full
+    #[tracing::instrument(skip_all, fields(checkpoint_seq = checkpoint.seq))]
     pub(super) fn queue_checkpoint(&self, checkpoint: Checkpoint) -> anyhow::Result<()> {
+        let seq = checkpoint.seq;
         let gate = self.gate.as_ref().context("checkpoint gate is absent")?;
         if gate.sink.is_closed() {
             warn!(alert = "checkpoint_post_failed", "checkpoint worker stopped; durable checkpoint awaits restart");
@@ -88,7 +90,9 @@ impl Sequencer {
                 .map_err(|_| anyhow::anyhow!("checkpoint work registry is poisoned"))?
                 .insert(work.checkpoint.seq, work.clone());
         }
-        gate.sink.try_send(work).map_err(|_| anyhow::anyhow!("checkpoint worker unavailable or queue full"))
+        gate.sink
+            .try_send(work)
+            .map_err(|_| anyhow::anyhow!("checkpoint {seq}: checkpoint worker unavailable or queue full"))
     }
 
     /// Releases only approvals covered by the confirmed prefix, and only after reconciliation.

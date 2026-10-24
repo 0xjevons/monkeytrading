@@ -8,7 +8,7 @@
 //! - checkpoints: post the signed state roots so anyone can check the enclave against the public
 //!   log.
 //!
-//! Deposits are built (`evm`); on-chain withdrawal payouts and checkpoint posting are not yet.
+//! Deposits (`evm`) and the optional checkpoint service are built; on-chain withdrawal payouts remain pending.
 
 use alloy::primitives::{Address, U256};
 use anyhow::Context;

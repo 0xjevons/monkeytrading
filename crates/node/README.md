@@ -78,6 +78,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/sequencer/checkpoints/accounting_tests.rs` — live/recovery accounting oracles and gated 100k-account capture scaling
 - `src/sequencer/checkpoint_tests.rs` — confirmed-prefix signature gating and restart tests
 - `src/sequencer/fixture_tests.rs` — test-only signing of copies of placeholder protocol fixtures
+- `src/sequencer/recovery.rs` — pure recovery validation and exact authenticated checkpoint-tail restoration
 - `src/sequencer/replay.rs` — log replay, which recovery and `engine replay` share
 - `src/sequencer/required.rs` — client auth, the operator, protocol activation, and genesis, which
   wait for trusted time
@@ -159,6 +160,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/config/telemetry.rs` — the metrics listener and alert webhook config, and the redacting
   `WebhookUrl`
 - `src/config/tests.rs` — config loading and validation tests
+- `src/config/mock_key_tests.rs` — published mock-only signer opt-in and hardware refusal regressions
 - `src/config/custody_tests.rs` — independent provider configuration checks
 - `src/config/telemetry_tests.rs` — metrics and alert config tests: the Critical route, the dev
   config's telemetry, and webhook URLs
@@ -170,10 +172,19 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/checkpoints/accounting/tests.rs` — cash/reference recomputation oracles and arithmetic boundaries
 - `src/checkpoints/signature.rs` — shared strict checkpoint signature and domain verification
 - `src/checkpoints/rpc.rs` — pinned-block vault reads and transaction relay through a signing RPC
+- `src/checkpoints/rpc/tests.rs` — sampled ancestry and durable relayer request regressions
+- `src/checkpoints/rpc/submission.rs` — bounded locked crash-durable nonce/hash reservations
+- `src/checkpoints/rpc/submission/posting.rs` — persisted reservation and exact transaction retry transitions
+- `src/checkpoints/rpc/submission/progress.rs` — canonical finalized obsolete nonce-consumer proofs
+- `src/checkpoints/rpc/submission/tests.rs` — response-loss, restart, identity, and reservation regressions
+- `src/checkpoints/rpc/submission/tests/fakes.rs` — isolated relay and canonical transaction RPC fixtures
+- `src/checkpoints/rpc/submission/tests/nonce_progress.rs` — free, obsolete, and resurfaced nonce regressions
 - `src/checkpoints/setup.rs` — finalized chain anchor lookup and pending-inclusion startup wait
 - `src/checkpoints/tests.rs` — signature mutations, rollback, retry, and reconciliation tests
 - `src/checkpoints/scenario.rs` — isolated Anvil posting, tampering, truncation, shortfall, and reorg checks
 - `src/history/preflight.rs` — immutable history planning before authorized SQLite mutation
+- `src/history/preflight/tests.rs` — private WAL resume and malformed geometry byte-preservation regressions
+- `src/node/tests/custody_preflight.rs` — local custody refusal preserves log/history across image states
 - `src/node/preflight.rs` — chain validation before writable history recovery
 - `src/node/preflight/tests.rs` — refused startup preserves history, WAL, and log bytes
 - `src/sequencer/replay/auth_tests.rs` — trusted immediate/deferred completion evidence regressions

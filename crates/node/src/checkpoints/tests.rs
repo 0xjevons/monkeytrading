@@ -13,6 +13,23 @@ use crate::log::{Checkpoint, CheckpointDomain, CommandEntry, LogEntry};
 use crate::sequencer::{Request, replay};
 use crate::tee::EnclaveKey;
 
+/// Corrupts a hex signature without the fixed-byte no-op case.
+pub(super) fn tamper_signature(signature: &mut String) {
+    let original = signature.clone();
+    let byte = u8::from_str_radix(&signature[4..6], 16).unwrap() ^ 1;
+    signature.replace_range(4..6, &format!("{byte:02x}"));
+    assert_ne!(*signature, original, "signature tampering must change the signed bytes");
+}
+
+#[test]
+fn signature_tampering_changes_every_original_byte() {
+    for byte in 0_u8..=u8::MAX {
+        let mut signature = format!("0x00{byte:02x}{}", "00".repeat(63));
+        tamper_signature(&mut signature);
+        assert_eq!(hex::decode(&signature[2..]).unwrap().len(), 65);
+    }
+}
+
 #[derive(Clone)]
 struct Chain {
     state: Arc<Mutex<VaultState>>,
@@ -62,7 +79,7 @@ fn strict_replay_rejects_missing_forged_domain_and_signer_signatures() {
         assert!(replay(&[entries[0].clone(), LogEntry::Checkpoint(altered)]).is_err(), "mutation {mutate}");
     }
     let mut altered = cp;
-    altered.signature.replace_range(4..6, "ff");
+    tamper_signature(&mut altered.signature);
     assert!(signature::verify(&altered, &engine).is_err());
 }
 

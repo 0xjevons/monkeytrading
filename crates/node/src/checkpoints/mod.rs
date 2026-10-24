@@ -14,7 +14,7 @@ use anyhow::{Context, ensure};
 use engine_core::Fixed;
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 use crate::checkpoints::accounting::Accounting;
 use crate::log::{Checkpoint, CheckpointDomain};
@@ -152,11 +152,15 @@ impl<R: CheckpointChain> Poster<R> {
                         .transpose()?.unwrap_or_default();
                     let mut known: Vec<&Work> = queued.iter().chain(registered.iter()).collect();
                     if let Some(latest) = latest.as_ref() { known.push(latest); }
-                    let result = self.reconcile_known(work, &known).await;
+                    // Identity belongs to context, not event fields: alert fields key episodes.
+                    let span = tracing::info_span!("checkpoint", checkpoint_seq = work.checkpoint.seq,
+                        checkpoint_root = %work.checkpoint.root, latest_seq = tracing::field::Empty,
+                        finalized_seq = tracing::field::Empty);
+                    let result = self.reconcile_known(work, &known).instrument(span.clone()).await;
                     if matches!(result, Ok((Some(_), false))) {
                         let since = pending_since.get_or_insert_with(tokio::time::Instant::now);
                         if since.elapsed() >= self.pending_deposits_critical_after {
-                            error!(alert = "collateral_mismatch", "withdrawals paused: collateral reconciliation exceeded its catch-up deadline");
+                            span.in_scope(|| error!(alert = "collateral_mismatch", "withdrawals paused: collateral reconciliation exceeded its catch-up deadline"));
                         }
                     } else if matches!(result, Ok((_, true))) {
                         pending_since = None;
@@ -165,10 +169,10 @@ impl<R: CheckpointChain> Poster<R> {
                         Ok(status) => status,
                         Err(error) => {
                             if error.is::<Conflict>() {
-                                error!(alert = "checkpoint_conflict", "refusing to continue: {error:#}");
+                                span.in_scope(|| error!(alert = "checkpoint_conflict", "refusing to continue: {error:#}"));
                                 return Err(error);
                             }
-                            warn!(alert = "checkpoint_post_failed", "checkpoint remains queued: {error:#}");
+                            span.in_scope(|| warn!(alert = "checkpoint_post_failed", "checkpoint remains queued: {error:#}"));
                             (None, false)
                         }
                     };
@@ -201,6 +205,8 @@ impl<R: CheckpointChain> Poster<R> {
     async fn reconcile_known(&self, work: &Work, known: &[&Work]) -> anyhow::Result<(Option<u64>, bool)> {
         let mut work = work;
         let mut state = self.chain.state(View::Latest).await?;
+        tracing::Span::current()
+            .record("latest_seq", tracing::field::debug(state.checkpoint.as_ref().map(|(seq, _)| *seq)));
         if let Some((seq, root)) = &state.checkpoint
             && *seq > work.checkpoint.seq
         {
@@ -258,8 +264,12 @@ impl<R: CheckpointChain> Poster<R> {
             }
         }
         // Latest inclusion prevents duplicate submission, but is revocable by a shallow reorg.
+        tracing::Span::current()
+            .record("latest_seq", tracing::field::debug(state.checkpoint.as_ref().map(|(seq, _)| *seq)));
         let included_height = state.height;
         let state = self.chain.state(View::Finalized).await?;
+        tracing::Span::current()
+            .record("finalized_seq", tracing::field::debug(state.checkpoint.as_ref().map(|(seq, _)| *seq)));
         ensure!(included_height >= state.height, "latest checkpoint view is behind the finalized view");
         if state.signer != self.signer {
             return Err(Conflict("finalized vault signer differs from this enclave").into());

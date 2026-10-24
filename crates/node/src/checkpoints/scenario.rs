@@ -322,7 +322,7 @@ async fn dev_scenario_posts_replays_refuses_truncation_and_pauses_shortfall() {
             _ => None,
         })
         .unwrap();
-    cp.signature.replace_range(4..6, "ff");
+    super::tests::tamper_signature(&mut cp.signature);
     let tampered = dir.join("tampered.jsonl");
     write_entries(&tampered, &forged);
     assert!(replay_path(&tampered).is_err(), "edited signature fails replay");
