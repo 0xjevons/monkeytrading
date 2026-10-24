@@ -97,3 +97,51 @@ fn empty_database_never_deletes_recovery_evidence_during_preflight() {
     assert!(plan.progress.unwrap_err().to_string().contains("empty"));
     assert_eq!(files(&dir), before);
 }
+
+#[test]
+fn invalid_database_geometry_preserves_every_recovery_sidecar() {
+    use std::io::{Read, Seek, Write};
+    for size in [1, 99, 511, 1_u64 << 44] {
+        let dir = scratch_dir(&format!("history-geometry-{size}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(INDEX_FILE);
+        let mut header = [0; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        header[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        let mut file = std::fs::File::options().create_new(true).read(true).write(true).open(&path).unwrap();
+        file.write_all(&header[..usize::try_from(size.min(100)).unwrap()]).unwrap();
+        file.set_len(size).unwrap(); // Sparse: never allocate/read the oversized image.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            std::fs::write(dir.join(format!("{INDEX_FILE}{suffix}")), suffix.as_bytes()).unwrap();
+        }
+        let plan = HistoryPlan::open(&HistorySection { dir: dir.clone(), retention: Duration::from_secs(60) }).unwrap();
+        assert!(plan.progress.is_err(), "unsafe geometry must be rejected before SQLite opens");
+        assert_eq!(file.metadata().unwrap().len(), size);
+        file.rewind().unwrap();
+        let mut after = vec![0; usize::try_from(size.min(100)).unwrap()];
+        file.read_exact(&mut after).unwrap();
+        assert_eq!(after, header[..after.len()]);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert_eq!(std::fs::read(dir.join(format!("{INDEX_FILE}{suffix}"))).unwrap(), suffix.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn geometry_bounds_follow_the_encoded_page_size_without_overflow() {
+    let dir = scratch_dir("history-geometry-bounds");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(INDEX_FILE);
+    for page_size in [512_u64, 4096, 65_536] {
+        let mut header = [0; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        let encoded = if page_size == 65_536 { 1 } else { u16::try_from(page_size).unwrap() };
+        header[16..18].copy_from_slice(&encoded.to_be_bytes());
+        std::fs::write(&path, header).unwrap();
+        let limit = (u64::from(u32::MAX) - 1) * page_size;
+        assert!(super::validate_geometry(&path, limit).is_ok());
+        assert!(super::validate_geometry(&path, limit + 1).is_err());
+        assert!(super::validate_geometry(&path, u64::MAX).is_err());
+        assert!(super::validate_geometry(&path, page_size - 1).is_err());
+    }
+}

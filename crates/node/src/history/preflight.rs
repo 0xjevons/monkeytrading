@@ -1,5 +1,6 @@
 //! Read-only history planning before authenticated log and custody preflight permits writes.
 
+use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{Context, ensure};
@@ -34,6 +35,7 @@ impl HistoryPlan {
             // SQLite may remove an existing WAL while opening a zero-page main database,
             // even on a read-only connection. Such an image must wait for authorized repair.
             ensure!(metadata.len() > 0, "history database is empty");
+            validate_geometry(&path, metadata.len())?;
             // A read-only no-lock VFS plus EXCLUSIVE mode gives SQLite a private heap WAL
             // index. It reads committed WAL pages without creating/updating the original SHM,
             // unlike an ordinary read-only open. Actual writable progress is rechecked below.
@@ -109,6 +111,21 @@ impl HistoryPlan {
         }
         check.finish()
     }
+}
+
+/// SQLite's Unix VFS maps a one-byte file to zero bytes; its pager also narrows
+/// the page count to u32. Either zero-page interpretation can unlink recovery
+/// evidence even during a read-only open. Validate the header without SQLite.
+fn validate_geometry(path: &std::path::Path, len: u64) -> anyhow::Result<()> {
+    let mut header = [0; 100];
+    std::fs::File::open(path)?.read_exact(&mut header).context("reading history database header")?;
+    ensure!(&header[..16] == b"SQLite format 3\0", "invalid history database header");
+    let encoded = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = if encoded == 1 { 65_536_u64 } else { u64::from(encoded) };
+    ensure!((512..=65_536).contains(&page_size) && page_size.is_power_of_two(), "invalid history page size");
+    ensure!(len >= page_size, "history database is smaller than one page");
+    ensure!(len.div_ceil(page_size) <= u64::from(u32::MAX) - 1, "history database page count exceeds SQLite limit");
+    Ok(())
 }
 
 #[cfg(test)]

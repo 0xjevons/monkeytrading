@@ -154,6 +154,8 @@ async fn serve_node(
         operator,
         metrics: metrics.clone(),
     };
+    let custody = Custody::connect(&cfg.custody, log.last_seq())
+        .inspect_err(|e| error!(alert = "custody_connect_failed", "refusing to serve: {e:#}"))?;
     let mut history = finish_preflight(
         history_plan,
         checkpoint_setup.as_ref().map(|setup| (&setup.poster, anchor.as_ref())),
@@ -162,8 +164,6 @@ async fn serve_node(
     .await?;
     let mut seq = Sequencer::recover_from(log, seq_cfg, key.clone(), stream_tx.clone(), withdrawals_tx)
         .inspect_err(|e| error!(alert = "log_recovery_failed", "refusing to serve: {e:#}"))?;
-    let custody = Custody::connect(&cfg.custody, seq.last_seq())
-        .inspect_err(|e| error!(alert = "custody_connect_failed", "refusing to serve: {e:#}"))?;
     // Protocol activation and genesis wait, like any command, for a stamp trusted time admits;
     // with no sample yet, they are queued. Parameters an older log set take the config's toxicity
     // notional weighting first, which the latest version needs.

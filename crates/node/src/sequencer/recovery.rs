@@ -4,6 +4,11 @@ use super::*;
 use crate::sequencer::replay::Replay;
 
 impl ReplayedLog {
+    /// Last engine command authenticated by the read-only replay.
+    pub(crate) fn last_seq(&self) -> Option<u64> {
+        self.replayed.engine.last_seq()
+    }
+
     /// Requires a live reserved signature to occur in the same authenticated durable tail.
     /// Error cases:
     /// - a reserved checkpoint conflicts with the anchor or is absent from outstanding work

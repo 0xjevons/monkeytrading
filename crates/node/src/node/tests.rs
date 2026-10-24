@@ -174,3 +174,5 @@ fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
     let names = fs::read_dir(dir).unwrap().map(|file| file.unwrap().file_name().into_string().unwrap());
     names.map(|name| (name.clone(), fs::read(dir.join(name)).unwrap())).collect()
 }
+
+mod custody_preflight;
