@@ -101,13 +101,13 @@ fn empty_database_never_deletes_recovery_evidence_during_preflight() {
 #[test]
 fn invalid_database_geometry_preserves_every_recovery_sidecar() {
     use std::io::{Read, Seek, Write};
-    for size in [1, 99, 511, 1_u64 << 44] {
+    for size in [1, 99, 511, 1_u64 << 41] {
         let dir = scratch_dir(&format!("history-geometry-{size}"));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(INDEX_FILE);
         let mut header = [0; 100];
         header[..16].copy_from_slice(b"SQLite format 3\0");
-        header[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        header[16..18].copy_from_slice(&512_u16.to_be_bytes());
         let mut file = std::fs::File::options().create_new(true).read(true).write(true).open(&path).unwrap();
         file.write_all(&header[..usize::try_from(size.min(100)).unwrap()]).unwrap();
         file.set_len(size).unwrap(); // Sparse: never allocate/read the oversized image.
