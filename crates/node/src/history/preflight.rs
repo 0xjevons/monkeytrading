@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, ensure};
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::config::HistorySection;
@@ -28,16 +29,30 @@ impl HistoryPlan {
             if !path.exists() {
                 return Ok(None);
             }
-            // Immutable SQLite ignores WAL. A crash WAL is conservatively rebuilt after preflight,
-            // rather than opening its shared-memory file for writes before authorization.
-            ensure!(!path.with_file_name(format!("{INDEX_FILE}-wal")).exists(), "history has a recovery WAL");
+            // A read-only no-lock VFS plus EXCLUSIVE mode gives SQLite a private heap WAL
+            // index. It reads committed WAL pages without creating/updating the original SHM,
+            // unlike an ordinary read-only open. Actual writable progress is rechecked below.
+            // SQLite documents this mode at https://sqlite.org/wal.html#noshm.
             let mut uri = reqwest::Url::from_file_path(std::path::absolute(&path)?)
                 .map_err(|_| anyhow::anyhow!("history path is not absolute"))?;
-            uri.query_pairs_mut().append_pair("immutable", "1");
+            let has_wal =
+                path.with_file_name(format!("{INDEX_FILE}-wal")).try_exists().context("checking history WAL")?;
+            if has_wal {
+                uri.query_pairs_mut().append_pair("vfs", "unix-none");
+            } else {
+                // SQLite may create an empty WAL even for a read-only normal WAL-mode open.
+                // With no existing WAL, immutable mode reads the complete database itself.
+                uri.query_pairs_mut().append_pair("immutable", "1");
+            }
             let conn = Connection::open_with_flags(
                 uri.as_str(),
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
+            if has_wal {
+                conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+                    .context("disabling preflight close checkpoints")?;
+                conn.pragma_update(None, "locking_mode", "exclusive").context("using a private read-only WAL index")?;
+            }
             harden(&conn)?;
             check_schema(&conn, &expected_schema(), &path)?;
             let progress: Option<(String, engine_core::types::Millis)> = conn
@@ -90,3 +105,6 @@ impl HistoryPlan {
         check.finish()
     }
 }
+
+#[cfg(test)]
+mod tests;

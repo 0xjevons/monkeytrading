@@ -373,7 +373,9 @@ protect real funds. All signature, domain and changed-authority checks still app
 under another key require that retained authority, with no migration or self-named signer fallback.
 Real key persistence and rotation remain separate work: a fresh different key fails closed. Before any history SQLite open-for-write, schema creation,
 WAL recovery, or repair, the node authenticates the replay and finalized anchor. History preflight
-uses immutable read-only access; a crash WAL is conservatively rebuilt only after authorization. The Anvil test provisions its generated signer before deploying
+uses a read-only private WAL index without changing the original WAL/SHM, then rechecks actual
+progress after authorization. Valid WAL-backed history resumes; damaged history is repaired only
+after authorization. The Anvil test provisions its generated signer before deploying
 the vault; this is a local harness, not a production key-provisioning workflow. Withdrawals still
 have no on-chain payout path, so reconciliation counts every approval as unpaid. Payout settlement
 must subtract confirmed payouts when that feature is added.
