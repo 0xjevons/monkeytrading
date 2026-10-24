@@ -16,7 +16,7 @@ use engine_core::Fixed;
 use engine_core::eip712::{self, B256};
 use engine_core::types::AccountId;
 use k256::ecdsa::SigningKey;
-use rand::rngs::OsRng;
+use k256::elliptic_curve::Generate;
 use serde::Serialize;
 use sha3::{Digest, Keccak256};
 
@@ -97,7 +97,7 @@ impl EnclaveKey {
     /// TODO: survive restarts by sealing the key to the measurement (or having a KMS release it on
     /// attestation), and hand it over between operators once rotation is on.
     pub fn generate() -> Self {
-        Self { key: SigningKey::random(&mut OsRng) }
+        Self { key: SigningKey::generate() }
     }
 
     /// Selects an explicitly configured public mock authority or generates a private fresh key.
@@ -243,6 +243,7 @@ pub(crate) fn checkpoint_digest(chain_id: u64, vault: &[u8; 20], seq: u64, root:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::ecdsa::signature::hazmat::PrehashVerifier;
     use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 
     fn recover(digest: [u8; 32], sig_hex: &str) -> VerifyingKey {
@@ -250,7 +251,9 @@ mod tests {
         assert_eq!(sig.len(), 65);
         let signature = Signature::from_slice(&sig[..64]).unwrap();
         let recid = RecoveryId::from_byte(sig[64] - 27).unwrap();
-        VerifyingKey::recover_from_prehash(&digest, &signature, recid).unwrap()
+        let key = VerifyingKey::recover_from_prehash(&digest, &signature, recid).unwrap();
+        key.verify_prehash(&digest, &signature).unwrap();
+        key
     }
 
     #[test]

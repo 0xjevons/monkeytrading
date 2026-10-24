@@ -13,11 +13,9 @@ use std::future::IntoFuture;
 use std::time::Duration;
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, Bytes};
-use alloy::providers::{Provider, RootProvider};
+use alloy::primitives::{Address, Bytes, U64};
 use alloy::rpc::client::RpcClient;
-use alloy::rpc::types::{Filter, Header, Log, TransactionRequest};
+use alloy::rpc::types::{Block, Filter, Header, Log, TransactionRequest};
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolEvent};
 use alloy::transports::http::reqwest::{Certificate, Client, Url};
@@ -38,8 +36,6 @@ sol! {
 }
 
 pub struct VaultRpc {
-    provider: RootProvider,
-    /// The provider's client, for batches.
     client: RpcClient,
     /// Kept only to scrub it from errors.
     url: Url,
@@ -79,7 +75,7 @@ impl VaultReader for VaultRpc {
     /// Error cases:
     /// - a request fails or times out, or a non-empty answer does not decode as an address
     async fn identity(&self) -> anyhow::Result<VaultIdentity> {
-        let chain_id = self.deadline("eth_chainId", self.provider.get_chain_id()).await?;
+        let chain_id = self.deadline("eth_chainId", self.client.request::<_, U64>("eth_chainId", ())).await?.to();
         let out = self.call(usdcCall {}.abi_encode(), BlockId::latest()).await.context("reading the vault's token")?;
         let token = if out.is_empty() {
             None
@@ -93,10 +89,17 @@ impl VaultReader for VaultRpc {
     /// Error cases:
     /// - a request fails or times out, or the endpoint has no head
     async fn finality(&self) -> anyhow::Result<Finality> {
-        let tagged =
-            self.deadline("eth_getBlockByNumber", self.provider.get_block_by_number(self.finality_tag)).await?;
+        let tagged = self
+            .deadline(
+                "eth_getBlockByNumber",
+                self.client.request::<_, Option<Block>>("eth_getBlockByNumber", (self.finality_tag, false)),
+            )
+            .await?;
         let head = self
-            .deadline("eth_getBlockByNumber", self.provider.get_block_by_number(BlockNumberOrTag::Latest))
+            .deadline(
+                "eth_getBlockByNumber",
+                self.client.request::<_, Option<Block>>("eth_getBlockByNumber", (BlockNumberOrTag::Latest, false)),
+            )
             .await?
             .context("the RPC has no latest block")?;
         Ok(Finality {
@@ -137,7 +140,7 @@ impl VaultReader for VaultRpc {
             .event_signature(vec![Deposited::SIGNATURE_HASH, HouseDeposited::SIGNATURE_HASH])
             .from_block(from)
             .to_block(to);
-        let logs = self.deadline("eth_getLogs", self.provider.get_logs(&filter)).await?;
+        let logs = self.deadline("eth_getLogs", self.client.request::<_, Vec<Log>>("eth_getLogs", (filter,))).await?;
         let mut deposits = logs.iter().map(|log| self.decode(log)).collect::<anyhow::Result<Vec<_>>>()?;
         deposits.sort_by_key(|d| (d.block, d.log_index));
         Ok(deposits)
@@ -172,7 +175,6 @@ impl VaultRpc {
         let http = Client::builder().tls_certs_only(roots).build().context("building the RPC client")?;
         let client = RpcClient::new_http_with_client(http, url.clone());
         Ok(VaultRpc {
-            provider: RootProvider::new(client.clone()),
             client,
             url,
             vault,
@@ -189,8 +191,8 @@ impl VaultRpc {
     /// Error cases:
     /// - the call fails, reverts, or times out
     async fn call(&self, input: Vec<u8>, block: BlockId) -> anyhow::Result<Bytes> {
-        let request = TransactionRequest::default().with_to(self.vault).with_input(input);
-        self.deadline("eth_call", self.provider.call(request).block(block)).await
+        let request = TransactionRequest::default().to(self.vault).input(input.into());
+        self.deadline("eth_call", self.client.request("eth_call", (request, block))).await
     }
 
     /// Awaits one RPC request under the configured timeout.

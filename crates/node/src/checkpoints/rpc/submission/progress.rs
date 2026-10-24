@@ -2,8 +2,7 @@
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::{Address, B256, U64, U256};
-use alloy::providers::Provider;
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{Block, TransactionRequest};
 use alloy::sol_types::SolCall;
 use anyhow::{Context, ensure};
 use serde::Deserialize;
@@ -26,14 +25,16 @@ impl CheckpointRpc {
     /// - canonical history is absent/inconsistent, finality lags, or the consumer is unrelated
     pub(super) async fn verify_consumer(&self, reservation: &Reservation, obsolete: &Checkpoint) -> anyhow::Result<()> {
         let mut anchor = self
-            .deadline(self.provider.get_block_by_number(self.finality_tag))
+            .deadline(self.client.request::<_, Option<Block>>("eth_getBlockByNumber", (self.finality_tag, false)))
             .await?
             .context("nonce reconciliation has no finality block")?;
         ensure!(anchor.header.number >= self.confirmations, "nonce reconciliation lacks confirmation depth");
         // Follow the sampled tag's immutable ancestry, exactly as the vault state reader does.
         for _ in 0..self.confirmations {
             let parent = self
-                .deadline(self.provider.get_block_by_hash(anchor.header.parent_hash))
+                .deadline(
+                    self.client.request::<_, Option<Block>>("eth_getBlockByHash", (anchor.header.parent_hash, false)),
+                )
                 .await?
                 .context("nonce reconciliation confirmation ancestor is missing")?;
             ensure!(
@@ -68,7 +69,9 @@ impl CheckpointRpc {
             }
         }
         let block = self
-            .deadline(self.provider.get_block_by_number(BlockNumberOrTag::Number(low)))
+            .deadline(
+                self.client.request::<_, Option<Block>>("eth_getBlockByNumber", (BlockNumberOrTag::Number(low), false)),
+            )
             .await?
             .context("nonce consuming block is missing")?;
         ensure!(
@@ -81,11 +84,7 @@ impl CheckpointRpc {
             "canonical block does not bracket the reserved nonce"
         );
         let full: ConsumingBlock = self
-            .deadline(
-                self.provider
-                    .client()
-                    .request::<_, Option<ConsumingBlock>>("eth_getBlockByHash", (block.header.hash, true)),
-            )
+            .deadline(self.client.request::<_, Option<ConsumingBlock>>("eth_getBlockByHash", (block.header.hash, true)))
             .await?
             .context("nonce consuming transactions are missing")?;
         ensure!(
@@ -111,11 +110,7 @@ impl CheckpointRpc {
     /// - historical state is unavailable, orphaned, or the RPC fails
     async fn nonce_at(&self, hash: B256) -> anyhow::Result<u64> {
         let value: U64 = self
-            .deadline(
-                self.provider
-                    .client()
-                    .request("eth_getTransactionCount", (self.relayer, BlockId::hash_canonical(hash))),
-            )
+            .deadline(self.client.request("eth_getTransactionCount", (self.relayer, BlockId::hash_canonical(hash))))
             .await?;
         Ok(value.to())
     }
@@ -125,7 +120,10 @@ impl CheckpointRpc {
     /// - historical blocks/state are missing, inconsistent, orphaned, or unavailable
     async fn nonce_at_height(&self, height: u64) -> anyhow::Result<u64> {
         let block = self
-            .deadline(self.provider.get_block_by_number(BlockNumberOrTag::Number(height)))
+            .deadline(
+                self.client
+                    .request::<_, Option<Block>>("eth_getBlockByNumber", (BlockNumberOrTag::Number(height), false)),
+            )
             .await?
             .context("nonce reconciliation history is missing")?;
         ensure!(block.header.number == height, "nonce reconciliation block height mismatch");

@@ -14,6 +14,8 @@ path = "src/main.rs"
 engine-core.workspace = true
 
 alloy.workspace = true
+alloy-rpc-client.workspace = true
+alloy-transport-http.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -28,7 +30,7 @@ http-body-util.workspace = true
 humantime-serde.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
-k256.workspace = true
+k256 = { workspace = true, features = ["getrandom"] }
 prometheus-client.workspace = true
 rand.workspace = true
 rcgen.workspace = true

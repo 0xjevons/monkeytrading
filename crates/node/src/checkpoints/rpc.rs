@@ -6,11 +6,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, Bytes};
-use alloy::providers::{Provider, RootProvider};
+use alloy::primitives::{Address, Bytes, U64};
 use alloy::rpc::client::RpcClient;
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{Block, TransactionRequest};
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use alloy::transports::http::reqwest::{Certificate, Client, Url};
@@ -37,7 +35,7 @@ sol! {
 }
 
 pub(crate) struct CheckpointRpc {
-    provider: RootProvider,
+    client: RpcClient,
     url: Url,
     domain: CheckpointDomain,
     token: Address,
@@ -69,7 +67,7 @@ impl CheckpointRpc {
         let url = cfg.rpc_url.expose()?;
         let client = RpcClient::new_http_with_client(http, url.clone());
         Ok(Self {
-            provider: RootProvider::new(client),
+            client,
             url,
             domain,
             token,
@@ -89,8 +87,10 @@ impl CheckpointRpc {
     /// Error cases:
     /// - transport, timeout, EVM, or canonical-block errors
     async fn call(&self, to: Address, input: Vec<u8>, block: BlockId) -> anyhow::Result<Bytes> {
-        self.deadline(self.provider.call(TransactionRequest::default().with_to(to).with_input(input)).block(block))
-            .await
+        self.deadline(
+            self.client.request("eth_call", (TransactionRequest::default().to(to).input(input.into()), block)),
+        )
+        .await
     }
 
     /// Bounds requests and redacts transport credentials from their errors.
@@ -129,11 +129,11 @@ impl CheckpointChain for CheckpointRpc {
     /// Error cases:
     /// - the endpoint is on the wrong chain or token, or an RPC/decoding error occurs
     async fn state(&self, view: View) -> anyhow::Result<VaultState> {
-        let chain_id = self.deadline(self.provider.get_chain_id()).await?;
+        let chain_id: u64 = self.deadline(self.client.request::<_, U64>("eth_chainId", ())).await?.to();
         ensure!(chain_id == self.domain.chain_id, "checkpoint endpoint is on another chain");
         let tag = if view == View::Latest { BlockNumberOrTag::Latest } else { self.finality_tag };
         let tagged = self
-            .deadline(self.provider.get_block_by_number(tag))
+            .deadline(self.client.request::<_, Option<Block>>("eth_getBlockByNumber", (tag, false)))
             .await?
             .context("checkpoint RPC has no finality block")?;
         // Follow immutable parent hashes from the exact sampled tag. A by-number read could
@@ -143,7 +143,10 @@ impl CheckpointChain for CheckpointRpc {
             ensure!(block.header.number >= self.confirmations, "checkpoint chain has insufficient confirmation depth");
             for _ in 0..self.confirmations {
                 let parent = self
-                    .deadline(self.provider.get_block_by_hash(block.header.parent_hash))
+                    .deadline(
+                        self.client
+                            .request::<_, Option<Block>>("eth_getBlockByHash", (block.header.parent_hash, false)),
+                    )
                     .await?
                     .context("checkpoint confirmation ancestor is missing")?;
                 ensure!(

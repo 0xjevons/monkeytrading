@@ -17,6 +17,7 @@ pub use alloy_primitives::B256;
 use alloy_primitives::{Address, FixedBytes, U256};
 pub use alloy_sol_types::Eip712Domain;
 use alloy_sol_types::SolStruct;
+use k256::ecdsa::signature::hazmat::PrehashVerifier;
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey, VerifyingKey};
 use sha3::{Digest, Keccak256};
 
@@ -163,12 +164,13 @@ pub fn recover(hash: &B256, signature: &Signature) -> Option<AccountId> {
     };
     let ecdsa = EcdsaSignature::from_slice(&signature[..64]).ok()?;
     let key = VerifyingKey::recover_from_prehash(hash.as_slice(), &ecdsa, recovery_id).ok()?;
+    key.verify_prehash(hash.as_slice(), &ecdsa).ok()?;
     Some(address(&key))
 }
 
 /// The EVM address of `key`: the last 20 bytes of keccak-256 over the uncompressed point.
 pub fn address(key: &VerifyingKey) -> AccountId {
-    let point = key.to_encoded_point(false);
+    let point = key.to_sec1_point(false);
     let hash = Keccak256::digest(&point.as_bytes()[1..]);
     AccountId(hash[12..].try_into().expect("keccak-256 has 32 bytes"))
 }
@@ -176,8 +178,7 @@ pub fn address(key: &VerifyingKey) -> AccountId {
 /// Signs `hash` with `key` in the form `recover` reads. For clients, tests, and the node's enclave
 /// key; the engine only verifies.
 pub fn sign(key: &SigningKey, hash: &B256) -> Signature {
-    // Signing a 32-byte prehash with a valid key cannot fail.
-    let (ecdsa, recovery_id) = key.sign_prehash_recoverable(hash.as_slice()).expect("signing a 32-byte digest");
+    let (ecdsa, recovery_id) = key.sign_prehash_recoverable(hash.as_slice());
     let mut out = [0u8; 65];
     out[..64].copy_from_slice(&ecdsa.to_bytes());
     out[64] = 27 + recovery_id.to_byte();

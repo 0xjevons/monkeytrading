@@ -16,7 +16,7 @@ use engine_core::types::{AccountId, Side};
 use engine_core::{Engine, Fixed};
 use futures_util::FutureExt;
 use k256::ecdsa::SigningKey;
-use rand::rngs::OsRng;
+use k256::elliptic_curve::Generate;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -231,8 +231,8 @@ pub fn scratch_dir(name: &str) -> PathBuf {
 
 /// An operator public key nobody has published: the uncompressed SEC1 hex of a fresh random key.
 pub fn own_operator_key() -> String {
-    let key = SigningKey::random(&mut OsRng);
-    format!("0x{}", hex::encode(key.verifying_key().to_encoded_point(false).as_bytes()))
+    let key = SigningKey::generate();
+    format!("0x{}", hex::encode(key.verifying_key().to_sec1_point(false).as_bytes()))
 }
 
 /// The committed dev config.
