@@ -35,6 +35,7 @@ const RESTART: Millis = FIRST + 2 * 86_400_000 + 1;
 const TRADER: AccountId = AccountId([0xaa; 20]);
 
 mod recovery;
+mod retention;
 
 type WatchCase = (&'static str, &'static str, fn() -> Millis, usize);
 

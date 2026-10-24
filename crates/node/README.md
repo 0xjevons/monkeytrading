@@ -118,6 +118,7 @@ and posts alerts to webhooks. The same binary replays a published log and verifi
 - `src/api/admin.rs` — the operator's admin route, checked before it is sequenced
 - `src/api/benchmark_tests.rs` — deterministic publisher/TLS/API restart and financing dev scenario
 - `src/api/benchmark_tests/recovery.rs` — publisher retries during an in-process trusted-time halt
+- `src/api/benchmark_tests/retention.rs` — failed publisher refreshes and calendar changes after restart
 - `src/api/admin_tests.rs` — admin route tests, and the operator channel dev scenario through
   `engine admin`
 - `src/api/stream/mod.rs` — the WebSocket stream: backfill from disk, then live, under the
@@ -705,13 +706,15 @@ Monitor both processes. A configured node waiting for its worker logs `benchmark
 the worker must run after every restart. SONIA's free database has the publisher's publication delay.
 For long outages, size `api.max_body_bytes` for the signed history (the protocol allows 16,384
 observations per snapshot); a rejected or lost HTTP submission leaves startup synchronization pending.
-After catch-up, histories retain the predecessor required for the next rollover. Previously charged
-dates are not billed again when a publisher revises a rate.
+After catch-up, histories retain predecessors needed by unpaid rollovers and any legal calendar
+change. Older observations are removed only after a retained predecessor supersedes them for all
+those dates. Previously charged dates are not billed again when a publisher revises a rate.
 
 Protocol activation is one-way: a build predating V18 cannot replay a log that activated it.
 Run the deterministic dev scenario with
 `cargo test -p engine-node dev_scenario_benchmark_worker` and protocol coverage with
-`cargo test -p engine-core --test benchmarks`; both run in the existing crate CI lanes.
+`cargo test -p engine-core --test benchmarks --test benchmark_retention`; both run in the existing
+crate CI lanes.
 
 ## Testing
 

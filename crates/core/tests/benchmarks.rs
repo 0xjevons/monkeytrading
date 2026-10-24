@@ -228,9 +228,16 @@ fn snapshot_rate_bounds_and_size_limits_are_checked_before_any_install() {
 }
 
 #[test]
-fn active_snapshots_drop_superseded_history_but_keep_the_next_rollovers_predecessor() {
+fn active_snapshots_keep_future_calendar_predecessors_until_they_are_superseded() {
     let mut h = dated();
     h.operator_admin(batch(&h, &[("2026-10-19", "0.01"), ("2026-10-20", "0.02")]));
+    assert_eq!(h.engine.benchmark_history()["SOFR"].len(), 2);
+    let boundary = chrono::DateTime::parse_from_rfc3339("2026-10-20T18:00:00Z").unwrap().timestamp_millis();
+    h.advance_to(boundary - 1);
+    h.operator_admin(batch(&h, &[]));
+    assert_eq!(h.engine.benchmark_history()["SOFR"].len(), 2);
+    h.advance_to(boundary);
+    h.operator_admin(batch(&h, &[]));
     let retained = &h.engine.benchmark_history()["SOFR"];
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[&date("2026-10-20")], f("0.02"));

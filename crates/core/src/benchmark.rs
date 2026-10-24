@@ -16,6 +16,9 @@ use crate::types::{MarketId, Millis};
 pub const MAX_BENCHMARK_RATES: usize = 16_384;
 pub type BenchmarkHistory = BTreeMap<String, BTreeMap<NaiveDate, Fixed>>;
 
+// Every offset in pinned chrono-tz 2025b is east of -18h (the minimum is -15:56:08).
+const MAX_WESTWARD_OFFSET_MS: Millis = 18 * 60 * 60 * 1_000;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkRate {
@@ -47,7 +50,7 @@ impl Engine {
         self.next_rollover
     }
 
-    /// The publisher history retained for the next rollover, including its preceding observation.
+    /// Publisher history retained for unpaid rollovers and future legal calendar changes.
     pub fn benchmark_history(&self) -> &BenchmarkHistory {
         &self.benchmark_history
     }
@@ -123,8 +126,13 @@ impl Engine {
         }
     }
 
-    /// Drops observations superseded before the next rollover, retaining its predecessor.
+    /// Keeps predecessors for unpaid rollovers and any local date a future calendar can select.
     pub(crate) fn prune_benchmark_history(&mut self, date: NaiveDate) {
+        // Monotone engine time and the offset bound protect future calendars; `date` protects catch-up.
+        let earliest_future_date = DateTime::from_timestamp_millis(self.now - MAX_WESTWARD_OFFSET_MS)
+            .expect("engine timestamps fit chrono")
+            .date_naive();
+        let date = date.min(earliest_future_date);
         for history in self.benchmark_history.values_mut() {
             if let Some((&last, _)) = history.range(..=date).next_back() {
                 *history = history.split_off(&last);
@@ -169,5 +177,13 @@ impl BenchmarkState {
     pub fn date_at(&self, ts: Millis) -> NaiveDate {
         let utc = DateTime::from_timestamp_millis(ts).expect("timestamps fit chrono");
         self.rollover.as_ref().map_or(utc.date_naive(), |r| utc.with_timezone(&r.tz).date_naive())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn timezone_database_changes_require_reauditing_the_retention_offset_bound() {
+        assert_eq!(chrono_tz::IANA_TZDB_VERSION, "2025b", "re-audit every UTC offset against the retention bound");
     }
 }

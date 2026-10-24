@@ -83,7 +83,8 @@ this crate and reproduce the signed state roots exactly.
   the window raises fast-move stress as it would without the halt
 
 - From protocol `V18`, dated decimal benchmark histories select each missed rollover's rate by its
-  local date; observations older than five weekdays still apply and produce a stale status
+  local date; observations older than five weekdays still apply and produce a stale status. Retained
+  history covers unpaid rollovers and legal timezone/hour changes, including earlier local dates
 
 ## Repository Structure
 
@@ -192,6 +193,7 @@ operator's next nonce; `engine admin`, in `engine-node`, signs and submits it.
 `SIGNER_KEY`: the account's private key, hex, for the `sign_request` example.
 
 `tests/benchmarks.rs` covers dated financing, catch-up, snapshots, staleness, and replay.
+`tests/benchmark_retention.rs` covers calendar changes, retention boundaries, and dated financing.
 
 ## Testing
 
